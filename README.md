@@ -15,6 +15,7 @@ Everything runs locally: the model (any OpenAI-compatible endpoint — Ollama by
 - **Learning** — Hermes-style user + agent memory stores the agent curates itself, recalled via search
 - **Memory database** — built-in SQLite (FTS5) by default, or point at a local Postgres
 - **Skills** — reusable `SKILL.md` workflows the agent can load, create, and fix on its own
+- **Local model sharing** — share your local LLM with others via QR code or invite link over Tailscale; per-guest pinned model, live usage, disconnect from either side
 - **Sessions** — resume past conversations, project-scoped, stored locally
 
 ## Architecture
@@ -27,7 +28,8 @@ Everything runs locally: the model (any OpenAI-compatible endpoint — Ollama by
 ├─────────────────────────────────────────────┤
 │  src/core   blackwall-core (headless Rust)  │  model client · agent loop · subagents
 │                                                 tools · approvals · web · memory
-│                                                 skills · auth · sessions
+│                                                 skills · share gateway · auth
+│                                                 sessions
 │  src/app    Tauri shell        src/bw  CLI   │
 └─────────────────────────────────────────────┘
 ```
@@ -37,7 +39,7 @@ Everything runs locally: the model (any OpenAI-compatible endpoint — Ollama by
 
 ## Stack
 
-Rust · Tauri 2 · Svelte 5 · TypeScript · Tailwind CSS 4 · SQLite (rusqlite/FTS5) · tokio · reqwest
+Rust · Tauri 2 · Svelte 5 · TypeScript · Tailwind CSS 4 · SQLite (rusqlite/FTS5) · tokio · reqwest · axum · Tailscale
 
 ## Development
 
