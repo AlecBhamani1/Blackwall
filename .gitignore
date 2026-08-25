@@ -1,0 +1,21 @@
+# Rust
+target/
+# Cargo.lock is kept for the app (tauri) crates; see docs/PLAN.md
+
+# Node / UI
+node_modules/
+dist/
+*.local
+
+# macOS
+.DS_Store
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+*.swp
