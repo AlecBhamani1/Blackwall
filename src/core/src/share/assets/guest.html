@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Blackwall Guest</title>
+    <link rel="stylesheet" href="/guest/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div class="brand"><span class="mark" aria-hidden="true">◆</span> Blackwall</div>
+        <div class="connection"><span class="dot" id="status-dot"></span><span id="status">Connecting…</span></div>
+      </header>
+
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="empty" id="empty-state">
+          <span class="empty-mark" aria-hidden="true">◆</span>
+          <h1>How can I help?</h1>
+          <p>Private guest access to a model shared through Blackwall.</p>
+        </div>
+      </section>
+
+      <section class="composer-wrap">
+        <div class="attachments" id="attachments" aria-live="polite"></div>
+        <form class="composer" id="composer">
+          <label class="attach" for="files" title="Attach images or text files">
+            <span aria-hidden="true">＋</span><span class="sr-only">Attach files</span>
+          </label>
+          <input id="files" type="file" multiple accept="image/*,text/*,.md,.json,.csv" />
+          <textarea id="prompt" rows="1" maxlength="32000" placeholder="Message Blackwall" aria-label="Message Blackwall"></textarea>
+          <button class="send" id="send" type="submit" aria-label="Send message">↑</button>
+        </form>
+        <p class="privacy">Shared by the host · requests travel over your private link</p>
+      </section>
+    </main>
+    <script src="/guest/app.js" defer></script>
+  </body>
+</html>

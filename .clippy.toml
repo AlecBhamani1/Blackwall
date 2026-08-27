@@ -1,0 +1,8 @@
+# `unwrap_used` and `expect_used` are enabled at the workspace level. Tests may use them when the
+# failure itself is a useful assertion; production code must return a typed error instead.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+too-many-lines-threshold = 100

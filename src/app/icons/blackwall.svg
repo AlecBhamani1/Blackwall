@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Blackwall">
+  <rect width="512" height="512" rx="112" fill="#14161c"/>
+  <rect x="78" y="78" width="356" height="356" rx="78" fill="#1a1d25" stroke="#343946" stroke-width="12"/>
+  <path d="M142 236V154c0-7 5-12 12-12h82M370 276v82c0 7-5 12-12 12h-82" fill="none" stroke="#8b90a0" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="244" y="154" width="24" height="204" rx="12" fill="#39c5a8"/>
+</svg>

@@ -1,50 +1,122 @@
 # Blackwall
 
-A local-first agent harness for running **local LLMs** — chat, an agent loop with tool calls, subagents, memory, and skills — with a desktop UI that mirrors the simplicity and readability of Cursor and Codex.
+Blackwall is a local-first agent harness with a deliberately simple desktop chat: choose your
+model, write a message, attach images or files, and receive a streamed response. The model can run
+on this computer or on another machine you control through any OpenAI-compatible endpoint.
 
-Everything runs locally: the model (any OpenAI-compatible endpoint — Ollama by default), the memory database, the sessions, the skills. No cloud, no connection service.
+> **Current status:** the first working desktop vertical slice is implemented. Chat, remote model
+> discovery, streaming, attachments, recent conversations, and the native macOS window work now.
+> The first QR/link browser-sharing slice is intentionally narrow and documented in
+> [`docs/SHARING.md`](docs/SHARING.md). Agent tools, durable memory, approvals, and broader sharing
+> remain roadmap milestones in [`docs/PLAN.md`](docs/PLAN.md).
 
-> **Status:** planning & design — see [`docs/PLAN.md`](docs/PLAN.md) for the full implementation plan, design system, feature specs, and task breakdown.
+## What works now
 
-## Features (v0.1 scope)
+- Native Tauri 2 app with a focused Svelte 5 chat interface
+- Model discovery and switching against an OpenAI-compatible endpoint
+- Streamed assistant replies with stop and reconnect controls
+- Images, pasted photos, text files, and general file attachments
+- Drag-and-drop, attachment previews, duplicate detection, and bounded upload limits
+- Recent conversations saved on the device
+- Sanitized Markdown responses and responsive desktop/mobile-width layouts
+- Expiring QR and browser-link guest sharing over the owner's Tailscale interface
+- Typed Rust commands and one versionable `blackwall://event` stream contract
 
-- **Chat + agent loop** — streaming responses, shell & file tools, inline approval cards (allow / always / deny)
-- **Subagents** — the main agent spawns focused child agents (parallel, foreground/background)
-- **Internet access** — gated `web_fetch`/`web_search` with per-host approval and an SSRF guard
-- **Security** — passphrase unlock (argon2id), macOS Keychain for keys, workspace jail for file tools
-- **Learning** — Hermes-style user + agent memory stores the agent curates itself, recalled via search
-- **Memory database** — built-in SQLite (FTS5) by default, or point at a local Postgres
-- **Skills** — reusable `SKILL.md` workflows the agent can load, create, and fix on its own
-- **Local model sharing** — share your local LLM with others via QR code or invite link over Tailscale; per-guest pinned model, live usage, disconnect from either side
-- **Sessions** — resume past conversations, project-scoped, stored locally
+Blackwall does **not** launch or manage Ollama. If Ollama runs on a different machine, point
+Blackwall at that machine and leave it running there.
+
+## Run the desktop app
+
+Prerequisites are Node.js 22.12+, npm, the stable Rust toolchain, and the
+[Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+
+```sh
+npm install
+npm --prefix ui install
+
+export BLACKWALL_MODEL_ENDPOINT=http://your-model-host:11434
+npm run desktop
+```
+
+An existing `OLLAMA_HOST` is used automatically, so the export is unnecessary when that variable
+already points at the model machine. Both `http://host:11434` and `http://host:11434/v1` are
+accepted. Set `BLACKWALL_MODEL_API_KEY` when the endpoint expects a Bearer token.
+
+For browser-only UI development:
+
+```sh
+export BLACKWALL_DEV_MODEL_ENDPOINT=http://your-model-host:11434
+npm run dev
+```
+
+Then open `http://127.0.0.1:1420`. The browser development server proxies requests to the configured
+model host; production desktop traffic goes through the Rust bridge.
+
+## Verify the workspace
+
+```sh
+npm run verify
+cargo fmt --manifest-path src/Cargo.toml --all -- --check
+cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+cargo test --manifest-path src/Cargo.toml --workspace --all-features
+cargo deny --manifest-path src/Cargo.toml check
+```
+
+Create an unsigned local desktop bundle with `npm run desktop:build`. Public macOS distribution
+still requires an Apple Developer signing identity and notarization.
 
 ## Architecture
 
+```text
+┌──────────────────────────────────────────────┐
+│ ui/       Svelte 5 chat and attachment UI    │
+├──────────────────────────────────────────────┤
+│ typed Tauri commands + blackwall://event     │
+├──────────────────────────────────────────────┤
+│ src/app  endpoint bridge and desktop shell   │
+│ src/core protocol and headless domain types  │
+│ src/bw   future command-line adapter         │
+└──────────────────────┬───────────────────────┘
+                       │ HTTPS/HTTP on your network
+                       ▼
+             OpenAI-compatible model host
 ```
-┌─────────────────────────────────────────────┐
-│  ui/        Svelte 5 webview (Tauri 2)      │  presentation only — restyled via theme.css tokens
-├─────────────────────────────────────────────┤
-│        typed serde event bridge             │  blackwall://event  (the UI contract)
-├─────────────────────────────────────────────┤
-│  src/core   blackwall-core (headless Rust)  │  model client · agent loop · subagents
-│                                                 tools · approvals · web · memory
-│                                                 skills · share gateway · auth
-│                                                 sessions
-│  src/app    Tauri shell        src/bw  CLI   │
-└─────────────────────────────────────────────┘
+
+`blackwall-core` stays independent of Tauri so later CLI, gateway, and test clients can share the
+same protocol. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
+forms, and streams typed events back to the UI. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
+roadmap.
+
+## First guest-sharing slice
+
+Open **Settings** from the bottom-left of the desktop app. Under **Share your model**, confirm the
+pinned model, choose an expiry, and select **Create guest link**. Blackwall presents a QR code and
+copy-link control containing the same browser URL. The invite expires, can be revoked at any time,
+and never reveals the upstream model address or its credentials.
+
+The gateway listens on port `11435` by default. It advertises the owner's Tailscale IPv4 address
+when one is available and otherwise falls back to loopback, which is useful only for an owner-side
+preview. Guest devices must already be able to reach the advertised address; Blackwall does not yet
+automate Tailscale Serve or Funnel.
+
+```sh
+# The model may run on a different machine; Blackwall does not launch Ollama.
+export BLACKWALL_MODEL_ENDPOINT=http://model-machine:11434/v1
+# Or use an existing OLLAMA_HOST instead.
+
+export BLACKWALL_SHARE_PORT=11435                       # optional
+export BLACKWALL_SHARE_PUBLIC_URL=https://chat.example # optional advertised URL override
+npm run desktop
 ```
 
-- `blackwall-core` is framework-free and unit-tested — the TUI, GUI, or CLI are all thin clients over the same event protocol.
-- All state lives under `~/.blackwall/` (config, sessions, memory DB, skills); keys live in the macOS Keychain.
+Each invite is bound to one pinned model and permits at most `2` guest chat requests in flight.
+**Stop sharing** revokes the invite and closes the share surface. See
+[`docs/SHARING.md`](docs/SHARING.md) for the token flow, network assumptions, and current limits.
 
-## Stack
-
-Rust · Tauri 2 · Svelte 5 · TypeScript · Tailwind CSS 4 · SQLite (rusqlite/FTS5) · tokio · reqwest · axum · Tailscale
-
-## Development
-
-Full build steps land with the scaffold (milestone M0). Conventions: Conventional Commits, `cargo fmt` + `clippy -D warnings` + `cargo deny`, `vitest` for the UI, GitHub Actions CI. See `CONTRIBUTING.md` once present.
+Named guest accounts, persisted guest telemetry, automatic Serve/Funnel setup, and signed public
+desktop distribution are later work—not capabilities of this slice.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [`LICENSE`](LICENSE).

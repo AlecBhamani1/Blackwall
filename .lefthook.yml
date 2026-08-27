@@ -1,0 +1,30 @@
+min_version: 2.1.0
+glob_matcher: doublestar
+
+commit-msg:
+  commands:
+    commitlint:
+      run: npx --no-install commitlint --edit "{1}"
+
+pre-commit:
+  parallel: true
+  commands:
+    rust-fmt:
+      glob: "src/**/*.rs"
+      run: cargo fmt --manifest-path src/Cargo.toml --all -- --check
+    rust-clippy:
+      glob: "src/**/*.{rs,toml}"
+      run: cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+    ui-check:
+      glob: "ui/**/*.{css,html,js,json,svelte,ts}"
+      run: npm --prefix ui run check
+
+pre-push:
+  parallel: true
+  commands:
+    rust-test:
+      glob: "src/**/*.{rs,toml}"
+      run: cargo test --manifest-path src/Cargo.toml --workspace --all-features
+    ui-test:
+      glob: "ui/**/*.{css,html,js,json,svelte,ts}"
+      run: npm --prefix ui run test:run
