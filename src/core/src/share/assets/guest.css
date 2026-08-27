@@ -1,0 +1,70 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0e0f13;
+  color: #e8eaed;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; margin: 0; }
+body { background: #0e0f13; }
+button, textarea { font: inherit; }
+
+.shell { min-height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
+.header {
+  height: 54px; padding: 0 22px; border-bottom: 1px solid #262a35;
+  display: flex; align-items: center; justify-content: space-between; background: #111218;
+}
+.brand { font-size: 14px; font-weight: 650; letter-spacing: -0.01em; }
+.mark, .empty-mark { color: #39c5a8; }
+.connection { display: flex; align-items: center; gap: 8px; color: #8b90a0; font-size: 12px; }
+.dot { width: 7px; height: 7px; border-radius: 999px; background: #fbbf24; box-shadow: 0 0 0 3px #fbbf2418; }
+.dot.ok { background: #4ade80; box-shadow: 0 0 0 3px #4ade8018; }
+.dot.err { background: #f87171; box-shadow: 0 0 0 3px #f8717118; }
+
+.conversation { width: min(760px, 100%); margin: 0 auto; padding: 44px 22px 190px; }
+.empty { min-height: 46dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.empty-mark { font-size: 26px; margin-bottom: 15px; }
+.empty h1 { margin: 0; font-size: clamp(24px, 5vw, 32px); letter-spacing: -0.035em; font-weight: 550; }
+.empty p { color: #8b90a0; margin: 10px 0 0; font-size: 13.5px; }
+.message { padding: 15px 0; line-height: 1.65; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message.user { margin: 16px 0 10px auto; width: fit-content; max-width: 88%; padding: 11px 15px; border-radius: 17px; background: #1e222c; }
+.message.assistant { color: #d9dce2; }
+.message.error { color: #fca5a5; }
+.message .meta { display: block; margin-bottom: 5px; color: #8b90a0; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+
+.composer-wrap {
+  position: fixed; bottom: 0; left: 0; right: 0; padding: 18px 18px 12px;
+  background: linear-gradient(180deg, transparent, #0e0f13 24%, #0e0f13);
+}
+.composer, .attachments { width: min(720px, 100%); margin: 0 auto; }
+.composer {
+  min-height: 58px; display: grid; grid-template-columns: auto 1fr auto; align-items: end; gap: 8px;
+  padding: 10px; border: 1px solid #303542; border-radius: 19px; background: #181a21;
+  box-shadow: 0 16px 44px #0006;
+}
+.composer:focus-within { border-color: #39c5a8aa; box-shadow: 0 0 0 3px #39c5a822, 0 16px 44px #0006; }
+textarea { resize: none; max-height: 150px; padding: 8px 2px; border: 0; outline: 0; color: #e8eaed; background: transparent; line-height: 1.45; }
+textarea::placeholder { color: #686e7d; }
+#files { display: none; }
+.attach, .send { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; cursor: pointer; }
+.attach { color: #a5a9b3; font-size: 23px; transition: background .15s, color .15s; }
+.attach:hover { background: #262a35; color: #e8eaed; }
+.send { border: 0; background: #e8eaed; color: #111218; font-size: 19px; font-weight: 700; }
+.send:disabled { cursor: not-allowed; opacity: .35; }
+.privacy { margin: 8px auto 0; color: #565b6b; text-align: center; font-size: 10.5px; }
+.attachments { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 8px; }
+.attachment { display: flex; align-items: center; gap: 7px; max-width: 230px; padding: 6px 8px; border: 1px solid #303542; border-radius: 9px; background: #181a21; color: #b8bcc6; font-size: 11.5px; }
+.attachment img { width: 28px; height: 28px; object-fit: cover; border-radius: 5px; }
+.attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment button { border: 0; background: none; color: #8b90a0; cursor: pointer; padding: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+@media (max-width: 560px) {
+  .header { padding: 0 15px; }
+  .conversation { padding: 26px 16px 180px; }
+  .composer-wrap { padding-inline: 10px; }
+  .message.user { max-width: 94%; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }

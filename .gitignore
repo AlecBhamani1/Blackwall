@@ -5,6 +5,7 @@ target/
 # Node / UI
 node_modules/
 dist/
+coverage/
 *.local
 
 # macOS
