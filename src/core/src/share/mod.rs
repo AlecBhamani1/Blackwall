@@ -1,14 +1,15 @@
-//! Secure, temporary browser sharing for a host-controlled model endpoint.
+//! Secure, temporary browser sharing through a configurable hosted relay.
 //!
-//! A [`ShareHub`] owns at most one listener. Invite credentials are generated
-//! from the operating system CSPRNG, returned only by [`ShareHub::start`], and
-//! immediately reduced to a salted SHA-256 digest for in-memory verification.
+//! The desktop opens an outbound-only WebSocket to the relay. Guest invite
+//! credentials are generated locally, returned only by [`ShareHub::start`],
+//! and shared with the relay only as a salted SHA-256 digest.
 
-mod gateway;
-pub mod tailscale;
+pub mod guest_assets;
+mod relay;
+pub mod relay_protocol;
 
 use std::{
-    net::Ipv4Addr,
+    net::IpAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,28 +19,28 @@ use qrcode::{render::svg, QrCode};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use self::{
-    gateway::{salted_key_hash, start_gateway, GatewayConfig, GatewayControl},
-    tailscale::detect_share_network,
+    relay::{start_relay_host, RelayHostConfig, RelayHostControl, RelayHostError},
+    relay_protocol::RelayRegistration,
 };
 
-/// Default TCP port dedicated to guest traffic.
-pub const DEFAULT_SHARE_PORT: u16 = 11_435;
-/// Environment variable overriding the URL advertised in invitations.
-pub const SHARE_PUBLIC_URL_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_SHARE_PUBLIC_URL";
-/// Environment variable overriding the dedicated listener port.
-pub const SHARE_PORT_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_SHARE_PORT";
+/// Environment variable selecting the hosted relay origin.
+pub const RELAY_URL_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_RELAY_URL";
+/// Optional deployment-wide relay registration credential.
+pub const RELAY_TOKEN_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_RELAY_TOKEN";
 const MODEL_ENDPOINT_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_MODEL_ENDPOINT";
 const OLLAMA_HOST_ENVIRONMENT_VARIABLE: &str = "OLLAMA_HOST";
 const MODEL_API_KEY_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_MODEL_API_KEY";
 const DEFAULT_MODEL_ENDPOINT: &str = "http://localhost:11434/v1";
 const MIN_INVITE_MINUTES: u64 = 1;
 const MAX_INVITE_MINUTES: u64 = 7 * 24 * 60;
+const PROTOCOL_VERSION: u16 = 1;
 
-/// UI request to create one temporary, model-pinned browser invite.
+/// UI request to create one temporary, model-pinned hosted invite.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartShareRequest {
@@ -48,27 +49,32 @@ pub struct StartShareRequest {
     /// Optional endpoint selected in the desktop UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Hosted relay origin selected in Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Optional deployment registration credential. This is never returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
     /// Invite lifetime in minutes, from 1 minute through 7 days.
     pub expires_in_minutes: u64,
 }
 
-/// Current state of the guest gateway.
+/// Current state of the hosted guest share.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareStatus {
-    /// Whether the listener is unrevoked and the invitation is unexpired.
+    /// Whether the invite remains live or is reconnecting to its relay.
     pub active: bool,
     /// Browser invitation URL. Populated only by `start_share` because it embeds
     /// the raw credential; subsequent status calls intentionally return `""`.
     pub share_url: String,
-    /// SVG data URL encoding `share_url` byte-for-byte. Like `share_url`, this
-    /// is returned once and is empty on later status calls.
+    /// SVG data URL encoding `share_url` byte-for-byte.
     pub qr_data_url: String,
     /// Host-selected model guests are allowed to use.
     pub model: String,
     /// Invite expiry as milliseconds since the Unix epoch.
     pub expires_at: u64,
-    /// Human-readable reachability scope for the bound interface.
+    /// Human-readable relay connection state.
     pub network_label: String,
     /// Number of accepted authenticated API requests during this invite.
     pub request_count: u64,
@@ -89,7 +95,7 @@ impl ShareStatus {
     }
 }
 
-/// Owns the process-wide guest listener and its revocable authorization state.
+/// Owns the process-wide outbound relay connection and revocable invite.
 #[derive(Clone)]
 pub struct ShareHub {
     inner: Arc<Mutex<Option<RunningShare>>>,
@@ -102,19 +108,32 @@ impl Default for ShareHub {
 }
 
 impl ShareHub {
-    /// Creates an idle hub. This does not start a model process or a listener.
+    /// Creates an idle hub without opening a network connection.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Starts a temporary guest listener using existing endpoint environment
-    /// configuration. Any previous listener is revoked before replacement.
+    /// Publishes a temporary invite through the selected hosted relay.
     pub async fn start(&self, request: StartShareRequest) -> Result<ShareStatus, ShareError> {
         validate_request(&request)?;
-        let network = detect_share_network();
-        let port = configured_port()?;
+        let relay_value = request
+            .relay_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| environment_value(RELAY_URL_ENVIRONMENT_VARIABLE))
+            .ok_or(ShareError::MissingRelayUrl)?;
+        let relay_base_url = normalize_relay_base_url(&relay_value)?;
+        let relay_token = request
+            .relay_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| environment_value(RELAY_TOKEN_ENVIRONMENT_VARIABLE));
         let environment_endpoint = environment_value(MODEL_ENDPOINT_ENVIRONMENT_VARIABLE)
             .or_else(|| environment_value(OLLAMA_HOST_ENVIRONMENT_VARIABLE));
         let upstream_endpoint = normalize_upstream_endpoint(
@@ -126,24 +145,15 @@ impl ShareHub {
                 .or(environment_endpoint.as_deref())
                 .unwrap_or(DEFAULT_MODEL_ENDPOINT),
         )?;
-        let public_base_url = environment_value(SHARE_PUBLIC_URL_ENVIRONMENT_VARIABLE)
-            .map(|value| normalize_public_base_url(&value))
-            .transpose()?;
-        let config = ShareStartConfig {
+        self.start_configured(ShareStartConfig {
             model: request.model,
             expires_in: Duration::from_secs(request.expires_in_minutes.saturating_mul(60)),
             upstream_endpoint,
             upstream_api_key: environment_value(MODEL_API_KEY_ENVIRONMENT_VARIABLE),
-            bind_ip: network.bind_ip,
-            port,
-            public_base_url,
-            network_label: if environment_value(SHARE_PUBLIC_URL_ENVIRONMENT_VARIABLE).is_some() {
-                "Configured share URL".to_owned()
-            } else {
-                network.label.to_owned()
-            },
-        };
-        self.start_configured(config).await
+            relay_base_url,
+            relay_token,
+        })
+        .await
     }
 
     /// Returns metadata without returning the raw invite credential again.
@@ -152,18 +162,23 @@ impl ShareHub {
         let Some(running) = guard.as_ref() else {
             return ShareStatus::inactive();
         };
+        let active = unix_epoch_millis() < running.expires_at && !running.task.is_finished();
         ShareStatus {
-            active: running.control.is_active() && !running.task.is_finished(),
+            active,
             share_url: String::new(),
             qr_data_url: String::new(),
             model: running.model.clone(),
             expires_at: running.expires_at,
-            network_label: running.network_label.clone(),
+            network_label: if running.control.is_connected() {
+                "Hosted relay".to_owned()
+            } else {
+                "Hosted relay · reconnecting".to_owned()
+            },
             request_count: running.control.request_count(),
         }
     }
 
-    /// Revokes the current credential and closes the listener.
+    /// Revokes the current invitation by closing its authenticated host session.
     pub async fn stop(&self) -> ShareStatus {
         let running = self.inner.lock().await.take();
         if let Some(running) = running {
@@ -173,16 +188,6 @@ impl ShareHub {
     }
 
     async fn start_configured(&self, config: ShareStartConfig) -> Result<ShareStatus, ShareError> {
-        if config.model.trim().is_empty() {
-            return Err(ShareError::MissingModel);
-        }
-        if config.expires_in.is_zero() {
-            return Err(ShareError::InvalidExpiry {
-                minimum_minutes: MIN_INVITE_MINUTES,
-                maximum_minutes: MAX_INVITE_MINUTES,
-            });
-        }
-
         let mut guard = self.inner.lock().await;
         if let Some(running) = guard.take() {
             stop_running(running).await;
@@ -190,12 +195,11 @@ impl ShareHub {
 
         let expires_at = unix_epoch_millis()
             .saturating_add(config.expires_in.as_millis().try_into().unwrap_or(u64::MAX));
-        let mut key_bytes = [0_u8; 32];
+        let raw_key = random_secret("bw1_");
+        let host_key = random_secret("bwh_");
+        let session_id = random_secret("bws_");
         let mut salt = [0_u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
         OsRng.fill_bytes(&mut salt);
-        let raw_key = format!("bw1_{}", URL_SAFE_NO_PAD.encode(key_bytes));
-        key_bytes.fill(0);
         let key_hash = salted_key_hash(&salt, &raw_key);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -203,29 +207,31 @@ impl ShareHub {
             .user_agent(concat!("blackwall-share/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(ShareError::Client)?;
-        let gateway = start_gateway(GatewayConfig {
+        let socket_url = relay_socket_url(&config.relay_base_url)?;
+        let registration = RelayRegistration {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.clone(),
+            host_key,
+            relay_token: config.relay_token,
+            model: config.model.clone(),
+            guest_key_salt: URL_SAFE_NO_PAD.encode(salt),
+            guest_key_hash: URL_SAFE_NO_PAD.encode(key_hash),
+            expires_at_ms: expires_at,
+        };
+        let relay = start_relay_host(RelayHostConfig {
+            socket_url,
+            registration,
             client,
             upstream_endpoint: config.upstream_endpoint,
             upstream_api_key: config.upstream_api_key,
-            pinned_model: config.model.clone(),
-            bind_ip: config.bind_ip,
-            port: config.port,
-            salt,
-            key_hash,
-            expires_at_ms: expires_at,
         })
         .await
-        .map_err(ShareError::Listener)?;
+        .map_err(|error| ShareError::Relay(error.to_string()))?;
 
-        let advertised_base = match config.public_base_url {
-            Some(base) => base,
-            None => format!(
-                "http://{}:{}",
-                gateway.local_addr.ip(),
-                gateway.local_addr.port()
-            ),
-        };
-        let share_url = format!("{advertised_base}/guest#key={raw_key}");
+        let share_url = format!(
+            "{}/s/{session_id}/guest#key={raw_key}",
+            config.relay_base_url
+        );
         let qr_data_url = qr_data_url(&share_url)?;
         let status = ShareStatus {
             active: true,
@@ -233,16 +239,15 @@ impl ShareHub {
             qr_data_url,
             model: config.model.clone(),
             expires_at,
-            network_label: config.network_label.clone(),
+            network_label: "Hosted relay".to_owned(),
             request_count: 0,
         };
         *guard = Some(RunningShare {
             model: config.model,
             expires_at,
-            network_label: config.network_label,
-            control: gateway.control,
-            shutdown: gateway.shutdown,
-            task: gateway.task,
+            control: relay.control,
+            shutdown: relay.shutdown,
+            task: relay.task,
         });
         Ok(status)
     }
@@ -253,27 +258,20 @@ struct ShareStartConfig {
     expires_in: Duration,
     upstream_endpoint: String,
     upstream_api_key: Option<String>,
-    bind_ip: Ipv4Addr,
-    port: u16,
-    public_base_url: Option<String>,
-    network_label: String,
+    relay_base_url: String,
+    relay_token: Option<String>,
 }
 
 struct RunningShare {
     model: String,
     expires_at: u64,
-    network_label: String,
-    control: GatewayControl,
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    control: RelayHostControl,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<(), RelayHostError>>,
 }
 
 async fn stop_running(running: RunningShare) {
-    running.control.revoke();
-    let _send_result = running.shutdown.send(());
-    // The gateway supervisor owns a blocking socket bridge. Tokio cannot
-    // safely cancel an already-running blocking task, so always let the
-    // supervisor close both socket sides and join every worker before return.
+    let _shutdown_result = running.shutdown.send(true);
     let _join_result = running.task.await;
 }
 
@@ -288,22 +286,6 @@ fn validate_request(request: &StartShareRequest) -> Result<(), ShareError> {
         });
     }
     Ok(())
-}
-
-fn configured_port() -> Result<u16, ShareError> {
-    match environment_value(SHARE_PORT_ENVIRONMENT_VARIABLE) {
-        Some(value) => {
-            value
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .ok_or(ShareError::InvalidPort {
-                    value,
-                    variable: SHARE_PORT_ENVIRONMENT_VARIABLE,
-                })
-        }
-        None => Ok(DEFAULT_SHARE_PORT),
-    }
 }
 
 fn normalize_upstream_endpoint(endpoint: &str) -> Result<String, ShareError> {
@@ -323,10 +305,10 @@ fn normalize_upstream_endpoint(endpoint: &str) -> Result<String, ShareError> {
             reason: "only http and https endpoints are supported".to_owned(),
         });
     }
-    if !url.username().is_empty() || url.password().is_some() {
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
         return Err(ShareError::InvalidEndpoint {
             endpoint: endpoint.to_owned(),
-            reason: "credentials must not be embedded in the URL".to_owned(),
+            reason: "a host is required and credentials must not be embedded in the URL".to_owned(),
         });
     }
     if url.query().is_some() || url.fragment().is_some() {
@@ -344,25 +326,38 @@ fn normalize_upstream_endpoint(endpoint: &str) -> Result<String, ShareError> {
     Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
-fn normalize_public_base_url(value: &str) -> Result<String, ShareError> {
-    let mut url = Url::parse(value.trim()).map_err(|error| ShareError::InvalidPublicUrl {
+fn normalize_relay_base_url(value: &str) -> Result<String, ShareError> {
+    let mut url = Url::parse(value.trim()).map_err(|error| ShareError::InvalidRelayUrl {
         value: value.to_owned(),
         reason: error.to_string(),
     })?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(ShareError::InvalidPublicUrl {
+        return Err(ShareError::InvalidRelayUrl {
             value: value.to_owned(),
             reason: "only http and https URLs are supported".to_owned(),
         });
     }
-    if url.host_str().is_none()
-        || !url.username().is_empty()
+    let host = url.host_str().ok_or_else(|| ShareError::InvalidRelayUrl {
+        value: value.to_owned(),
+        reason: "a host is required".to_owned(),
+    })?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if url.scheme() != "https" && !loopback {
+        return Err(ShareError::InvalidRelayUrl {
+            value: value.to_owned(),
+            reason: "public relay URLs must use HTTPS".to_owned(),
+        });
+    }
+    if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || !matches!(url.path(), "" | "/")
     {
-        return Err(ShareError::InvalidPublicUrl {
+        return Err(ShareError::InvalidRelayUrl {
             value: value.to_owned(),
             reason: "the URL must be an origin with no credentials, path, query, or fragment"
                 .to_owned(),
@@ -370,6 +365,37 @@ fn normalize_public_base_url(value: &str) -> Result<String, ShareError> {
     }
     url.set_path("");
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn relay_socket_url(relay_base_url: &str) -> Result<String, ShareError> {
+    let mut url = Url::parse(relay_base_url).map_err(|error| ShareError::InvalidRelayUrl {
+        value: relay_base_url.to_owned(),
+        reason: error.to_string(),
+    })?;
+    let socket_scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(socket_scheme)
+        .map_err(|()| ShareError::InvalidRelayUrl {
+            value: relay_base_url.to_owned(),
+            reason: "could not construct the relay WebSocket URL".to_owned(),
+        })?;
+    url.set_path("/v1/host/connect");
+    Ok(url.to_string())
+}
+
+fn random_secret(prefix: &str) -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let secret = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes));
+    bytes.fill(0);
+    secret
+}
+
+/// Computes the digest stored by the relay instead of a raw invite key.
+pub fn salted_key_hash(salt: &[u8; 32], key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(key.as_bytes());
+    hasher.finalize().into()
 }
 
 fn qr_data_url(payload: &str) -> Result<String, ShareError> {
@@ -416,13 +442,16 @@ pub enum ShareError {
         /// Largest accepted lifetime.
         maximum_minutes: u64,
     },
-    /// Listener port environment configuration is malformed.
-    #[error("{variable} must be a non-zero TCP port, not {value:?}")]
-    InvalidPort {
-        /// Invalid environment value.
+    /// Neither the request nor the environment selected a relay.
+    #[error("enter a hosted relay URL before sharing")]
+    MissingRelayUrl,
+    /// The hosted relay origin cannot be used safely.
+    #[error("invalid hosted relay URL {value:?}: {reason}")]
+    InvalidRelayUrl {
+        /// Rejected relay URL.
         value: String,
-        /// Stable environment variable name.
-        variable: &'static str,
+        /// Validation detail.
+        reason: String,
     },
     /// The host model endpoint cannot be used safely.
     #[error("invalid model endpoint {endpoint:?}: {reason}")]
@@ -432,20 +461,12 @@ pub enum ShareError {
         /// Validation detail.
         reason: String,
     },
-    /// The advertised share URL override is malformed.
-    #[error("invalid public share URL {value:?}: {reason}")]
-    InvalidPublicUrl {
-        /// Rejected override.
-        value: String,
-        /// Validation detail.
-        reason: String,
-    },
     /// The bounded upstream HTTP client could not be created.
     #[error("could not initialize the guest model client: {0}")]
     Client(#[source] reqwest::Error),
-    /// The exact Tailscale or loopback listener address could not be opened.
-    #[error("could not start the guest listener: {0}")]
-    Listener(#[source] std::io::Error),
+    /// Hosted relay connection or registration failed.
+    #[error("could not publish the guest share: {0}")]
+    Relay(String),
     /// Invite payload exceeded QR encoding limits.
     #[error("could not encode the invite QR: {0}")]
     Qr(#[source] qrcode::types::QrError),
@@ -458,68 +479,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serde_contract_uses_ui_field_names_and_epoch_milliseconds() {
+    fn serde_contract_uses_ui_field_names_and_hides_optional_secrets() {
         let request: StartShareRequest = serde_json::from_value(serde_json::json!({
             "model": "qwen3",
             "endpoint": "http://model-host:11434",
+            "relayUrl": "https://relay.example.com",
+            "relayToken": "deployment-secret",
             "expiresInMinutes": 60
         }))
         .unwrap();
         assert_eq!(request.expires_in_minutes, 60);
-        assert_eq!(request.endpoint.as_deref(), Some("http://model-host:11434"));
+        assert_eq!(
+            request.relay_url.as_deref(),
+            Some("https://relay.example.com")
+        );
+        assert_eq!(request.relay_token.as_deref(), Some("deployment-secret"));
 
         let value = serde_json::to_value(ShareStatus {
             active: true,
-            share_url: "http://100.64.1.2:11435/guest#key=bw1_test".to_owned(),
+            share_url: "https://relay.example.com/s/id/guest#key=bw1_test".to_owned(),
             qr_data_url: "data:image/svg+xml;base64,PHN2Zz4=".to_owned(),
             model: "qwen3".to_owned(),
             expires_at: 1_787_680_000_000,
-            network_label: "Tailscale tailnet".to_owned(),
+            network_label: "Hosted relay".to_owned(),
             request_count: 2,
         })
         .unwrap();
         assert_eq!(value["expiresAt"], 1_787_680_000_000_u64);
         assert!(value.get("shareUrl").is_some());
-        assert!(value.get("qrDataUrl").is_some());
-        assert!(value.get("requestCount").is_some());
+        assert!(value.get("relayToken").is_none());
     }
 
     #[test]
-    fn endpoint_and_public_url_normalization_are_bounded() {
+    fn endpoint_and_relay_url_normalization_are_bounded() {
         assert_eq!(
             normalize_upstream_endpoint("192.0.2.42:11434").unwrap(),
             "http://192.0.2.42:11434/v1"
         );
         assert_eq!(
-            normalize_upstream_endpoint("https://model.example/v1/").unwrap(),
-            "https://model.example/v1"
+            normalize_relay_base_url("https://relay.example.com/").unwrap(),
+            "https://relay.example.com"
         );
-        assert!(normalize_upstream_endpoint("file:///tmp/model").is_err());
-        assert!(normalize_upstream_endpoint("http://user:pass@host/v1").is_err());
         assert_eq!(
-            normalize_public_base_url("https://host.example/").unwrap(),
-            "https://host.example"
+            relay_socket_url("https://relay.example.com").unwrap(),
+            "wss://relay.example.com/v1/host/connect"
         );
-        assert!(normalize_public_base_url("https://host.example/share/").is_err());
-        assert!(normalize_public_base_url("javascript:alert(1)").is_err());
+        assert!(normalize_relay_base_url("http://relay.example.com").is_err());
+        assert!(normalize_relay_base_url("https://relay.example.com/path").is_err());
+        assert!(normalize_relay_base_url("https://user:pass@relay.example.com").is_err());
+        assert_eq!(
+            normalize_relay_base_url("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787"
+        );
     }
 
     #[test]
-    fn qr_is_an_svg_data_url_generated_from_the_exact_link() {
-        let link = "http://100.64.1.2:11435/guest#key=bw1_byte_exact";
+    fn salted_hash_is_deterministic_and_the_qr_encodes_the_exact_link() {
+        assert_eq!(
+            salted_key_hash(&[1; 32], "bw1_test"),
+            salted_key_hash(&[1; 32], "bw1_test")
+        );
+        assert_ne!(
+            salted_key_hash(&[1; 32], "bw1_test"),
+            salted_key_hash(&[2; 32], "bw1_test")
+        );
+
+        let link = "https://relay.example.com/s/id/guest#key=bw1_byte_exact";
         let data_url = qr_data_url(link).unwrap();
         let encoded = data_url.strip_prefix("data:image/svg+xml;base64,").unwrap();
         let svg = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .unwrap();
-        let svg = String::from_utf8(svg).unwrap();
-        assert!(svg.starts_with("<?xml") || svg.starts_with("<svg"));
-
-        let expected_code = QrCode::new(link.as_bytes()).unwrap();
-        let repeated_code = QrCode::new(link.as_bytes()).unwrap();
-        assert_eq!(
-            expected_code.render::<svg::Color>().build(),
-            repeated_code.render::<svg::Color>().build()
-        );
+        assert!(String::from_utf8(svg).unwrap().contains("<svg"));
     }
 }

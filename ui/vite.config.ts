@@ -23,7 +23,7 @@ export default defineConfig(({ mode }) => {
         },
       },
       watch: {
-        ignored: ['**/src/app/**', '**/src/core/**', '**/src/bw/**'],
+        ignored: ['**/src/app/**', '**/src/core/**', '**/src/bw/**', '**/src/relay/**'],
       },
     },
     build: {

@@ -10,6 +10,11 @@ on this computer or on another machine you control through any OpenAI-compatible
 > [`docs/SHARING.md`](docs/SHARING.md). Agent tools, durable memory, approvals, and broader sharing
 > remain roadmap milestones in [`docs/PLAN.md`](docs/PLAN.md).
 
+## Download for macOS
+
+[Download the latest macOS build](https://github.com/AlecBhamani1/Blackwall/releases/tag/main).
+Choose the `aarch64` DMG for Apple Silicon Macs or the `x64` DMG for Intel Macs.
+
 ## What works now
 
 - Native Tauri 2 app with a focused Svelte 5 chat interface
@@ -19,7 +24,7 @@ on this computer or on another machine you control through any OpenAI-compatible
 - Drag-and-drop, attachment previews, duplicate detection, and bounded upload limits
 - Recent conversations saved on the device
 - Sanitized Markdown responses and responsive desktop/mobile-width layouts
-- Expiring QR and browser-link guest sharing over the owner's Tailscale interface
+- Expiring QR and browser-link guest sharing through a self-hosted relay
 - Signed in-app updates from the latest successful `main` build on GitHub
 - Typed Rust commands and one versionable `blackwall://event` stream contract
 
@@ -41,6 +46,8 @@ npm install
 npm --prefix ui install
 
 export BLACKWALL_MODEL_ENDPOINT=http://your-model-host:11434
+export BLACKWALL_RELAY_URL=https://relay.example.com       # optional until sharing
+export BLACKWALL_RELAY_TOKEN='your-relay-registration-token'
 npm run desktop
 ```
 
@@ -100,13 +107,14 @@ one final manual replacement with an updater-enabled build; later updates instal
 │ src/app  endpoint bridge and desktop shell   │
 │ src/core protocol and headless domain types  │
 │ src/bw   future command-line adapter         │
-└──────────────────────┬───────────────────────┘
-                       │ HTTPS/HTTP on your network
-                       ▼
-             OpenAI-compatible model host
+└───────────┬──────────────────────┬────────────┘
+            │ HTTPS/HTTP           │ outbound WSS
+            ▼                      ▼
+ OpenAI-compatible model     hosted relay ◄── HTTPS ── guest
+ host you control
 ```
 
-`blackwall-core` stays independent of Tauri so later CLI, gateway, and test clients can share the
+`blackwall-core` stays independent of Tauri so later CLI, mobile, and test clients can share the
 same protocol. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
 forms, and streams typed events back to the UI. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
@@ -115,31 +123,29 @@ roadmap.
 ## First guest-sharing slice
 
 Open **Settings** from the bottom-left of the desktop app. Under **Share your model**, confirm the
-pinned model, choose an expiry, and select **Create guest link**. Blackwall presents a QR code and
-copy-link control containing the same browser URL. The invite expires, can be revoked at any time,
-and never reveals the upstream model address or its credentials.
-
-The gateway listens on port `11435` by default. It advertises the owner's Tailscale IPv4 address
-when one is available and otherwise falls back to loopback, which is useful only for an owner-side
-preview. Guest devices must already be able to reach the advertised address; Blackwall does not yet
-automate Tailscale Serve or Funnel.
+pinned model, enter the HTTPS origin of a hosted relay, choose an expiry, and select **Create guest
+link**. Blackwall presents a QR code and copy-link control containing the same browser URL. The
+invite expires, can be revoked at any time, and never reveals the upstream model address or its
+credentials. The Mac makes an outbound WebSocket connection, so guest access needs no VPN, shared
+Wi-Fi, inbound port, or public IP on the Mac.
 
 ```sh
 # The model may run on a different machine; Blackwall does not launch Ollama.
 export BLACKWALL_MODEL_ENDPOINT=http://model-machine:11434/v1
 # Or use an existing OLLAMA_HOST instead.
 
-export BLACKWALL_SHARE_PORT=11435                       # optional
-export BLACKWALL_SHARE_PUBLIC_URL=https://chat.example # optional advertised URL override
+export BLACKWALL_RELAY_URL=https://relay.example.com
+export BLACKWALL_RELAY_TOKEN='the-token-configured-on-the-relay'
 npm run desktop
 ```
 
 Each invite is bound to one pinned model and permits at most `2` guest chat requests in flight.
-**Stop sharing** revokes the invite and closes the share surface. See
-[`docs/SHARING.md`](docs/SHARING.md) for the token flow, network assumptions, and current limits.
+**Stop sharing** revokes the invite and removes its relay session. See
+[`docs/SHARING.md`](docs/SHARING.md) for the included Docker/Caddy deployment, token flow, and
+current limits.
 
-Named guest accounts, persisted guest telemetry, automatic Serve/Funnel setup, and signed public
-desktop distribution are later work—not capabilities of this slice.
+Named guest accounts, end-to-end application encryption, persisted guest telemetry, and signed
+public desktop distribution are later work—not capabilities of this slice.
 
 ## License
 

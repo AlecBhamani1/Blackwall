@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "bw", "core"]
+members = ["app", "bw", "core", "relay"]
 resolver = "2"
 
 [workspace.package]
@@ -11,12 +11,10 @@ repository = "https://github.com/AlecBhamani1/Blackwall"
 
 [workspace.dependencies]
 async-stream = "0.3.6"
-axum = { version = "0.8.4", features = ["http1", "json", "tokio"] }
+axum = { version = "0.8.4", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.22.1"
 blackwall-core = { path = "core", version = "0.1.0" }
 futures-util = "0.3.31"
-if-addrs = "0.14.0"
-nix = { version = "0.30.1", default-features = false, features = ["poll"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rand = "0.8.5"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -30,6 +28,7 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-updater = "2.10.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = { version = "0.5.2", features = ["util"] }
 
 [workspace.lints.rust]

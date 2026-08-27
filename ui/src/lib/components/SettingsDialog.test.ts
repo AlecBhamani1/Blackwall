@@ -17,7 +17,7 @@ function mockClient(): GuestShareClient {
       qrDataUrl: QR_DATA_URL,
       model: MODEL,
       expiresAt: Date.now() + 60 * 60 * 1_000,
-      networkLabel: 'Tailscale network',
+      networkLabel: 'Hosted relay',
       requestCount: 0,
     }),
     stopShare: vi.fn().mockResolvedValue({ active: false }),
@@ -100,14 +100,19 @@ describe('SettingsDialog', () => {
     });
 
     await screen.findByText('Link expires after');
+    await user.type(screen.getByLabelText('Hosted relay URL'), 'https://relay.example.com');
+    await user.type(screen.getByLabelText(/Relay token/), 'relay-secret');
     await user.click(screen.getByLabelText('8 hours'));
     await user.click(screen.getByRole('button', { name: 'Create guest link' }));
 
     expect(client.startShare).toHaveBeenCalledWith({
       model: MODEL,
       endpoint: 'http://model-host:11434/v1',
+      relayUrl: 'https://relay.example.com',
+      relayToken: 'relay-secret',
       expiresInMinutes: 480,
     });
+    expect(window.localStorage.getItem('blackwall.relay-url.v1')).toBe('https://relay.example.com');
     expect(await screen.findByRole('img', { name: 'QR code for guest chat link' })).toHaveAttribute(
       'src',
       QR_DATA_URL,

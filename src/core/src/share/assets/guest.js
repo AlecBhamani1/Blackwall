@@ -56,7 +56,7 @@
       return;
     }
     try {
-      const response = await fetch("/v1/models", { headers: authHeaders(), cache: "no-store" });
+      const response = await fetch("v1/models", { headers: authHeaders(), cache: "no-store" });
       if (!response.ok) throw new Error(await apiError(response));
       const payload = await response.json();
       model = payload.data?.[0]?.id || "";
@@ -198,7 +198,7 @@
         addMessage("assistant", "Earlier messages were left out to keep this request within the 32 MB safety limit.");
       }
       assistant = addMessage("assistant", "");
-      const response = await fetch("/v1/chat/completions", {
+      const response = await fetch("v1/chat/completions", {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: request.body
