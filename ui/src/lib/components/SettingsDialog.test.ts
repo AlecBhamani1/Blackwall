@@ -25,6 +25,61 @@ function mockClient(): GuestShareClient {
 }
 
 describe('SettingsDialog', () => {
+  it('offers an available signed update and installs it on request', async () => {
+    const user = userEvent.setup();
+    const onInstallUpdate = vi.fn().mockResolvedValue(undefined);
+
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        model: MODEL,
+        currentVersion: '0.1.0',
+        updateState: 'available',
+        availableUpdate: {
+          currentVersion: '0.1.0',
+          version: '0.1.9',
+          body: 'A signed build from main.',
+        },
+        onInstallUpdate,
+        onClose: vi.fn(),
+        client: mockClient(),
+      },
+    });
+
+    expect(await screen.findByText('Update available')).toBeInTheDocument();
+    expect(screen.getByText('v0.1.9')).toBeInTheDocument();
+    expect(screen.getByText('A signed build from main.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Install update and restart' }));
+    expect(onInstallUpdate).toHaveBeenCalledOnce();
+  });
+
+  it('saves and tests a model endpoint from settings', async () => {
+    const user = userEvent.setup();
+    const onConfigureEndpoint = vi.fn().mockResolvedValue(true);
+
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        model: MODEL,
+        endpoint: 'http://localhost:11434/v1',
+        connectionState: 'offline',
+        connectionError: 'Connection refused.',
+        onConfigureEndpoint,
+        onClose: vi.fn(),
+        client: mockClient(),
+      },
+    });
+
+    const input = screen.getByLabelText('Endpoint URL');
+    await user.clear(input);
+    await user.type(input, 'http://100.76.24.116:11434');
+    await user.click(screen.getByRole('button', { name: 'Save and reconnect' }));
+
+    expect(onConfigureEndpoint).toHaveBeenCalledWith('http://100.76.24.116:11434');
+    expect(await screen.findByText('Connected and loaded the available models.')).toBeInTheDocument();
+  });
+
   it('creates a temporary share and exposes both its QR code and copyable link', async () => {
     const user = userEvent.setup();
     const client = mockClient();
@@ -35,14 +90,24 @@ describe('SettingsDialog', () => {
     });
 
     render(SettingsDialog, {
-      props: { open: true, model: MODEL, onClose: vi.fn(), client },
+      props: {
+        open: true,
+        model: MODEL,
+        endpoint: 'http://model-host:11434/v1',
+        onClose: vi.fn(),
+        client,
+      },
     });
 
     await screen.findByText('Link expires after');
     await user.click(screen.getByLabelText('8 hours'));
     await user.click(screen.getByRole('button', { name: 'Create guest link' }));
 
-    expect(client.startShare).toHaveBeenCalledWith({ model: MODEL, expiresInMinutes: 480 });
+    expect(client.startShare).toHaveBeenCalledWith({
+      model: MODEL,
+      endpoint: 'http://model-host:11434/v1',
+      expiresInMinutes: 480,
+    });
     expect(await screen.findByRole('img', { name: 'QR code for guest chat link' })).toHaveAttribute(
       'src',
       QR_DATA_URL,

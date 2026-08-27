@@ -2,5 +2,5 @@
   "identifier": "default",
   "description": "Base capability for the local Blackwall chat window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "process:allow-restart", "updater:default"]
 }

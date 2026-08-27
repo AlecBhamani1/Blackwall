@@ -6,8 +6,10 @@
   import Sidebar from './lib/components/Sidebar.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
   import { createChatController } from './lib/store';
+  import { createAppUpdateController } from './lib/updates';
 
   const controller = createChatController();
+  const updateController = createAppUpdateController();
   const {
     messages,
     sessions,
@@ -16,9 +18,18 @@
     connectionState,
     models,
     selectedModel,
+    endpoint,
     contextPercent,
     notice,
+    connectionError,
   } = controller;
+  const {
+    state: updateState,
+    currentVersion,
+    update: availableUpdate,
+    progress: updateProgress,
+    error: updateError,
+  } = updateController;
 
   let sidebarVisible = typeof window === 'undefined' ? true : window.innerWidth > 760;
   const showHarnessDemo =
@@ -58,6 +69,7 @@
 
   onMount(() => {
     void controller.initialize();
+    void updateController.initialize();
     window.addEventListener('keydown', keydown);
   });
 
@@ -74,9 +86,19 @@
     activeSessionId={$activeSessionId}
     connectionState={$connectionState}
     selectedModel={$selectedModel}
+    endpoint={$endpoint}
+    connectionError={$connectionError}
+    updateState={$updateState}
+    currentVersion={$currentVersion}
+    availableUpdate={$availableUpdate}
+    updateProgress={$updateProgress}
+    updateError={$updateError}
     onNewChat={newChat}
     onOpenSession={openSession}
     onRemoveSession={controller.removeSession}
+    onConfigureEndpoint={controller.configureEndpoint}
+    onCheckForUpdates={updateController.checkForUpdates}
+    onInstallUpdate={updateController.installUpdate}
     onClose={() => (sidebarVisible = false)}
   />
 

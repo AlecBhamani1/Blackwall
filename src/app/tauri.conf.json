@@ -29,6 +29,22 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3NUMxRDZDNzE1NzY0MwpSV1JEZGhYSDFzRjFCaEpWOEhldE85TTBTejluZTE5VmZpQStJcDZ1U3NSajhMYlpyaWZMZ2FERwo=",
+      "endpoints": [
+        "https://github.com/AlecBhamani1/Blackwall/releases/download/main/latest.json"
+      ]
+    }
   }
 }

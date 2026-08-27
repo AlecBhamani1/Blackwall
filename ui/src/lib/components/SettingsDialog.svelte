@@ -1,11 +1,23 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
   import { guestShareClient, type GuestShareClient } from '../ipc';
-  import type { ShareExpiryMinutes, ShareStatus } from '../types';
+  import type { ConnectionState, ShareExpiryMinutes, ShareStatus } from '../types';
+  import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
   import Icon from './Icon.svelte';
 
   export let open = false;
   export let model = '';
+  export let endpoint = '';
+  export let connectionState: ConnectionState = 'checking';
+  export let connectionError = '';
+  export let onConfigureEndpoint: (endpoint: string) => Promise<boolean> = async () => false;
+  export let updateState: AppUpdateState = 'idle';
+  export let currentVersion = '';
+  export let availableUpdate: AppUpdateInfo | null = null;
+  export let updateProgress: AppUpdateProgress = { downloadedBytes: 0 };
+  export let updateError = '';
+  export let onCheckForUpdates: () => Promise<boolean> = async () => false;
+  export let onInstallUpdate: () => Promise<void> = async () => {};
   export let onClose: () => void;
   export let client: GuestShareClient = guestShareClient;
 
@@ -24,6 +36,11 @@
   let previouslyOpen = false;
   let pollTimer: number | undefined;
   let operationVersion = 0;
+  let endpointDraft = endpoint;
+  let previousEndpoint = endpoint;
+  let endpointBusy = false;
+  let endpointFeedback = '';
+  let endpointInputError = '';
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : 'Blackwall could not update guest sharing.';
@@ -62,11 +79,39 @@
     error = '';
     copied = false;
     try {
-      mergeStatus(await client.startShare({ model, expiresInMinutes: expiry }));
+      mergeStatus(
+        await client.startShare({
+          model,
+          ...(endpoint ? { endpoint } : {}),
+          expiresInMinutes: expiry,
+        }),
+      );
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
       busy = '';
+    }
+  }
+
+  async function connectEndpoint(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const candidate = endpointDraft.trim();
+    if (!candidate) {
+      endpointInputError = 'Enter an endpoint URL before connecting.';
+      endpointFeedback = '';
+      return;
+    }
+
+    endpointBusy = true;
+    endpointInputError = '';
+    endpointFeedback = '';
+    try {
+      const connected = await onConfigureEndpoint(candidate);
+      endpointFeedback = connected ? 'Connected and loaded the available models.' : '';
+    } catch (cause) {
+      endpointInputError = errorMessage(cause);
+    } finally {
+      endpointBusy = false;
     }
   }
 
@@ -106,6 +151,15 @@
     }).format(parsed)}`;
   }
 
+  function downloadPercent(progress: AppUpdateProgress): number {
+    if (!progress.totalBytes) return 0;
+    return Math.min(100, Math.round((progress.downloadedBytes / progress.totalBytes) * 100));
+  }
+
+  function versionLabel(version: string): string {
+    return version.startsWith('v') ? version : `v${version}`;
+  }
+
   function handleKeydown(event: KeyboardEvent): void {
     if (open && event.key === 'Escape') {
       event.preventDefault();
@@ -140,6 +194,10 @@
     previouslyOpen = open;
     if (open) {
       copied = false;
+      endpointDraft = endpoint;
+      previousEndpoint = endpoint;
+      endpointFeedback = '';
+      endpointInputError = '';
       void refresh();
       void tick().then(() => dialog?.focus());
       pollTimer = window.setInterval(() => void refresh(true), 10_000);
@@ -147,6 +205,12 @@
       window.clearInterval(pollTimer);
       pollTimer = undefined;
     }
+  }
+
+
+  $: if (!endpointBusy && endpoint !== previousEndpoint) {
+    previousEndpoint = endpoint;
+    endpointDraft = endpoint;
   }
 
   onDestroy(() => {
@@ -171,7 +235,7 @@
       <header>
         <div>
           <h2 id="settings-title">Settings</h2>
-          <p>Manage guest access to your model.</p>
+          <p>Configure your model connection and guest access.</p>
         </div>
         <button class="icon-button" aria-label="Close settings" onclick={onClose}>
           <Icon name="x" size={18} />
@@ -179,6 +243,118 @@
       </header>
 
       <div class="dialog-content">
+        <section class="connection-section" aria-labelledby="connection-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="connection-heading">Model connection</h3>
+              <p>Use any Ollama or OpenAI-compatible endpoint you can reach.</p>
+            </div>
+            <span
+              class:connected={connectionState === 'ready'}
+              class:checking={connectionState === 'checking'}
+              class="connection-badge"
+            >
+              <span></span>
+              {connectionState === 'ready' ? 'Connected' : connectionState === 'checking' ? 'Checking' : 'Offline'}
+            </span>
+          </div>
+
+          <form class="endpoint-form" onsubmit={connectEndpoint}>
+            <label for="model-endpoint">Endpoint URL</label>
+            <input
+              id="model-endpoint"
+              bind:value={endpointDraft}
+              placeholder="http://localhost:11434/v1"
+              autocomplete="url"
+              autocapitalize="none"
+              spellcheck="false"
+              disabled={endpointBusy}
+            />
+            <p class="endpoint-hint">
+              You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall adds <code>/v1</code> automatically.
+            </p>
+
+            {#if endpointInputError}
+              <p class="connection-error" role="alert">{endpointInputError}</p>
+            {:else if endpointFeedback}
+              <p class="connection-success" role="status">{endpointFeedback}</p>
+            {:else if connectionError}
+              <p class="connection-error" role="alert">{connectionError}</p>
+            {/if}
+
+            <button class="connect-button" disabled={endpointBusy || connectionState === 'checking'} type="submit">
+              {endpointBusy || connectionState === 'checking' ? 'Checking endpoint…' : 'Save and reconnect'}
+            </button>
+          </form>
+        </section>
+
+        <section class="update-section" aria-labelledby="update-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="update-heading">App updates</h3>
+              <p>Signed builds are checked against Blackwall’s latest GitHub release.</p>
+            </div>
+            {#if currentVersion}
+              <span class="version-badge">{versionLabel(currentVersion)}</span>
+            {/if}
+          </div>
+
+          {#if updateState === 'downloading'}
+            <div class="update-card" role="status">
+              <strong>Installing {availableUpdate ? versionLabel(availableUpdate.version) : 'update'}…</strong>
+              <p>Blackwall will restart when the signed update is ready.</p>
+              <div
+                class:indeterminate={!updateProgress.totalBytes}
+                class="progress-track"
+                aria-label="Update download progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={downloadPercent(updateProgress)}
+                role="progressbar"
+              >
+                <span style={`width: ${downloadPercent(updateProgress)}%`}></span>
+              </div>
+            </div>
+          {:else if availableUpdate}
+            <div class="update-card available">
+              <div>
+                <span class="update-label">Update available</span>
+                <strong>{versionLabel(availableUpdate.version)}</strong>
+              </div>
+              {#if availableUpdate.body}
+                <p class="release-notes">{availableUpdate.body}</p>
+              {/if}
+              {#if updateError}
+                <p class="update-error" role="alert">{updateError}</p>
+              {/if}
+              <button class="install-button" onclick={onInstallUpdate}>Install update and restart</button>
+            </div>
+          {:else}
+            <div class="update-status">
+              {#if updateState === 'checking'}
+                <span class="spinner"></span>
+                <span>Checking GitHub for a signed update…</span>
+              {:else if updateState === 'current'}
+                <Icon name="check" size={15} />
+                <span>Blackwall is up to date.</span>
+              {:else if updateState === 'unsupported'}
+                <span>Updates are available in the installed desktop app.</span>
+              {:else if updateState === 'error'}
+                <span class="update-error" role="alert">{updateError}</span>
+              {:else}
+                <span>Blackwall checks for updates when it starts.</span>
+              {/if}
+            </div>
+            <button
+              class="check-button"
+              disabled={updateState === 'checking' || updateState === 'unsupported'}
+              onclick={onCheckForUpdates}
+            >
+              {updateState === 'checking' ? 'Checking…' : 'Check for updates'}
+            </button>
+          {/if}
+        </section>
+
         <section class="share-section" aria-labelledby="share-heading">
           <div class="section-heading">
             <div>
@@ -364,10 +540,19 @@
     padding: 20px;
   }
 
+  .connection-section,
+  .update-section,
   .share-section {
     display: flex;
     flex-direction: column;
     gap: 17px;
+  }
+
+  .connection-section,
+  .update-section {
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
   }
 
   .section-heading {
@@ -402,6 +587,207 @@
     height: 6px;
     border-radius: 50%;
     background: var(--ok);
+  }
+
+  .connection-badge {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid #f8717133;
+    border-radius: var(--radius-pill);
+    padding: 3px 9px;
+    background: #f871710c;
+    color: var(--err);
+    font-size: 10.5px;
+    font-weight: 650;
+    text-transform: uppercase;
+  }
+
+  .connection-badge span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .connection-badge.connected {
+    border-color: #4ade8033;
+    background: #4ade800c;
+    color: var(--ok);
+  }
+
+  .connection-badge.checking {
+    border-color: #fbbf2433;
+    background: #fbbf240c;
+    color: var(--warn);
+  }
+
+  .endpoint-form {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .endpoint-form label {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    font-weight: 600;
+  }
+
+  .endpoint-form input {
+    width: 100%;
+    min-height: 40px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 0 11px;
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-family: var(--font-code);
+    font-size: 11.5px;
+  }
+
+  .endpoint-form input::placeholder {
+    color: var(--text-faint);
+  }
+
+  .endpoint-form input:disabled {
+    opacity: 0.65;
+  }
+
+  .endpoint-hint,
+  .connection-error,
+  .connection-success {
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+
+  .endpoint-hint {
+    color: var(--text-faint);
+  }
+
+  .endpoint-hint code {
+    color: var(--text-muted);
+    font-family: var(--font-code);
+    font-size: 10.5px;
+  }
+
+  .connection-error {
+    border: 1px solid #f8717129;
+    border-radius: var(--radius-sm);
+    padding: 9px 10px;
+    background: #f8717108;
+    color: var(--err);
+  }
+
+  .connection-success {
+    color: var(--ok);
+  }
+
+  .version-badge {
+    flex: 0 0 auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    padding: 3px 9px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-family: var(--font-code);
+    font-size: 10.5px;
+  }
+
+  .update-card,
+  .update-status {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 12px 13px;
+    background: var(--bg-elevated);
+  }
+
+  .update-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .update-card.available {
+    border-color: #39c5a833;
+    background: #39c5a808;
+  }
+
+  .update-card > div:first-child {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .update-card strong {
+    font-size: 12.5px;
+  }
+
+  .update-label {
+    color: var(--accent);
+    font-size: 11.5px;
+    font-weight: 620;
+  }
+
+  .release-notes,
+  .update-card > p,
+  .update-status {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+
+  .release-notes {
+    max-height: 88px;
+    overflow-y: auto;
+    white-space: pre-line;
+  }
+
+  .update-status {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 9px;
+  }
+
+  .update-status :global(svg) {
+    color: var(--ok);
+  }
+
+  .update-error {
+    color: var(--err);
+  }
+
+  .progress-track {
+    position: relative;
+    height: 5px;
+    overflow: hidden;
+    border-radius: var(--radius-pill);
+    background: var(--border);
+  }
+
+  .progress-track span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width var(--transition-fast);
+  }
+
+  .progress-track.indeterminate span {
+    width: 35% !important;
+    animation: update-progress 1s ease-in-out infinite alternate;
+  }
+
+  @keyframes update-progress {
+    from {
+      transform: translateX(-30%);
+    }
+    to {
+      transform: translateX(215%);
+    }
   }
 
   .loading-row {
@@ -533,6 +919,8 @@
     color: #d6bd7c;
   }
 
+  .connect-button,
+  .install-button,
   .start-button,
   .stop-button {
     min-height: 40px;
@@ -540,17 +928,41 @@
     font-weight: 620;
   }
 
+  .connect-button,
+  .install-button,
   .start-button {
     background: var(--accent);
     color: var(--text-on-accent);
   }
 
+  .connect-button:hover:not(:disabled),
+  .install-button:hover:not(:disabled),
   .start-button:hover:not(:disabled) {
     background: var(--accent-hover);
   }
 
+  .connect-button:disabled,
+  .install-button:disabled,
   .start-button:disabled {
     opacity: 0.45;
+  }
+
+  .check-button {
+    min-height: 38px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-weight: 590;
+  }
+
+  .check-button:hover:not(:disabled) {
+    border-color: var(--text-faint);
+    color: var(--text-primary);
+  }
+
+  .check-button:disabled {
+    opacity: 0.5;
   }
 
   .stop-button {

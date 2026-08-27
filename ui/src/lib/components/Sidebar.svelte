@@ -2,6 +2,7 @@
   import { tick } from 'svelte';
   import { relativeTime } from '../format';
   import type { ConnectionState, SessionSummary } from '../types';
+  import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
@@ -11,9 +12,19 @@
   export let activeSessionId = '';
   export let connectionState: ConnectionState = 'checking';
   export let selectedModel = '';
+  export let endpoint = '';
+  export let connectionError = '';
+  export let updateState: AppUpdateState = 'idle';
+  export let currentVersion = '';
+  export let availableUpdate: AppUpdateInfo | null = null;
+  export let updateProgress: AppUpdateProgress = { downloadedBytes: 0 };
+  export let updateError = '';
   export let onNewChat: () => void;
   export let onOpenSession: (sessionId: string) => void;
   export let onRemoveSession: (sessionId: string) => void;
+  export let onConfigureEndpoint: (endpoint: string) => Promise<boolean>;
+  export let onCheckForUpdates: () => Promise<boolean>;
+  export let onInstallUpdate: () => Promise<void>;
   export let onClose: () => void;
 
   let settingsOpen = false;
@@ -90,7 +101,22 @@
   </div>
 </aside>
 
-<SettingsDialog open={settingsOpen} model={selectedModel} onClose={closeSettings} />
+<SettingsDialog
+  open={settingsOpen}
+  model={selectedModel}
+  {endpoint}
+  {connectionState}
+  {connectionError}
+  {updateState}
+  {currentVersion}
+  {availableUpdate}
+  {updateProgress}
+  {updateError}
+  {onConfigureEndpoint}
+  {onCheckForUpdates}
+  {onInstallUpdate}
+  onClose={closeSettings}
+/>
 
 <style>
   aside {

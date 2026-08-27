@@ -57,6 +57,7 @@ export interface ModelMessage {
 
 export interface ChatRequest {
   requestId: string;
+  endpoint?: string;
   model?: string;
   messages: ModelMessage[];
 }
@@ -87,6 +88,7 @@ export type ShareExpiryMinutes = 15 | 60 | 480;
 
 export interface StartShareRequest {
   model: string;
+  endpoint?: string;
   expiresInMinutes: ShareExpiryMinutes;
 }
 

@@ -7,6 +7,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Add signed in-app updates backed by continuous macOS builds from GitHub `main`.
+- Explicitly bundle the Blackwall logo for the app, Dock, and installer icons.
+
 ### Added
 
 - A native Tauri desktop chat connected to a user-configured OpenAI-compatible model endpoint.

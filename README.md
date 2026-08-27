@@ -20,10 +20,16 @@ on this computer or on another machine you control through any OpenAI-compatible
 - Recent conversations saved on the device
 - Sanitized Markdown responses and responsive desktop/mobile-width layouts
 - Expiring QR and browser-link guest sharing over the owner's Tailscale interface
+- Signed in-app updates from the latest successful `main` build on GitHub
 - Typed Rust commands and one versionable `blackwall://event` stream contract
 
 Blackwall does **not** launch or manage Ollama. If Ollama runs on a different machine, point
 Blackwall at that machine and leave it running there.
+
+The endpoint can be changed and tested inside the app: open **Settings**, enter the Ollama host or
+OpenAI-compatible base URL under **Model connection**, then choose **Save and reconnect**. Blackwall
+remembers this override for future launches. This is the recommended setup for a packaged macOS
+app because apps opened from Finder do not reliably inherit shell environment variables.
 
 ## Run the desktop app
 
@@ -38,9 +44,10 @@ export BLACKWALL_MODEL_ENDPOINT=http://your-model-host:11434
 npm run desktop
 ```
 
-An existing `OLLAMA_HOST` is used automatically, so the export is unnecessary when that variable
-already points at the model machine. Both `http://host:11434` and `http://host:11434/v1` are
-accepted. Set `BLACKWALL_MODEL_API_KEY` when the endpoint expects a Bearer token.
+An existing `OLLAMA_HOST` is used automatically when no in-app override has been saved, so the
+export is unnecessary when that variable already points at the model machine. Both
+`http://host:11434` and `http://host:11434/v1` are accepted. Set `BLACKWALL_MODEL_API_KEY` when the
+endpoint expects a Bearer token.
 
 For browser-only UI development:
 
@@ -62,8 +69,25 @@ cargo test --manifest-path src/Cargo.toml --workspace --all-features
 cargo deny --manifest-path src/Cargo.toml check
 ```
 
-Create an unsigned local desktop bundle with `npm run desktop:build`. Public macOS distribution
-still requires an Apple Developer signing identity and notarization.
+Release bundles must be signed for the updater. On the maintainer's Mac, use the private key and
+its Keychain password before building:
+
+```sh
+export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/blackwall.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(security find-generic-password -a "$USER" -s com.blackwall.updater-signing -w)"
+npm run desktop:build
+```
+
+This signs the updater archive, not the macOS application itself. Public macOS distribution still
+requires an Apple Developer signing identity and notarization.
+
+## In-app updates
+
+Blackwall checks for signed updates when the desktop app starts. Open **Settings → App updates** to
+check manually, review the available version, and choose **Install update and restart**. Pushes to
+`main` publish the continuous update channel through GitHub Actions. Existing installations need
+one final manual replacement with an updater-enabled build; later updates install in place. See
+[`docs/UPDATES.md`](docs/UPDATES.md) for signing, publishing, and key-recovery details.
 
 ## Architecture
 
