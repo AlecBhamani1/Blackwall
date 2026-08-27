@@ -26,6 +26,7 @@
     { value: 60, label: '1 hour' },
     { value: 480, label: '8 hours' },
   ];
+  const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let expiry: ShareExpiryMinutes = 60;
   let status: ShareStatus = { active: false };
@@ -41,6 +42,9 @@
   let endpointBusy = false;
   let endpointFeedback = '';
   let endpointInputError = '';
+  let relayUrlDraft =
+    typeof window === 'undefined' ? '' : window.localStorage.getItem(RELAY_URL_STORAGE_KEY) ?? '';
+  let relayTokenDraft = '';
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : 'Blackwall could not update guest sharing.';
@@ -55,6 +59,12 @@
           qrDataUrl: next.qrDataUrl ?? status.qrDataUrl,
         }
       : { active: false };
+  }
+
+  function rememberRelayUrl(): void {
+    const relayUrl = relayUrlDraft.trim();
+    if (relayUrl) window.localStorage.setItem(RELAY_URL_STORAGE_KEY, relayUrl);
+    else window.localStorage.removeItem(RELAY_URL_STORAGE_KEY);
   }
 
   async function refresh(silent = false): Promise<void> {
@@ -79,10 +89,15 @@
     error = '';
     copied = false;
     try {
+      const relayUrl = relayUrlDraft.trim();
+      const relayToken = relayTokenDraft.trim();
+      rememberRelayUrl();
       mergeStatus(
         await client.startShare({
           model,
           ...(endpoint ? { endpoint } : {}),
+          ...(relayUrl ? { relayUrl } : {}),
+          ...(relayToken ? { relayToken } : {}),
           expiresInMinutes: expiry,
         }),
       );
@@ -422,6 +437,36 @@
             </div>
           {:else}
             <div class="inactive-share">
+              <div class="relay-form">
+                <label for="relay-url">Hosted relay URL</label>
+                <input
+                  id="relay-url"
+                  bind:value={relayUrlDraft}
+                  placeholder="https://relay.example.com"
+                  autocomplete="url"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={busy === 'starting'}
+                  onchange={rememberRelayUrl}
+                />
+                <p class="relay-hint">
+                  Saved on this Mac. Change this origin whenever you move the relay to another server.
+                </p>
+
+                <label for="relay-token">Relay token <span>(optional)</span></label>
+                <input
+                  id="relay-token"
+                  type="password"
+                  bind:value={relayTokenDraft}
+                  placeholder="Uses BLACKWALL_RELAY_TOKEN when blank"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={busy === 'starting'}
+                />
+                <p class="relay-hint">Kept only until Blackwall closes and never included in guest links.</p>
+              </div>
+
               <div class="model-row">
                 <span>Model</span>
                 <strong>{model || 'No model selected'}</strong>
@@ -440,7 +485,7 @@
               </fieldset>
 
               <div class="notice">
-                Blackwall must stay open and connected while guests are chatting. You can end access at any time.
+                Blackwall must stay open and connected to the hosted relay while guests are chatting. No inbound port or VPN is required.
               </div>
 
               <button class="start-button" disabled={!model || busy === 'starting'} onclick={start}>
@@ -623,19 +668,22 @@
     color: var(--warn);
   }
 
-  .endpoint-form {
+  .endpoint-form,
+  .relay-form {
     display: flex;
     flex-direction: column;
     gap: 9px;
   }
 
-  .endpoint-form label {
+  .endpoint-form label,
+  .relay-form label {
     color: var(--text-muted);
     font-size: 11.5px;
     font-weight: 600;
   }
 
-  .endpoint-form input {
+  .endpoint-form input,
+  .relay-form input {
     width: 100%;
     min-height: 40px;
     border: 1px solid var(--border-strong);
@@ -647,15 +695,18 @@
     font-size: 11.5px;
   }
 
-  .endpoint-form input::placeholder {
+  .endpoint-form input::placeholder,
+  .relay-form input::placeholder {
     color: var(--text-faint);
   }
 
-  .endpoint-form input:disabled {
+  .endpoint-form input:disabled,
+  .relay-form input:disabled {
     opacity: 0.65;
   }
 
   .endpoint-hint,
+  .relay-hint,
   .connection-error,
   .connection-success {
     font-size: 11.5px;
@@ -664,6 +715,22 @@
 
   .endpoint-hint {
     color: var(--text-faint);
+  }
+
+  .relay-form {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 12px 13px;
+    background: var(--bg-elevated);
+  }
+
+  .relay-form label span,
+  .relay-hint {
+    color: var(--text-faint);
+  }
+
+  .relay-form label span {
+    font-weight: 450;
   }
 
   .endpoint-hint code {

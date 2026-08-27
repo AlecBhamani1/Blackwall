@@ -89,6 +89,8 @@ export type ShareExpiryMinutes = 15 | 60 | 480;
 export interface StartShareRequest {
   model: string;
   endpoint?: string;
+  relayUrl?: string;
+  relayToken?: string;
   expiresInMinutes: ShareExpiryMinutes;
 }
 

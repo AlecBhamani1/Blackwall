@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add signed in-app updates backed by continuous macOS builds from GitHub `main`.
 - Explicitly bundle the Blackwall logo for the app, Dock, and installer icons.
+- Replace direct private-network guest sharing with a configurable, self-hosted HTTPS relay and
+  outbound-only desktop connection.
 
 ### Added
 
@@ -19,7 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A focused Svelte interface with responsive navigation, Markdown rendering, and a tokenized dark
   visual system.
 - A typed Rust protocol and a single typed desktop event channel for UI/core communication.
-- Tailnet-only guest sharing with expiring QR/browser-link invites, a pinned model, authenticated
-  streaming, and an immediate host-side stop control.
+- Hosted guest sharing with expiring QR/browser-link invites, a pinned model, authenticated
+  streaming, automatic host reconnects, and an immediate host-side stop control.
 - Repository quality gates for formatting, linting, testing, dependency policy, and commit
   conventions.

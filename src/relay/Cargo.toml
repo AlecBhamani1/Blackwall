@@ -1,6 +1,6 @@
 [package]
-name = "blackwall-core"
-description = "Framework-free protocol and agent primitives for Blackwall"
+name = "blackwall-relay"
+description = "Self-hostable outbound relay for Blackwall guest sharing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,20 +11,17 @@ repository.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+blackwall-core.workspace = true
 futures-util.workspace = true
-qrcode.workspace = true
 rand.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 
 [dev-dependencies]
-tower.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
 
 [lints]
 workspace = true

@@ -23,5 +23,7 @@ Bearer token. Blackwall does not write the endpoint or key to source, local
 storage, or configuration in this scaffold. Keychain-backed settings replace
 this environment-only bridge in the security milestone.
 
-Only expose an Ollama listener on a network you trust. The later Blackwall share
-gateway will authenticate guests instead of exposing the raw model endpoint.
+Only expose an Ollama listener on a network you trust. Guest sharing keeps the
+raw model endpoint private: the desktop opens an outbound WebSocket to the
+configured hosted relay, authenticates invites, and pins the selected model.
+See [`../../docs/SHARING.md`](../../docs/SHARING.md) for relay deployment.

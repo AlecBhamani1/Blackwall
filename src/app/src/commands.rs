@@ -264,7 +264,7 @@ pub(crate) async fn stream_chat(
     Ok(StreamStarted { request_id })
 }
 
-/// Starts a temporary browser invite on the exact Tailscale or loopback address.
+/// Starts a temporary browser invite through the selected hosted relay.
 #[tauri::command]
 pub(crate) async fn start_share(
     request: StartShareRequest,

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const guestHtml = readFileSync(resolve(process.cwd(), '../src/core/src/share/assets/guest.html'), 'utf8');
 const guestScript = readFileSync(resolve(process.cwd(), '../src/core/src/share/assets/guest.js'), 'utf8');
-const gatewaySource = readFileSync(resolve(process.cwd(), '../src/core/src/share/gateway.rs'), 'utf8');
+const relaySource = readFileSync(resolve(process.cwd(), '../src/core/src/share/relay_protocol.rs'), 'utf8');
 const bodyMarkup = guestHtml.match(/<body>([\s\S]*)<\/body>/)?.[1] ?? '';
 
 type FetchInit = { body?: unknown };
@@ -41,13 +41,13 @@ async function bootGuest(requestLimit: number) {
 
   const chatBodies: Uint8Array[] = [];
   const fetchMock = vi.fn(async (input: string, init?: FetchInit) => {
-    if (input === '/v1/models') {
+    if (input === 'v1/models') {
       return {
         ok: true,
         json: async () => ({ data: [{ id: 'test-model' }] }),
       };
     }
-    if (input === '/v1/chat/completions') {
+    if (input === 'v1/chat/completions') {
       chatBodies.push(init?.body as Uint8Array);
       return eventStreamResponse();
     }
@@ -91,7 +91,7 @@ afterEach(() => {
 describe('guest request payload limits', () => {
   it('stays locked to the Rust gateway body limit and sends the measured UTF-8 bytes', async () => {
     expect(guestScript).toContain('const MAX_REQUEST_BYTES = 32 * 1024 * 1024;');
-    expect(gatewaySource).toContain('const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;');
+    expect(relaySource).toContain('const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;');
 
     const { chatBodies } = await bootGuest(500);
     attachImage(100, 'first.png');
