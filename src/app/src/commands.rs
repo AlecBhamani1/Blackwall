@@ -149,6 +149,12 @@ enum BridgeError {
     Emit(#[source] tauri::Error),
 }
 
+/// Returns the normalized endpoint selected from the process configuration.
+#[tauri::command]
+pub(crate) fn model_endpoint(state: State<'_, AppState>) -> Result<String, CommandError> {
+    normalize_endpoint(&state.default_endpoint).map_err(CommandError::from)
+}
+
 /// Lists chat models advertised by the configured OpenAI-compatible endpoint.
 #[tauri::command]
 pub(crate) async fn discover_models(

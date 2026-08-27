@@ -15,6 +15,7 @@ import type {
 
 const SESSION_STORAGE_KEY = 'blackwall.sessions.v1';
 const MODEL_STORAGE_KEY = 'blackwall.model.v1';
+const ENDPOINT_STORAGE_KEY = 'blackwall.endpoint.v1';
 const MAX_SAVED_SESSIONS = 30;
 
 function canUseStorage(): boolean {
@@ -71,6 +72,21 @@ function storedModel(): string {
   return window.localStorage.getItem(MODEL_STORAGE_KEY) ?? '';
 }
 
+function storedEndpoint(): string {
+  if (!canUseStorage()) return '';
+  return window.localStorage.getItem(ENDPOINT_STORAGE_KEY)?.trim() ?? '';
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+  }
+  return 'The configured model endpoint is unavailable.';
+}
+
 function sessionTitle(messages: ChatMessage[]): string {
   const firstUserMessage = messages.find((message) => message.role === 'user');
   if (!firstUserMessage) return 'New chat';
@@ -111,8 +127,11 @@ export function createChatController(client: LocalModelClient = localModelClient
   const connectionState = writable<ConnectionState>('checking');
   const models = writable<ModelInfo[]>([]);
   const selectedModel = writable(storedModel() || import.meta.env.VITE_BLACKWALL_MODEL || '');
+  const endpoint = writable(storedEndpoint());
   const notice = writable('');
+  const connectionError = writable('');
   let activeRequest: AbortController | null = null;
+  let connectionAttempt = 0;
 
   const contextPercent = derived(messages, ($messages) => {
     const characters = $messages.reduce((total, message) => total + message.content.length, 0);
@@ -138,15 +157,28 @@ export function createChatController(client: LocalModelClient = localModelClient
     });
   }
 
-  async function initialize(): Promise<void> {
+  async function initialize(): Promise<boolean> {
+    const attempt = ++connectionAttempt;
     connectionState.set('checking');
+    connectionError.set('');
+    models.set([]);
     try {
-      const catalog = await client.discoverModels();
+      let configuredEndpoint = get(endpoint).trim();
+      if (!configuredEndpoint) {
+        configuredEndpoint = (await client.modelEndpoint()).trim();
+        if (attempt !== connectionAttempt) return false;
+        if (configuredEndpoint) endpoint.set(configuredEndpoint);
+      }
+
+      const catalog = await client.discoverModels(configuredEndpoint || undefined);
+      if (attempt !== connectionAttempt) return false;
       models.set(catalog);
       if (catalog.length === 0) {
         connectionState.set('offline');
-        notice.set('No models were reported by the configured model endpoint.');
-        return;
+        const message = 'The endpoint responded, but it did not report any models.';
+        connectionError.set(message);
+        notice.set(message);
+        return false;
       }
 
       const preferred = get(selectedModel);
@@ -154,11 +186,31 @@ export function createChatController(client: LocalModelClient = localModelClient
       selectedModel.set(choice);
       if (canUseStorage()) window.localStorage.setItem(MODEL_STORAGE_KEY, choice);
       connectionState.set('ready');
+      connectionError.set('');
       notice.set('');
-    } catch {
+      return true;
+    } catch (error) {
+      if (attempt !== connectionAttempt) return false;
+      const detail = errorMessage(error);
       connectionState.set('offline');
-      notice.set('The configured model endpoint is unavailable. Check it, then reconnect.');
+      connectionError.set(detail);
+      notice.set(detail);
+      return false;
     }
+  }
+
+  async function configureEndpoint(value: string): Promise<boolean> {
+    const next = value.trim();
+    if (!next) {
+      const message = 'Enter the URL of an OpenAI-compatible model endpoint.';
+      connectionError.set(message);
+      notice.set(message);
+      return false;
+    }
+
+    endpoint.set(next);
+    if (canUseStorage()) window.localStorage.setItem(ENDPOINT_STORAGE_KEY, next);
+    return initialize();
   }
 
   function chooseModel(modelId: string): void {
@@ -222,6 +274,7 @@ export function createChatController(client: LocalModelClient = localModelClient
         await client.streamChat(
           {
             requestId,
+            endpoint: get(endpoint) || undefined,
             model: get(selectedModel),
             messages: asModelMessages(nextMessages.filter((message) => message.id !== assistantId)),
           },
@@ -336,9 +389,12 @@ export function createChatController(client: LocalModelClient = localModelClient
     connectionState,
     models,
     selectedModel,
+    endpoint,
     contextPercent,
     notice,
+    connectionError,
     initialize,
+    configureEndpoint,
     chooseModel,
     send,
     stop,

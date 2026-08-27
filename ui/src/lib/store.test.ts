@@ -5,6 +5,7 @@ import { createChatController } from './store';
 
 function mockClient(): LocalModelClient {
   return {
+    modelEndpoint: vi.fn().mockResolvedValue('http://localhost:11434/v1'),
     discoverModels: vi.fn().mockResolvedValue([{ id: 'remote-model:latest', name: 'remote-model:latest' }]),
     streamChat: vi.fn(async (_request, callbacks) => {
       callbacks.onDelta('Blackwall ');
@@ -35,6 +36,35 @@ describe('chat controller', () => {
       status: 'complete',
     });
     expect(get(controller.sessions)[0]?.title).toBe('Hello');
+  });
+
+  it('persists an endpoint override and uses it for discovery and chat', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    const endpoint = 'http://100.76.24.116:11434';
+
+    await expect(controller.configureEndpoint(endpoint)).resolves.toBe(true);
+    expect(client.discoverModels).toHaveBeenCalledWith(endpoint);
+    expect(window.localStorage.getItem('blackwall.endpoint.v1')).toBe(endpoint);
+
+    await controller.send('Use the configured host', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(client.streamChat).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint }),
+      expect.any(Object),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('surfaces the endpoint failure detail for troubleshooting', async () => {
+    const client = mockClient();
+    client.discoverModels = vi.fn().mockRejectedValue(new Error('connection refused at 127.0.0.1:11434'));
+    const controller = createChatController(client);
+
+    await expect(controller.initialize()).resolves.toBe(false);
+    expect(get(controller.connectionState)).toBe('offline');
+    expect(get(controller.connectionError)).toBe('connection refused at 127.0.0.1:11434');
+    expect(get(controller.notice)).toBe('connection refused at 127.0.0.1:11434');
   });
 
   it('does not send whitespace or send while disconnected', async () => {

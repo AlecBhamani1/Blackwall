@@ -14,8 +14,11 @@ fn main() {
 
 fn run() -> Result<(), StartupError> {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new()?)
         .invoke_handler(tauri::generate_handler![
+            commands::model_endpoint,
             commands::discover_models,
             commands::chat,
             commands::stream_chat,

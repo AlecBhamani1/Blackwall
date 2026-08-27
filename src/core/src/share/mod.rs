@@ -45,6 +45,9 @@ const MAX_INVITE_MINUTES: u64 = 7 * 24 * 60;
 pub struct StartShareRequest {
     /// Model identifier forced onto every guest completion request.
     pub model: String,
+    /// Optional endpoint selected in the desktop UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Invite lifetime in minutes, from 1 minute through 7 days.
     pub expires_in_minutes: u64,
 }
@@ -112,10 +115,15 @@ impl ShareHub {
         validate_request(&request)?;
         let network = detect_share_network();
         let port = configured_port()?;
+        let environment_endpoint = environment_value(MODEL_ENDPOINT_ENVIRONMENT_VARIABLE)
+            .or_else(|| environment_value(OLLAMA_HOST_ENVIRONMENT_VARIABLE));
         let upstream_endpoint = normalize_upstream_endpoint(
-            environment_value(MODEL_ENDPOINT_ENVIRONMENT_VARIABLE)
-                .or_else(|| environment_value(OLLAMA_HOST_ENVIRONMENT_VARIABLE))
+            request
+                .endpoint
                 .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or(environment_endpoint.as_deref())
                 .unwrap_or(DEFAULT_MODEL_ENDPOINT),
         )?;
         let public_base_url = environment_value(SHARE_PUBLIC_URL_ENVIRONMENT_VARIABLE)
@@ -453,10 +461,12 @@ mod tests {
     fn serde_contract_uses_ui_field_names_and_epoch_milliseconds() {
         let request: StartShareRequest = serde_json::from_value(serde_json::json!({
             "model": "qwen3",
+            "endpoint": "http://model-host:11434",
             "expiresInMinutes": 60
         }))
         .unwrap();
         assert_eq!(request.expires_in_minutes, 60);
+        assert_eq!(request.endpoint.as_deref(), Some("http://model-host:11434"));
 
         let value = serde_json::to_value(ShareStatus {
             active: true,

@@ -95,9 +95,40 @@ function normalizeCatalog(value: unknown): ModelInfo[] {
   return [];
 }
 
-async function discoverBrowserModels(): Promise<ModelInfo[]> {
+function normalizeBrowserEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  const candidate = trimmed.includes('://') ? trimmed : `http://${trimmed}`;
+  const url = new URL(candidate);
+  url.search = '';
+  url.hash = '';
+  if (url.pathname === '' || url.pathname === '/') url.pathname = '/v1';
+  return url.toString().replace(/\/$/, '');
+}
+
+function browserModelRoutes(endpoint?: string): { models: string; tags?: string; chat: string } {
+  if (!endpoint?.trim()) {
+    return {
+      models: '/local-llm/v1/models',
+      tags: '/local-llm/api/tags',
+      chat: '/local-llm/v1/chat/completions',
+    };
+  }
+
+  const normalized = normalizeBrowserEndpoint(endpoint);
+  const url = new URL(normalized);
+  const origin = url.origin;
+  return {
+    models: `${normalized}/models`,
+    tags: url.pathname === '/v1' ? `${origin}/api/tags` : undefined,
+    chat: `${normalized}/chat/completions`,
+  };
+}
+
+async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
+  const routes = browserModelRoutes(endpoint);
   try {
-    const tagsResponse = await fetchWithTimeout('/local-llm/api/tags', MODEL_DISCOVERY_TIMEOUT_MS);
+    if (!routes.tags) throw new Error('This endpoint does not expose the Ollama tags route.');
+    const tagsResponse = await fetchWithTimeout(routes.tags, MODEL_DISCOVERY_TIMEOUT_MS);
     if (tagsResponse.ok) {
       const payload = (await tagsResponse.json()) as OllamaTagsResponse;
       const models = (payload.models ?? [])
@@ -114,7 +145,7 @@ async function discoverBrowserModels(): Promise<ModelInfo[]> {
     // Generic OpenAI-compatible endpoints do not expose Ollama's /api/tags route.
   }
 
-  const response = await fetchWithTimeout('/local-llm/v1/models', MODEL_DISCOVERY_TIMEOUT_MS);
+  const response = await fetchWithTimeout(routes.models, MODEL_DISCOVERY_TIMEOUT_MS);
   if (!response.ok) {
     throw new Error(`Model endpoint returned ${response.status}.`);
   }
@@ -203,7 +234,7 @@ async function streamBrowserChat(
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch('/local-llm/v1/chat/completions', {
+  const response = await fetch(browserModelRoutes(request.endpoint).chat, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -317,10 +348,16 @@ async function streamTauriChat(
 }
 
 export const localModelClient = {
-  async discoverModels(): Promise<ModelInfo[]> {
-    if (!isTauriRuntime()) return discoverBrowserModels();
+  async modelEndpoint(): Promise<string> {
+    if (!isTauriRuntime()) return '';
     const { invoke } = await import('@tauri-apps/api/core');
-    return normalizeCatalog(await invoke<unknown>('discover_models'));
+    return invoke<string>('model_endpoint');
+  },
+
+  async discoverModels(endpoint?: string): Promise<ModelInfo[]> {
+    if (!isTauriRuntime()) return discoverBrowserModels(endpoint);
+    const { invoke } = await import('@tauri-apps/api/core');
+    return normalizeCatalog(await invoke<unknown>('discover_models', { endpoint: endpoint || null }));
   },
 
   async streamChat(
