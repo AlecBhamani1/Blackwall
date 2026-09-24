@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 /// Largest streamed model response accepted for one guest request.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Keep idle tunnels observable across sleep, network loss, and reverse proxies.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+pub const SOCKET_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// First message sent by a desktop host when it attaches to a relay.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

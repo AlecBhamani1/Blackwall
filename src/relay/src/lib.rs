@@ -1,5 +1,10 @@
 //! Self-hostable public edge for Blackwall's outbound guest-sharing relay.
 
+mod ownership;
+mod pairing;
+pub use ownership::OwnershipError;
+use ownership::OwnershipStore;
+
 use std::{
     collections::HashMap,
     io,
@@ -33,7 +38,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use blackwall_core::share::{
     guest_assets,
     relay_protocol::{
-        HostToRelay, RelayRegistration, RelayToHost, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+        HostToRelay, RelayRegistration, RelayToHost, HEARTBEAT_INTERVAL, MAX_REQUEST_BYTES,
+        MAX_RESPONSE_BYTES, PEER_IDLE_TIMEOUT, SOCKET_WRITE_TIMEOUT,
     },
     salted_key_hash,
 };
@@ -75,6 +81,8 @@ impl Default for RelayConfig {
 struct RelayState {
     sessions: Arc<RwLock<HashMap<String, Arc<RelaySession>>>>,
     config: RelayConfig,
+    ownership: Arc<OwnershipStore>,
+    pairing: Arc<tokio::sync::Mutex<pairing::Exchanges>>,
 }
 
 struct RelaySession {
@@ -101,13 +109,29 @@ struct ResponseMetadata {
     content_type: HeaderValue,
 }
 
-/// Builds the relay HTTP/WebSocket application.
+/// Builds an ephemeral relay for tests and embedded development. Production uses
+/// [`app_with_storage`] so public address ownership survives process restarts.
 pub fn app(config: RelayConfig) -> Router {
+    build_app(config, OwnershipStore::memory())
+}
+
+/// Opens durable ownership storage before accepting traffic; never falls back to memory.
+pub fn app_with_storage(
+    config: RelayConfig,
+    directory: &std::path::Path,
+) -> Result<Router, OwnershipError> {
+    Ok(build_app(config, OwnershipStore::open(directory)?))
+}
+
+fn build_app(config: RelayConfig, ownership: OwnershipStore) -> Router {
     let state = RelayState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         config,
+        ownership: Arc::new(ownership),
+        pairing: Arc::new(tokio::sync::Mutex::new(pairing::Exchanges::default())),
     };
     Router::new()
+        .merge(pairing::routes())
         .route("/health", get(health))
         .route("/v1/host/connect", get(host_connect))
         .route("/s/{session_id}/guest", get(guest_page))
@@ -207,6 +231,27 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
             .await;
             return;
         }
+        let ownership = Arc::clone(&state.ownership);
+        let owner_id = registration.session_id.clone();
+        let owner_key = registration.host_key.clone();
+        // Serialize claims with live-session insertion, but perform disk I/O off the runtime.
+        let claim =
+            tokio::task::spawn_blocking(move || ownership.claim(&owner_id, &owner_key)).await;
+        if !matches!(claim, Ok(Ok(()))) {
+            drop(sessions);
+            let message = match claim {
+                Ok(Err(OwnershipError::Invalid(message))) => message,
+                _ => "relay ownership storage is unavailable",
+            };
+            let _send_result = send_socket_protocol(
+                &mut socket,
+                &RelayToHost::Error {
+                    message: message.to_owned(),
+                },
+            )
+            .await;
+            return;
+        }
         sessions.insert(registration.session_id.clone(), Arc::clone(&session))
     };
     if let Some(previous) = replaced {
@@ -223,11 +268,23 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
     }
 
     let (mut sender, mut receiver) = socket.split();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_received = tokio::time::Instant::now();
+    let expiry = tokio::time::sleep(Duration::from_millis(
+        session.expires_at_ms.saturating_sub(unix_epoch_millis()),
+    ));
+    tokio::pin!(expiry);
     loop {
         tokio::select! {
+            () = &mut expiry => break,
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() >= PEER_IDLE_TIMEOUT { break; }
+                if !matches!(tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sender.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) { break; }
+            }
             outgoing = host_rx.recv() => {
                 let Some(outgoing) = outgoing else { break };
-                if sender.send(outgoing).await.is_err() {
+                if !matches!(tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sender.send(outgoing)).await, Ok(Ok(()))) {
                     break;
                 }
             }
@@ -237,6 +294,7 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
                     Ok(message) => message,
                     Err(_) => break,
                 };
+                last_received = tokio::time::Instant::now();
                 match message {
                     Message::Text(payload) => {
                         let parsed = serde_json::from_str::<HostToRelay>(payload.as_ref());
@@ -255,7 +313,7 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
                         handle_host_message(&session, parsed).await;
                     }
                     Message::Ping(payload) => {
-                        if session.host_tx.send(Message::Pong(payload)).await.is_err() {
+                        if !matches!(tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sender.send(Message::Pong(payload))).await, Ok(Ok(()))) {
                             break;
                         }
                     }
@@ -266,7 +324,12 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
         }
     }
 
-    session.disconnect("The Blackwall host disconnected.").await;
+    let reason = if unix_epoch_millis() >= session.expires_at_ms {
+        "This invitation expired."
+    } else {
+        "The Blackwall host disconnected."
+    };
+    session.disconnect(reason).await;
     remove_session(&state, &registration.session_id, &session).await;
 }
 
@@ -381,10 +444,13 @@ impl RelaySession {
 
     async fn send_to_host(&self, message: &RelayToHost) -> Result<(), ()> {
         let payload = serde_json::to_string(message).map_err(|_| ())?;
-        self.host_tx
-            .send(Message::Text(payload.into()))
-            .await
-            .map_err(|_| ())
+        tokio::time::timeout(
+            SOCKET_WRITE_TIMEOUT,
+            self.host_tx.send(Message::Text(payload.into())),
+        )
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
     }
 
     fn pending(&self, request_id: &str) -> Option<Arc<PendingResponse>> {
@@ -434,9 +500,9 @@ impl RelaySession {
 }
 
 impl PendingResponse {
-    fn start(&self, status: u16, content_type: &str) {
+    fn start(&self, status: u16, content_type: &str) -> bool {
         if self.started.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
         let content_type = HeaderValue::from_str(content_type)
@@ -452,6 +518,7 @@ impl PendingResponse {
                 content_type,
             });
         }
+        true
     }
 
     async fn push(&self, chunk: Bytes) -> Result<(), ()> {
@@ -467,17 +534,25 @@ impl PendingResponse {
                 .await;
             return Err(());
         }
-        self.body.send(Ok(chunk)).await.map_err(|_| ())
+        tokio::time::timeout(SOCKET_WRITE_TIMEOUT, self.body.send(Ok(chunk)))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
     }
 
     async fn abort(&self, message: &str) {
-        if !self.started.load(Ordering::Acquire) {
-            self.start(StatusCode::BAD_GATEWAY.as_u16(), "application/json");
-        }
-        let _send_result = self
-            .body
-            .send(Err(io::Error::other(message.to_owned())))
-            .await;
+        let chunk = if self.start(StatusCode::BAD_GATEWAY.as_u16(), "application/json") {
+            // Before headers, send a complete error response. An errored body here makes
+            // Hyper discard the 502 and leaves the guest with an unreadable network failure.
+            Ok(Bytes::from(
+                json!({ "error": { "message": message } }).to_string(),
+            ))
+        } else {
+            Err(io::Error::other(message.to_owned()))
+        };
+        // A guest that stops reading must not prevent host disconnection or revocation.
+        let _send_result =
+            tokio::time::timeout(Duration::from_secs(1), self.body.send(chunk)).await;
     }
 }
 
@@ -648,6 +723,16 @@ async fn models(GuestAccess(session): GuestAccess) -> Result<Response, RelayApiE
     ))
 }
 
+struct PendingRequestGuard {
+    session: Arc<RelaySession>,
+    request_id: String,
+}
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.session.remove_pending(&self.request_id);
+    }
+}
+
 async fn chat_completions(
     ChatAccess { session, permit }: ChatAccess,
     body: Result<Bytes, BytesRejection>,
@@ -687,6 +772,10 @@ async fn chat_completions(
             started: AtomicBool::new(false),
         }),
     );
+    let pending_guard = PendingRequestGuard {
+        session: Arc::clone(&session),
+        request_id: request_id.clone(),
+    };
     let delivery = session
         .send_to_host(&RelayToHost::ChatRequest {
             request_id: request_id.clone(),
@@ -717,10 +806,9 @@ async fn chat_completions(
         }
     };
 
-    let response_session = Arc::clone(&session);
-    let response_request_id = request_id.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
+        let _pending_guard = pending_guard;
         loop {
             let next = match tokio::time::timeout(RESPONSE_IDLE_TIMEOUT, body_rx.recv()).await {
                 Ok(next) => next,
@@ -735,7 +823,6 @@ async fn chat_completions(
             let Some(chunk) = next else { break };
             yield chunk;
         }
-        response_session.remove_pending(&response_request_id);
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = metadata.status;
@@ -755,10 +842,13 @@ fn random_request_id() -> String {
 
 async fn send_socket_protocol(socket: &mut WebSocket, message: &RelayToHost) -> Result<(), ()> {
     let payload = serde_json::to_string(message).map_err(|_| ())?;
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(|_| ())
+    tokio::time::timeout(
+        SOCKET_WRITE_TIMEOUT,
+        socket.send(Message::Text(payload.into())),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
 }
 
 fn constant_time_text_eq(expected: &str, presented: &str) -> bool {
@@ -865,7 +955,11 @@ mod tests {
         >,
     ) -> RelayToHost {
         loop {
-            let message = socket.next().await.unwrap().unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             if let ClientMessage::Text(payload) = message {
                 return serde_json::from_str(payload.as_ref()).unwrap();
             }
@@ -997,7 +1091,16 @@ mod tests {
         let model_server = tokio::spawn(async move {
             axum::serve(
                 model_listener,
-                Router::new().route("/v1/chat/completions", post(canned_model)),
+                Router::new().route(
+                    "/v1/chat/completions",
+                    post(|headers: HeaderMap, body: Json<Value>| async move {
+                        assert_eq!(
+                            headers.get(AUTHORIZATION).unwrap(),
+                            "Bearer saved-model-key"
+                        );
+                        canned_model(body).await
+                    }),
+                ),
             )
             .await
             .unwrap();
@@ -1018,13 +1121,16 @@ mod tests {
 
         let hub = ShareHub::new();
         let status = hub
-            .start(StartShareRequest {
-                model: "owner-pinned-model".to_owned(),
-                endpoint: Some(format!("http://{model_address}/v1")),
-                relay_url: Some(format!("http://{relay_address}")),
-                relay_token: Some("deployment-token".to_owned()),
-                expires_in_minutes: 1,
-            })
+            .start_with_model_key(
+                StartShareRequest {
+                    model: "owner-pinned-model".to_owned(),
+                    endpoint: Some(format!("http://{model_address}/v1")),
+                    relay_url: Some(format!("http://{relay_address}")),
+                    relay_token: Some("deployment-token".to_owned()),
+                    expires_in_minutes: 1,
+                },
+                Some("saved-model-key".into()),
+            )
             .await
             .unwrap();
         let mut invite = reqwest::Url::parse(&status.share_url).unwrap();
@@ -1055,5 +1161,257 @@ mod tests {
         hub.stop().await;
         relay_server.abort();
         model_server.abort();
+    }
+    #[tokio::test]
+    async fn named_invites_are_bounded_independent_and_revocable() {
+        use blackwall_core::share::manager::ShareManager;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(RelayConfig::default()))
+                .await
+                .unwrap();
+        });
+        let manager = ShareManager::new();
+        let request = StartShareRequest {
+            model: "shared-model".into(),
+            endpoint: Some("http://127.0.0.1:1/v1".into()),
+            relay_url: Some(format!("http://{address}")),
+            relay_token: None,
+            expires_in_minutes: 1,
+        };
+        let mut created = Vec::new();
+        for index in 0..4 {
+            created.push(
+                manager
+                    .start_named(request.clone(), None, format!("Guest {index}"))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(manager
+            .start_named(request, None, "Fifth".into())
+            .await
+            .is_err());
+        let listed = manager.list().await;
+        assert_eq!(listed.len(), 4);
+        assert!(listed
+            .iter()
+            .all(|entry| entry.status.share_url.is_empty() && entry.status.qr_data_url.is_empty()));
+        let client = reqwest::Client::new();
+        let models_url = |invite: &str| {
+            let mut url = reqwest::Url::parse(invite).unwrap();
+            let key = url
+                .fragment()
+                .unwrap()
+                .strip_prefix("key=")
+                .unwrap()
+                .to_owned();
+            url.set_fragment(None);
+            url.set_path(&url.path().replace("/guest", "/v1/models"));
+            (url, key)
+        };
+        let (revoked_url, revoked_key) = models_url(&created[0].status.share_url);
+        let (live_url, live_key) = models_url(&created[1].status.share_url);
+        assert!(manager.revoke(&created[0].id).await);
+        assert!(!manager.revoke("missing-invite").await);
+        let revoked = client
+            .get(revoked_url)
+            .bearer_auth(revoked_key)
+            .send()
+            .await
+            .unwrap();
+        assert!(!revoked.status().is_success());
+        let live = client
+            .get(live_url)
+            .bearer_auth(live_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        assert_eq!(manager.list().await.len(), 3);
+        manager.stop().await;
+        assert!(manager.list().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn overload_and_host_loss_fail_promptly_and_reconnection_restores_access() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app(RelayConfig::default()))
+                    .await
+                    .unwrap();
+            });
+            let guest_key = "bw1_test-recovery-key";
+            let salt = [9_u8; 32];
+            let registration = RelayRegistration {
+                protocol_version: 1,
+                session_id: format!("bws_{}", URL_SAFE_NO_PAD.encode([3_u8; 32])),
+                host_key: format!("bwh_{}", URL_SAFE_NO_PAD.encode([4_u8; 32])),
+                relay_token: None,
+                model: "recovery-model".into(),
+                guest_key_salt: URL_SAFE_NO_PAD.encode(salt),
+                guest_key_hash: URL_SAFE_NO_PAD.encode(salted_key_hash(&salt, guest_key)),
+                expires_at_ms: unix_epoch_millis() + 60_000,
+            };
+            let register = ClientMessage::Text(
+                serde_json::to_string(&HostToRelay::Register {
+                    registration: registration.clone(),
+                })
+                .unwrap()
+                .into(),
+            );
+            let host_url = format!("ws://{address}/v1/host/connect");
+            let (mut host, _) = connect_async(&host_url).await.unwrap();
+            host.send(register.clone()).await.unwrap();
+            assert_eq!(next_protocol(&mut host).await, RelayToHost::Registered);
+            let client = reqwest::Client::new();
+            let chat_url = format!(
+                "http://{address}/s/{}/v1/chat/completions",
+                registration.session_id
+            );
+            let models_url = format!("http://{address}/s/{}/v1/models", registration.session_id);
+            let mut pending = Vec::new();
+            for _ in 0..2 {
+                let request = client.post(&chat_url).bearer_auth(guest_key).json(
+                    &json!({ "messages": [{ "role": "user", "content": "wait" }], "stream": true }),
+                );
+                pending.push(tokio::spawn(async move { request.send().await.unwrap() }));
+                loop {
+                    if matches!(
+                        next_protocol(&mut host).await,
+                        RelayToHost::ChatRequest { .. }
+                    ) {
+                        break;
+                    }
+                }
+            }
+            // Capacity is checked before parsing the body; malformed extra traffic still gets 429.
+            let overloaded = client
+                .post(&chat_url)
+                .bearer_auth(guest_key)
+                .body("not-json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(overloaded
+                .text()
+                .await
+                .unwrap()
+                .contains("Try again shortly"));
+            let unauthorized = client
+                .post(&chat_url)
+                .bearer_auth("wrong-key")
+                .body("not-json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+            host.close(None).await.unwrap();
+            for response in pending {
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                assert!(response.text().await.unwrap().contains("host disconnected"));
+            }
+            let (mut reconnected, _) = connect_async(&host_url).await.unwrap();
+            reconnected.send(register).await.unwrap();
+            assert_eq!(
+                next_protocol(&mut reconnected).await,
+                RelayToHost::Registered
+            );
+            let restored = client
+                .get(&models_url)
+                .bearer_auth(guest_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(restored.status(), StatusCode::OK);
+            assert!(restored.text().await.unwrap().contains("recovery-model"));
+            // A different host credential cannot take over the existing invitation.
+            let (mut impostor, _) = connect_async(&host_url).await.unwrap();
+            let mut invalid = registration;
+            invalid.host_key = format!("bwh_{}", URL_SAFE_NO_PAD.encode([5_u8; 32]));
+            impostor
+                .send(ClientMessage::Text(
+                    serde_json::to_string(&HostToRelay::Register {
+                        registration: invalid,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_protocol(&mut impostor).await,
+                RelayToHost::Error { .. }
+            ));
+            assert_eq!(
+                client
+                    .get(models_url)
+                    .bearer_auth(guest_key)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            reconnected.close(None).await.unwrap();
+            server.abort();
+        })
+        .await
+        .expect("relay recovery must finish without hanging guests");
+    }
+    #[tokio::test]
+    async fn dropping_a_guest_response_releases_its_pending_state_and_capacity() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (host_tx, mut host_rx) = mpsc::channel(8);
+            let session = Arc::new(RelaySession {
+                host_key: "fixture-host".into(),
+                model: "fixture-model".into(),
+                salt: [0; 32],
+                key_hash: [0; 32],
+                expires_at_ms: unix_epoch_millis() + 60_000,
+                connected: AtomicBool::new(true),
+                host_tx,
+                pending: StdMutex::new(HashMap::new()),
+                in_flight: Arc::new(Semaphore::new(2)),
+            });
+            let access = ChatAccess {
+                session: Arc::clone(&session),
+                permit: Arc::clone(&session.in_flight).try_acquire_owned().unwrap(),
+            };
+            let response = tokio::spawn(chat_completions(
+                access,
+                Ok(Bytes::from_static(b"{\"messages\":[],\"stream\":true}")),
+            ));
+            let Message::Text(payload) = host_rx.recv().await.unwrap() else {
+                panic!("expected a chat request")
+            };
+            let RelayToHost::ChatRequest { request_id, .. } =
+                serde_json::from_str(payload.as_ref()).unwrap()
+            else {
+                panic!("expected a chat request")
+            };
+            session
+                .pending
+                .lock()
+                .unwrap()
+                .get(&request_id)
+                .unwrap()
+                .start(200, "text/event-stream");
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(session.pending.lock().unwrap().len(), 1);
+            assert_eq!(session.in_flight.available_permits(), 1);
+            // This is the response body being abandoned before consuming the model stream.
+            drop(response);
+            assert!(session.pending.lock().unwrap().is_empty());
+            assert_eq!(session.in_flight.available_permits(), 2);
+        })
+        .await
+        .expect("abandoned guest requests must not retain capacity");
     }
 }

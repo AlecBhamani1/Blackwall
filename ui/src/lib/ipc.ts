@@ -1,3 +1,6 @@
+import { invoke } from '@tauri-apps/api/core';
+import { normalizeEndpoint } from './setup';
+import { nativeModelError } from './modelError';
 import type {
   AgentEvent,
   AttachmentPayload,
@@ -48,6 +51,8 @@ function normalizeShareStatus(value: unknown): ShareStatus {
     typeof field === 'string' && field.length > 0 ? field : undefined;
   return {
     active: Boolean(record.active),
+    id: optionalText(record.id),
+    name: optionalText(record.name),
     shareUrl: optionalText(record.shareUrl),
     qrDataUrl: optionalText(record.qrDataUrl),
     model: optionalText(record.model),
@@ -95,16 +100,6 @@ function normalizeCatalog(value: unknown): ModelInfo[] {
   return [];
 }
 
-function normalizeBrowserEndpoint(endpoint: string): string {
-  const trimmed = endpoint.trim();
-  const candidate = trimmed.includes('://') ? trimmed : `http://${trimmed}`;
-  const url = new URL(candidate);
-  url.search = '';
-  url.hash = '';
-  if (url.pathname === '' || url.pathname === '/') url.pathname = '/v1';
-  return url.toString().replace(/\/$/, '');
-}
-
 function browserModelRoutes(endpoint?: string): { models: string; tags?: string; chat: string } {
   if (!endpoint?.trim()) {
     return {
@@ -114,7 +109,7 @@ function browserModelRoutes(endpoint?: string): { models: string; tags?: string;
     };
   }
 
-  const normalized = normalizeBrowserEndpoint(endpoint);
+  const normalized = normalizeEndpoint(endpoint);
   const url = new URL(normalized);
   const origin = url.origin;
   return {
@@ -137,7 +132,10 @@ async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
           return id ? { id, name: id, sizeBytes: model.size } : null;
         })
         .filter((model): model is ModelInfo => model !== null)
-        .sort((a, b) => (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER));
+        .sort(
+          (a, b) =>
+            (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER),
+        );
 
       if (models.length > 0) return models;
     }
@@ -249,7 +247,7 @@ async function streamBrowserChat(
     let detail = '';
     try {
       const payload = (await response.json()) as { error?: { message?: string } | string };
-      detail = typeof payload.error === 'string' ? payload.error : payload.error?.message ?? '';
+      detail = typeof payload.error === 'string' ? payload.error : (payload.error?.message ?? '');
     } catch {
       detail = await response.text().catch(() => '');
     }
@@ -309,6 +307,56 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       code: typeof event.code === 'string' ? event.code : undefined,
     };
   }
+  if (
+    type === 'subagent_status' &&
+    typeof event.agentId === 'string' &&
+    typeof event.state === 'string'
+  )
+    return {
+      type,
+      requestId,
+      agentId: event.agentId,
+      state: event.state,
+      summary: typeof event.summary === 'string' ? event.summary : undefined,
+    };
+  if (
+    type === 'tool_call' &&
+    typeof event.toolCallId === 'string' &&
+    typeof event.name === 'string' &&
+    typeof event.arguments === 'string'
+  )
+    return {
+      type,
+      requestId,
+      toolCallId: event.toolCallId,
+      name: event.name,
+      arguments: event.arguments,
+    };
+  if (
+    type === 'tool_result' &&
+    typeof event.toolCallId === 'string' &&
+    typeof event.output === 'string'
+  )
+    return {
+      type,
+      requestId,
+      toolCallId: event.toolCallId,
+      output: event.output,
+      success: event.success === true,
+    };
+  if (
+    type === 'approval_request' &&
+    typeof event.approvalId === 'string' &&
+    typeof event.detail === 'string' &&
+    typeof event.kind === 'string'
+  )
+    return {
+      type,
+      requestId,
+      approvalId: event.approvalId,
+      detail: event.detail,
+      kind: event.kind,
+    };
   return null;
 }
 
@@ -317,10 +365,7 @@ async function streamTauriChat(
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
-  const [{ invoke }, { listen }] = await Promise.all([
-    import('@tauri-apps/api/core'),
-    import('@tauri-apps/api/event'),
-  ]);
+  const { listen } = await import('@tauri-apps/api/event');
 
   let remoteError: Error | undefined;
   let complete = false;
@@ -328,21 +373,34 @@ async function streamTauriChat(
     const event = normalizeEvent(payload);
     if (!event || event.requestId !== request.requestId || signal.aborted) return;
 
+    callbacks.onEvent?.(event);
     if (event.type === 'assistant_delta') callbacks.onDelta(event.delta);
     if (event.type === 'turn_complete') {
       complete = true;
       callbacks.onComplete?.();
     }
-    if (event.type === 'error') remoteError = new Error(event.message);
+    if (event.type === 'error') remoteError = nativeModelError(event);
   });
 
+  const cancel = () => {
+    void invoke('cancel_request', { requestId: request.requestId }).catch(() => {});
+  };
+  signal.addEventListener('abort', cancel, { once: true });
   try {
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');
-    await invoke('stream_chat', { request });
+    await invoke('stream_chat', {
+      request,
+      agentMode: request.agentMode ?? false,
+      webEnabled: request.webEnabled ?? false,
+    });
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');
     if (remoteError) throw remoteError;
     if (!complete) callbacks.onComplete?.();
+  } catch (cause) {
+    if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');
+    throw remoteError ?? nativeModelError(cause);
   } finally {
+    signal.removeEventListener('abort', cancel);
     unlisten();
   }
 }
@@ -350,14 +408,14 @@ async function streamTauriChat(
 export const localModelClient = {
   async modelEndpoint(): Promise<string> {
     if (!isTauriRuntime()) return '';
-    const { invoke } = await import('@tauri-apps/api/core');
     return invoke<string>('model_endpoint');
   },
 
   async discoverModels(endpoint?: string): Promise<ModelInfo[]> {
     if (!isTauriRuntime()) return discoverBrowserModels(endpoint);
-    const { invoke } = await import('@tauri-apps/api/core');
-    return normalizeCatalog(await invoke<unknown>('discover_models', { endpoint: endpoint || null }));
+    return normalizeCatalog(
+      await invoke<unknown>('discover_models', { endpoint: endpoint || null }),
+    );
   },
 
   async streamChat(
@@ -375,21 +433,31 @@ export type LocalModelClient = typeof localModelClient;
 export const guestShareClient = {
   async startShare(request: StartShareRequest): Promise<ShareStatus> {
     if (!isTauriRuntime()) throw sharingUnavailable();
-    const { invoke } = await import('@tauri-apps/api/core');
-    return normalizeShareStatus(await invoke<unknown>('start_share', { request }));
+    return normalizeShareStatus(
+      await invoke<unknown>('start_share', { request, name: request.name }),
+    );
   },
 
   async shareStatus(): Promise<ShareStatus> {
     if (!isTauriRuntime()) throw sharingUnavailable();
-    const { invoke } = await import('@tauri-apps/api/core');
     return normalizeShareStatus(await invoke<unknown>('share_status'));
   },
 
   async stopShare(): Promise<ShareStatus> {
     if (!isTauriRuntime()) throw sharingUnavailable();
-    const { invoke } = await import('@tauri-apps/api/core');
     return normalizeShareStatus(await invoke<unknown>('stop_share'));
   },
 };
 
+export const multiShareClient = {
+  async list(): Promise<ShareStatus[]> {
+    if (!isTauriRuntime()) return [];
+    const values = await invoke<unknown[]>('list_shares');
+    return values.map(normalizeShareStatus);
+  },
+  async revoke(id: string): Promise<void> {
+    if (!isTauriRuntime()) throw sharingUnavailable();
+    await invoke('revoke_share', { id });
+  },
+};
 export type GuestShareClient = typeof guestShareClient;

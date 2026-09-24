@@ -5,6 +5,7 @@
 //! and shared with the relay only as a salted SHA-256 digest.
 
 pub mod guest_assets;
+pub mod manager;
 mod relay;
 pub mod relay_protocol;
 
@@ -99,6 +100,7 @@ impl ShareStatus {
 #[derive(Clone)]
 pub struct ShareHub {
     inner: Arc<Mutex<Option<RunningShare>>>,
+    cancellation: Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl Default for ShareHub {
@@ -112,11 +114,21 @@ impl ShareHub {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
+            cancellation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     /// Publishes a temporary invite through the selected hosted relay.
     pub async fn start(&self, request: StartShareRequest) -> Result<ShareStatus, ShareError> {
+        self.start_with_model_key(request, None).await
+    }
+
+    /// Uses a credential resolved by the host's secure store for this request's endpoint.
+    pub async fn start_with_model_key(
+        &self,
+        request: StartShareRequest,
+        model_key: Option<String>,
+    ) -> Result<ShareStatus, ShareError> {
         validate_request(&request)?;
         let relay_value = request
             .relay_url
@@ -133,7 +145,14 @@ impl ShareHub {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .or_else(|| environment_value(RELAY_TOKEN_ENVIRONMENT_VARIABLE));
+            .or_else(|| {
+                let configured = environment_value(RELAY_URL_ENVIRONMENT_VARIABLE)?;
+                if crate::connection::same_origin(&configured, &relay_base_url) {
+                    environment_value(RELAY_TOKEN_ENVIRONMENT_VARIABLE)
+                } else {
+                    None
+                }
+            });
         let environment_endpoint = environment_value(MODEL_ENDPOINT_ENVIRONMENT_VARIABLE)
             .or_else(|| environment_value(OLLAMA_HOST_ENVIRONMENT_VARIABLE));
         let upstream_endpoint = normalize_upstream_endpoint(
@@ -145,11 +164,23 @@ impl ShareHub {
                 .or(environment_endpoint.as_deref())
                 .unwrap_or(DEFAULT_MODEL_ENDPOINT),
         )?;
+        let credential_endpoint = normalize_upstream_endpoint(
+            environment_endpoint
+                .as_deref()
+                .unwrap_or(DEFAULT_MODEL_ENDPOINT),
+        )?;
+        let upstream_api_key = model_key.or_else(|| {
+            if crate::connection::same_origin(&credential_endpoint, &upstream_endpoint) {
+                environment_value(MODEL_API_KEY_ENVIRONMENT_VARIABLE)
+            } else {
+                None
+            }
+        });
         self.start_configured(ShareStartConfig {
             model: request.model,
             expires_in: Duration::from_secs(request.expires_in_minutes.saturating_mul(60)),
             upstream_endpoint,
-            upstream_api_key: environment_value(MODEL_API_KEY_ENVIRONMENT_VARIABLE),
+            upstream_api_key,
             relay_base_url,
             relay_token,
         })
@@ -179,12 +210,85 @@ impl ShareHub {
     }
 
     /// Revokes the current invitation by closing its authenticated host session.
+    pub fn request_stop(&self) {
+        if let Some(shutdown) = self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = shutdown.send(true);
+        }
+    }
     pub async fn stop(&self) -> ShareStatus {
+        self.request_stop();
         let running = self.inner.lock().await.take();
         if let Some(running) = running {
             stop_running(running).await;
         }
         ShareStatus::inactive()
+    }
+
+    /// Restore a host-approved device using native persisted metadata and a Keychain host key.
+    /// Starts in reconnecting state when the relay is offline; no new identity is generated.
+    pub async fn start_paired(
+        &self,
+        device: &crate::pairing::PairedDevice,
+        host_key: String,
+        model_key: Option<String>,
+        relay_token: Option<String>,
+    ) -> Result<(), ShareError> {
+        device.validate().map_err(ShareError::Relay)?;
+        if device.role != "host"
+            || device.state != "active"
+            || !crate::pairing::valid_secret(&host_key, "bwh_")
+        {
+            return Err(ShareError::Relay(
+                "This paired device cannot host a connection.".into(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10 * 60))
+            .build()
+            .map_err(ShareError::Client)?;
+        let config = RelayHostConfig {
+            socket_url: relay_socket_url(&normalize_relay_base_url(&device.relay_url)?)?,
+            registration: RelayRegistration {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: device.id.clone(),
+                host_key,
+                relay_token,
+                model: device.model.clone(),
+                guest_key_salt: device.salt.clone(),
+                guest_key_hash: device.hash.clone(),
+                expires_at_ms: unix_epoch_millis() + 24 * 60 * 60 * 1000,
+            },
+            client,
+            upstream_endpoint: normalize_upstream_endpoint(
+                device.upstream.as_deref().unwrap_or(""),
+            )?,
+            upstream_api_key: model_key,
+            persistent: true,
+        };
+        let mut guard = self.inner.lock().await;
+        if let Some(running) = guard.take() {
+            stop_running(running).await;
+        }
+        let relay = relay::start_persistent_relay_host(config);
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(relay.shutdown.clone());
+        *guard = Some(RunningShare {
+            model: device.model.clone(),
+            expires_at: u64::MAX,
+            control: relay.control,
+            shutdown: relay.shutdown,
+            task: relay.task,
+        });
+        Ok(())
     }
 
     async fn start_configured(&self, config: ShareStartConfig) -> Result<ShareStatus, ShareError> {
@@ -203,6 +307,7 @@ impl ShareHub {
         let key_hash = salted_key_hash(&salt, &raw_key);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10 * 60))
             .user_agent(concat!("blackwall-share/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -224,6 +329,7 @@ impl ShareHub {
             client,
             upstream_endpoint: config.upstream_endpoint,
             upstream_api_key: config.upstream_api_key,
+            persistent: false,
         })
         .await
         .map_err(|error| ShareError::Relay(error.to_string()))?;
@@ -242,6 +348,10 @@ impl ShareHub {
             network_label: "Hosted relay".to_owned(),
             request_count: 0,
         };
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(relay.shutdown.clone());
         *guard = Some(RunningShare {
             model: config.model,
             expires_at,
@@ -326,7 +436,7 @@ fn normalize_upstream_endpoint(endpoint: &str) -> Result<String, ShareError> {
     Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
-fn normalize_relay_base_url(value: &str) -> Result<String, ShareError> {
+pub(crate) fn normalize_relay_base_url(value: &str) -> Result<String, ShareError> {
     let mut url = Url::parse(value.trim()).map_err(|error| ShareError::InvalidRelayUrl {
         value: value.to_owned(),
         reason: error.to_string(),
@@ -431,6 +541,12 @@ fn unix_epoch_millis() -> u64 {
 /// Safe failure returned while validating or starting guest sharing.
 #[derive(Debug, Error)]
 pub enum ShareError {
+    /// Guest concurrency is bounded by the number of live invitations.
+    #[error("Four guest links are already active. Revoke a link before creating another.")]
+    InviteLimit,
+    /// Labels are displayed as plain text and must remain short.
+    #[error("Use an invitation name of at most 120 bytes, without control characters.")]
+    InvalidInviteName,
     /// No model was selected for the guest.
     #[error("a model must be selected before sharing")]
     MissingModel,

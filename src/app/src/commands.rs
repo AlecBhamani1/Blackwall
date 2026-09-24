@@ -4,7 +4,10 @@ use blackwall_core::protocol::{
     AgentEvent, Attachment, ChatMessage, ChatRequest, ChatResponse, MessageRole, ModelCatalog,
     ModelInfo, ProtocolError, StreamStarted, TokenUsage, DEFAULT_MODEL_ENDPOINT,
 };
-use blackwall_core::share::{ShareError, ShareHub, ShareStatus, StartShareRequest};
+use blackwall_core::share::{
+    manager::{ManagedShare, ShareManager},
+    ShareError, ShareStatus, StartShareRequest,
+};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -29,7 +32,7 @@ pub(crate) struct AppState {
     client: Client,
     default_endpoint: String,
     api_key: Option<String>,
-    share_hub: ShareHub,
+    pub(crate) share_hub: ShareManager,
 }
 
 impl AppState {
@@ -37,6 +40,7 @@ impl AppState {
         Ok(Self {
             client: Client::builder()
                 .connect_timeout(MODEL_CONNECT_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("blackwall/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             default_endpoint: environment_value(MODEL_ENDPOINT_ENVIRONMENT_VARIABLE)
@@ -45,9 +49,44 @@ impl AppState {
             api_key: std::env::var(API_KEY_ENVIRONMENT_VARIABLE)
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            share_hub: ShareHub::new(),
+            share_hub: ShareManager::new(),
         })
     }
+}
+
+// Credentials are resolved in Rust, never returned to the webview.
+pub(crate) async fn scoped_api_key(
+    state: &AppState,
+    endpoint: &str,
+) -> Result<Option<String>, CommandError> {
+    if let Some(key) = crate::credentials::model_key(endpoint)
+        .await
+        .map_err(|message| CommandError {
+            code: "credential_error",
+            message,
+            retryable: true,
+        })?
+    {
+        return Ok(Some(key));
+    }
+    let configured = normalize_endpoint(&state.default_endpoint).map_err(CommandError::from)?;
+    Ok(
+        if blackwall_core::connection::same_origin(&configured, endpoint) {
+            state.api_key.clone()
+        } else {
+            None
+        },
+    )
+}
+
+async fn require_unlocked(app: &AppHandle) -> Result<(), CommandError> {
+    crate::auth::require_unlocked(app)
+        .await
+        .map_err(|message| CommandError {
+            code: "app_locked",
+            message,
+            retryable: false,
+        })
 }
 
 /// Error shape serialized across the Tauri IPC boundary.
@@ -79,7 +118,16 @@ impl CommandError {
             | BridgeError::AttachmentsRequireUserMessage => "invalid_request",
             BridgeError::Request(source) if source.is_timeout() => "model_timeout",
             BridgeError::Request(_) => "model_unavailable",
-            BridgeError::HttpStatus { .. } => "model_http_error",
+            BridgeError::HttpStatus { status, .. } => match *status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE => {
+                    "model_access_denied"
+                }
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY => "model_unavailable",
+                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "model_timeout",
+                StatusCode::TOO_MANY_REQUESTS => "model_busy",
+                StatusCode::NOT_FOUND => "model_not_found",
+                _ => "model_http_error",
+            },
             BridgeError::ModelError(_) => "model_error",
             BridgeError::Decode(_) | BridgeError::InvalidEventEncoding(_) => {
                 "invalid_model_response"
@@ -91,7 +139,19 @@ impl CommandError {
 
         Self {
             code,
-            message: error.to_string(),
+            // Public errors must never include endpoint URLs or upstream response bodies.
+            message: match code {
+                "model_unavailable" => "The model computer is unavailable. Open and unlock Blackwall on that computer, keep its model running, and reconnect.",
+                "model_access_denied" => "Model access was refused or removed. Check your access key, or pair the computer again if its access was removed.",
+                "model_timeout" => "The model took too long to respond. Check that its computer is awake and connected, then try again.",
+                "model_busy" => "The model is busy. Wait for another request to finish, then try again.",
+                "model_not_found" => "The model connection is no longer available. Check that its computer is open, unlocked, and awake. If access was removed, pair again.",
+                "invalid_request" => "The request could not be sent. Check the connection settings, model, and attachments.",
+                "model_response_too_large" => "The model response was too large. Ask for a shorter response.",
+                "empty_model_response" => "The model returned no answer. Try again or choose another model.",
+                "invalid_model_response" => "The model returned an unreadable response. Try again or check the model service.",
+                _ => "The model could not complete the request. Try again or check the model service.",
+            }.into(),
             retryable,
         }
     }
@@ -159,8 +219,10 @@ pub(crate) fn model_endpoint(state: State<'_, AppState>) -> Result<String, Comma
 #[tauri::command]
 pub(crate) async fn discover_models(
     endpoint: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ModelCatalog, CommandError> {
+    require_unlocked(&app).await?;
     let endpoint = normalize_endpoint(
         endpoint
             .as_deref()
@@ -169,12 +231,13 @@ pub(crate) async fn discover_models(
             .unwrap_or(state.default_endpoint.as_str()),
     )
     .map_err(CommandError::from)?;
+    let api_key = scoped_api_key(&state, &endpoint).await?;
     let response = authorized_request(
         state
             .client
             .get(format!("{endpoint}/models"))
             .timeout(MODEL_DISCOVERY_TIMEOUT),
-        state.api_key.as_deref(),
+        api_key.as_deref(),
     )
     .send()
     .await
@@ -206,31 +269,74 @@ pub(crate) async fn discover_models(
     })
 }
 
+async fn inject_memory(app: &AppHandle, request: &mut ChatRequest) -> Result<(), CommandError> {
+    let memory = crate::data::with_store(app, |store| {
+        let preferences: serde_json::Value = store
+            .setting("preferences")?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?
+            .unwrap_or_default();
+        if preferences.get("memoryEnabled").and_then(|v| v.as_bool()) != Some(true) {
+            return Ok(String::new());
+        }
+        Ok(blackwall_core::memory::context(&store.memories("")?, 4000))
+    })
+    .await
+    .map_err(|message| CommandError {
+        code: "storage_error",
+        message,
+        retryable: true,
+    })?;
+    if !memory.is_empty() {
+        request
+            .messages
+            .insert(0, ChatMessage::new(MessageRole::System, memory));
+    }
+    Ok(())
+}
+
 /// Runs a complete non-streaming chat request.
 #[tauri::command]
 pub(crate) async fn chat(
-    request: ChatRequest,
+    mut request: ChatRequest,
+    app: AppHandle,
     state: State<'_, AppState>,
+    jobs: State<'_, crate::setup::SetupState>,
 ) -> Result<ChatResponse, CommandError> {
+    require_unlocked(&app).await?;
     request.validate()?;
+    let mut job = jobs
+        .jobs
+        .start(&request.request_id)
+        .map_err(|message| CommandError {
+            code: "request_stopped",
+            message,
+            retryable: false,
+        })?;
+    inject_memory(&app, &mut request).await?;
     validate_attachment_target(&request).map_err(CommandError::from)?;
-    complete_chat(
-        &state.client,
-        state.api_key.as_deref(),
-        &state.default_endpoint,
-        request,
-    )
-    .await
-    .map_err(CommandError::from)
+    let selected =
+        selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
+    let api_key = scoped_api_key(&state, &selected).await?;
+    tokio::select! {
+        biased;
+        _ = job.cancelled() => Err(CommandError { code: "request_stopped", message: "Response stopped.".into(), retryable: false }),
+        response = complete_chat(&state.client, api_key.as_deref(), &state.default_endpoint, request) => response.map_err(CommandError::from),
+    }
 }
 
 /// Runs a model stream, emitting typed events until completion.
 #[tauri::command]
 pub(crate) async fn stream_chat(
-    request: ChatRequest,
+    mut request: ChatRequest,
     app: AppHandle,
     state: State<'_, AppState>,
+    jobs: State<'_, crate::setup::SetupState>,
+    agent: State<'_, crate::agent_commands::AgentState>,
+    agent_mode: Option<bool>,
+    web_enabled: Option<bool>,
 ) -> Result<StreamStarted, CommandError> {
+    require_unlocked(&app).await?;
     let request_id = request.request_id.clone();
     let setup_result = request
         .validate()
@@ -245,20 +351,78 @@ pub(crate) async fn stream_chat(
         ));
     }
 
-    let stream_result = stream_chat_events(
-        &state.client,
-        state.api_key.as_deref(),
-        &state.default_endpoint,
-        &app,
-        request,
-    )
-    .await;
+    let selected =
+        selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
+    let mut job = jobs
+        .jobs
+        .start(&request_id)
+        .map_err(|message| CommandError {
+            code: "request_stopped",
+            message,
+            retryable: false,
+        })?;
+    inject_memory(&app, &mut request).await?;
+    let api_key = scoped_api_key(&state, &selected).await?;
+    let stopped = || CommandError {
+        code: "request_stopped",
+        message: "Response stopped.".into(),
+        retryable: false,
+    };
+    let stream_result = if agent_mode.unwrap_or(false) {
+        let workspace = agent
+            .workspace
+            .lock()
+            .map_err(|_| stopped())?
+            .clone()
+            .ok_or(CommandError {
+                code: "workspace_required",
+                message: "Choose a project folder before starting an agent task.".into(),
+                retryable: false,
+            })?;
+        let skill_context = crate::data::with_skills(&app, |store| {
+            Ok(blackwall_core::skills::prompt(&store.list()?.0))
+        })
+        .await
+        .map_err(|message| CommandError {
+            code: "skills_error",
+            message,
+            retryable: true,
+        })?;
+        if !skill_context.is_empty() {
+            request
+                .messages
+                .insert(0, ChatMessage::new(MessageRole::System, skill_context));
+        }
+        let backend = blackwall_core::model::HttpModel::new(&selected, &request.model, api_key)
+            .map_err(|error| CommandError {
+                code: "model_error",
+                message: error.to_string(),
+                retryable: true,
+            })?;
+        let event_app = app.clone();
+        let runner = blackwall_core::agent::Agent {
+            backend: &backend,
+            workspace,
+            web_enabled: web_enabled.unwrap_or(false),
+            approvals: agent.approvals.clone(),
+            emit: std::sync::Arc::new(move |event| {
+                let _ = event_app.emit(EVENT_CHANNEL, event);
+            }),
+        };
+        tokio::select! {
+            biased;
+            _=job.cancelled()=>Err(stopped()),
+            result=runner.run(&request_id,blackwall_core::model::messages(&request))=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _=job.cancelled()=>Err(stopped()),
+            result=stream_chat_events(&state.client,api_key.as_deref(),&state.default_endpoint,&app,request)=>result.map_err(CommandError::from),
+        }
+    };
     if let Err(error) = stream_result {
-        return Err(emit_command_error(
-            &app,
-            request_id,
-            CommandError::from(error),
-        ));
+        return Err(emit_command_error(&app, request_id, error));
     }
 
     Ok(StreamStarted { request_id })
@@ -267,20 +431,85 @@ pub(crate) async fn stream_chat(
 /// Starts a temporary browser invite through the selected hosted relay.
 #[tauri::command]
 pub(crate) async fn start_share(
-    request: StartShareRequest,
+    mut request: StartShareRequest,
+    name: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<ShareStatus, CommandError> {
-    state
+) -> Result<ManagedShare, CommandError> {
+    require_unlocked(&app).await?;
+    let endpoint = normalize_endpoint(
+        request
+            .endpoint
+            .as_deref()
+            .unwrap_or(&state.default_endpoint),
+    )?;
+    let key = scoped_api_key(&state, &endpoint).await?;
+    let relay_origin = request
+        .relay_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| environment_value("BLACKWALL_RELAY_URL"));
+    let supplied_token = request
+        .relay_token
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    if supplied_token.is_none() {
+        if let Some(origin) = &relay_origin {
+            request.relay_token =
+                crate::credentials::relay_key(origin)
+                    .await
+                    .map_err(|message| CommandError {
+                        code: "keychain_error",
+                        message,
+                        retryable: true,
+                    })?;
+        }
+    }
+    let status = state
         .share_hub
-        .start(request)
+        .start_named(request, key, name.unwrap_or_default())
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?;
+    if let Err(error) = require_unlocked(&app).await {
+        state.share_hub.stop().await;
+        return Err(error);
+    }
+    if let (Some(origin), Some(token)) = (relay_origin, supplied_token) {
+        if let Err(message) = crate::credentials::save_relay_key(&origin, token).await {
+            state.share_hub.revoke(&status.id).await;
+            return Err(CommandError {
+                code: "keychain_error",
+                message,
+                retryable: true,
+            });
+        }
+    }
+    Ok(status)
 }
 
 /// Returns non-secret guest listener metadata.
 #[tauri::command]
-pub(crate) async fn share_status(state: State<'_, AppState>) -> Result<ShareStatus, CommandError> {
+pub(crate) async fn share_status(state: State<'_, AppState>) -> Result<ManagedShare, CommandError> {
     Ok(state.share_hub.status().await)
+}
+
+#[tauri::command]
+pub(crate) async fn list_shares(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ManagedShare>, CommandError> {
+    require_unlocked(&app).await?;
+    Ok(state.share_hub.list().await)
+}
+#[tauri::command]
+pub(crate) async fn revoke_share(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), CommandError> {
+    require_unlocked(&app).await?;
+    state.share_hub.revoke(&id).await;
+    Ok(())
 }
 
 /// Revokes the active invite and closes its network listener.
@@ -516,8 +745,13 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, BridgeError> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(BridgeError::EndpointCredentialsNotAllowed);
     }
-    parsed.set_query(None);
-    parsed.set_fragment(None);
+    if parsed.query().is_some() || parsed.fragment().is_some() || endpoint.len() > 2048 {
+        return Err(BridgeError::InvalidEndpoint {
+            endpoint: "model address".into(),
+            reason: "Use an address without query parameters or fragments, at most 2,048 bytes."
+                .into(),
+        });
+    }
     if parsed.path().is_empty() || parsed.path() == "/" {
         parsed.set_path("/v1");
     }
@@ -893,6 +1127,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn public_model_failures_classify_recovery_without_exposing_upstream_bodies() {
+        for (status, code, retryable) in [
+            (StatusCode::SERVICE_UNAVAILABLE, "model_unavailable", true),
+            (StatusCode::FORBIDDEN, "model_access_denied", false),
+            (StatusCode::GONE, "model_access_denied", false),
+            (StatusCode::GATEWAY_TIMEOUT, "model_timeout", true),
+            (StatusCode::TOO_MANY_REQUESTS, "model_busy", true),
+            (StatusCode::NOT_FOUND, "model_not_found", false),
+        ] {
+            let error = CommandError::from_bridge(BridgeError::HttpStatus {
+                status,
+                body: "private upstream body https://private.example/?key=secret".into(),
+            });
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert!(!error.message.contains("private"));
+            assert!(!error.message.contains("secret"));
+        }
+    }
 
     #[test]
     fn endpoint_defaults_to_ollama_and_adds_v1_to_origin() {

@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
 
+  export let setupMode = false;
   export let sidebarVisible = true;
   export let models: ModelInfo[] = [];
   export let selectedModel = '';
@@ -19,7 +20,11 @@
 
 <header>
   <div class="header-side">
-    <button class="icon-button" aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'} onclick={onToggleSidebar}>
+    <button
+      class="icon-button"
+      aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
+      onclick={onToggleSidebar}
+    >
       <Icon name="menu" size={18} />
     </button>
     {#if !sidebarVisible}
@@ -30,7 +35,7 @@
   <div class="model-control">
     <span
       class:ready={connectionState === 'ready'}
-      class:offline={connectionState === 'offline'}
+      class:offline={connectionState === 'offline' && !setupMode}
       class="state-dot"
       aria-hidden="true"
     ></span>
@@ -44,24 +49,27 @@
       <span class="select-chevron"><Icon name="chevron-down" size={14} /></span>
     {:else}
       <span class="model-placeholder">
-        {connectionState === 'checking' ? 'Finding your model…' : 'Model unavailable'}
+        {setupMode
+          ? 'Let’s get connected'
+          : connectionState === 'checking'
+            ? 'Finding your model…'
+            : 'Model unavailable'}
       </span>
     {/if}
   </div>
 
   <div class="header-side right">
-    {#if connectionState === 'offline'}
+    {#if setupMode}
+      <span class="privacy">Setup</span>
+    {:else if connectionState === 'offline'}
       <button class="reconnect" onclick={onReconnect}>
         <Icon name="refresh" size={14} />
         <span>Reconnect</span>
       </button>
     {:else}
-      <div class="privacy" title="Connected only to your configured model endpoint">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
-          <rect width="16" height="11" x="4" y="11" rx="2" />
-          <path d="M8 11V7a4 4 0 0 1 8 0v4" />
-        </svg>
-        <span>Private</span>
+      <div class="privacy" title="Messages go to your selected model service">
+        <Icon name="link" size={13} />
+        <span>Your model</span>
       </div>
     {/if}
   </div>

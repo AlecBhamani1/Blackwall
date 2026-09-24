@@ -25,13 +25,16 @@ use tokio_tungstenite::{
 };
 
 use super::relay_protocol::{
-    HostToRelay, RelayRegistration, RelayToHost, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    HostToRelay, RelayRegistration, RelayToHost, HEARTBEAT_INTERVAL, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES, PEER_IDLE_TIMEOUT, SOCKET_WRITE_TIMEOUT,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_millis((2_000_u64 << attempt.min(4)).min(30_000) + rand::random::<u64>() % 1_000)
+}
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -45,6 +48,7 @@ pub(crate) struct RelayHostConfig {
     pub(crate) client: reqwest::Client,
     pub(crate) upstream_endpoint: String,
     pub(crate) upstream_api_key: Option<String>,
+    pub(crate) persistent: bool,
 }
 
 /// Host-visible liveness and request counters.
@@ -93,6 +97,40 @@ pub(crate) async fn start_relay_host(
     })
 }
 
+/// Restored devices tolerate offline startup and renew a one-day lease on each connection.
+pub(crate) fn start_persistent_relay_host(mut config: RelayHostConfig) -> RunningRelayHost {
+    let control = RelayHostControl {
+        connected: Arc::new(AtomicBool::new(false)),
+        request_count: Arc::new(AtomicU64::new(0)),
+    };
+    let (shutdown, mut rx) = watch::channel(false);
+    let task_control = control.clone();
+    let task = tokio::spawn(async move {
+        let mut attempt = 0_u32;
+        loop {
+            config.registration.expires_at_ms = unix_epoch_millis() + 24 * 60 * 60 * 1000;
+            let connection = tokio::select! {
+                _ = rx.changed() => return Ok(()),
+                result = connect_and_register(&config) => result,
+            };
+            match connection {
+                Ok(socket) => return run_relay_host(config, socket, task_control, rx).await,
+                Err(RelayHostError::Rejected(message)) => {
+                    return Err(RelayHostError::Rejected(message))
+                }
+                Err(_) => {}
+            }
+            tokio::select! { _ = rx.changed() => return Ok(()), _ = tokio::time::sleep(reconnect_delay(attempt)) => {} }
+            attempt = attempt.saturating_add(1);
+        }
+    });
+    RunningRelayHost {
+        control,
+        shutdown,
+        task,
+    }
+}
+
 async fn connect_and_register(config: &RelayHostConfig) -> Result<RelaySocket, RelayHostError> {
     let request = config
         .socket_url
@@ -126,7 +164,7 @@ async fn connect_and_register(config: &RelayHostConfig) -> Result<RelaySocket, R
 }
 
 async fn run_relay_host(
-    config: RelayHostConfig,
+    mut config: RelayHostConfig,
     mut socket: RelaySocket,
     control: RelayHostControl,
     mut shutdown: watch::Receiver<bool>,
@@ -136,13 +174,16 @@ async fn run_relay_host(
         let connection_result = run_connection(&config, socket, &control, shutdown.clone()).await;
         control.connected.store(false, Ordering::Release);
 
-        if *shutdown.borrow() || unix_epoch_millis() >= config.registration.expires_at_ms {
+        if *shutdown.borrow()
+            || (!config.persistent && unix_epoch_millis() >= config.registration.expires_at_ms)
+        {
             return Ok(());
         }
         if matches!(connection_result, Err(RelayHostError::Rejected(_))) {
             return connection_result;
         }
 
+        let mut attempt = 0_u32;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -150,12 +191,21 @@ async fn run_relay_host(
                         return Ok(());
                     }
                 }
-                () = tokio::time::sleep(RECONNECT_DELAY) => {}
+                () = tokio::time::sleep(reconnect_delay(attempt)) => {}
             }
-            if unix_epoch_millis() >= config.registration.expires_at_ms {
+            if config.persistent {
+                config.registration.expires_at_ms = unix_epoch_millis() + 24 * 60 * 60 * 1000;
+            } else if unix_epoch_millis() >= config.registration.expires_at_ms {
                 return Ok(());
             }
-            match connect_and_register(&config).await {
+            let reconnect = tokio::select! {
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return Ok(());
+                }
+                result = connect_and_register(&config) => result,
+            };
+            match reconnect {
                 Ok(reconnected) => {
                     socket = reconnected;
                     break;
@@ -163,7 +213,10 @@ async fn run_relay_host(
                 Err(RelayHostError::Rejected(message)) => {
                     return Err(RelayHostError::Rejected(message));
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
             }
         }
     }
@@ -175,16 +228,38 @@ async fn run_connection(
     control: &RelayHostControl,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RelayHostError> {
+    if *shutdown.borrow() {
+        return Ok(());
+    }
     let (mut sink, mut source) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
     let permits = Arc::new(Semaphore::new(2));
     let mut jobs = JoinSet::new();
 
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_received = tokio::time::Instant::now();
+    let expiry = tokio::time::sleep(Duration::from_millis(
+        config
+            .registration
+            .expires_at_ms
+            .saturating_sub(unix_epoch_millis()),
+    ));
+    tokio::pin!(expiry);
     let result = loop {
         tokio::select! {
+            () = &mut expiry => break Ok(()),
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() >= PEER_IDLE_TIMEOUT {
+                    break Err(RelayHostError::Disconnected);
+                }
+                if !matches!(tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) {
+                    break Err(RelayHostError::Disconnected);
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _close_result = sink.send(Message::Close(None)).await;
+                    let _close_result = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(Message::Close(None))).await;
                     break Ok(());
                 }
             }
@@ -192,8 +267,10 @@ async fn run_connection(
                 let Some(message) = outbound else {
                     break Err(RelayHostError::Disconnected);
                 };
-                if let Err(error) = sink.send(message).await {
-                    break Err(RelayHostError::WebSocket(error));
+                match tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(message)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => break Err(RelayHostError::WebSocket(error)),
+                    Err(_) => break Err(RelayHostError::Disconnected),
                 }
             }
             incoming = source.next() => {
@@ -204,8 +281,10 @@ async fn run_connection(
                     Ok(message) => message,
                     Err(error) => break Err(RelayHostError::WebSocket(error)),
                 };
+                last_received = tokio::time::Instant::now();
                 if let Message::Ping(payload) = &message {
-                    if outbound_tx.send(Message::Pong(payload.clone())).await.is_err() {
+                    // Do not enqueue into the queue this same loop must drain.
+                    if !matches!(tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(Message::Pong(payload.clone()))).await, Ok(Ok(()))) {
                         break Err(RelayHostError::Disconnected);
                     }
                     continue;
@@ -215,6 +294,12 @@ async fn run_connection(
                 };
                 match message {
                     RelayToHost::ChatRequest { request_id, body } => {
+                        // One process-wide GPU budget shared by guest links and paired devices.
+                        static BUDGET: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+                        let Ok(global_permit) = BUDGET.get_or_init(|| Arc::new(Semaphore::new(8))).clone().try_acquire_owned() else {
+                            send_error_response(&outbound_tx, request_id, 429, "The host is busy. Try again shortly.").await?;
+                            continue;
+                        };
                         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                             send_error_response(
                                 &outbound_tx,
@@ -228,6 +313,7 @@ async fn run_connection(
                         let job_tx = outbound_tx.clone();
                         jobs.spawn(async move {
                             let _permit = permit;
+                            let _global_permit = global_permit;
                             if relay_chat(job_config, request_id.clone(), body, &job_tx).await.is_err() {
                                 let _error_result = send_error_response(
                                     &job_tx,
@@ -442,10 +528,13 @@ async fn send_protocol(
     message: &HostToRelay,
 ) -> Result<(), RelayHostError> {
     let payload = serde_json::to_string(message).map_err(RelayHostError::Serialize)?;
-    outbound
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(|_| RelayHostError::Disconnected)
+    tokio::time::timeout(
+        SOCKET_WRITE_TIMEOUT,
+        outbound.send(Message::Text(payload.into())),
+    )
+    .await
+    .map_err(|_| RelayHostError::Disconnected)?
+    .map_err(|_| RelayHostError::Disconnected)
 }
 
 fn parse_relay_message(message: Message) -> Result<Option<RelayToHost>, RelayHostError> {

@@ -20,3 +20,11 @@ coverage/
 .idea/
 .vscode/
 *.swp
+
+# Relay runtime ownership database
+blackwall-relay-data/
+
+# Local analysis and Python caches
+/graphify-out/
+__pycache__/
+*.py[cod]

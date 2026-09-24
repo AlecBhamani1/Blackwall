@@ -1,10 +1,17 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
-  import { guestShareClient, type GuestShareClient } from '../ipc';
+  import { guestShareClient, multiShareClient, type GuestShareClient } from '../ipc';
   import type { ConnectionState, ShareExpiryMinutes, ShareStatus } from '../types';
   import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
+  import LockSettings from './LockSettings.svelte';
+  import CredentialSettings from './CredentialSettings.svelte';
+  import PairingPanel from './PairingPanel.svelte';
+  import { isPairedEndpoint } from '../pairing';
+  import { isDesktop } from '../setup';
   import Icon from './Icon.svelte';
 
+  export let onLock: () => Promise<void> = async () => {};
+  export let onSetup: () => void = () => {};
   export let open = false;
   export let model = '';
   export let endpoint = '';
@@ -20,6 +27,7 @@
   export let onInstallUpdate: () => Promise<void> = async () => {};
   export let onClose: () => void;
   export let client: GuestShareClient = guestShareClient;
+  export let invites = multiShareClient;
 
   const expiryOptions: Array<{ value: ShareExpiryMinutes; label: string }> = [
     { value: 15, label: '15 min' },
@@ -28,7 +36,12 @@
   ];
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
+  let keysOpen = false;
   let expiry: ShareExpiryMinutes = 60;
+  let inviteName = '';
+  let creatingLink = false;
+  let sharedLinks: ShareStatus[] = [];
+  const knownLinks = new Map<string, ShareStatus>();
   let status: ShareStatus = { active: false };
   let busy: 'loading' | 'starting' | 'stopping' | '' = '';
   let error = '';
@@ -42,43 +55,90 @@
   let endpointBusy = false;
   let endpointFeedback = '';
   let endpointInputError = '';
-  let relayUrlDraft =
-    typeof window === 'undefined' ? '' : window.localStorage.getItem(RELAY_URL_STORAGE_KEY) ?? '';
+  let relayUrlDraft = typeof window === 'undefined' ? '' : readRelayUrl();
+  let credentialRelayUrl = relayUrlDraft;
   let relayTokenDraft = '';
 
   function errorMessage(value: unknown): string {
     return value instanceof Error ? value.message : 'Blackwall could not update guest sharing.';
   }
 
-  function mergeStatus(next: ShareStatus): void {
-    status = next.active
-      ? {
-          ...status,
-          ...next,
-          shareUrl: next.shareUrl ?? status.shareUrl,
-          qrDataUrl: next.qrDataUrl ?? status.qrDataUrl,
-        }
-      : { active: false };
+  async function focusGuestResult(): Promise<void> {
+    await tick();
+    if (!open || !dialog) return;
+    const active = document.activeElement;
+    if (active !== document.body && !dialog.contains(active)) return;
+    // Creating/revoking a link removes the initiating control from the DOM.
+    // Keep keyboard navigation inside Settings after that transition.
+    (
+      dialog.querySelector<HTMLElement>('[data-guest-error]') ??
+      dialog.querySelector<HTMLElement>('#guest-link') ??
+      dialog.querySelector<HTMLElement>('.start-button') ??
+      dialog
+    ).focus();
   }
 
+  function mergeStatus(next: ShareStatus): void {
+    const previous = next.id ? knownLinks.get(next.id) : !status.id ? status : undefined;
+    status = next.active
+      ? {
+          ...next,
+          shareUrl: next.shareUrl ?? previous?.shareUrl,
+          qrDataUrl: next.qrDataUrl ?? previous?.qrDataUrl,
+        }
+      : { active: false };
+    if (status.id) knownLinks.set(status.id, status);
+  }
+  async function revoke(id: string) {
+    if (busy) return;
+    busy = 'stopping';
+    error = '';
+    operationVersion += 1;
+    try {
+      await invites.revoke(id);
+      knownLinks.delete(id);
+      if (status.id === id) status = { active: false };
+      await refresh(true);
+    } catch (cause) {
+      error = errorMessage(cause);
+    } finally {
+      busy = '';
+      await focusGuestResult();
+    }
+  }
+
+  function readRelayUrl(): string {
+    try {
+      return window.localStorage.getItem(RELAY_URL_STORAGE_KEY) ?? '';
+    } catch {
+      return '';
+    }
+  }
   function rememberRelayUrl(): void {
-    const relayUrl = relayUrlDraft.trim();
-    if (relayUrl) window.localStorage.setItem(RELAY_URL_STORAGE_KEY, relayUrl);
-    else window.localStorage.removeItem(RELAY_URL_STORAGE_KEY);
+    try {
+      const relayUrl = relayUrlDraft.trim();
+      credentialRelayUrl = relayUrl;
+      if (relayUrl) window.localStorage.setItem(RELAY_URL_STORAGE_KEY, relayUrl);
+      else window.localStorage.removeItem(RELAY_URL_STORAGE_KEY);
+    } catch {
+      /* The connection can still be used for this app session. */
+    }
   }
 
   async function refresh(silent = false): Promise<void> {
     const version = operationVersion;
     if (!silent) busy = 'loading';
     try {
-      const next = await client.shareStatus();
+      const [latest, links] = await Promise.all([client.shareStatus(), invites.list()]);
+      const next = links.find((link) => link.id === status.id) ?? latest;
       if (version !== operationVersion) return;
+      sharedLinks = links;
       mergeStatus(next);
       error = '';
     } catch (cause) {
-      if (!silent) error = errorMessage(cause);
+      if (!silent && version === operationVersion) error = errorMessage(cause);
     } finally {
-      if (!silent) busy = '';
+      if (!silent && version === operationVersion) busy = '';
     }
   }
 
@@ -95,16 +155,22 @@
       mergeStatus(
         await client.startShare({
           model,
+          ...(inviteName.trim() ? { name: inviteName.trim() } : {}),
           ...(endpoint ? { endpoint } : {}),
           ...(relayUrl ? { relayUrl } : {}),
           ...(relayToken ? { relayToken } : {}),
           expiresInMinutes: expiry,
         }),
       );
+      creatingLink = false;
+      inviteName = '';
+      relayTokenDraft = '';
+      sharedLinks = await invites.list();
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
       busy = '';
+      await focusGuestResult();
     }
   }
 
@@ -137,11 +203,15 @@
     error = '';
     try {
       mergeStatus(await client.stopShare());
+      sharedLinks = [];
+      knownLinks.clear();
+      creatingLink = false;
       copied = false;
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
       busy = '';
+      await focusGuestResult();
     }
   }
 
@@ -186,9 +256,9 @@
     if (event.key !== 'Tab') return;
     const focusable = Array.from(
       dialog.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])',
       ),
-    );
+    ).filter((element) => !element.closest('details:not([open])') || element.tagName === 'SUMMARY');
     const first = focusable[0];
     const last = focusable.at(-1);
     if (!first || !last) {
@@ -199,7 +269,10 @@
     if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
       event.preventDefault();
       last.focus();
-    } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog)) {
+    } else if (
+      !event.shiftKey &&
+      (document.activeElement === last || document.activeElement === dialog)
+    ) {
       event.preventDefault();
       first.focus();
     }
@@ -221,7 +294,6 @@
       pollTimer = undefined;
     }
   }
-
 
   $: if (!endpointBusy && endpoint !== previousEndpoint) {
     previousEndpoint = endpoint;
@@ -270,38 +342,299 @@
               class="connection-badge"
             >
               <span></span>
-              {connectionState === 'ready' ? 'Connected' : connectionState === 'checking' ? 'Checking' : 'Offline'}
+              {connectionState === 'ready'
+                ? 'Connected'
+                : connectionState === 'checking'
+                  ? 'Checking'
+                  : 'Offline'}
             </span>
           </div>
 
-          <form class="endpoint-form" onsubmit={connectEndpoint}>
-            <label for="model-endpoint">Endpoint URL</label>
-            <input
-              id="model-endpoint"
-              bind:value={endpointDraft}
-              placeholder="http://localhost:11434/v1"
-              autocomplete="url"
-              autocapitalize="none"
-              spellcheck="false"
-              disabled={endpointBusy}
-            />
-            <p class="endpoint-hint">
-              You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall adds <code>/v1</code> automatically.
-            </p>
+          <button class="connect-button setup-button" onclick={onSetup}>Set up a connection</button>
+          <details class="advanced-connection">
+            <summary>Advanced · Enter a server address</summary>
+            <form class="endpoint-form" onsubmit={connectEndpoint}>
+              <label for="model-endpoint">Endpoint URL</label>
+              <input
+                id="model-endpoint"
+                bind:value={endpointDraft}
+                placeholder="http://localhost:11434/v1"
+                autocomplete="url"
+                autocapitalize="none"
+                spellcheck="false"
+                disabled={endpointBusy}
+              />
+              <p class="endpoint-hint">
+                You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall
+                adds <code>/v1</code> automatically.
+              </p>
 
-            {#if endpointInputError}
-              <p class="connection-error" role="alert">{endpointInputError}</p>
-            {:else if endpointFeedback}
-              <p class="connection-success" role="status">{endpointFeedback}</p>
-            {:else if connectionError}
-              <p class="connection-error" role="alert">{connectionError}</p>
-            {/if}
+              {#if endpointInputError}
+                <p class="connection-error" role="alert">{endpointInputError}</p>
+              {:else if endpointFeedback}
+                <p class="connection-success" role="status">{endpointFeedback}</p>
+              {:else if connectionError}
+                <p class="connection-error" role="alert">{connectionError}</p>
+              {/if}
 
-            <button class="connect-button" disabled={endpointBusy || connectionState === 'checking'} type="submit">
-              {endpointBusy || connectionState === 'checking' ? 'Checking endpoint…' : 'Save and reconnect'}
-            </button>
-          </form>
+              <button
+                class="connect-button"
+                disabled={endpointBusy || connectionState === 'checking'}
+                type="submit"
+              >
+                {endpointBusy || connectionState === 'checking'
+                  ? 'Checking endpoint…'
+                  : 'Save and reconnect'}
+              </button>
+            </form>
+          </details>
         </section>
+
+        <section class="share-section">
+          <PairingPanel
+            mode="host"
+            onCreated={rememberRelayUrl}
+            {model}
+            {endpoint}
+            bind:relayUrl={relayUrlDraft}
+            bind:relayKey={relayTokenDraft}
+          />
+        </section>
+        <section class="share-section" aria-labelledby="share-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="share-heading">Share your model</h3>
+              <p>Create a temporary browser link for someone you trust.</p>
+            </div>
+            {#if status.active}
+              <span class="live-badge"><span></span>Live</span>
+            {/if}
+          </div>
+
+          {#if busy === 'loading'}
+            <div class="loading-row" role="status">
+              <span class="spinner"></span>
+              Checking guest access…
+            </div>
+          {:else if status.active && !creatingLink}
+            <div class="active-share">
+              <div class="share-summary">
+                <div>
+                  <span class="summary-label">Sharing</span>
+                  <strong title={status.name || status.model}
+                    >{status.name || status.model || model}</strong
+                  >{#if status.name}<small>{status.model || model}</small>{/if}
+                </div>
+                <div>
+                  <span class="summary-label">Access</span>
+                  <strong>{status.networkLabel || 'Hosted relay'}</strong>
+                </div>
+              </div>
+
+              {#if status.qrDataUrl && status.shareUrl}
+                <div class="qr-wrap">
+                  <img src={status.qrDataUrl} alt="QR code for guest chat link" />
+                  <div>
+                    <strong>Scan to open</strong>
+                    <p>Guests can scan this code with their phone camera.</p>
+                  </div>
+                </div>
+
+                <label class="link-label" for="guest-link">Guest link</label>
+                <div class="link-field">
+                  <input
+                    id="guest-link"
+                    readonly
+                    value={status.shareUrl}
+                    onclick={(event) => event.currentTarget.select()}
+                  />
+                  <button class:copied aria-label="Copy guest link" onclick={copyLink}>
+                    <Icon name={copied ? 'check' : 'copy'} size={15} />
+                    <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              {:else}
+                <div class="notice warning">
+                  This link is active, but its access code is no longer available in this window.
+                  Revoke this link below and create a replacement if you need to share it again.
+                </div>
+              {/if}
+
+              <div class="share-meta">
+                <span>{expiresLabel(status.expiresAt)}</span>
+                <span
+                  >{status.requestCount ?? 0}
+                  {(status.requestCount ?? 0) === 1 ? 'request' : 'requests'}</span
+                >
+              </div>
+
+              <div class="notice warning">
+                Anyone with this link can send prompts and files to your model until it expires or
+                you stop sharing.
+              </div>
+
+              <button
+                class="check-button"
+                disabled={!!busy || sharedLinks.length >= 4}
+                onclick={() => (creatingLink = true)}>Create another guest link</button
+              >
+              <button class="stop-button" disabled={busy === 'stopping'} onclick={stop}>
+                {busy === 'stopping' ? 'Stopping…' : 'Stop sharing'}
+              </button>
+            </div>
+          {:else}
+            <div class="inactive-share">
+              <div class="endpoint-form">
+                <label for="invite-name">Name this guest link <span>(optional)</span></label><input
+                  id="invite-name"
+                  bind:value={inviteName}
+                  maxlength={60}
+                  placeholder="For example, Alex’s phone"
+                  disabled={busy === 'starting'}
+                />
+              </div>
+              {#if creatingLink}<button
+                  class="check-button"
+                  disabled={!!busy}
+                  onclick={() => (creatingLink = false)}>Back to active links</button
+                >{/if}
+              <div class="relay-form">
+                <label for="relay-url">Hosted relay URL</label>
+                <input
+                  id="relay-url"
+                  bind:value={relayUrlDraft}
+                  placeholder="https://relay.example.com"
+                  autocomplete="url"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={busy === 'starting'}
+                  onchange={rememberRelayUrl}
+                />
+                <p class="relay-hint">
+                  Saved on this Mac. Change this origin whenever you move the relay to another
+                  server.
+                </p>
+
+                <label for="relay-token">Relay token <span>(optional)</span></label>
+                <input
+                  id="relay-token"
+                  type="password"
+                  bind:value={relayTokenDraft}
+                  placeholder="Use the saved relay token when blank"
+                  autocomplete="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={busy === 'starting'}
+                />
+                <p class="relay-hint">
+                  Saved in macOS Keychain after the relay accepts it. Never included in guest links.
+                </p>
+              </div>
+
+              <div class="model-row">
+                <span>Model</span>
+                <strong>{model || 'No model selected'}</strong>
+              </div>
+
+              <fieldset disabled={busy === 'starting'}>
+                <legend>Link expires after</legend>
+                <div class="expiry-options">
+                  {#each expiryOptions as option}
+                    <label class:checked={expiry === option.value}>
+                      <input
+                        type="radio"
+                        name="share-expiry"
+                        value={option.value}
+                        bind:group={expiry}
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  {/each}
+                </div>
+              </fieldset>
+
+              <div class="notice">
+                Blackwall must stay open and connected to the hosted relay while guests are
+                chatting. No inbound port or VPN is required.
+              </div>
+
+              <button class="start-button" disabled={!model || busy === 'starting'} onclick={start}>
+                {busy === 'starting' ? 'Creating link…' : 'Create guest link'}
+              </button>
+            </div>
+          {/if}
+
+          {#if sharedLinks.length}
+            <div class="guest-list" aria-label="Active guest links">
+              <h4>Active links · {sharedLinks.length} of 4</h4>
+              {#each sharedLinks as link (link.id)}
+                <div class="guest-row">
+                  <button
+                    class="guest-select"
+                    class:selected={status.id === link.id}
+                    disabled={!!busy}
+                    onclick={() => {
+                      mergeStatus(link);
+                      creatingLink = false;
+                    }}
+                    ><strong>{link.name || 'Guest link'}</strong><small
+                      >{link.model} · {expiresLabel(link.expiresAt)} · {link.requestCount ?? 0} requests</small
+                    ></button
+                  ><button
+                    class="guest-revoke"
+                    aria-label={`Revoke ${link.name || 'guest link'}`}
+                    disabled={!!busy}
+                    onclick={() => link.id && revoke(link.id)}>Revoke</button
+                  >
+                </div>
+              {/each}
+              <p>
+                Each link has separate access. Revoke one here, or use Stop sharing to revoke every
+                link.
+              </p>
+            </div>
+          {/if}
+          {#if error}
+            <p class="error" role="alert" data-guest-error tabindex="-1">{error}</p>
+          {/if}
+
+          <p class="privacy-note">
+            Guest chats are routed through this Blackwall app to your configured model endpoint.
+          </p>
+        </section>
+
+        {#if isDesktop()}
+          <details class="access-keys" bind:open={keysOpen}>
+            <summary>Access keys</summary>
+            <p>
+              Manage saved keys for your current model service and configured relay. Keys are shared
+              by connections using the same service origin.
+            </p>
+            {#if keysOpen}
+              {#if isPairedEndpoint(endpoint)}<p class="notice">
+                  This connection uses a paired device key. Manage it under connection setup →
+                  paired computers.
+                </p>{:else if endpoint}<CredentialSettings {endpoint} />{/if}
+              {#if credentialRelayUrl}<CredentialSettings
+                  kind="relay"
+                  endpoint={credentialRelayUrl}
+                />{/if}
+              {#if !endpoint && !credentialRelayUrl}<p>
+                  Connect a model or configure a relay to manage its access key.
+                </p>{/if}
+              <p>
+                Keys supplied through environment variables are managed outside Blackwall and are
+                unaffected by removal here.
+              </p>
+            {/if}
+          </details>
+        {/if}
+        {#if isDesktop()}
+          <details class="access-keys">
+            <summary>App lock</summary>
+            <LockSettings {onLock} />
+          </details>
+        {/if}
 
         <section class="update-section" aria-labelledby="update-heading">
           <div class="section-heading">
@@ -316,7 +649,11 @@
 
           {#if updateState === 'downloading'}
             <div class="update-card" role="status">
-              <strong>Installing {availableUpdate ? versionLabel(availableUpdate.version) : 'update'}…</strong>
+              <strong
+                >Installing {availableUpdate
+                  ? versionLabel(availableUpdate.version)
+                  : 'update'}…</strong
+              >
               <p>Blackwall will restart when the signed update is ready.</p>
               <div
                 class:indeterminate={!updateProgress.totalBytes}
@@ -342,7 +679,9 @@
               {#if updateError}
                 <p class="update-error" role="alert">{updateError}</p>
               {/if}
-              <button class="install-button" onclick={onInstallUpdate}>Install update and restart</button>
+              <button class="install-button" onclick={onInstallUpdate}
+                >Install update and restart</button
+              >
             </div>
           {:else}
             <div class="update-status">
@@ -369,145 +708,91 @@
             </button>
           {/if}
         </section>
-
-        <section class="share-section" aria-labelledby="share-heading">
-          <div class="section-heading">
-            <div>
-              <h3 id="share-heading">Share your model</h3>
-              <p>Create a temporary browser link for someone you trust.</p>
-            </div>
-            {#if status.active}
-              <span class="live-badge"><span></span>Live</span>
-            {/if}
-          </div>
-
-          {#if busy === 'loading'}
-            <div class="loading-row" role="status">
-              <span class="spinner"></span>
-              Checking guest access…
-            </div>
-          {:else if status.active}
-            <div class="active-share">
-              <div class="share-summary">
-                <div>
-                  <span class="summary-label">Sharing</span>
-                  <strong>{status.model || model}</strong>
-                </div>
-                <div>
-                  <span class="summary-label">Access</span>
-                  <strong>{status.networkLabel || 'Private network'}</strong>
-                </div>
-              </div>
-
-              {#if status.qrDataUrl && status.shareUrl}
-                <div class="qr-wrap">
-                  <img src={status.qrDataUrl} alt="QR code for guest chat link" />
-                  <div>
-                    <strong>Scan to open</strong>
-                    <p>Guests can scan this code with their phone camera.</p>
-                  </div>
-                </div>
-
-                <label class="link-label" for="guest-link">Guest link</label>
-                <div class="link-field">
-                  <input id="guest-link" readonly value={status.shareUrl} onclick={(event) => event.currentTarget.select()} />
-                  <button class:copied aria-label="Copy guest link" onclick={copyLink}>
-                    <Icon name={copied ? 'check' : 'copy'} size={15} />
-                    <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
-                  </button>
-                </div>
-              {:else}
-                <div class="notice warning">
-                  This share is active, but its link and QR code are no longer available here. Stop sharing and create a new link to display them again.
-                </div>
-              {/if}
-
-              <div class="share-meta">
-                <span>{expiresLabel(status.expiresAt)}</span>
-                <span>{status.requestCount ?? 0} {(status.requestCount ?? 0) === 1 ? 'request' : 'requests'}</span>
-              </div>
-
-              <div class="notice warning">
-                Anyone with this link can send prompts and files to your model until it expires or you stop sharing.
-              </div>
-
-              <button class="stop-button" disabled={busy === 'stopping'} onclick={stop}>
-                {busy === 'stopping' ? 'Stopping…' : 'Stop sharing'}
-              </button>
-            </div>
-          {:else}
-            <div class="inactive-share">
-              <div class="relay-form">
-                <label for="relay-url">Hosted relay URL</label>
-                <input
-                  id="relay-url"
-                  bind:value={relayUrlDraft}
-                  placeholder="https://relay.example.com"
-                  autocomplete="url"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  disabled={busy === 'starting'}
-                  onchange={rememberRelayUrl}
-                />
-                <p class="relay-hint">
-                  Saved on this Mac. Change this origin whenever you move the relay to another server.
-                </p>
-
-                <label for="relay-token">Relay token <span>(optional)</span></label>
-                <input
-                  id="relay-token"
-                  type="password"
-                  bind:value={relayTokenDraft}
-                  placeholder="Uses BLACKWALL_RELAY_TOKEN when blank"
-                  autocomplete="off"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  disabled={busy === 'starting'}
-                />
-                <p class="relay-hint">Kept only until Blackwall closes and never included in guest links.</p>
-              </div>
-
-              <div class="model-row">
-                <span>Model</span>
-                <strong>{model || 'No model selected'}</strong>
-              </div>
-
-              <fieldset disabled={busy === 'starting'}>
-                <legend>Link expires after</legend>
-                <div class="expiry-options">
-                  {#each expiryOptions as option}
-                    <label class:checked={expiry === option.value}>
-                      <input type="radio" name="share-expiry" value={option.value} bind:group={expiry} />
-                      <span>{option.label}</span>
-                    </label>
-                  {/each}
-                </div>
-              </fieldset>
-
-              <div class="notice">
-                Blackwall must stay open and connected to the hosted relay while guests are chatting. No inbound port or VPN is required.
-              </div>
-
-              <button class="start-button" disabled={!model || busy === 'starting'} onclick={start}>
-                {busy === 'starting' ? 'Creating link…' : 'Create guest link'}
-              </button>
-            </div>
-          {/if}
-
-          {#if error}
-            <p class="error" role="alert">{error}</p>
-          {/if}
-
-          <p class="privacy-note">
-            Guest chats are routed through this Blackwall app to your configured model endpoint.
-          </p>
-        </section>
       </div>
     </div>
   </div>
 {/if}
 
 <style>
+  .access-keys {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 20px;
+  }
+  .access-keys summary {
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .access-keys > p {
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-muted);
+  }
+
+  .guest-list {
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+  .guest-list h4 {
+    margin: 0 0 10px;
+    font-size: 12px;
+  }
+  .guest-list > p {
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    margin-top: 10px;
+  }
+  .guest-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 7px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px;
+  }
+  .guest-select {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: transparent;
+    padding: 9px;
+    text-align: left;
+  }
+  .guest-select strong {
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .guest-select small {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .guest-select.selected strong {
+    color: var(--accent);
+  }
+  .guest-revoke {
+    padding: 9px;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--err);
+    font-size: 11px;
+  }
+
+  .setup-button {
+    margin: 16px 0;
+  }
+  .advanced-connection summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .advanced-connection[open] summary {
+    margin-bottom: 14px;
+  }
   .modal-layer {
     position: fixed;
     z-index: 100;

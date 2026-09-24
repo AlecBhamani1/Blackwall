@@ -77,7 +77,9 @@ describe('SettingsDialog', () => {
     await user.click(screen.getByRole('button', { name: 'Save and reconnect' }));
 
     expect(onConfigureEndpoint).toHaveBeenCalledWith('http://100.76.24.116:11434');
-    expect(await screen.findByText('Connected and loaded the available models.')).toBeInTheDocument();
+    expect(
+      await screen.findByText('Connected and loaded the available models.'),
+    ).toBeInTheDocument();
   });
 
   it('creates a temporary share and exposes both its QR code and copyable link', async () => {
@@ -118,6 +120,7 @@ describe('SettingsDialog', () => {
       QR_DATA_URL,
     );
     expect(screen.getByLabelText('Guest link')).toHaveValue(SHARE_URL);
+    await waitFor(() => expect(screen.getByLabelText('Guest link')).toHaveFocus());
 
     await user.click(screen.getByRole('button', { name: 'Copy guest link' }));
     expect(writeText).toHaveBeenCalledWith(SHARE_URL);
@@ -126,6 +129,9 @@ describe('SettingsDialog', () => {
     await user.click(screen.getByRole('button', { name: 'Stop sharing' }));
     await waitFor(() => expect(client.stopShare).toHaveBeenCalledOnce());
     expect(await screen.findByRole('button', { name: 'Create guest link' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Create guest link' })).toHaveFocus(),
+    );
   });
 
   it('explains when an active share secret is unavailable after reopening the app', async () => {
@@ -142,7 +148,7 @@ describe('SettingsDialog', () => {
       props: { open: true, model: MODEL, onClose: vi.fn(), client },
     });
 
-    expect(await screen.findByText(/link and QR code are no longer available/i)).toBeInTheDocument();
+    expect(await screen.findByText(/access code is no longer available/i)).toBeInTheDocument();
     expect(screen.getByText('3 requests')).toBeInTheDocument();
   });
 
@@ -154,5 +160,28 @@ describe('SettingsDialog', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Guest sharing requires the Blackwall desktop app.',
     );
+  });
+  it('revokes one named link while keeping the other active', async () => {
+    const user = userEvent.setup();
+    const client = mockClient();
+    const first = { id: 'first', name: 'Alex’s phone', active: true, model: MODEL };
+    const second = { id: 'second', name: 'Taylor’s laptop', active: true, model: MODEL };
+    client.shareStatus = vi.fn().mockResolvedValue(second);
+    const invites = {
+      list: vi.fn().mockResolvedValue([first, second]),
+      revoke: vi.fn().mockResolvedValue(undefined),
+    };
+    render(SettingsDialog, {
+      props: { open: true, model: MODEL, onClose: vi.fn(), client, invites },
+    });
+    const revoke = await screen.findByRole('button', { name: 'Revoke Alex’s phone' });
+    invites.list.mockResolvedValue([second]);
+    await user.click(revoke);
+    expect(invites.revoke).toHaveBeenCalledExactlyOnceWith('first');
+    expect(client.stopShare).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole('button', { name: 'Revoke Taylor’s laptop' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Revoke Alex’s phone' })).not.toBeInTheDocument();
   });
 });

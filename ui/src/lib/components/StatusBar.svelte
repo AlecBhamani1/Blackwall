@@ -5,6 +5,7 @@
   export let connectionState: ConnectionState = 'checking';
   export let runState: RunState = 'idle';
   export let model = '';
+  export let mode = 'Chat mode';
   export let contextPercent = 0;
 
   $: stateLabel =
@@ -34,7 +35,7 @@
     <span class="separator">·</span>
     <span>context {contextPercent}% <span class="estimate">est</span></span>
   </div>
-  <div class="status-group right"><span>private endpoint</span></div>
+  <div class="status-group right"><span>{mode}</span></div>
 </footer>
 
 <style>
