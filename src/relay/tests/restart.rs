@@ -258,14 +258,31 @@ async fn desktop_recovers_the_same_invitation_after_relay_process_restart_withou
         .contains("recovered"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     hub.stop().await;
-    assert!(!client
-        .get(format!("{base}/v1/models"))
-        .bearer_auth(key)
-        .send()
-        .await
-        .unwrap()
-        .status()
-        .is_success());
+    // Stopping joins the local host task; the separate relay process must still
+    // receive the socket close and remove its session before metadata returns 404.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = client
+                .get(format!("{base}/v1/models"))
+                .bearer_auth(key)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                break;
+            }
+            assert!(
+                status.is_success() || status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "unexpected response while the relay processes host shutdown: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relay must remove the stopped host within five seconds");
+    assert_eq!(chat().send().await.unwrap().status(), 404);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     upstream_task.abort();
 }
 
