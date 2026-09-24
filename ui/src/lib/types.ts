@@ -27,6 +27,8 @@ export interface ChatMessage {
   status: MessageStatus;
   createdAt: number;
   error?: string;
+  tools?: ToolEntry[];
+  children?: ChildEntry[];
 }
 
 export interface ModelInfo {
@@ -57,6 +59,8 @@ export interface ModelMessage {
 
 export interface ChatRequest {
   requestId: string;
+  agentMode?: boolean;
+  webEnabled?: boolean;
   endpoint?: string;
   model?: string;
   messages: ModelMessage[];
@@ -65,11 +69,41 @@ export interface ChatRequest {
 export type AgentEvent =
   | { type: 'assistant_delta'; requestId: string; delta: string }
   | { type: 'turn_complete'; requestId: string; finishReason?: string }
-  | { type: 'error'; requestId: string; message: string; code?: string };
+  | { type: 'error'; requestId: string; message: string; code?: string }
+  | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
+  | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
+  | { type: 'tool_result'; requestId: string; toolCallId: string; output: string; success: boolean }
+  | {
+      type: 'approval_request';
+      requestId: string;
+      approvalId: string;
+      kind: string;
+      detail: string;
+    };
+
+export interface ChildEntry {
+  id: string;
+  state: string;
+  summary: string;
+}
+export interface ToolEntry {
+  id: string;
+  name: string;
+  arguments: string;
+  output?: string;
+  status: 'running' | 'complete' | 'error' | 'stopped';
+}
+export interface PendingApproval {
+  requestId: string;
+  approvalId: string;
+  kind: string;
+  detail: string;
+}
 
 export interface StreamCallbacks {
   onDelta: (delta: string) => void;
   onComplete?: () => void;
+  onEvent?: (event: AgentEvent) => void;
 }
 
 export interface SessionSummary {
@@ -87,6 +121,7 @@ export interface AttachmentRejection {
 export type ShareExpiryMinutes = 15 | 60 | 480;
 
 export interface StartShareRequest {
+  name?: string;
   model: string;
   endpoint?: string;
   relayUrl?: string;
@@ -95,6 +130,8 @@ export interface StartShareRequest {
 }
 
 export interface ShareStatus {
+  id?: string;
+  name?: string;
   active: boolean;
   shareUrl?: string;
   qrDataUrl?: string;

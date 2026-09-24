@@ -4,11 +4,10 @@ Blackwall is a local-first agent harness with a deliberately simple desktop chat
 model, write a message, attach images or files, and receive a streamed response. The model can run
 on this computer or on another machine you control through any OpenAI-compatible endpoint.
 
-> **Current status:** the first working desktop vertical slice is implemented. Chat, remote model
-> discovery, streaming, attachments, recent conversations, and the native macOS window work now.
-> The first QR/link browser-sharing slice is intentionally narrow and documented in
-> [`docs/SHARING.md`](docs/SHARING.md). Agent tools, durable memory, approvals, and broader sharing
-> remain roadmap milestones in [`docs/PLAN.md`](docs/PLAN.md).
+> **Development status:** guided setup, durable local conversations, project tools with approvals,
+> memory, skills, and an interruptible agent runtime are implemented in this checkout. These changes
+> are not yet a published release. Persistent pairing is implemented with a configured relay;
+> native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in [the delivery plan](docs/DELIVERY_PLAN.md).
 
 ## Download for macOS
 
@@ -17,24 +16,31 @@ Choose the `aarch64` DMG for Apple Silicon Macs or the `x64` DMG for Intel Macs.
 
 ## What works now
 
-- Native Tauri 2 app with a focused Svelte 5 chat interface
-- Model discovery and switching against an OpenAI-compatible endpoint
-- Streamed assistant replies with stop and reconnect controls
-- Images, pasted photos, text files, and general file attachments
-- Drag-and-drop, attachment previews, duplicate detection, and bounded upload limits
-- Recent conversations saved on the device
-- Sanitized Markdown responses and responsive desktop/mobile-width layouts
-- Expiring QR and browser-link guest sharing through a self-hosted relay
-- Signed in-app updates from the latest successful `main` build on GitHub
-- Typed Rust commands and one versionable `blackwall://event` stream contract
+- Guided setup for local models, another computer, or a browser invitation
+- Detection of local Ollama and LM Studio; explicit starter-model downloads through Ollama
+- Named saved connections with remembered models, tested replacements, and managed Keychain access keys
+- Host-approved persistent computer pairing, per-device Keychain credentials, reconnect, and individual removal
+- Streaming chat, images/files, Markdown, stop controls, and JSON conversation export
+- Native SQLite history with attachment contents, migration, and ordered save retries
+- Optional desktop passphrase lock that stops active work and guest sharing
+- Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
+- Opt-in approved web reads/search and up to three concurrent read-only child investigations
+- User-managed local memory and reusable Markdown skills
+- CLI `bw run`, `bw resume`, and `bw sessions` using the same core agent runtime
+- Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
-Blackwall does **not** launch or manage Ollama. If Ollama runs on a different machine, point
-Blackwall at that machine and leave it running there.
+For everyday setup, open **Settings → Set up a connection → Use this computer**. Blackwall detects
+an existing model service, guides you to install Ollama if needed, and offers a small model download
+only after you choose it. It does not install, start, or reconfigure model-server software itself.
 
-The endpoint can be changed and tested inside the app: open **Settings**, enter the Ollama host or
-OpenAI-compatible base URL under **Model connection**, then choose **Save and reconnect**. Blackwall
-remembers this override for future launches. This is the recommended setup for a packaged macOS
-app because apps opened from Finder do not reliably inherit shell environment variables.
+For another computer, create a pairing invitation in Settings on the model host. Paste it into
+**Connect a computer** on your other Mac, compare the code on both screens, and approve on the host.
+The saved computer reconnects using its own Keychain credential. The host must stay open, unlocked,
+and awake. A configured relay is currently required; direct model URLs remain under advanced setup.
+Temporary guest invitations open browser chat and have their own expiry and removal controls.
+
+See [the user and operator guide](docs/RUNTIME_GUIDE.md) for project tools, data storage, app-lock
+limits, memory, skills, and troubleshooting.
 
 ## Run the desktop app
 
@@ -105,8 +111,8 @@ one final manual replacement with an updater-enabled build; later updates instal
 │ typed Tauri commands + blackwall://event     │
 ├──────────────────────────────────────────────┤
 │ src/app  endpoint bridge and desktop shell   │
-│ src/core protocol and headless domain types  │
-│ src/bw   future command-line adapter         │
+│ src/core agent, tools, storage, and protocol │
+│ src/bw   command-line run/resume adapter     │
 └───────────┬──────────────────────┬────────────┘
             │ HTTPS/HTTP           │ outbound WSS
             ▼                      ▼
@@ -114,8 +120,7 @@ one final manual replacement with an updater-enabled build; later updates instal
  host you control
 ```
 
-`blackwall-core` stays independent of Tauri so later CLI, mobile, and test clients can share the
-same protocol. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
+`blackwall-core` stays independent of Tauri so the desktop, CLI, and tests share the same runtime. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
 forms, and streams typed events back to the UI. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
 roadmap.
@@ -140,7 +145,7 @@ npm run desktop
 ```
 
 Each invite is bound to one pinned model and permits at most `2` guest chat requests in flight.
-**Stop sharing** revokes the invite and removes its relay session. See
+**Revoke** removes one invite; **Stop sharing** removes all active invites. See
 [`docs/SHARING.md`](docs/SHARING.md) for the included Docker/Caddy deployment, token flow, and
 current limits.
 

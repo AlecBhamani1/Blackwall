@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr, process::ExitCode};
 
-use blackwall_relay::{app, RelayConfig};
+use blackwall_relay::{app_with_storage, OwnershipError, RelayConfig};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
@@ -32,8 +32,11 @@ async fn run() -> Result<(), StartupError> {
         registration_token: environment_value("BLACKWALL_RELAY_TOKEN"),
         ..RelayConfig::default()
     };
+    let directory = environment_value("BLACKWALL_RELAY_DATA_DIR")
+        .unwrap_or_else(|| "blackwall-relay-data".to_owned());
+    let router = app_with_storage(config, std::path::Path::new(&directory))?;
     eprintln!("blackwall-relay listening on {local_addr}");
-    axum::serve(listener, app(config)).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -46,6 +49,8 @@ fn environment_value(name: &str) -> Option<String> {
 
 #[derive(Debug, Error)]
 enum StartupError {
+    #[error(transparent)]
+    Ownership(#[from] OwnershipError),
     #[error("invalid BLACKWALL_RELAY_BIND value {value:?}: {source}")]
     InvalidBind {
         value: String,

@@ -5,8 +5,15 @@
   import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
+  import SkillsDialog from './SkillsDialog.svelte';
+  import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
+  export let onPreferences: (preferences: {
+    memoryEnabled: boolean;
+    contextWindow: number;
+  }) => void = () => {};
+  export let onLock: () => Promise<void> = async () => {};
   export let visible = true;
   export let sessions: SessionSummary[] = [];
   export let activeSessionId = '';
@@ -19,6 +26,7 @@
   export let availableUpdate: AppUpdateInfo | null = null;
   export let updateProgress: AppUpdateProgress = { downloadedBytes: 0 };
   export let updateError = '';
+  export let onSetup: () => void = () => {};
   export let onNewChat: () => void;
   export let onOpenSession: (sessionId: string) => void;
   export let onRemoveSession: (sessionId: string) => void;
@@ -28,6 +36,8 @@
   export let onClose: () => void;
 
   let settingsOpen = false;
+  let memoryOpen = false;
+  let skillsOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -58,6 +68,12 @@
     <kbd>⌘N</kbd>
   </button>
 
+  <button class="memory-button" onclick={() => (memoryOpen = true)}
+    >Memory <span>Saved preferences & context</span></button
+  >
+  <button class="memory-button" onclick={() => (skillsOpen = true)}
+    >Skills <span>Reusable workflows</span></button
+  >
   <section class="history">
     <div class="section-label">Recent</div>
     {#if sessions.length === 0}
@@ -95,13 +111,27 @@
       <Icon name="gear" size={17} />
     </button>
     <div class="connection-label">
-      <span class:ready={connectionState === 'ready'} class:offline={connectionState === 'offline'} class="dot"></span>
-      <span>{connectionState === 'ready' ? 'Model connected' : connectionState === 'checking' ? 'Checking endpoint' : 'Model offline'}</span>
+      <span
+        class:ready={connectionState === 'ready'}
+        class:offline={connectionState === 'offline'}
+        class="dot"
+      ></span>
+      <span
+        >{connectionState === 'ready'
+          ? 'Model connected'
+          : connectionState === 'checking'
+            ? 'Checking connection'
+            : 'Model offline'}</span
+      >
     </div>
   </div>
 </aside>
 
+{#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
+{#if memoryOpen}<MemoryDialog {onPreferences} onClose={() => (memoryOpen = false)} />{/if}
+
 <SettingsDialog
+  {onLock}
   open={settingsOpen}
   model={selectedModel}
   {endpoint}
@@ -112,6 +142,10 @@
   {availableUpdate}
   {updateProgress}
   {updateError}
+  onSetup={() => {
+    closeSettings();
+    onSetup();
+  }}
   {onConfigureEndpoint}
   {onCheckForUpdates}
   {onInstallUpdate}
@@ -119,6 +153,26 @@
 />
 
 <style>
+  .memory-button {
+    margin: -6px 10px 20px;
+    padding: 9px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    text-align: left;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .memory-button:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .memory-button span {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
   aside {
     position: relative;
     z-index: 20;

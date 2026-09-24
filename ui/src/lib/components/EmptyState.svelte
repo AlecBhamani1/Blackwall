@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ConnectionState } from '../types';
   import LogoMark from './LogoMark.svelte';
+  import Icon from './Icon.svelte';
 
   export let connectionState: ConnectionState = 'checking';
 </script>
@@ -12,17 +13,14 @@
     {#if connectionState === 'ready'}
       Chat with your model. Add a photo or file whenever it helps.
     {:else if connectionState === 'checking'}
-      Connecting to your local model…
+      Connecting to your model…
     {:else}
-      Connect your Ollama host to begin. You can still compose below.
+      Set up a connection to begin. You can still write your message below.
     {/if}
   </p>
   <div class="local-note">
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
-      <rect width="16" height="11" x="4" y="11" rx="2" />
-      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
-    </svg>
-    Private by default · your model endpoint
+    <Icon name="link" size={13} />
+    Chats go to your selected model
   </div>
 </div>
 
