@@ -28,3 +28,4 @@ blackwall-relay-data/
 /graphify-out/
 __pycache__/
 *.py[cod]
+/.build/
