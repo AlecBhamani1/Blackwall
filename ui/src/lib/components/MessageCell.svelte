@@ -1,6 +1,6 @@
 <script lang="ts">
   import ToolActivity from './ToolActivity.svelte';
-  import { renderMarkdown } from '../markdown';
+  import { copyableMarkdown } from '../copyableMarkdown';
   import type { ChatMessage } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
   import Icon from './Icon.svelte';
@@ -8,9 +8,6 @@
 
   export let message: ChatMessage;
   let copied = false;
-
-  $: rendered =
-    message.role === 'assistant' && message.content ? renderMarkdown(message.content) : '';
 
   async function copyMessage() {
     if (!message.content || !navigator.clipboard) return;
@@ -31,7 +28,7 @@
     {#if message.role === 'user'}
       {#if message.content}<div class="user-content">{message.content}</div>{/if}
     {:else if message.content}
-      <div class="markdown">{@html rendered}</div>
+      <div class="markdown" use:copyableMarkdown={message.content}></div>
     {/if}
 
     {#if message.children?.length}<div class="children" aria-label="Delegated tasks">
@@ -228,6 +225,42 @@
     border: 0;
     padding: 0;
     background: transparent;
+  }
+
+  .markdown :global(.code-block) {
+    margin: 12px 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+  }
+
+  .markdown :global(.code-block-toolbar) {
+    display: flex;
+    justify-content: flex-end;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .markdown :global(.code-block-copy) {
+    border-radius: 4px;
+    padding: 4px 6px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .markdown :global(.code-block-copy:hover),
+  .markdown :global(.code-block-copy:focus-visible) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .markdown :global(.code-block pre) {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
   }
 
   .markdown :global(blockquote) {

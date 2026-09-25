@@ -14,6 +14,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Copy buttons on individual Markdown code blocks, with success and failure feedback.
 - Persistent computer pairing with five-minute invitations, matching-code host consent, per-device
   Keychain credentials, saved computer cards, automatic tunnel recovery, and durable individual revocation.
 - Relay pairing capability detection, bounded exchanges, and a shared eight-request guest/device budget.
