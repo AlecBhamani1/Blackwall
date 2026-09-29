@@ -6,12 +6,13 @@ on this computer or on another machine you control through any OpenAI-compatible
 
 > **Development status:** guided setup, durable local conversations, project tools with approvals,
 > memory, skills, and an interruptible agent runtime are implemented in this checkout. These changes
-> are not yet a published release. Persistent pairing is implemented with a configured relay;
+> are available in the 0.1.3 development build. Release acceptance remains incomplete.
+> Persistent pairing is implemented with a configured relay;
 > native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in [the delivery plan](docs/DELIVERY_PLAN.md).
 
 ## Download for macOS
 
-[Download the latest macOS build](https://github.com/AlecBhamani1/Blackwall/releases/tag/main).
+[Download the latest macOS build](https://github.com/AlecBhamani1/Blackwall/releases/latest).
 Choose the `aarch64` DMG for Apple Silicon Macs or the `x64` DMG for Intel Macs.
 
 ## What works now
