@@ -10,8 +10,14 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     groups:
-      rust-dependencies:
+      rust-routine:
         patterns: ["*"]
+        # A 0.x minor can break Rust APIs, so only group its patches.
+        exclude-patterns: ["base64", "rand", "sha2", "tokio-tungstenite", "argon2", "async-stream", "axum", "qrcode", "reqwest", "serde_yaml_ng"]
+        update-types: [minor, patch]
+      rust-pre-one-patches:
+        patterns: ["base64", "rand", "sha2", "tokio-tungstenite", "argon2", "async-stream", "axum", "qrcode", "reqwest", "serde_yaml_ng"]
+        update-types: [patch]
   - package-ecosystem: npm
     directories: ["/", "/ui"]
     target-branch: partial
@@ -21,9 +27,18 @@ updates:
     labels: [dependencies]
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # svelte-check 4.7.6 supports TypeScript 5 and 6; remove this hold after a
+      # compatible svelte-check release and an explicitly verified TS migration.
+      - dependency-name: typescript
+        versions: [">=7"]
     groups:
-      javascript-dependencies:
+      javascript-routine:
         patterns: ["*"]
+        update-types: [minor, patch]
+      javascript-test-major:
+        patterns: [vitest, "@vitest/*"]
+        update-types: [major]
   - package-ecosystem: github-actions
     directory: /
     target-branch: partial
@@ -35,3 +50,4 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+        update-types: [minor, patch]

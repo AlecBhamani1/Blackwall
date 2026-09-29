@@ -116,7 +116,12 @@ sets `partial` as default, configures merge methods, adds tracking labels, and e
 scanning/push protection, Dependabot security fixes, and private vulnerability reporting.
 Version tags matching `v*` are protected against updates and deletion.
 Existing unrelated rulesets remain in place. Weekly dependency PRs target `partial` and undergo
-the same CI gates. Feature branches are deleted explicitly so a release merge cannot delete
+the same CI gates. Routine patch/minor updates are grouped separately from breaking upgrades;
+known pre-1.0 Rust dependencies only group patch updates because their minor upgrades can break
+APIs. Major upgrades use separate PRs, with Vitest and its coverage package updated together.
+TypeScript stays on version 6 until `svelte-check` declares support for the next major version;
+remove the Dependabot `>=7` hold only alongside a verified tooling migration.
+Feature branches are deleted explicitly so a release merge cannot delete
 the long-lived integration branch.
 
 The setup PR first lands in `partial`; it does not publish an application version. The committed
