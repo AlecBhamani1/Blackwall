@@ -17,7 +17,7 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use qrcode::{render::svg, QrCode};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -303,7 +303,7 @@ impl ShareHub {
         let host_key = random_secret("bwh_");
         let session_id = random_secret("bws_");
         let mut salt = [0_u8; 32];
-        OsRng.fill_bytes(&mut salt);
+        UnwrapErr(SysRng).fill_bytes(&mut salt);
         let key_hash = salted_key_hash(&salt, &raw_key);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -494,7 +494,7 @@ fn relay_socket_url(relay_base_url: &str) -> Result<String, ShareError> {
 
 fn random_secret(prefix: &str) -> String {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     let secret = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes));
     bytes.fill(0);
     secret

@@ -1,7 +1,7 @@
 //! Pairing wire types and native-only credential material. Protocol 1 is explicit and bounded.
 use crate::share::salted_key_hash;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -91,8 +91,9 @@ impl PairedDevice {
     }
 }
 pub fn secret(prefix: &str) -> String {
+    // Preserve the previous infallible, OS-backed entropy contract through rand's adapter.
     let mut bytes = [0; 32];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 pub fn valid_secret(value: &str, prefix: &str) -> bool {
@@ -103,7 +104,7 @@ pub fn decode_digest(value: &str) -> Option<[u8; 32]> {
 }
 pub fn digest(key: &str) -> (String, String) {
     let mut salt = [0; 32];
-    OsRng.fill_bytes(&mut salt);
+    UnwrapErr(SysRng).fill_bytes(&mut salt);
     (
         URL_SAFE_NO_PAD.encode(salt),
         URL_SAFE_NO_PAD.encode(salted_key_hash(&salt, key)),
