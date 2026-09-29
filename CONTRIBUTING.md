@@ -13,7 +13,7 @@ preparation, and promotion. A production merge automatically publishes a version
 
 Blackwall is macOS-first. You will need:
 
-- the current stable Rust toolchain with `rustfmt` and `clippy`;
+- Rust 1.90 or newer with `rustfmt` and `clippy` (the updated Tauri build tooling requires 1.90);
 - Node.js 22.12 or newer and npm;
 - the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for macOS; and
 - `cargo-deny` for dependency-policy checks.
