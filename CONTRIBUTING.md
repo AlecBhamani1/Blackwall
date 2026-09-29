@@ -4,6 +4,11 @@ Thank you for helping make Blackwall a dependable local-first agent harness. Thi
 describes the baseline expected of every change. The architecture and security invariants are
 documented in `docs/PLAN.md` while the initial implementation is being built.
 
+Start feature branches from `origin/partial` and target `partial` with development PRs.
+`main` is production and accepts release promotions from `partial` only. Follow the
+[repository workflow](docs/REPOSITORY_WORKFLOW.md) for milestones, enforced checks, release
+preparation, and promotion. A production merge automatically publishes a version after CI.
+
 ## Development setup
 
 Blackwall is macOS-first. You will need:
@@ -61,6 +66,7 @@ cargo deny --manifest-path src/Cargo.toml check
 npm --prefix ui run check
 npm --prefix ui run test:run
 npm --prefix ui run build
+npm run test:release
 ```
 
 Tests should be deterministic and offline. Use scripted model backends and local test servers;
@@ -84,6 +90,10 @@ Keep commits focused and write subjects in the imperative mood. Use `!` and a `B
 footer for incompatible changes. Pull requests should explain the user impact, identify security
 or data-migration consequences, list verification performed, and include screenshots for visible
 UI changes. Update `CHANGELOG.md` for user-visible behavior.
+
+Link the tracking issue and assign the PR to its intended version milestone. Use a Conventional
+Commit PR title for squash merges. Production promotions and `main` → `partial` sync PRs must
+use merge commits to preserve the history of both long-lived branches.
 
 Do not commit secrets, model transcripts containing private data, generated build output, or local
 database files. Report suspected vulnerabilities privately to the repository maintainers instead

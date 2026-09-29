@@ -16,6 +16,9 @@
     "dev": "npm --prefix ui run dev",
     "hooks:install": "lefthook install",
     "prepare": "lefthook install",
+    "release:prepare": "node scripts/release/prepare.mjs",
+    "repo:configure": "node scripts/repository/configure.mjs",
+    "test:release": "node --test scripts/release/*.test.mjs scripts/repository/*.test.mjs",
     "test": "npm --prefix ui run test:run",
     "verify": "npm run check && npm run test && npm run build"
   },

@@ -5,10 +5,12 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { compareVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
+import { validateReleaseNotes } from './promotion.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
-const version = process.env.RELEASE_VERSION;
-const sha = process.env.GITHUB_SHA;
+const version = JSON.parse(readFileSync('.github/release.json', 'utf8')).version;
+if (process.env.RELEASE_VERSION) assert.equal(process.env.RELEASE_VERSION, version, 'Build version must match the committed release plan');
+const sha = process.env.RELEASE_COMMIT ?? process.env.GITHUB_SHA;
 assert.match(repository ?? '', /^[\w.-]+\/[\w.-]+$/);
 versionParts(version);
 assert.match(sha ?? '', /^[a-f0-9]{40}$/);
@@ -59,17 +61,27 @@ function assertCI() {
 }
 
 async function prepare() {
-  assert.equal(process.env.GITHUB_REF, 'refs/heads/main', 'Dispatch releases from main only');
+  assertProductionTrigger();
   assert.equal(process.env.RELEASE_APPROVED, 'true', 'Release acceptance must be explicitly confirmed');
   assertCI();
   const notes = readFileSync(`docs/releases/${version}.md`, 'utf8').trim();
-  assert(notes.length >= 80, 'Commit meaningful release notes before publishing');
-  const current = feed(api('releases/tags/main'));
-  assert(compareVersions(version, current.version) > 0, 'Version must be newer than the current updater feed');
+  validateReleaseNotes(notes + '\n', version);
   const existing = findRelease(tag);
+  const compatibility = api('releases/tags/main');
+  if (compatibility.assets.some(asset => asset.name === 'latest.json')) {
+    const current = feed(compatibility);
+    const comparison = compareVersions(version, current.version);
+    assert(existing && !existing.draft ? comparison >= 0 : comparison > 0,
+      'Version must be newer than the feed, or a retry of its published version');
+  } else {
+    assert(existing && !existing.draft && api('releases/latest').id === existing.id,
+      'Only the published Latest release may repair a missing feed');
+  }
+  if (existing && !existing.draft) {
+    assert.equal(api('releases/latest').id, existing.id, 'Only the current Latest release may be retried');
+  }
   let release;
   if (existing) {
-    assert(existing.draft, 'A published version must never be rebuilt or overwritten');
     assertReleaseCommit(existing);
     release = existing;
   } else {
@@ -79,11 +91,24 @@ async function prepare() {
       body: `${notes}\n\nSource commit: ${sha}.`, draft: true, prerelease: false, make_latest: 'false',
     });
   }
-  appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${release.id}\nversion=${version}\ncommit=${sha}\n`);
+  appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${release.id}\nversion=${version}\ncommit=${sha}\nbuild_required=${release.draft}\n`);
+}
+
+function assertProductionTrigger() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_run') {
+    const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+    assert.equal(event.workflow_run.event, 'push');
+    assert.equal(event.workflow_run.head_branch, 'main');
+    assert.equal(event.workflow_run.head_repository.full_name, repository);
+    assert.equal(event.workflow_run.conclusion, 'success');
+    assert.equal(event.workflow_run.head_sha, sha);
+  } else {
+    assert.equal(process.env.GITHUB_REF, 'refs/heads/main', 'Dispatch releases from main only');
+  }
 }
 
 async function publish() {
-  assert.equal(process.env.GITHUB_REF, 'refs/heads/main');
+  assertProductionTrigger();
   assert.equal(process.env.RELEASE_APPROVED, 'true');
   assertCI();
   const release = findRelease(tag);

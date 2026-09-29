@@ -11,29 +11,36 @@ An available update is downloaded only after the user selects **Install update a
 
 ## Publishing an approved version
 
-Merging into `main` runs CI but does **not** publish a release. Publishing is an explicit maintainer
-operation using the **Publish versioned release** workflow (`.github/workflows/release-main.yml`).
+`partial` is integration and `main` is production. A checked `partial` → `main` promotion
+records acceptance approval **before** production changes. Every production promotion must
+increment `.github/release.json`, commit matching release notes, and belong to its version
+milestone. Follow [the repository workflow](REPOSITORY_WORKFLOW.md) for the full checklist.
 
-1. Complete the applicable [native and distribution acceptance checks](NATIVE_ACCEPTANCE.md).
-   Updater signatures authenticate artifacts; Apple Developer ID signing/notarization, clean-machine
-   installation, signed upgrades, and physical-device checks require their own acceptance evidence.
-2. Choose a stable version newer than the live updater version, without a `v` prefix (for example
-   `0.1.4`). Commit meaningful release notes in `docs/releases/0.1.4.md`, merge, and wait for CI on
-   that exact main commit to pass. Version numbers compare numerically; `0.1.10` follows `0.1.9`.
-3. Open **Actions → Publish versioned release → Run workflow**, select **main**, enter the version,
-   and check the acceptance confirmation. This explicitly authorizes publication after validation.
-4. The workflow creates a draft tied to the selected commit and builds Apple Silicon and Intel
-   installers and signed updater archives. Both builds must finish before publication. An existing
-   published version cannot be rebuilt, and an existing tag cannot be reassigned.
-5. The final job verifies all six files against their GitHub SHA-256 digests, verifies both updater
+1. Complete applicable [native and distribution acceptance checks](NATIVE_ACCEPTANCE.md),
+   recording evidence and remaining limitations in the release notes. Start a preparation branch
+   from `partial` and use `npm run release:prepare -- 0.1.4` to create the next release plan.
+2. Merge the preparation work into `partial`, then open a `partial` → `main` PR. Assign its
+   `v<version>` milestone and complete the production checklist. The gate requires meaningful
+   notes, a newer version, current main ancestry, and the previous release's completed feed.
+   CI also checks desktop builds for both architectures before merging.
+3. Merge the promotion with a merge commit. After CI succeeds for this exact main push,
+   **Publish versioned release** automatically checks out that production SHA and creates a
+   commit-pinned draft. It builds Apple Silicon and Intel installers and signed updater archives.
+4. The final job verifies all six files against their GitHub SHA-256 digests, verifies both updater
    entries reference those archives and match their signature files, then publishes `v<version>`
    as Latest. It updates the old `main/latest.json` feed only after publishing the complete release.
-6. Confirm both architecture downloads and the app's update check against the published build.
+5. Verify downloads and the app's update check, close the milestone, and merge `main` back into
+   `partial` with a checked sync PR and merge commit before the next promotion.
 
-The workflow overrides the Tauri application version for the build. It no longer derives public
-versions from Actions run numbers. The source commit and release notes are recorded on each release.
-GitHub asset digest checks protect download integrity; matching the updater manifest to signature
-files does not replace Tauri's cryptographic signature verification during installation.
+The workflow retains the existing release title, release-note sections, download filenames,
+signed updater assets, and compatibility feed. It overrides the Tauri application version using
+the committed release plan and records the source commit on each release. Versions compare
+numerically; `0.1.10` follows `0.1.9`. GitHub asset digest checks protect download integrity;
+matching updater metadata to signature files does not replace Tauri's cryptographic signature
+verification during installation.
+
+Manual dispatch is reserved for recovery: select **main** and confirm the existing acceptance
+approval. The committed version is used, so a dispatch cannot silently choose a different version.
 
 ## Failure and retry
 
@@ -45,7 +52,7 @@ Publishing the release and replacing the compatibility feed are separate GitHub 
 feed upload fails after publication, re-run the failed publish job. It validates the published
 assets again and repairs the feed without rebuilding or overwriting the versioned release files.
 A completed publication can also be retried safely when the feed already matches it. The workflow
-refuses to downgrade the feed. Do not restart the entire workflow for an already-published version.
+refuses to downgrade the feed. A full workflow retry skips rebuilding an already-published version and runs publication verification/feed recovery only.
 
 GitHub replaces an uploaded `latest.json` by deleting and recreating that single asset; there can
 be a brief unavailable-feed interval. An interrupted replacement is repairable by rerunning the

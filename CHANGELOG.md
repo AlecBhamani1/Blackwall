@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A protected `partial` integration branch and checked production promotions, tracked by version
+  milestones and release notes, with automatic versioned publication after production CI.
+- Both-architecture desktop build checks before promotion, dependency vulnerability review,
+  weekly dependency maintenance, issue/PR templates, and reproducible GitHub repository policy.
+
 - Copy buttons on individual Markdown code blocks, with success and failure feedback.
 - Persistent computer pairing with five-minute invitations, matching-code host consent, per-device
   Keychain credentials, saved computer cards, automatic tunnel recovery, and durable individual revocation.

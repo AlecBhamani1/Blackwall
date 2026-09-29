@@ -98,10 +98,18 @@ requires an Apple Developer signing identity and notarization.
 ## In-app updates
 
 Blackwall checks for signed updates when the desktop app starts. Open **Settings → App updates** to
-check manually, review the available version, and choose **Install update and restart**. Pushes to
-`main` publish the continuous update channel through GitHub Actions. Existing installations need
+check manually, review the available version, and choose **Install update and restart**. Approved
+`partial` → `main` promotions publish a versioned release after production CI and signed builds pass.
+Existing installations need
 one final manual replacement with an updater-enabled build; later updates install in place. See
 [`docs/UPDATES.md`](docs/UPDATES.md) for signing, publishing, and key-recovery details.
+
+## Contributing and releases
+
+`partial` is the default integration branch; `main` is production. Branch from `partial`, link
+work to an issue and version milestone, and merge through required CI checks. Promote a batch
+with a `partial` → `main` PR containing a new version, release notes, and acceptance approval.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [repository workflow](docs/REPOSITORY_WORKFLOW.md).
 
 ## Architecture
 
