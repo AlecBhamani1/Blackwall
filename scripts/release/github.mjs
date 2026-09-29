@@ -152,6 +152,10 @@ async function publish() {
     gh(['release', 'upload', 'main', path, '--clobber', '--repo', repository]);
     assert.deepEqual(feed(api('releases/tags/main')), manifest, 'Feed verification failed');
     console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+        `Published [Blackwall ${tag}](https://github.com/${repository}/releases/tag/${tag}) from source commit \`${sha}\`.\n\nBoth architecture downloads, updater signatures, and the compatibility feed were verified.\n`);
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

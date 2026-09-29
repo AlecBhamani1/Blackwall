@@ -118,7 +118,6 @@ jobs:
       always() && needs.prepare.result == 'success' &&
       (needs.build-macos.result == 'success' ||
        (needs.prepare.outputs.build_required == 'false' && needs.build-macos.result == 'skipped'))
-    environment: production
     env:
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     runs-on: ubuntu-latest
