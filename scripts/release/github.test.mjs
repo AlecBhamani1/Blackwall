@@ -37,8 +37,10 @@ function fixture(t) {
   asset(release, 'latest.json', JSON.stringify({ version: '0.1.4', notes: 'Release notes', pub_date: '2026-09-29T12:00:00Z', platforms }));
   asset(compatibility, 'latest.json', JSON.stringify({ version: '0.1.3' }));
   mkdirSync(join(directory, 'bin'));
+  mkdirSync(join(directory, '.github'));
+  writeFileSync(join(directory, '.github/release.json'), JSON.stringify({ version: '0.1.4' }));
   mkdirSync(join(directory, 'docs/releases'), { recursive: true });
-  writeFileSync(join(directory, 'docs/releases/0.1.4.md'), '# Release notes\n' + 'Reviewed release changes. '.repeat(5));
+  writeFileSync(join(directory, 'docs/releases/0.1.4.md'), '# Blackwall 0.1.4\n\n## Changes\n\nReviewed release changes.\n\n## Downloads\n\nInstall the macOS builds.\n\n## Acceptance status\n\nAutomated checks passed; physical-device checks remain open.\n');
   const mock = join(directory, 'bin/gh');
   writeFileSync(mock, `#!${process.execPath}
 import fs from 'node:fs';
@@ -144,14 +146,47 @@ for (const [name, mutate] of [
   });
 }
 
-test('prepare requires explicit approval on main and refuses published versions', t => {
+test('prepare requires explicit approval on main and never rebuilds a published version', t => {
   const f = fixture(t);
   assert.notEqual(f.run('prepare', { RELEASE_APPROVED: 'false' }).status, 0);
   assert.notEqual(f.run('prepare', { GITHUB_REF: 'refs/heads/feature' }).status, 0);
   f.release.draft = false;
+  f.state.latest = f.release.id;
   f.save();
-  assert.notEqual(f.run('prepare').status, 0);
+  const retry = f.run('prepare');
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.match(readFileSync(join(f.directory, 'output'), 'utf8'), /build_required=false/);
   assert.deepEqual(f.read().mutations, []);
+});
+
+test('workflow_run uses the exact successful main push rather than the default branch SHA', t => {
+  const f = fixture(t);
+  const eventPath = join(f.directory, 'event.json');
+  const event = { workflow_run: { event: 'push', head_branch: 'main', head_sha: sha,
+    head_repository: { full_name: repository }, conclusion: 'success' } };
+  writeFileSync(eventPath, JSON.stringify(event));
+  const overrides = { GITHUB_EVENT_NAME: 'workflow_run', GITHUB_EVENT_PATH: eventPath,
+    GITHUB_REF: 'refs/heads/partial', GITHUB_SHA: 'b'.repeat(40), RELEASE_COMMIT: sha };
+  const result = f.run('prepare', overrides);
+  assert.equal(result.status, 0, result.stderr);
+  for (const change of [{ event: 'pull_request' }, { head_branch: 'partial' }, { conclusion: 'failure' },
+    { head_repository: { full_name: 'fork/blackwall' } }, { head_sha: 'c'.repeat(40) }]) {
+    writeFileSync(eventPath, JSON.stringify({ workflow_run: { ...event.workflow_run, ...change } }));
+    assert.notEqual(f.run('prepare', overrides).status, 0);
+  }
+  assert.deepEqual(f.read().mutations, []);
+});
+
+test('a full retry repairs a missing compatibility feed without rebuilding published artifacts', t => {
+  const f = fixture(t);
+  f.state.failUpload = true;
+  f.save();
+  assert.notEqual(f.run('publish').status, 0);
+  const retry = f.run('prepare');
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.match(readFileSync(join(f.directory, 'output'), 'utf8'), /build_required=false/);
+  assert.equal(f.run('publish').status, 0);
+  assert.deepEqual(f.read().mutations, ['publish', 'advance-feed']);
 });
 
 test('prepare creates a commit-pinned draft with committed release notes, and can resume it', t => {

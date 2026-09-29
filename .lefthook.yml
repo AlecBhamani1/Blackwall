@@ -9,6 +9,9 @@ commit-msg:
 pre-commit:
   parallel: true
   commands:
+    release-policy:
+      glob: "{scripts/release/**/*.mjs,scripts/repository/**/*.mjs,.github/**/*}"
+      run: npm run test:release
     rust-fmt:
       glob: "src/**/*.rs"
       run: cargo fmt --manifest-path src/Cargo.toml --all -- --check
@@ -22,6 +25,9 @@ pre-commit:
 pre-push:
   parallel: true
   commands:
+    release-policy:
+      glob: "{scripts/release/**/*.mjs,scripts/repository/**/*.mjs,.github/**/*}"
+      run: npm run test:release
     rust-test:
       glob: "src/**/*.{rs,toml}"
       run: cargo test --manifest-path src/Cargo.toml --workspace --all-features
