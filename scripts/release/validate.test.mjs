@@ -68,6 +68,19 @@ test('every architecture needs its installer, updater archive, and signature', (
   assert.throws(() => validate(f), /Missing platform/);
 });
 
+test('GitHub temporary draft URLs become the final version URLs before feed publication', () => {
+  const f = fixture();
+  f.release.draft = true;
+  f.release.html_url = `https://github.com/${repository}/releases/tag/untagged-abc123`;
+  for (const asset of f.release.assets) {
+    asset.browser_download_url = asset.browser_download_url.replace('/v0.1.4/', '/untagged-abc123/');
+  }
+  const result = validate(f);
+  assert(Object.values(result.platforms).every(entry => entry.url.includes('/v0.1.4/')));
+  f.release.draft = false;
+  assert.throws(() => validate(f), 'Published releases cannot retain temporary draft URLs');
+});
+
 test('rejects stale, substituted, partial, and mismatched release metadata', () => {
   const mutations = [
     f => { f.manifest.version = '0.1.3'; },

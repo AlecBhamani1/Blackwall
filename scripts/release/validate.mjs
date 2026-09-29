@@ -40,6 +40,14 @@ export function validateManifest(release, manifest, signatures, repository, vers
   assert.equal(manifest.version, version);
   assert(Number.isFinite(Date.parse(manifest.pub_date)), 'Missing updater publication date');
   assert.equal(typeof manifest.notes, 'string');
+  let downloadTag = `v${version}`;
+  if (release.draft && release.html_url) {
+    const prefix = `https://github.com/${repository}/releases/tag/`;
+    assert(release.html_url.startsWith(prefix), 'Unexpected draft release URL');
+    const draftTag = release.html_url.slice(prefix.length);
+    assert(draftTag === downloadTag || /^untagged-[a-f0-9]+$/.test(draftTag), 'Unexpected draft tag');
+    downloadTag = draftTag;
+  }
   const assets = new Map();
   for (const asset of release.assets) {
     assert(!assets.has(asset.name), `Duplicate asset: ${asset.name}`);
@@ -49,7 +57,7 @@ export function validateManifest(release, manifest, signatures, repository, vers
     const asset = assets.get(name);
     assert(asset?.state === 'uploaded' && asset.size > 0, `Missing or incomplete asset: ${name}`);
     assert.equal(asset.browser_download_url,
-      `https://github.com/${repository}/releases/download/v${version}/${name}`);
+      `https://github.com/${repository}/releases/download/${downloadTag}/${name}`);
   }
   const platforms = {};
   for (const [platform, arch] of [['darwin-aarch64', 'aarch64'], ['darwin-x86_64', 'x64']]) {
@@ -59,12 +67,13 @@ export function validateManifest(release, manifest, signatures, repository, vers
     assert(entry, `Missing platform: ${platform}`);
     const signature = signatures[name + '.sig']?.trim();
     assert(signature && signature.length > 0, `Missing signature: ${name}`);
+    const publicUrl = `https://github.com/${repository}/releases/download/v${version}/${name}`;
     for (const key of [platform, `${platform}-app`]) {
       const candidate = manifest.platforms[key];
       if (!candidate && key.endsWith('-app')) continue;
       assert.equal(candidate.signature?.trim(), signature, `Signature mismatch: ${key}`);
-      assert([asset.url, asset.browser_download_url].includes(candidate.url), `Wrong release asset: ${key}`);
-      platforms[key] = { signature, url: asset.browser_download_url };
+      assert([asset.url, asset.browser_download_url, publicUrl].includes(candidate.url), `Wrong release asset: ${key}`);
+      platforms[key] = { signature, url: publicUrl };
     }
   }
   assert(Object.keys(manifest.platforms).every(key => key in platforms), 'Unexpected updater platform');
