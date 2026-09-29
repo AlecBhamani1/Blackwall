@@ -1,6 +1,6 @@
 //! Passphrase hashing for the optional desktop lock. This does not encrypt stored chats.
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use rand::{rngs::OsRng, RngCore};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use rand::{rngs::SysRng, TryRng};
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -14,10 +14,11 @@ pub fn hash(passphrase: &str) -> Result<String, AuthError> {
         return Err(AuthError::Length);
     }
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
-    let salt = SaltString::encode_b64(&bytes).map_err(|_| AuthError::Hash)?;
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| AuthError::Hash)?;
     Argon2::default()
-        .hash_password(passphrase.as_bytes(), &salt)
+        .hash_password_with_salt(passphrase.as_bytes(), &bytes)
         .map(|hash| hash.to_string())
         .map_err(|_| AuthError::Hash)
 }
@@ -52,5 +53,25 @@ mod tests {
         assert!(!verify("wrong", &a));
         assert!(hash("short").is_err());
         assert!(!a.contains("passphrase"));
+    }
+
+    #[test]
+    fn hashes_generated_before_the_argon2_upgrade_still_verify() {
+        // Generated with argon2 0.5.3 and salt b"0123456789abcdef".
+        // This represents passphrase verifier data already stored in Keychain.
+        let legacy = "$argon2id$v=19$m=19456,t=2,p=1$MDEyMzQ1Njc4OWFiY2RlZg$xhKtVoMRUrF1cI5zFr93ye0toSBbFL9kSQfe2G8t7GI";
+        assert!(verify("a long test passphrase", legacy));
+        assert!(!verify("a different passphrase", legacy));
+        for (parameter, replacement) in [
+            ("m=19456", "m=65537"),
+            ("t=2", "t=7"),
+            ("p=1", "p=5"),
+            ("argon2id", "argon2i"),
+        ] {
+            assert!(!verify(
+                "a long test passphrase",
+                &legacy.replace(parameter, replacement)
+            ));
+        }
     }
 }

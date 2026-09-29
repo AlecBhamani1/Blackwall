@@ -5,7 +5,7 @@ use crate::{
     protocol::{AgentEvent, ApprovalKind},
 };
 use cap_std::fs::{Dir, OpenOptions};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
@@ -184,7 +184,7 @@ impl Workspace {
             .open_dir(parent)
             .map_err(|_| ToolError::Path)?;
         let name = path.file_name().ok_or(ToolError::Path)?;
-        let temporary = format!(".blackwall-edit-{:016x}", OsRng.next_u64());
+        let temporary = format!(".blackwall-edit-{:016x}", UnwrapErr(SysRng).next_u64());
         let result = (|| {
             let mut file = directory
                 .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
@@ -455,7 +455,10 @@ mod tests {
     use super::*;
     #[test]
     fn file_tools_reject_escape_and_stale_edits() {
-        let path = std::env::temp_dir().join(format!("blackwall-tools-{:016x}", OsRng.next_u64()));
+        let path = std::env::temp_dir().join(format!(
+            "blackwall-tools-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
         std::fs::create_dir(&path).unwrap();
         let workspace = Workspace::open(&path).unwrap();
         assert!(workspace.read("../outside").is_err());
@@ -501,8 +504,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_shell_stops_descendant_side_effects() {
-        let directory =
-            std::env::temp_dir().join(format!("blackwall-shell-cancel-{}", OsRng.next_u64()));
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-shell-cancel-{}",
+            UnwrapErr(SysRng).next_u64()
+        ));
         std::fs::create_dir(&directory).unwrap();
         let result = tokio::time::timeout(
             Duration::from_millis(30),
