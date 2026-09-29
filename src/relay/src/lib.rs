@@ -833,10 +833,10 @@ async fn chat_completions(
 }
 
 fn random_request_id() -> String {
-    use rand::{rngs::OsRng, RngCore};
+    use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 
     let mut bytes = [0_u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

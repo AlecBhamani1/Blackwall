@@ -1,6 +1,6 @@
 //! Exact-action approvals tied to a live run. Dropping a wait invalidates its decision handle.
 use crate::protocol::{AgentEvent, ApprovalDecision, ApprovalKind, ResolveApprovalRequest};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -39,7 +39,7 @@ impl Approvals {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
         let (sender, receiver) = oneshot::channel();
-        let id = format!("approval_{:016x}", OsRng.next_u64());
+        let id = format!("approval_{:016x}", UnwrapErr(SysRng).next_u64());
         {
             let mut state = self
                 .0
