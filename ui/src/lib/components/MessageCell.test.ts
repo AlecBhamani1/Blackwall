@@ -51,6 +51,22 @@ describe('MessageCell', () => {
     expect(screen.getByText('2.0 KB')).toBeInTheDocument();
   });
 
+  it('renders completed streamed equations and copies the original LaTeX', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    const { container, rerender } = render(MessageCell, {
+      props: { message: message({ content: 'Result: $x^2', status: 'streaming' }) },
+    });
+    expect(container.querySelector('.katex')).toBeNull();
+    expect(container).toHaveTextContent('Result: $x^2');
+
+    const content = String.raw`Result: $x^2$ and \[\frac{1}{2}\]`;
+    await rerender({ message: message({ content }) });
+    expect(container.querySelectorAll('.katex')).toHaveLength(2);
+    await user.click(screen.getByRole('button', { name: 'Copy response' }));
+    expect(writeText).toHaveBeenCalledWith(content);
+  });
+
   it('copies individual code blocks verbatim without surrounding text or Markdown fences', async () => {
     const user = userEvent.setup();
     const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
