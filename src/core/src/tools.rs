@@ -18,6 +18,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 const MAX_FILE: usize = 64 * 1024;
+mod browser;
+pub use browser::{DirectoryListing, FileEntry, FileSearch, FileSearchMatch, FileSearchMode};
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("Use a relative file path inside the selected project folder.")]

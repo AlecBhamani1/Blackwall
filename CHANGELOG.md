@@ -14,6 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Browse project files in a right sidebar in Agent mode, with expandable folders, name and
+  content search, refresh controls, and bounded text previews inside the selected workspace.
 - Render inline and display LaTeX equations in assistant messages with bundled offline fonts.
 - Drop screenshots or files anywhere in the conversation to attach them, and use `@` to
   select and reference files from the current chat, including names with spaces.
