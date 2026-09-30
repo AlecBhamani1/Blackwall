@@ -12,6 +12,7 @@ describe('attachments', () => {
     expect(attachmentKind(new File(['x'], 'photo.png', { type: 'image/png' }))).toBe('image');
     expect(attachmentKind(new File(['const x = 1'], 'index.ts'))).toBe('text');
     expect(attachmentKind(new File(['x'], 'report.pdf', { type: 'application/pdf' }))).toBe('file');
+    expect(attachmentKind(new File(['x'], 'file.constructor'))).toBe('file');
   });
 
   it('accepts supported files and rejects duplicates deterministically', () => {
@@ -29,8 +30,9 @@ describe('attachments', () => {
     const oversized = new File([new Uint8Array(MAX_ATTACHMENT_SIZE_BYTES + 1)], 'large.bin');
     expect(prepareAttachments([oversized]).rejected[0]?.reason).toContain('15 MB');
 
-    const files = Array.from({ length: MAX_ATTACHMENT_COUNT + 1 }, (_, index) =>
-      new File(['x'], `file-${index}.txt`, { lastModified: index }),
+    const files = Array.from(
+      { length: MAX_ATTACHMENT_COUNT + 1 },
+      (_, index) => new File(['x'], `file-${index}.txt`, { lastModified: index }),
     );
     const result = prepareAttachments(files);
     expect(result.accepted).toHaveLength(MAX_ATTACHMENT_COUNT);
@@ -38,12 +40,23 @@ describe('attachments', () => {
   });
 
   it('materializes text attachments without base64 inflation', async () => {
-    const [pending] = prepareAttachments([new File(['hello Blackwall'], 'notes.md', { type: 'text/markdown' })])
-      .accepted;
+    const [pending] = prepareAttachments([
+      new File(['hello Blackwall'], 'notes.md', { type: 'text/markdown' }),
+    ]).accepted;
     await expect(materializeAttachment(pending)).resolves.toMatchObject({
       name: 'notes.md',
       kind: 'text',
       textContent: 'hello Blackwall',
+    });
+  });
+
+  it('recognizes dropped screenshots even when the OS supplies no MIME type', async () => {
+    const [pending] = prepareAttachments([new File(['pixels'], 'Screenshot.PNG')]).accepted;
+    expect(pending.kind).toBe('image');
+    expect(pending.previewUrl).toBeDefined();
+    await expect(materializeAttachment(pending)).resolves.toMatchObject({
+      mimeType: 'image/png',
+      dataUrl: 'data:image/png;base64,cGl4ZWxz',
     });
   });
 });

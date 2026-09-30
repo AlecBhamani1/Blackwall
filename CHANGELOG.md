@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Drop screenshots or files anywhere in the conversation to attach them, and use `@` to
+  select and reference files from the current chat, including names with spaces.
+
 - A protected `partial` integration branch and checked production promotions, tracked by version
   milestones and release notes, with automatic versioned publication after production CI.
 - Both-architecture desktop build checks before promotion, dependency vulnerability review,

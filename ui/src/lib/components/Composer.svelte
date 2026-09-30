@@ -1,7 +1,12 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import { prepareAttachments, revokeAttachmentPreview } from '../attachments';
-  import type { PendingAttachment } from '../types';
+  import {
+    attachmentReferences,
+    mentionAtCaret,
+    type AttachmentReference,
+  } from '../attachmentReferences';
+  import type { Attachment, PendingAttachment } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
   import Icon from './Icon.svelte';
 
@@ -11,16 +16,56 @@
   export let onDismissNotice: () => void = () => undefined;
   export let onSend: (text: string, attachments: PendingAttachment[]) => Promise<boolean>;
   export let onStop: () => void;
+  export let chatAttachments: Attachment[] = [];
+  export let sessionId: string | null = null;
 
   let text = '';
   let attachments: PendingAttachment[] = [];
   let fileInput: HTMLInputElement;
   let textarea: HTMLTextAreaElement;
-  let dragDepth = 0;
-  let dragging = false;
+  let submitting = false;
+  let mention: ReturnType<typeof mentionAtCaret> = null;
+  let mentionIndex = 0;
+  let draftSessionId = sessionId;
   let attachmentNotice = '';
 
-  $: canSend = !disabled && !busy && Boolean(text.trim() || attachments.length);
+  $: canSend = !disabled && !busy && !submitting && Boolean(text.trim() || attachments.length);
+  $: references = attachmentReferences([...chatAttachments, ...attachments]);
+  $: suggestions = mention
+    ? references.filter(({ label }) => label.toLowerCase().includes(mention!.query.toLowerCase()))
+    : [];
+  $: if (sessionId !== draftSessionId) {
+    attachments.forEach(revokeAttachmentPreview);
+    attachments = [];
+    text = '';
+    mention = null;
+    attachmentNotice = '';
+    draftSessionId = sessionId;
+  }
+
+  function updateMention() {
+    mention = mentionAtCaret(text, textarea.selectionStart);
+    mentionIndex = 0;
+  }
+
+  async function selectReference(reference: AttachmentReference) {
+    if (!mention) return;
+    const caret = textarea.selectionStart;
+    const before = text.slice(0, mention.start);
+    const after = text.slice(caret);
+    const insertion = `${reference.token} `;
+    text = before + insertion + after;
+    mention = null;
+    await tick();
+    textarea.focus();
+    textarea.setSelectionRange(before.length + insertion.length, before.length + insertion.length);
+    resizeTextarea();
+  }
+
+  function input() {
+    resizeTextarea();
+    updateMention();
+  }
 
   function resizeTextarea() {
     if (!textarea) return;
@@ -28,14 +73,18 @@
     textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
   }
 
-  function addFiles(files: Iterable<File>) {
+  export function addFiles(files: Iterable<File>) {
+    if (busy || submitting) return;
     const result = prepareAttachments(files, attachments);
     attachments = [...attachments, ...result.accepted];
-    attachmentNotice = result.rejected.map((item) => `${item.fileName}: ${item.reason}`).join(' · ');
+    attachmentNotice = result.rejected
+      .map((item) => `${item.fileName}: ${item.reason}`)
+      .join(' · ');
+    textarea?.focus();
   }
 
   function chooseFiles() {
-    if (!busy) fileInput.click();
+    if (!busy && !submitting) fileInput.click();
   }
 
   function selectedFiles(event: Event) {
@@ -54,9 +103,16 @@
   async function submit() {
     if (!canSend) return;
     const submitted = attachments;
-    const accepted = await onSend(text, submitted);
+    submitting = true;
+    let accepted: boolean;
+    try {
+      accepted = await onSend(text, submitted);
+    } finally {
+      submitting = false;
+    }
     if (!accepted) return;
     text = '';
+    mention = null;
     attachments = [];
     attachmentNotice = '';
     await tick();
@@ -65,6 +121,26 @@
   }
 
   function keydown(event: KeyboardEvent) {
+    if (event.isComposing) return;
+    if (mention && suggestions.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        mentionIndex = (mentionIndex + direction + suggestions.length) % suggestions.length;
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        void selectReference(suggestions[mentionIndex] ?? suggestions[0]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        mention = null;
+        return;
+      }
+    }
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
     event.preventDefault();
     void submit();
@@ -75,33 +151,10 @@
       .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
       .map((item) => item.getAsFile())
       .filter((file): file is File => file !== null);
-    if (imageFiles.length > 0) addFiles(imageFiles);
-  }
-
-  function dragEnter(event: DragEvent) {
-    if (!event.dataTransfer?.types.includes('Files')) return;
-    event.preventDefault();
-    dragDepth += 1;
-    dragging = true;
-  }
-
-  function dragOver(event: DragEvent) {
-    if (!event.dataTransfer?.types.includes('Files')) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'copy';
-  }
-
-  function dragLeave(event: DragEvent) {
-    event.preventDefault();
-    dragDepth = Math.max(0, dragDepth - 1);
-    if (dragDepth === 0) dragging = false;
-  }
-
-  function drop(event: DragEvent) {
-    event.preventDefault();
-    dragDepth = 0;
-    dragging = false;
-    if (event.dataTransfer?.files) addFiles(event.dataTransfer.files);
+    if (imageFiles.length > 0) {
+      event.preventDefault();
+      addFiles(imageFiles);
+    }
   }
 
   onMount(() => textarea?.focus());
@@ -112,53 +165,93 @@
   {#if notice || attachmentNotice}
     <div class="notice" role="status">
       <span>{attachmentNotice || notice}</span>
-      <button aria-label="Dismiss message" onclick={() => { attachmentNotice = ''; onDismissNotice(); }}>
+      <button
+        aria-label="Dismiss message"
+        onclick={() => {
+          attachmentNotice = '';
+          onDismissNotice();
+        }}
+      >
         <Icon name="x" size={13} />
       </button>
     </div>
   {/if}
 
-  <div
-    class:dragging
-    class="composer"
-    role="group"
-    aria-label="Message composer"
-    ondragenter={dragEnter}
-    ondragover={dragOver}
-    ondragleave={dragLeave}
-    ondrop={drop}
-  >
-    {#if dragging}
-      <div class="drop-prompt"><Icon name="paperclip" size={17} /> Drop files here</div>
-    {/if}
-
+  <div class="composer" role="group" aria-label="Message composer">
     <AttachmentTray {attachments} removable onRemove={removeAttachment} />
+
+    {#if suggestions.length > 0}
+      <div
+        class="file-suggestions"
+        id="file-suggestions"
+        role="listbox"
+        aria-label="Files in this chat"
+      >
+        {#each suggestions as reference, index (reference.attachment.id)}
+          <button
+            id={`file-suggestion-${index}`}
+            role="option"
+            aria-selected={index === mentionIndex}
+            class:highlighted={index === mentionIndex}
+            onmousedown={(event) => event.preventDefault()}
+            onclick={() => selectReference(reference)}
+          >
+            <Icon name={reference.attachment.kind === 'image' ? 'image' : 'file'} size={16} />
+            <span>{reference.label}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
 
     <textarea
       bind:this={textarea}
       bind:value={text}
       rows="1"
       aria-label="Message Blackwall"
-      placeholder="Message Blackwall"
-      oninput={resizeTextarea}
+      placeholder="Message Blackwall · @ to reference a file"
+      aria-autocomplete="list"
+      aria-controls={suggestions.length ? 'file-suggestions' : undefined}
+      aria-activedescendant={suggestions.length ? `file-suggestion-${mentionIndex}` : undefined}
+      oninput={input}
+      onclick={updateMention}
+      onkeyup={(event) => {
+        if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention();
+      }}
       onkeydown={keydown}
-      onpaste={paste}
-    ></textarea>
+      onpaste={paste}></textarea>
 
     <div class="composer-actions">
       <div class="left-actions">
-        <button class="attach" aria-label="Add photos or files" title="Add photos or files" onclick={chooseFiles} disabled={busy}>
+        <button
+          class="attach"
+          aria-label="Add photos or files"
+          title="Add photos or files"
+          onclick={chooseFiles}
+          disabled={busy || submitting}
+        >
           <Icon name="paperclip" size={18} />
         </button>
         <span class="local-hint">Sent only to your model</span>
       </div>
 
       {#if busy}
-        <button class="send active" aria-label="Stop response" title="Stop response" onclick={onStop}>
+        <button
+          class="send active"
+          aria-label="Stop response"
+          title="Stop response"
+          onclick={onStop}
+        >
           <Icon name="stop" size={16} />
         </button>
       {:else}
-        <button class="send" class:active={canSend} aria-label="Send message" title="Send message" disabled={!canSend} onclick={submit}>
+        <button
+          class="send"
+          class:active={canSend}
+          aria-label="Send message"
+          title="Send message"
+          disabled={!canSend}
+          onclick={submit}
+        >
           <Icon name="arrow-up" size={18} strokeWidth={2.1} />
         </button>
       {/if}
@@ -197,10 +290,11 @@
       box-shadow var(--transition-fast);
   }
 
-  .composer:focus-within,
-  .composer.dragging {
+  .composer:focus-within {
     border-color: var(--accent);
-    box-shadow: var(--shadow-composer), 0 0 0 2px var(--focus-ring);
+    box-shadow:
+      var(--shadow-composer),
+      0 0 0 2px var(--focus-ring);
   }
 
   textarea {
@@ -329,19 +423,36 @@
     color: var(--text-primary);
   }
 
-  .drop-prompt {
-    position: absolute;
-    z-index: 5;
-    inset: 5px;
+  .file-suggestions {
+    max-height: 180px;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+    padding: 6px;
+  }
+
+  .file-suggestions button {
     display: flex;
+    width: 100%;
     align-items: center;
-    justify-content: center;
     gap: 8px;
-    border: 1px dashed var(--accent);
-    border-radius: calc(var(--radius-lg) - 3px);
-    background: var(--bg-panel);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    background: transparent;
+    color: var(--text-muted);
+    text-align: left;
+    font-size: 12px;
+  }
+
+  .file-suggestions button.highlighted,
+  .file-suggestions button:hover {
+    background: var(--bg-hover);
     color: var(--text-primary);
-    font-weight: 550;
+  }
+
+  .file-suggestions span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   @media (max-width: 560px) {
