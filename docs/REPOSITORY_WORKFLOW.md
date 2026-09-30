@@ -38,13 +38,62 @@ flowchart LR
    dependency policy, dependency vulnerability review, UI check/test/build, and release-policy
    tests. `Quality gate` fails when an applicable job fails, is cancelled, or unexpectedly skips.
    `Production promotion` checks the branch contract. Both statuses are required.
-6. Resolve review conversations and update the branch to the latest base if needed. Squash merge
-   development PRs with a Conventional Commit title. Delete the feature branch after merging.
+6. Resolve review conversations and use a Conventional Commit PR title. After reviewing the
+   current code, apply `ready-to-merge` to enter the automatic queue described below. Manual
+   checked squash merges remain available. Delete the feature branch after merging.
 
 Both long-lived branches prohibit direct pushes, force pushes, deletion, and administrator bypass.
 The repository currently has one collaborator, so mandatory external reviews are set to zero.
 Code ownership routes reviews to the maintainer. Once another reviewer joins, run
 `npm run repo:configure -- --apply --reviews=1` to require fresh approval and code-owner review.
+
+## Automatically merge reviewed development PRs
+
+Apply `ready-to-merge` after reviewing a feature PR into `partial`. A maintainer with write,
+maintain, or admin access must apply the label. The queue records that PR's exact head commit
+in its **Merge queue** check. Only non-draft branches in this repository are eligible; fork
+PRs, production promotions, and `main`/`partial` sync branches use the manual process.
+
+The oldest label request goes first. Each cycle updates or merges only that PR, then exits:
+
+1. If the branch is behind, merge the latest `partial` into it without rebasing or force pushes.
+2. Preserve approval only for that exact base-merge commit and wait for fresh PR CI.
+3. Require successful **Quality gate** and **Production promotion** checks from the latest
+   CI and Branch policy PR runs. Pending, cancelled, skipped, stale, or failed required checks
+   never qualify. Re-running CI makes the queue wait for that newer attempt.
+4. Squash merge the reviewed head through GitHub's normal protected-branch API. GitHub still
+   enforces reviews, resolved conversations, up-to-date checks, and all other rules. The queue
+   grants no administrator bypass, never promotes to `main`, and never deletes a branch.
+
+The **Partial merge queue** workflow wakes on labels, PR changes, completed CI, and `partial`
+pushes. A five-minute schedule and **Run workflow** provide recovery for missed wakeups; GitHub
+may delay scheduled runs. Queue order is the latest label time, with the PR number as a tie-breaker.
+
+If the first PR conflicts, fails checks, becomes a draft, or receives a new source push, the
+queue pauses behind it. Inspect the **Merge queue** check and workflow summary. For failed CI,
+fix the problem or rerun transient failures; after code changes, review the new head and remove
+then reapply `ready-to-merge`. Do the same after resolving conflicts. Remove the label to
+withdraw the PR and let the next one proceed. Reapplying it places the PR at the back of the queue.
+Do not enable GitHub auto-merge separately for queued PRs; this workflow owns sequencing.
+
+### One-time credential setup
+
+Create a dedicated fine-grained personal access token with only `AlecBhamani1/Blackwall` selected.
+Grant **Contents**, **Pull requests**, and **Workflows** read/write access; Metadata read is
+included. Add it under repository **Settings → Secrets and variables → Actions** as the secret
+`MERGE_QUEUE_TOKEN`. Choose an expiry and rotate the secret before it expires. Do not reuse a
+general-purpose CLI token or put credentials in Git, PRs, or workflow logs.
+
+The ordinary `GITHUB_TOKEN` records queue checks and reads repository state. The dedicated token
+is used only by the update and merge API calls, so those actions trigger normal CI and the
+subsequent `partial` push workflows without a manual workflow-approval step. See GitHub's
+[token-trigger behavior](https://docs.github.com/en/actions/concepts/security/github_token).
+Only trusted code from `partial` executes in the privileged queue workflow; it never checks out
+or executes a PR's code. No token has a branch-protection bypass. Without the secret, queued PRs
+pause with a setup instruction instead of attempting an update or merge.
+
+Start each new task from `origin/partial`. Completed feature branches are historical snapshots;
+they do not need continuous updates. The queue updates open PRs, not local worktrees.
 
 ## Promote a release batch
 
