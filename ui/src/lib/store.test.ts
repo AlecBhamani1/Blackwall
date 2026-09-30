@@ -230,7 +230,7 @@ describe('chat controller', () => {
   it('persists an endpoint override and uses it for discovery and chat', async () => {
     const client = mockClient();
     const controller = createChatController(client);
-    const endpoint = 'http://100.76.24.116:11434';
+    const endpoint = 'http://192.0.2.10:11434';
 
     await expect(controller.configureEndpoint(endpoint)).resolves.toBe(true);
     expect(client.discoverModels).toHaveBeenCalledWith(endpoint);

@@ -73,10 +73,10 @@ describe('SettingsDialog', () => {
 
     const input = screen.getByLabelText('Endpoint URL');
     await user.clear(input);
-    await user.type(input, 'http://100.76.24.116:11434');
+    await user.type(input, 'http://192.0.2.10:11434');
     await user.click(screen.getByRole('button', { name: 'Save and reconnect' }));
 
-    expect(onConfigureEndpoint).toHaveBeenCalledWith('http://100.76.24.116:11434');
+    expect(onConfigureEndpoint).toHaveBeenCalledWith('http://192.0.2.10:11434');
     expect(
       await screen.findByText('Connected and loaded the available models.'),
     ).toBeInTheDocument();
