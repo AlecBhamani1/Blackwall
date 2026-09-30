@@ -30,6 +30,7 @@ export function branchRules(branch, approvingReviews = 0) {
 }
 
 export const labels = [
+  ['ready-to-merge', '0E8A16', 'Maintainer reviewed this head; queue updates, checks, and merges it into partial'],
   ['release', '5319E7', 'A partial-to-main production promotion'],
   ['security', 'B60205', 'Security-sensitive work; report vulnerabilities privately'],
   ['dependencies', '0366D6', 'Dependency maintenance'],
