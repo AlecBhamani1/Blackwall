@@ -41,6 +41,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Separate Chat and Agent histories, lock conversation mode and project after the first message,
+  restore each Agent conversation’s project, and clear the project when starting a new chat.
+
 - Keep a stable pairing address through failed saves; serialize activation with locking, retain
   authorization until database workers finish, and complete lock cleanup after caller cancellation.
 

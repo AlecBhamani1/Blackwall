@@ -11,7 +11,7 @@ pub struct AgentState {
     pub approvals: Approvals,
 }
 
-fn selected_workspace(state: &AgentState, expected: &str) -> Result<Workspace, String> {
+pub(crate) fn selected_workspace(state: &AgentState, expected: &str) -> Result<Workspace, String> {
     state
         .workspace
         .lock()
@@ -119,6 +119,43 @@ pub async fn choose_workspace(
         .map_err(|_| "The project could not be selected.")? = Some(workspace);
     Ok(Some(label))
 }
+/// Restore only projects recorded in a saved Agent conversation.
+#[tauri::command]
+pub async fn restore_workspace(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let session = crate::data::with_store(&app, move |store| store.load_session(&session_id))
+        .await?
+        .ok_or("This conversation could not be found.")?;
+    if session.get("mode").and_then(serde_json::Value::as_str) != Some("agent") {
+        return Err("This conversation has no agent project.".into());
+    }
+    let path = session
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or("This conversation has no saved project folder.")?
+        .to_owned();
+    let workspace = tokio::task::spawn_blocking(move || {
+        Workspace::open(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|_| "The saved project could not be opened.")?
+    .map_err(|_| {
+        "The saved project folder is unavailable. Restore it before opening this conversation."
+    })?;
+    crate::auth::require_unlocked(&app).await?;
+    let label = workspace.path.to_string_lossy().into_owned();
+    *state
+        .workspace
+        .lock()
+        .map_err(|_| "The project could not be selected.")? = Some(workspace);
+    Ok(Some(label))
+}
+
 #[tauri::command]
 pub async fn resolve_approval(
     app: AppHandle,

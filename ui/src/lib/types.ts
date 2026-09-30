@@ -60,6 +60,7 @@ export interface ModelMessage {
 export interface ChatRequest {
   requestId: string;
   agentMode?: boolean;
+  workspace?: string;
   webEnabled?: boolean;
   endpoint?: string;
   model?: string;
@@ -106,7 +107,12 @@ export interface StreamCallbacks {
   onEvent?: (event: AgentEvent) => void;
 }
 
+export type ConversationMode = 'chat' | 'agent';
+
 export interface SessionSummary {
+  // Older conversations did not record their mode or project. Treat them as Chat.
+  mode?: ConversationMode;
+  workspace?: string;
   id: string;
   title: string;
   updatedAt: number;

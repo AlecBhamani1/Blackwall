@@ -1,4 +1,4 @@
-import { derived, get, writable } from 'svelte/store';
+import { derived, get, readonly, writable } from 'svelte/store';
 import {
   materializeAttachment,
   revokeAttachmentPreview,
@@ -22,6 +22,7 @@ import type {
   RunState,
   PendingApproval,
   SessionSummary,
+  ConversationMode,
 } from './types';
 
 const SESSION_STORAGE_KEY = 'blackwall.sessions.v1';
@@ -144,11 +145,38 @@ export function createChatController(
   const agentMode = writable(false);
   const webEnabled = writable(false);
   const workspace = writable('');
+  const sessionLocked = derived(messages, ($messages) => $messages.length > 0);
+  const visibleSessions = derived([sessions, agentMode], ([$sessions, $agentMode]) =>
+    $sessions.filter((session) => (session.mode === 'agent') === $agentMode),
+  );
+  function chooseMode(mode: ConversationMode): void {
+    if (get(sessionLocked) || get(runState) !== 'idle') return;
+    sessionNavigation += 1;
+    agentMode.set(mode === 'agent');
+    workspace.set('');
+    webEnabled.set(false);
+  }
+  function sessionContext(): { mode: ConversationMode; workspace?: string } {
+    return {
+      mode: get(agentMode) ? 'agent' : 'chat',
+      workspace: get(agentMode) ? get(workspace) || undefined : undefined,
+    };
+  }
   const approval = writable<PendingApproval | null>(null);
   async function chooseWorkspace() {
-    if (get(runState) !== 'idle') return;
+    if (get(sessionLocked) || get(runState) !== 'idle' || !get(agentMode)) return;
+    const navigation = sessionNavigation;
+    const sessionId = get(activeSessionId);
     try {
       const selected = await agentClient.chooseWorkspace();
+      if (
+        navigation !== sessionNavigation ||
+        sessionId !== get(activeSessionId) ||
+        get(sessionLocked) ||
+        get(runState) !== 'idle' ||
+        destroyed
+      )
+        return;
       if (selected) {
         workspace.set(selected);
         agentMode.set(true);
@@ -166,6 +194,7 @@ export function createChatController(
   async function exportConversation() {
     if (!get(messages).length) return;
     const session = {
+      ...sessionContext(),
       id: get(activeSessionId),
       title: sessionTitle(get(messages)),
       updatedAt: Date.now(),
@@ -285,6 +314,7 @@ export function createChatController(
   function saveCurrentSession(nextMessages = get(messages)): void {
     if (nextMessages.length === 0) return;
     const session: SessionSummary = {
+      ...sessionContext(),
       id: get(activeSessionId),
       title: sessionTitle(nextMessages),
       updatedAt: Date.now(),
@@ -437,6 +467,11 @@ export function createChatController(
       return false;
     }
 
+    if (get(agentMode) && !get(workspace)) {
+      notice.set('Choose a project folder before starting an agent task.');
+      return false;
+    }
+
     const references = referencedAttachments(
       content,
       attachmentReferences([
@@ -522,6 +557,7 @@ export function createChatController(
           {
             requestId,
             agentMode: get(agentMode),
+            workspace: get(agentMode) ? get(workspace) : undefined,
             webEnabled: get(webEnabled),
             endpoint: get(endpoint) || undefined,
             model: get(selectedModel),
@@ -696,7 +732,9 @@ export function createChatController(
     saveCurrentSession();
   }
 
-  async function newChat(): Promise<boolean> {
+  async function newChat(
+    mode: ConversationMode = get(agentMode) ? 'agent' : 'chat',
+  ): Promise<boolean> {
     const navigation = ++sessionNavigation;
     stop();
     const generation = runGeneration;
@@ -713,6 +751,9 @@ export function createChatController(
     }
     releaseMessagePreviews(get(messages));
     messages.set([]);
+    workspace.set('');
+    agentMode.set(mode === 'agent');
+    webEnabled.set(false);
     activeSessionId.set(createId('session'));
     notice.set('');
     runState.set('idle');
@@ -721,10 +762,12 @@ export function createChatController(
 
   async function openSession(sessionId: string): Promise<void> {
     if (sessionId === get(activeSessionId)) return;
+    let session = get(visibleSessions).find((item) => item.id === sessionId);
+    if (!session) return;
     stop();
     const navigation = ++sessionNavigation;
-    let session = get(sessions).find((item) => item.id === sessionId);
-    if (!session) return;
+    const generation = runGeneration;
+    let restoredWorkspace = session.mode === 'agent' ? (session.workspace ?? '') : '';
     if (native) {
       try {
         await saves;
@@ -733,13 +776,25 @@ export function createChatController(
           return;
         }
         session = (await storage.load(sessionId)) ?? undefined;
+        if (
+          navigation !== sessionNavigation ||
+          generation !== runGeneration ||
+          destroyed ||
+          !session
+        )
+          return;
+        if (session.mode === 'agent') {
+          restoredWorkspace = (await agentClient.restoreWorkspace(sessionId)) ?? '';
+          if (!restoredWorkspace) throw new Error('The saved project is unavailable.');
+        }
       } catch {
         persistenceError.set(
           'This conversation could not be opened. Its saved copy has been left in place.',
         );
         return;
       }
-      if (navigation !== sessionNavigation || destroyed || !session) return;
+      if (navigation !== sessionNavigation || generation !== runGeneration || destroyed || !session)
+        return;
     }
     releaseMessagePreviews(get(messages));
     messages.set(
@@ -764,6 +819,9 @@ export function createChatController(
         })),
       })),
     );
+    workspace.set(restoredWorkspace);
+    agentMode.set(session.mode === 'agent');
+    webEnabled.set(false);
     activeSessionId.set(session.id);
     notice.set('');
     runState.set('idle');
@@ -775,6 +833,8 @@ export function createChatController(
       stop();
       releaseMessagePreviews(get(messages));
       messages.set([]);
+      workspace.set('');
+      webEnabled.set(false);
       activeSessionId.set(createId('session'));
       notice.set('');
     }
@@ -824,9 +884,12 @@ export function createChatController(
     sessions,
     activeSessionId,
     runState,
-    agentMode,
+    agentMode: readonly(agentMode),
     webEnabled,
-    workspace,
+    workspace: readonly(workspace),
+    sessionLocked,
+    visibleSessions,
+    chooseMode,
     approval,
     chooseWorkspace,
     resolveApproval,

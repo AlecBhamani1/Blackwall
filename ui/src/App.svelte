@@ -22,7 +22,8 @@
   const updateController = createAppUpdateController();
   const {
     messages,
-    sessions,
+    visibleSessions,
+    sessionLocked,
     activeSessionId,
     runState,
     connectionState,
@@ -166,7 +167,10 @@
         controller.preferences.update((current) => ({ ...current, ...patch }))}
       onLock={lock}
       visible={sidebarVisible}
-      sessions={$sessions}
+      sessions={$visibleSessions}
+      agentMode={$agentMode}
+      showModes={isDesktop()}
+      onModeChange={(mode) => controller.newChat(mode)}
       activeSessionId={$activeSessionId}
       connectionState={$connectionState}
       selectedModel={$selectedModel}
@@ -215,24 +219,25 @@
           <div class="mode-switch" aria-label="Conversation mode">
             <button
               class:active={!$agentMode}
-              disabled={$runState !== 'idle'}
-              onclick={() => agentMode.set(false)}>Chat</button
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
+              onclick={() => controller.chooseMode('chat')}>Chat</button
             ><button
               class:active={$agentMode}
-              disabled={$runState !== 'idle'}
-              onclick={() => ($workspace ? agentMode.set(true) : controller.chooseWorkspace())}
-              >Agent</button
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
+              onclick={() => controller.chooseMode('agent')}>Agent</button
             >
           </div>
-          <button
-            class="project-choice"
-            disabled={$runState !== 'idle'}
-            title={$workspace || 'Choose the folder Blackwall can work in'}
-            onclick={controller.chooseWorkspace}
-            >{$workspace
-              ? $workspace.split('/').filter(Boolean).at(-1)
-              : 'Choose project folder'}</button
-          ><span></span>{#if $agentMode}<label class="web-toggle"
+          {#if $agentMode}<button
+              class="project-choice"
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$workspace || 'Choose the folder Blackwall can work in'}
+              onclick={controller.chooseWorkspace}
+              >{$workspace
+                ? $workspace.split('/').filter(Boolean).at(-1)
+                : 'Choose project folder'}</button
+            >{/if}<span></span>{#if $agentMode}<label class="web-toggle"
               ><input
                 type="checkbox"
                 bind:checked={$webEnabled}
