@@ -11,6 +11,30 @@ afterEach(() => {
 });
 
 describe('native chat failure boundary', () => {
+  it('pins Agent requests to the conversation project at the native boundary', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    native.invoke.mockResolvedValue({ requestId: 'agent-test' });
+    await localModelClient.streamChat(
+      {
+        requestId: 'agent-test',
+        model: 'model',
+        messages: [],
+        agentMode: true,
+        workspace: '/projects/current',
+        webEnabled: false,
+      },
+      { onDelta: vi.fn() },
+      new AbortController().signal,
+    );
+    expect(native.invoke).toHaveBeenCalledWith(
+      'stream_chat',
+      expect.objectContaining({
+        options: { enabled: true, workspace: '/projects/current', webEnabled: false },
+      }),
+    );
+  });
+
   it('reports local storage failure without blaming the model or exposing native details', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

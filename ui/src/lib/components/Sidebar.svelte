@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { relativeTime } from '../format';
-  import type { ConnectionState, SessionSummary } from '../types';
+  import type { ConnectionState, ConversationMode, SessionSummary } from '../types';
   import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
@@ -15,6 +15,9 @@
   }) => void = () => {};
   export let onLock: () => Promise<void> = async () => {};
   export let visible = true;
+  export let showModes = false;
+  export let agentMode = false;
+  export let onModeChange: (mode: ConversationMode) => void = () => {};
   export let sessions: SessionSummary[] = [];
   export let activeSessionId = '';
   export let connectionState: ConnectionState = 'checking';
@@ -62,6 +65,25 @@
     </button>
   </div>
 
+  {#if showModes}
+    <div class="history-modes" aria-label="History mode">
+      <button
+        class:active={!agentMode}
+        aria-pressed={!agentMode}
+        onclick={() => {
+          if (agentMode) onModeChange('chat');
+        }}>Chat</button
+      >
+      <button
+        class:active={agentMode}
+        aria-pressed={agentMode}
+        onclick={() => {
+          if (!agentMode) onModeChange('agent');
+        }}>Agent</button
+      >
+    </div>
+  {/if}
+
   <button class="new-chat" onclick={onNewChat}>
     <Icon name="new-chat" size={16} />
     <span>New chat</span>
@@ -77,7 +99,9 @@
   <section class="history">
     <div class="section-label">Recent</div>
     {#if sessions.length === 0}
-      <p class="empty-history">Your local chats will appear here.</p>
+      <p class="empty-history">
+        Your {agentMode ? 'agent' : 'chat'} conversations will appear here.
+      </p>
     {:else}
       <div class="session-list">
         {#each sessions as session (session.id)}
@@ -153,6 +177,24 @@
 />
 
 <style>
+  .history-modes {
+    display: flex;
+    gap: 4px;
+    margin: 8px 10px 0;
+  }
+  .history-modes button {
+    flex: 1;
+    padding: 7px;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .history-modes button.active {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+
   .memory-button {
     margin: -6px 10px 20px;
     padding: 9px 10px;

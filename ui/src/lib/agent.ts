@@ -34,6 +34,9 @@ export const agentClient = {
   async chooseWorkspace(): Promise<string | null> {
     return invoke('choose_workspace');
   },
+  async restoreWorkspace(sessionId: string): Promise<string | null> {
+    return invoke('restore_workspace', { sessionId });
+  },
   async resolve(
     approval: PendingApproval,
     decision: 'allow' | 'always_allow' | 'deny',

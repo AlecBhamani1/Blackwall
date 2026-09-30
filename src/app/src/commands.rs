@@ -325,6 +325,16 @@ pub(crate) async fn chat(
     }
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentOptions {
+    #[serde(default)]
+    enabled: bool,
+    workspace: Option<String>,
+    #[serde(default)]
+    web_enabled: bool,
+}
+
 /// Runs a model stream, emitting typed events until completion.
 #[tauri::command]
 pub(crate) async fn stream_chat(
@@ -333,8 +343,7 @@ pub(crate) async fn stream_chat(
     state: State<'_, AppState>,
     jobs: State<'_, crate::setup::SetupState>,
     agent: State<'_, crate::agent_commands::AgentState>,
-    agent_mode: Option<bool>,
-    web_enabled: Option<bool>,
+    options: Option<AgentOptions>,
 ) -> Result<StreamStarted, CommandError> {
     require_unlocked(&app).await?;
     let request_id = request.request_id.clone();
@@ -368,16 +377,24 @@ pub(crate) async fn stream_chat(
         message: "Response stopped.".into(),
         retryable: false,
     };
-    let stream_result = if agent_mode.unwrap_or(false) {
-        let workspace = agent
+    let options = options.unwrap_or_default();
+    let stream_result = if options.enabled {
+        let workspace = options
             .workspace
-            .lock()
-            .map_err(|_| stopped())?
-            .clone()
+            .as_deref()
             .ok_or(CommandError {
                 code: "workspace_required",
                 message: "Choose a project folder before starting an agent task.".into(),
                 retryable: false,
+            })
+            .and_then(|expected| {
+                crate::agent_commands::selected_workspace(&agent, expected).map_err(|_| {
+                    CommandError {
+                        code: "workspace_required",
+                        message: "Reopen this conversation to restore its project folder.".into(),
+                        retryable: false,
+                    }
+                })
             })?;
         let skill_context = crate::data::with_skills(&app, |store| {
             Ok(blackwall_core::skills::prompt(&store.list()?.0))
@@ -403,7 +420,7 @@ pub(crate) async fn stream_chat(
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,
-            web_enabled: web_enabled.unwrap_or(false),
+            web_enabled: options.web_enabled,
             approvals: agent.approvals.clone(),
             emit: std::sync::Arc::new(move |event| {
                 let _ = event_app.emit(EVENT_CHANNEL, event);

@@ -46,6 +46,7 @@ fn run() -> Result<(), StartupError> {
             auth::set_passphrase,
             auth::lock_app,
             agent_commands::choose_workspace,
+            agent_commands::restore_workspace,
             agent_commands::browse_workspace,
             agent_commands::search_workspace,
             agent_commands::read_workspace_file,

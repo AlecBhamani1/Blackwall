@@ -160,9 +160,20 @@ impl LocalStore {
     }
     pub fn list_sessions(&self) -> Result<Vec<Value>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id,title,updated_at FROM sessions ORDER BY updated_at DESC LIMIT 500",
+            "SELECT id, title, updated_at, json_extract(body, '$.mode'),
+                    json_extract(body, '$.workspace')
+             FROM sessions ORDER BY updated_at DESC LIMIT 500",
         )?;
-        let rows = statement.query_map([], |row| Ok(json!({"id":row.get::<_,String>(0)?,"title":row.get::<_,String>(1)?,"updatedAt":row.get::<_,i64>(2)?,"messages":[]})))?;
+        let rows = statement.query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "updatedAt": row.get::<_, i64>(2)?,
+                "messages": [],
+                "mode": row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "chat".into()),
+                "workspace": row.get::<_, Option<String>>(4)?,
+            }))
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
     pub fn load_session(&self, id: &str) -> Result<Option<Value>, StorageError> {
@@ -478,6 +489,28 @@ mod tests {
         db.delete_session("session_one").unwrap();
         assert!(db.list_sessions().unwrap().is_empty());
     }
+    #[test]
+    fn session_summaries_retain_mode_and_project_without_loading_messages() {
+        let db = store();
+        let mut agent = session("agent");
+        agent["mode"] = json!("agent");
+        agent["workspace"] = json!("/projects/first");
+        db.save_session(&agent).unwrap();
+        db.save_session(&session("legacy")).unwrap();
+        let summaries = db.list_sessions().unwrap();
+        let saved_agent = summaries.iter().find(|item| item["id"] == "agent").unwrap();
+        assert_eq!(saved_agent["mode"], "agent");
+        assert_eq!(saved_agent["workspace"], "/projects/first");
+        assert_eq!(saved_agent["messages"], json!([]));
+        let legacy = summaries
+            .iter()
+            .find(|item| item["id"] == "legacy")
+            .unwrap();
+        assert_eq!(legacy["mode"], "chat");
+        assert_eq!(legacy["workspace"], serde_json::Value::Null);
+        assert_eq!(db.load_session("agent").unwrap(), Some(agent));
+    }
+
     #[test]
     fn migration_is_atomic_and_does_not_resurrect_deleted_legacy_sessions() {
         let mut db = store();
