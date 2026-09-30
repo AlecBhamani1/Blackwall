@@ -161,6 +161,14 @@ current limits.
 Named guest accounts, end-to-end application encryption, persisted guest telemetry, and signed
 public desktop distribution are later work—not capabilities of this slice.
 
+## Contributing
+
+Start new work from `origin/partial` and open a focused PR into `partial`. After reviewing its
+current code, a maintainer can apply `ready-to-merge`; the queue updates the branch, waits for
+required CI, and merges reviewed PRs one at a time. New source pushes require another review.
+See the [development and production workflow](docs/REPOSITORY_WORKFLOW.md#automatically-merge-reviewed-development-prs)
+for setup, paused-queue recovery, and production releases.
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE).
