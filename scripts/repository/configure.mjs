@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { branchRules, labels, tagRules } from './config.mjs';
+import { branchRules, labels, tagRules, queueEventPolicy } from './config.mjs';
 
 const args = process.argv.slice(2);
 assert(args.every(arg => arg === '--apply' || /^--reviews=[0-6]$/.test(arg)), 'Use --apply and optionally --reviews=1');
@@ -23,6 +23,8 @@ function api(path, method = 'GET', body) {
 const branches = JSON.parse(gh(['api', `${prefix}/branches?per_page=100`, '--paginate', '--slurp'])).flat();
 const rulesets = JSON.parse(gh(['api', `${prefix}/rulesets?per_page=100`, '--paginate', '--slurp'])).flat();
 const existingLabels = JSON.parse(gh(['api', `${prefix}/labels?per_page=100`, '--paginate', '--slurp'])).flat();
+const actionPolicies = JSON.parse(gh(['api', `${prefix}/actions/policies?per_page=100&has_parents=false`,
+  '--paginate', '--slurp'])).flatMap(page => page.policies);
 if (!branches.some(branch => branch.name === 'partial')) {
   const main = api('git/ref/heads/main');
   api('git/refs', 'POST', { ref: 'refs/heads/partial', sha: main.object.sha });
@@ -36,6 +38,11 @@ for (const branch of ['partial', 'main']) {
 const tags = tagRules();
 const existingTags = rulesets.find(rule => rule.name === tags.name);
 api(existingTags ? `rulesets/${existingTags.id}` : 'rulesets', existingTags ? 'PUT' : 'POST', tags);
+
+const queueEvents = queueEventPolicy();
+const existingQueueEvents = actionPolicies.find(policy => policy.name === queueEvents.name);
+api(existingQueueEvents ? `actions/policies/${existingQueueEvents.id}` : 'actions/policies',
+  existingQueueEvents ? 'PUT' : 'POST', queueEvents);
 
 api('', 'PATCH', {
   default_branch: 'partial', allow_auto_merge: true, allow_update_branch: true,
