@@ -1,5 +1,11 @@
 import { derived, get, writable } from 'svelte/store';
-import { materializeAttachment, revokeAttachmentPreview } from './attachments';
+import {
+  materializeAttachment,
+  revokeAttachmentPreview,
+  MAX_ATTACHMENT_COUNT,
+  MAX_ATTACHMENT_TOTAL_BYTES,
+} from './attachments';
+import { attachmentReferences, referencedAttachments } from './attachmentReferences';
 import { createId } from './id';
 import { normalizeEndpoint, connectionHelp } from './setup';
 import { agentClient } from './agent';
@@ -431,6 +437,32 @@ export function createChatController(
       return false;
     }
 
+    const references = referencedAttachments(
+      content,
+      attachmentReferences([
+        ...get(messages).flatMap((message) => message.attachments),
+        ...pending,
+      ]),
+    ).filter((attachment) => !pending.some((draft) => draft.id === attachment.id));
+    const unavailable = references.find(
+      (attachment) => attachment.dataUrl === undefined && attachment.textContent === undefined,
+    );
+    if (unavailable) {
+      notice.set(
+        `Reattach ${unavailable.name} to reference it; its contents are no longer available.`,
+      );
+      return false;
+    }
+    const allAttachments = [...references, ...pending];
+    if (
+      allAttachments.length > MAX_ATTACHMENT_COUNT ||
+      allAttachments.reduce((total, attachment) => total + attachment.sizeBytes, 0) >
+        MAX_ATTACHMENT_TOTAL_BYTES
+    ) {
+      notice.set('Attached and referenced files must fit within 8 files and 30 MB per message.');
+      return false;
+    }
+
     const generation = ++runGeneration;
     approval.set(null);
     runState.set('preparing');
@@ -438,7 +470,10 @@ export function createChatController(
 
     let attachmentPayloads;
     try {
-      attachmentPayloads = await Promise.all(pending.map(materializeAttachment));
+      attachmentPayloads = [
+        ...references.map(({ previewUrl: _previewUrl, ...payload }) => payload),
+        ...(await Promise.all(pending.map(materializeAttachment))),
+      ];
     } catch (error) {
       if (generation !== runGeneration || destroyed) return false;
       runState.set('error');

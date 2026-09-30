@@ -1,6 +1,6 @@
 # Using the current Blackwall development build
 
-Updated 2026-09-10. This guide describes the code in this checkout. It does not imply that a
+Updated 2026-09-30. This guide describes the code in this checkout. It does not imply that a
 published DMG contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
 
 ## Connect a model
@@ -38,6 +38,28 @@ separately. Environment-variable credentials are managed outside this screen. Ne
 **I have an invitation** opens a full HTTPS Blackwall invitation in the default browser. It does not
 save the invite secret or add a permanent computer. An expired or revoked invitation needs replacement
 by the sender. Guest sharing requires a configured relay; see [sharing](SHARING.md).
+
+## Attach and reference files
+
+Drop screenshots or files anywhere in the conversation, choose files with the paperclip button,
+or paste an image into the message box. Files appear as attachments ready to send with your next
+message. Wait for the current response to finish before adding files. Image questions require a
+vision-capable model.
+
+Type `@` to see files from the current conversation and the pending attachments. Type part of the
+filename to filter the list, then click a file or use the arrow keys and Enter or Tab to select it.
+Escape closes the list. Press Enter again to send. Names with spaces are quoted automatically,
+such as `@"Screenshot 2026-09-30.png"`; distinct files with the same name get numbered choices.
+Referencing a previously sent file includes its retained contents with the new message.
+
+Each message allows eight attached and referenced files, at most 15 MB per file and 30 MB total.
+Native saved conversations retain file contents for later references. If an older conversation
+only retained file metadata, Blackwall asks you to reattach the file before referencing it.
+
+Browser screenshots of the development UI, using a deterministic model fixture:
+[conversation drop target](screenshots/chat-file-drop.png) and
+[file reference picker](screenshots/chat-file-references.png). These demonstrate the browser flow;
+Finder and macOS screenshot-thumbnail drops still require packaged native acceptance.
 
 ## Share with guests
 

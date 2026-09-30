@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { LocalModelClient } from './ipc';
 import { createChatController } from './store';
 import { nativeModelError } from './modelError';
+import { prepareAttachments, MAX_ATTACHMENT_TOTAL_BYTES } from './attachments';
+import type { Attachment, SessionSummary } from './types';
 
 function mockClient(): LocalModelClient {
   return {
@@ -19,6 +21,95 @@ function mockClient(): LocalModelClient {
 }
 
 describe('chat controller', () => {
+  it('resends the contents of a referenced screenshot without reuploading it', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    const pending = prepareAttachments([
+      new File(['pixels'], 'Screenshot 1.png', { type: 'image/png' }),
+    ]).accepted;
+    await controller.send('Describe this', pending);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const original = get(controller.messages)[0].attachments[0];
+    expect(original.dataUrl).toMatch(/^data:image\/png;base64,/);
+    await controller.send('Look again at @"Screenshot 1.png"', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const request = vi.mocked(client.streamChat).mock.calls[1][0];
+    expect(request.messages.at(-1)?.attachments).toEqual([
+      expect.objectContaining({ id: original.id, dataUrl: original.dataUrl }),
+    ]);
+    expect(get(controller.messages)[2].attachments[0].id).toBe(original.id);
+    controller.destroy();
+  });
+
+  it('counts both new attachments and references against the message limits', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    const attachments: Attachment[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `file-${i}`,
+      name: `file-${i}.txt`,
+      kind: 'text',
+      mimeType: 'text/plain',
+      sizeBytes: 1,
+      textContent: 'x',
+    }));
+    controller.messages.set([
+      {
+        id: 'previous',
+        role: 'user',
+        content: '',
+        attachments,
+        status: 'complete',
+        createdAt: 1,
+      },
+    ]);
+    const pending = prepareAttachments([new File(['extra'], 'extra.txt')]).accepted;
+    expect(
+      await controller.send(attachments.map((file) => `@${file.name}`).join(' '), pending),
+    ).toBe(false);
+    expect(get(controller.notice)).toContain('8 files');
+    controller.messages.update((messages) => [
+      {
+        ...messages[0],
+        attachments: attachments.slice(0, 3).map((attachment) => ({
+          ...attachment,
+          sizeBytes: MAX_ATTACHMENT_TOTAL_BYTES / 3,
+        })),
+      },
+    ]);
+    expect(await controller.send('@file-0.txt @file-1.txt @file-2.txt', pending)).toBe(false);
+    expect(get(controller.notice)).toContain('30 MB');
+    expect(client.streamChat).not.toHaveBeenCalled();
+    controller.destroy();
+  });
+
+  it('keeps references out of another conversation and explains missing retained contents', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    controller.messages.set([
+      {
+        id: 'previous',
+        role: 'user',
+        content: '',
+        status: 'complete',
+        createdAt: 1,
+        attachments: [
+          { id: 'file', name: 'legacy.txt', kind: 'text', mimeType: 'text/plain', sizeBytes: 3 },
+        ],
+      },
+    ]);
+    expect(await controller.send('Read @legacy.txt', [])).toBe(false);
+    expect(get(controller.notice)).toContain('Reattach legacy.txt');
+    expect(client.streamChat).not.toHaveBeenCalled();
+    await controller.newChat();
+    expect(await controller.send('Read @legacy.txt', [])).toBe(true);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].messages[0].attachments).toEqual([]);
+    controller.destroy();
+  });
+
   it('preserves saved pairing after a Keychain failure and reconnects without replay', async () => {
     const client = mockClient();
     const controller = createChatController(client);
@@ -312,6 +403,54 @@ describe('native conversation persistence', () => {
       load: vi.fn().mockResolvedValue(null),
     };
   }
+  it('references retained files after reopening a saved native conversation', async () => {
+    const storage = await nativeStorage();
+    const saved: SessionSummary = {
+      id: 'saved',
+      title: 'Files',
+      updatedAt: 1,
+      messages: [
+        {
+          id: 'previous',
+          role: 'user',
+          content: 'Two files',
+          status: 'complete',
+          createdAt: 1,
+          attachments: [
+            {
+              id: 'first',
+              name: 'notes.md',
+              kind: 'text',
+              mimeType: 'text/markdown',
+              sizeBytes: 3,
+              textContent: 'one',
+            },
+            {
+              id: 'second',
+              name: 'notes.md',
+              kind: 'text',
+              mimeType: 'text/markdown',
+              sizeBytes: 3,
+              textContent: 'two',
+            },
+          ],
+        },
+      ],
+    };
+    storage.list.mockResolvedValue([saved]);
+    storage.load.mockResolvedValue(saved);
+    const client = mockClient();
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    await controller.openSession(saved.id);
+    await controller.send('Read @"notes.md (2)"', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].messages.at(-1)?.attachments).toEqual([
+      expect.objectContaining({ id: 'second', textContent: 'two' }),
+    ]);
+    controller.destroy();
+  });
+
   it('blocks new turns when the native database cannot open', async () => {
     const storage = await nativeStorage();
     storage.list.mockRejectedValue(new Error('disk unavailable'));
