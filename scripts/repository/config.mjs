@@ -47,3 +47,16 @@ export function tagRules() {
     rules: [{ type: 'deletion' }, { type: 'update' }],
   };
 }
+
+// An explicit, workflow-scoped event policy keeps the trusted queue running
+// when GitHub enforces its public-repository pull_request_target default.
+export function queueEventPolicy() {
+  return {
+    name: 'Partial merge queue triggers',
+    enforcement: 'active',
+    conditions: { workflow_path: { include: ['.github/workflows/merge-queue.yml'], exclude: [] } },
+    rules: [{ type: 'restrict_action_events', parameters: {
+      allowed_events: ['pull_request_target', 'workflow_run', 'push', 'schedule', 'workflow_dispatch'],
+    } }],
+  };
+}

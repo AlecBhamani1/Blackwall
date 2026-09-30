@@ -92,6 +92,12 @@ Only trusted code from `partial` executes in the privileged queue workflow; it n
 or executes a PR's code. No token has a branch-protection bypass. Without the secret, queued PRs
 pause with a setup instruction instead of attempting an update or merge.
 
+The active **Partial merge queue triggers** Actions policy explicitly allows this workflow's
+five triggers, including `pull_request_target`. It targets only `.github/workflows/merge-queue.yml`,
+so the queue continues working when GitHub enforces its public-repository event default on
+November 2, 2026. `npm run repo:configure -- --apply` creates or updates this policy while
+preserving unrelated policies. See GitHub's [event policy guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target#default-policy-for-pull_request_target).
+
 Start each new task from `origin/partial`. Completed feature branches are historical snapshots;
 they do not need continuous updates. The queue updates open PRs, not local worktrees.
 
