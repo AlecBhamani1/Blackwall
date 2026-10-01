@@ -288,18 +288,14 @@ async fn desktop_recovers_the_same_invitation_after_relay_process_restart_withou
 
 #[tokio::test]
 async fn expiry_ends_an_in_flight_request_and_rejects_the_old_invitation() {
+    const INVITE_LIFETIME: Duration = Duration::from_secs(10);
     let mut relay = RelayProcess::new();
     relay.start().await;
     let mut owner = registration();
-    owner.expires_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-        + 750;
-    let (mut host, reply) = register(&relay, owner.clone()).await;
-    assert_eq!(reply, RelayToHost::Registered);
+    // Prepare the HTTP client before starting the invitation's lifetime. Client setup and
+    // durable host registration can exceed the old 750 ms deadline on Windows CI runners.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(INVITE_LIFETIME + Duration::from_secs(5))
         .build()
         .unwrap();
     let base = format!("{}/s/{}/v1", relay.url(), owner.session_id);
@@ -307,8 +303,15 @@ async fn expiry_ends_an_in_flight_request_and_rejects_the_old_invitation() {
         .post(format!("{base}/chat/completions"))
         .bearer_auth("guest-secret")
         .json(&serde_json::json!({"messages":[], "stream":true}));
+    owner.expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + INVITE_LIFETIME.as_millis() as u64;
+    let (mut host, reply) = register(&relay, owner.clone()).await;
+    assert_eq!(reply, RelayToHost::Registered);
     let response = tokio::spawn(async move { request.send().await.unwrap() });
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Message::Text(text) = host.next().await.unwrap().unwrap() {
                 if matches!(
@@ -321,7 +324,7 @@ async fn expiry_ends_an_in_flight_request_and_rejects_the_old_invitation() {
         }
     })
     .await
-    .unwrap();
+    .expect("the chat request must reach the host before the invitation expires");
     // Keep the socket open and deliberately leave the model request unfinished.
     let response = response.await.unwrap();
     assert_eq!(response.status(), 502);
