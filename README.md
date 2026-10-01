@@ -67,7 +67,7 @@ On macOS, Linux, or Windows with a POSIX shell (such as Git Bash), install the l
 Rust 1.90+ and Cargo available:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AlecBhamani1/Blackwall/main/scripts/install-cli.sh | sh
+curl -fsSL https://raw.githubusercontent.com/AlecBhamani1/Blackwall/partial/scripts/install-cli.sh | sh
 ```
 
 The installer works from any directory and installs `bw` onto Cargo's executable path. Then run:
