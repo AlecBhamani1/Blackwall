@@ -7,10 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- Add signed in-app updates backed by continuous macOS builds from GitHub `main`.
-- Explicitly bundle the Blackwall logo for the app, Dock, and installer icons.
-- Replace direct private-network guest sharing with a configurable, self-hosted HTTPS relay and
-  outbound-only desktop connection.
+## [0.1.4] - 2026-10-01
+
+Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).
+Release details and acceptance limits: [0.1.4 notes](docs/releases/0.1.4.md).
 
 ### Added
 
@@ -19,7 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   graceful cancellation retains partial answers, and environment access keys stay scoped to their origin.
 
 - Run Blackwall on Windows 10/11 (x64) and Linux (x86-64 and ARM64, including NVIDIA DGX Spark),
-  with signed installers and in-app updates. Access keys, pairing credentials, and the app lock use
+  with installers and signed in-app updates. Access keys, pairing credentials, and the app lock use
   Windows Credential Manager or the Linux Secret Service, and Agent-mode shell commands run in
   Windows PowerShell on Windows. Pairing and guest links work between any mix of macOS, Windows,
   and Linux computers.
@@ -39,6 +39,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   weekly dependency maintenance, issue/PR templates, and reproducible GitHub repository policy.
 
 - Copy buttons on individual Markdown code blocks, with success and failure feedback.
+
+### Fixed
+
+- Keep Blackwall running on macOS when the main window is closed, preserving active work and
+  restoring the window from the Dock. Quit and Cmd+Q still exit the app.
+
+- Stop Windows shell descendants on cancellation, timeout, and command completion even when
+  their parent PowerShell process has already exited.
+
+- Separate Chat and Agent histories, lock conversation mode and project after the first message,
+  restore each Agent conversation’s project, and clear the project when starting a new chat.
+
+### Changed
+
+- Reviewed development pull requests enter a checked merge queue before reaching `partial`.
+- Update Rust dependencies while preserving existing stored hashes; upgrade Vitest and coverage
+  together to version 5, and retain TypeScript 6 until the Svelte checker supports its successor.
+
+## [0.1.3] - 2026-09-24
+
+- Add signed in-app updates backed by continuous macOS builds from GitHub `main`.
+- Explicitly bundle the Blackwall logo for the app, Dock, and installer icons.
+- Replace direct private-network guest sharing with a configurable, self-hosted HTTPS relay and
+  outbound-only desktop connection.
+
+### Added
+
 - Persistent computer pairing with five-minute invitations, matching-code host consent, per-device
   Keychain credentials, saved computer cards, automatic tunnel recovery, and durable individual revocation.
 - Relay pairing capability detection, bounded exchanges, and a shared eight-request guest/device budget.
@@ -53,15 +80,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Up to four named guest invitations with independent revocation and Keychain-backed relay tokens.
 
 ### Fixed
-
-- Keep Blackwall running on macOS when the main window is closed, preserving active work and
-  restoring the window from the Dock. Quit and Cmd+Q still exit the app.
-
-- Stop Windows shell descendants on cancellation, timeout, and command completion even when
-  their parent PowerShell process has already exited.
-
-- Separate Chat and Agent histories, lock conversation mode and project after the first message,
-  restore each Agent conversation’s project, and clear the project when starting a new chat.
 
 - Keep a stable pairing address through failed saves; serialize activation with locking, retain
   authorization until database workers finish, and complete lock cleanup after caller cancellation.

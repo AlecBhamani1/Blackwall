@@ -68,12 +68,14 @@ milestone. Follow [the repository workflow](REPOSITORY_WORKFLOW.md) for the full
 2. Merge the preparation work into `partial`, then open a `partial` → `main` PR. Assign its
    `v<version>` milestone and complete the production checklist. The gate requires meaningful
    notes, a newer version, current main ancestry, and the previous release's completed feed.
-   CI also checks desktop builds for both architectures before merging.
+   CI also checks all five desktop targets before merging: Apple Silicon and Intel macOS,
+   Windows x64, and Linux x86-64/ARM64.
 3. Merge the promotion with a merge commit. After CI succeeds for this exact main push,
    **Publish versioned release** automatically checks out that production SHA and creates a
-   commit-pinned draft. It builds Apple Silicon and Intel installers and signed updater archives.
-4. The final job verifies all six files against their GitHub SHA-256 digests, verifies both updater
-   entries reference those archives and match their signature files, then publishes `v<version>`
+   commit-pinned draft. It builds installers and signed updater bundles for all five targets.
+4. The final job verifies every required installer, updater bundle, and signature against its
+   GitHub SHA-256 digest, verifies the updater entries reference those bundles and match their
+   signature files, then publishes `v<version>`
    as Latest. It updates the old `main/latest.json` feed only after publishing the complete release.
 5. Verify downloads and the app's update check, close the milestone, and merge `main` back into
    `partial` with a checked sync PR and merge commit before the next promotion.
@@ -91,7 +93,7 @@ approval. The committed version is used, so a dispatch cannot silently choose a 
 ## Failure and retry
 
 A failed build leaves a draft and the existing updater feed untouched. Use **Re-run failed jobs**
-to finish it. The two builds run sequentially because Tauri merges their updater entries into one
+to finish it. The five builds run sequentially because Tauri merges their updater entries into one
 manifest. Release runs are also serialized so an older run cannot overwrite a newer update feed.
 
 Publishing the release and replacing the compatibility feed are separate GitHub operations. If the
