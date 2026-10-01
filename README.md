@@ -9,18 +9,35 @@ on this computer or on another machine you control through any OpenAI-compatible
 > are available in the 0.1.3 development build. Release acceptance remains incomplete.
 > Persistent pairing is implemented with a configured relay;
 > native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in [the delivery plan](docs/DELIVERY_PLAN.md).
+> Linux and Windows builds are new and still need physical-device acceptance.
 
-## Download for macOS
+## Download
 
-[Download the latest macOS build](https://github.com/AlecBhamani1/Blackwall/releases/latest).
-Choose the `aarch64` DMG for Apple Silicon Macs or the `x64` DMG for Intel Macs.
+[Download the latest build](https://github.com/AlecBhamani1/Blackwall/releases/latest) for your
+computer:
+
+| Platform | File | Notes |
+| --- | --- | --- |
+| macOS, Apple Silicon | `Blackwall_<version>_aarch64.dmg` | |
+| macOS, Intel | `Blackwall_<version>_x64.dmg` | |
+| Windows 10/11, x64 | `Blackwall_<version>_x64-setup.exe` | Uses WebView2, which Windows 11 includes |
+| Linux, x86-64 | `Blackwall_<version>_amd64.AppImage` or `_amd64.deb` | AppImage updates in place |
+| Linux, ARM64 (for example NVIDIA DGX Spark) | `Blackwall_<version>_aarch64.AppImage` or `_arm64.deb` | AppImage updates in place |
+
+Linux builds target Ubuntu 22.04 or newer (and equivalent distributions) with WebKitGTK 4.1. They
+store access keys through the Secret Service, so a keyring such as GNOME Keyring or KWallet must
+be running and unlocked. Windows stores access keys in Credential Manager; macOS uses Keychain.
+Windows and macOS builds are not yet code-signed by a platform publisher, so the first launch shows
+a SmartScreen or Gatekeeper warning.
 
 ## What works now
 
 - Guided setup for local models, another computer, or a browser invitation
 - Detection of local Ollama and LM Studio; explicit starter-model downloads through Ollama
-- Named saved connections with remembered models, tested replacements, and managed Keychain access keys
-- Host-approved persistent computer pairing, per-device Keychain credentials, reconnect, and individual removal
+- Named saved connections with remembered models, tested replacements, and managed access keys in
+  the platform credential store (Keychain, Windows Credential Manager, or Secret Service)
+- Host-approved persistent computer pairing between any mix of macOS, Windows, and Linux, with
+  per-device stored credentials, reconnect, and individual removal
 - Streaming chat, images/files, Markdown, stop controls, and JSON conversation export
 - Native SQLite history with attachment contents, migration, and ordered save retries
 - Optional desktop passphrase lock that stops active work and guest sharing
@@ -35,9 +52,10 @@ an existing model service, guides you to install Ollama if needed, and offers a 
 only after you choose it. It does not install, start, or reconfigure model-server software itself.
 
 For another computer, create a pairing invitation in Settings on the model host. Paste it into
-**Connect a computer** on your other Mac, compare the code on both screens, and approve on the host.
-The saved computer reconnects using its own Keychain credential. The host must stay open, unlocked,
-and awake. A configured relay is currently required; direct model URLs remain under advanced setup.
+**Connect a computer** on your other computer, compare the code on both screens, and approve on the
+host. The host and client can run different operating systems: for example, a Linux DGX Spark can
+host its model for a Windows laptop. The saved computer reconnects using its own stored credential.
+The host must stay open, unlocked, and awake. A configured relay is currently required; direct model URLs remain under advanced setup.
 Temporary guest invitations open browser chat and have their own expiry and removal controls.
 
 See [the user and operator guide](docs/RUNTIME_GUIDE.md) for project tools, data storage, app-lock
@@ -47,6 +65,9 @@ limits, memory, skills, and troubleshooting.
 
 Prerequisites are Node.js 22.12+, npm, the stable Rust toolchain, and the
 [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+On Ubuntu or Debian, `./scripts/install-linux-deps.sh` installs the WebKitGTK, D-Bus, and bundling
+libraries. On Windows, install the Visual Studio C++ build tools and WebView2, then set the variables
+below with `$env:NAME = 'value'` in PowerShell.
 
 ```sh
 npm install
@@ -142,8 +163,8 @@ Open **Settings** from the bottom-left of the desktop app. Under **Share your mo
 pinned model, enter the HTTPS origin of a hosted relay, choose an expiry, and select **Create guest
 link**. Blackwall presents a QR code and copy-link control containing the same browser URL. The
 invite expires, can be revoked at any time, and never reveals the upstream model address or its
-credentials. The Mac makes an outbound WebSocket connection, so guest access needs no VPN, shared
-Wi-Fi, inbound port, or public IP on the Mac.
+credentials. The host computer makes an outbound WebSocket connection, so guest access needs no VPN,
+shared Wi-Fi, inbound port, or public IP on the host.
 
 ```sh
 # The model may run on a different machine; Blackwall does not launch Ollama.

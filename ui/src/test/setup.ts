@@ -36,3 +36,9 @@ Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
   configurable: true,
   value: vi.fn(),
 });
+
+// Platform copy is chosen at import; keep tests on the macOS wording on every CI host.
+Object.defineProperty(window.navigator, 'userAgent', {
+  configurable: true,
+  value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+});

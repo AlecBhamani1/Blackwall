@@ -48,17 +48,30 @@ export function requireSuccessfulCI(runs, sha, branch = 'main') {
     `The latest ${branch}-branch CI run for this exact commit must finish successfully first`);
 }
 
+// Each updater platform, the signed bundle it installs, and installers offered as direct downloads.
+// Names follow the Tauri CLI output that tauri-action uploads; macOS archives gain version and arch.
+export function desktopPlatforms(version) {
+  const file = suffix => `Blackwall_${version}_${suffix}`;
+  return [
+    { platform: 'darwin-aarch64', bundle: 'app', updater: file('aarch64.app.tar.gz'), installers: [file('aarch64.dmg')] },
+    { platform: 'darwin-x86_64', bundle: 'app', updater: file('x64.app.tar.gz'), installers: [file('x64.dmg')] },
+    { platform: 'linux-x86_64', bundle: 'appimage', updater: file('amd64.AppImage'), installers: [file('amd64.deb')] },
+    { platform: 'linux-aarch64', bundle: 'appimage', updater: file('aarch64.AppImage'), installers: [file('arm64.deb')] },
+    { platform: 'windows-x86_64', bundle: 'nsis', updater: file('x64-setup.exe'), installers: [] },
+  ];
+}
+
 export function requiredAssets(version) {
   releaseVersionParts(version);
-  return ['aarch64', 'x64'].flatMap(arch => [
-    `Blackwall_${version}_${arch}.dmg`,
-    `Blackwall_${version}_${arch}.app.tar.gz`,
-    `Blackwall_${version}_${arch}.app.tar.gz.sig`,
+  return desktopPlatforms(version).flatMap(({ installers, updater }) => [
+    ...installers,
+    updater,
+    `${updater}.sig`,
   ]);
 }
 
 // Convert Tauri's API asset URLs into stable, version-specific public downloads.
-// Both architecture entries and their signatures must match this release's files.
+// Every platform entry and its signature must match this release's files.
 export function validateManifest(release, manifest, signatures, repository, version, channel = 'stable') {
   assert(['stable', 'beta'].includes(channel));
   if (channel === 'stable') versionParts(version);
@@ -90,21 +103,25 @@ export function validateManifest(release, manifest, signatures, repository, vers
       `https://github.com/${repository}/releases/download/${downloadTag}/${name}`);
   }
   const platforms = {};
-  for (const [platform, arch] of [['darwin-aarch64', 'aarch64'], ['darwin-x86_64', 'x64']]) {
-    const name = `Blackwall_${version}_${arch}.app.tar.gz`;
+  const signed = (key, name) => {
     const asset = assets.get(name);
-    const entry = manifest.platforms?.[platform];
-    assert(entry, `Missing platform: ${platform}`);
+    assert(asset?.state === 'uploaded' && asset.size > 0, `Missing or incomplete asset: ${name}`);
     const signature = signatures[name + '.sig']?.trim();
     assert(signature && signature.length > 0, `Missing signature: ${name}`);
+    const candidate = manifest.platforms[key];
     const publicUrl = `https://github.com/${repository}/releases/download/v${version}/${name}`;
-    for (const key of [platform, `${platform}-app`]) {
-      const candidate = manifest.platforms[key];
-      if (!candidate && key.endsWith('-app')) continue;
-      assert.equal(candidate.signature?.trim(), signature, `Signature mismatch: ${key}`);
-      assert([asset.url, asset.browser_download_url, publicUrl].includes(candidate.url), `Wrong release asset: ${key}`);
-      platforms[key] = { signature, url: publicUrl };
-    }
+    assert.equal(candidate.signature?.trim(), signature, `Signature mismatch: ${key}`);
+    assert([asset.url, asset.browser_download_url, publicUrl].includes(candidate.url), `Wrong release asset: ${key}`);
+    platforms[key] = { signature, url: publicUrl };
+  };
+  for (const { platform, bundle, updater, installers } of desktopPlatforms(version)) {
+    assert(manifest.platforms?.[platform], `Missing platform: ${platform}`);
+    // The primary entry and its installer-specific alias both install the updater bundle.
+    signed(platform, updater);
+    if (manifest.platforms[`${platform}-${bundle}`]) signed(`${platform}-${bundle}`, updater);
+    // Newer Tauri builds also sign Debian packages so .deb installations update in place.
+    const deb = installers.find(name => name.endsWith('.deb'));
+    if (deb && manifest.platforms[`${platform}-deb`]) signed(`${platform}-deb`, deb);
   }
   assert(Object.keys(manifest.platforms).every(key => key in platforms), 'Unexpected updater platform');
   return { ...manifest, platforms };

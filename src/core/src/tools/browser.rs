@@ -77,15 +77,15 @@ impl Workspace {
                 continue;
             }
             let relative = root.join(name);
-            let Some(label) = relative.to_str() else {
+            let Some(label) = super::label(&relative) else {
                 continue;
             };
-            if Self::checked(label).is_err() {
+            if Self::checked(&label).is_err() {
                 continue;
             }
             entries.push(FileEntry {
                 name: name.into(),
-                path: label.into(),
+                path: label,
                 is_directory: kind.is_dir(),
             });
         }
@@ -187,13 +187,19 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::create_dir(root.join(".git")).unwrap();
-        std::fs::write(root.join("two\nlines.txt"), "Needle in text").unwrap();
+        // Windows forbids control characters in names; check an unusual Unicode name there.
+        let odd_name = if cfg!(windows) {
+            "two lines — ünïcode.txt"
+        } else {
+            "two\nlines.txt"
+        };
+        std::fs::write(root.join(odd_name), "Needle in text").unwrap();
         std::fs::write(root.join("docs/guide.md"), "another needle").unwrap();
         let workspace = Workspace::open(&root).unwrap();
         let listing = workspace.browse(".").unwrap();
         assert_eq!(listing.entries.len(), 2);
         assert_eq!(listing.entries[0].name, "docs");
-        assert_eq!(listing.entries[1].name, "two\nlines.txt");
+        assert_eq!(listing.entries[1].name, odd_name);
         assert!(!listing.truncated);
         assert!(workspace.browse("../").is_err());
         assert!(workspace.browse("/etc").is_err());
@@ -249,6 +255,8 @@ mod tests {
                 .len(),
             1
         );
+        // Close the directory handle first; Windows cannot delete an open directory.
+        drop(workspace);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

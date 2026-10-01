@@ -1,4 +1,4 @@
-//! Bound caller waits without pretending a blocking macOS security call can be cancelled.
+//! Bound caller waits without pretending a blocking credential-store call can be cancelled.
 use std::{
     sync::{Arc, LazyLock},
     time::Duration,
@@ -7,7 +7,10 @@ use tokio::sync::Semaphore;
 
 static READS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-const WAITING: &str = "Keychain access is still waiting. Respond to any macOS Keychain prompt, then try again. Your saved keys have not been changed.";
+fn waiting() -> String {
+    let (store, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
+    format!("Still waiting for {store}. {recover}, then try again. Your saved keys have not been changed.")
+}
 
 pub(crate) async fn read<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
@@ -21,7 +24,7 @@ async fn read_with<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     tokio::time::timeout(timeout, async move {
-        let permit = gate.acquire_owned().await.map_err(|_| WAITING.to_owned())?;
+        let permit = gate.acquire_owned().await.map_err(|_| waiting())?;
         tokio::task::spawn_blocking(move || {
             // Keep the permit inside the OS call even after timeout/caller cancellation.
             // Retries may wait, but cannot launch more simultaneous security prompts.
@@ -29,10 +32,15 @@ async fn read_with<T: Send + 'static>(
             operation()
         })
         .await
-        .map_err(|_| "Keychain access could not finish. Try again.".to_owned())?
+        .map_err(|_| {
+            format!(
+                "Access to {} could not finish. Try again.",
+                crate::secrets::STORE
+            )
+        })?
     })
     .await
-    .map_err(|_| WAITING.to_owned())?
+    .map_err(|_| waiting())?
 }
 
 #[cfg(test)]
@@ -58,7 +66,7 @@ mod tests {
         .await;
         // Always release the worker before asserting, including on test failure.
         let _ = release.send(());
-        assert!(first.is_err_and(|error| error.contains("Keychain")));
+        assert!(first.is_err_and(|error| error.contains(crate::secrets::STORE)));
         assert!(second.is_err());
         assert!(!attempted.load(Ordering::SeqCst));
         assert_eq!(

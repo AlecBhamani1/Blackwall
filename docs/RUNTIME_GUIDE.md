@@ -1,7 +1,14 @@
 # Using the current Blackwall development build
 
 Updated 2026-09-30. This guide describes the code in this checkout. It does not imply that a
-published DMG contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
+published installer contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
+
+Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
+credentials, and the app-lock verifier use the platform credential store: Keychain on macOS,
+Credential Manager on Windows, and the Secret Service (GNOME Keyring, KWallet, or a compatible
+provider) on Linux. On Linux, start and unlock a keyring before saving keys; without one, Blackwall
+reports that no system keyring is available and does not fall back to plain-text storage. Local data
+lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows).
 
 ## Connect a model
 
@@ -19,8 +26,9 @@ published DMG contains these changes. See [delivery status](DELIVERY_PLAN.md) be
 **Connect a computer** offers persistent pairing. On the model host, open Settings, choose
 **Pair another computer**, and create an invitation for the selected model. Paste it on the client,
 compare both confirmation codes, and approve on the host. The saved computer's **Connect** button
-checks model discovery before replacing your current connection. Later launches reuse its Keychain
-credential. Keep Blackwall open, unlocked, and awake on the host with its model service running.
+checks model discovery before replacing your current connection. Later launches reuse its stored
+credential. The host and client may run different operating systems; pairing uses the same relay
+protocol everywhere. Keep Blackwall open, unlocked, and awake on the host with its model service running.
 A configured relay is currently required; no default Blackwall-operated relay is provided yet.
 
 Direct model access remains under advanced setup. Save a reachable OpenAI-compatible address and a
@@ -28,7 +36,7 @@ friendly name after discovery succeeds. Each connection remembers its selected m
 direct connections do not start or reconfigure the model service automatically.
 
 For an authenticated service, expand **Access key**. The native app tests the key before saving it
-in macOS Keychain, scoped to the service origin. An empty setup field preserves the existing key.
+in the platform credential store, scoped to the service origin. An empty setup field preserves the existing key.
 **Settings → Access keys** shows whether the current model service or configured relay has a saved key.
 Replace a model key with **Verify and save key**, or remove a stored key after reviewing the confirmation.
 To replace a relay key, supply the new token when creating a guest link; it is saved after registration.
@@ -68,7 +76,7 @@ let the guest scan the QR code. You can keep four links active, each with its ow
 Choose **Create another guest link** for another person. The active-link list shows names, models,
 expiry, and request counts. **Revoke** ends only that link; **Stop sharing** revokes all links.
 
-The relay address is remembered locally. A supplied relay token is saved to macOS Keychain after
+The relay address is remembered locally. A supplied relay token is saved to the platform credential store after
 successful registration and reused for that relay origin. Guest links stay only in the app's memory;
 if a window loses its access code, revoke that individual link and create a replacement.
 
@@ -92,8 +100,10 @@ For each proposed change, choose **Deny**, **Allow once**, or **Allow identical 
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
 
-Shell commands run as your macOS account and are not sandboxed. Their output is bounded, they have a
-two-minute limit, and cancellation terminates their process group. Review the command itself when
+Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
+`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they have a two-minute
+limit, and cancellation terminates their process group or Windows Job Object, including children
+whose parent shell has already exited. Review the command itself when
 deciding; the selected project folder does not constrain what an approved shell command can access.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
@@ -152,13 +162,13 @@ Guest chats never receive owner memory, skills, project tools, or local conversa
 ## App lock
 
 Enable **App lock** in Settings with a passphrase of at least 10 characters. Blackwall stores a salted
-Argon2id verifier in macOS Keychain. The app locks on reopening, and **Lock now** stops active work and
+Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
 sharing after flushing pending conversation saves. Failed attempts incur a short delay, increasing
 after repeated failures. Changing or removing the lock requires the current passphrase.
 
 This is an access control for the desktop app. It does not encrypt the database, attachments, skills,
-or exports, and does not stop the same macOS account from reading them or using the CLI. FileVault
-protects the disk when the account/device is locked. There is no built-in forgotten-passphrase recovery
+or exports, and does not stop the same user account from reading them or using the CLI. Disk
+encryption (FileVault, BitLocker, or LUKS) protects the disk when the account/device is locked. There is no built-in forgotten-passphrase recovery
 flow; do not enable the lock without retaining the passphrase securely.
 
 ## CLI
@@ -176,12 +186,12 @@ are saved; interrupted CLI runs do not yet persist a partial transcript.
 
 Set `BLACKWALL_MODEL`, `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), and optionally
 `BLACKWALL_MODEL_API_KEY`. The CLI currently uses environment model credentials, not the desktop's
-Keychain connection selection. `bw request "prompt"` prints a protocol preview without calling a model.
+saved connection selection. `bw request "prompt"` prints a protocol preview without calling a model.
 
 ## Release and remote-access gates
 
-A release still needs native Keychain/dialog/lock testing in a packaged app, clean-machine installation,
-Apple signing/notarization, a signed-updater upgrade test, and model-tool compatibility checks.
+A release still needs native credential-store/dialog/lock testing in a packaged app on each
+platform, clean-machine installation, Apple signing/notarization, Windows code signing, a signed-updater upgrade test, and model-tool compatibility checks.
 
 Persistent pairing is implemented with a configured relay. Remote release gates still include
 packaged host-consent/revocation checks, an operated default relay, and two-computer tests across

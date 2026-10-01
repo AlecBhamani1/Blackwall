@@ -9,7 +9,7 @@ body:
     id: version
     attributes:
       label: Version and environment
-      description: Blackwall version, macOS version, CPU architecture, and relevant model/relay setup.
+      description: Blackwall version, operating system and version (macOS, Windows, or Linux distribution), CPU architecture, and relevant model/relay setup.
     validations:
       required: true
   - type: textarea

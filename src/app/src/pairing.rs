@@ -321,7 +321,7 @@ async fn reconcile(
                         Err(_) => warnings.push(format!("Removal of {} is pending. Keep Blackwall open and reconnect to the relay.", device.name)),
                     }
                 } else {
-                    warnings.push(format!("The removal key for {} is missing. Restore its Keychain entry to finish revocation.", device.name));
+                    warnings.push(format!("The removal key for {} is missing. Restore its entry in {} to finish revocation.", device.name, crate::secrets::STORE));
                 }
             }
             if device.state == "active" && !inner.tunnels.contains_key(&device.id) {

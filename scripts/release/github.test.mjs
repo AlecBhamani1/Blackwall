@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { requiredAssets } from './validate.mjs';
+import { desktopPlatforms, requiredAssets } from './validate.mjs';
 
 const script = fileURLToPath(new URL('./github.mjs', import.meta.url));
 const repository = 'example/blackwall';
@@ -33,9 +33,8 @@ function fixture(t, beta = false) {
   }
   for (const name of requiredAssets(version)) asset(release, name, name.endsWith('.sig') ? `signed-${name}\n` : `binary-${name}`);
   const platforms = {};
-  for (const [platform, arch] of [['darwin-aarch64', 'aarch64'], ['darwin-x86_64', 'x64']]) {
-    const name = `Blackwall_${version}_${arch}.app.tar.gz`;
-    platforms[platform] = { signature: `signed-${name}.sig`, url: release.assets.find(asset => asset.name === name).url };
+  for (const { platform, updater } of desktopPlatforms(version)) {
+    platforms[platform] = { signature: `signed-${updater}.sig`, url: release.assets.find(asset => asset.name === updater).url };
   }
   asset(release, 'latest.json', JSON.stringify({ version, notes: 'Release notes', pub_date: '2026-09-29T12:00:00Z', platforms }));
   asset(compatibility, 'latest.json', JSON.stringify({ version: beta ? '0.1.5-beta.41' : '0.1.3' }));

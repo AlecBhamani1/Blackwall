@@ -1,5 +1,5 @@
 //! Alternate bundle identifiers isolate acceptance builds from the production app.
-//! The production identifier retains its established data paths and Keychain names.
+//! The production identifier retains its established data paths and credential-store names.
 use std::{path::PathBuf, sync::OnceLock};
 use tauri::{AppHandle, Manager};
 const PRODUCTION_ID: &str = "com.blackwall.app";

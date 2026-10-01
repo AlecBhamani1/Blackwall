@@ -20,13 +20,13 @@ Select **Stable** to return to the latest production release, even when its vers
 an installed beta. Changing channels checks immediately; it never installs automatically.
 
 After CI succeeds for a trusted push to `partial`, **Publish beta release** creates a commit-pinned
-prerelease with signed Apple Silicon and Intel builds. It reuses the production signing secrets.
+prerelease with signed macOS (Apple Silicon and Intel), Windows x64, and Linux x86-64/ARM64 builds. It reuses the production signing secrets.
 Versions use the next patch above `.github/release.json`, followed by `-beta.<workflow run number>`;
 for a `0.1.4` production plan, a preview is `0.1.5-beta.42`. Each workflow retry retains its version.
 Beta notes include the Unreleased changelog and source commit. Beta does not require production
 acceptance and may contain unfinished features or bugs.
 
-The workflow verifies both architectures and signatures before publishing and advancing
+The workflow verifies every platform's downloads and signatures before publishing and advancing
 `beta/latest.json`. It creates the `beta` feed release on first publication, keeps versioned files
 immutable, and never changes GitHub Latest or `main/latest.json`. A failed upload is repaired by
 rerunning the failed job; published builds are not rebuilt. A newer published beta blocks an older
@@ -36,11 +36,24 @@ Once this change merges into `partial`, passing push CI starts the first beta bu
 manually, run **Publish beta release** from **partial**; successful push CI for that exact commit
 is still required. Existing apps without the channel selector need one manual installation of a
 beta download (or a stable release containing this selector). Download a numbered prerelease's
-DMG from GitHub Releases; the `beta` release itself hosts only the updater feed.
+installer from GitHub Releases; the `beta` release itself hosts only the updater feed.
 
 Beta and stable replace the same application and use the same local data. An older stable build
 may not understand data formats introduced by a future beta; back up local data before testing
 versions that change storage formats.
+
+## Platform updater bundles
+
+| Updater platform | Signed update bundle | Other downloads |
+| --- | --- | --- |
+| `darwin-aarch64`, `darwin-x86_64` | `.app.tar.gz` | `.dmg` |
+| `windows-x86_64` | NSIS `x64-setup.exe` | — |
+| `linux-x86_64`, `linux-aarch64` | `.AppImage` | `.deb` (updates in place when Tauri signs it) |
+
+Windows builds use NSIS only: WiX MSI cannot represent beta pre-release versions. Linux builds run on
+Ubuntu 22.04 runners so the AppImage works on 22.04 and newer distributions. A `.deb` installation is
+updated by the in-app updater only when the feed carries a signed `linux-<arch>-deb` entry;
+otherwise reinstall the newer package or use the AppImage.
 
 ## Publishing an approved version
 

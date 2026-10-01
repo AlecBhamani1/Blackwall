@@ -2,6 +2,7 @@
   import { tick } from 'svelte';
   import { authClient, authError, authStatus } from '../auth';
   import { isDesktop } from '../setup';
+  import { platform } from '../platform';
   export let onLock: () => Promise<void> = async () => {};
   let current = '';
   let passphrase = '';
@@ -62,8 +63,8 @@
       and paired computers.
     </p>
     <p class="limit">
-      This locks the desktop app. Saved files remain readable by your macOS account; use FileVault
-      to protect your disk.
+      This locks the desktop app. Saved files remain readable by your {platform.account}; use
+      {platform.diskEncryption} to protect your disk.
     </p>
     <form
       onsubmit={(event) => {

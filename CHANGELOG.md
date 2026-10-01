@@ -14,6 +14,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Run Blackwall on Windows 10/11 (x64) and Linux (x86-64 and ARM64, including NVIDIA DGX Spark),
+  with signed installers and in-app updates. Access keys, pairing credentials, and the app lock use
+  Windows Credential Manager or the Linux Secret Service, and Agent-mode shell commands run in
+  Windows PowerShell on Windows. Pairing and guest links work between any mix of macOS, Windows,
+  and Linux computers.
+
 - Select Stable or Beta in App updates to test signed builds from `partial` before production,
   with a saved channel preference and an explicit return to stable.
 
@@ -43,6 +49,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Up to four named guest invitations with independent revocation and Keychain-backed relay tokens.
 
 ### Fixed
+
+- Stop Windows shell descendants on cancellation, timeout, and command completion even when
+  their parent PowerShell process has already exited.
 
 - Separate Chat and Agent histories, lock conversation mode and project after the first message,
   restore each Agent conversation’s project, and clear the project when starting a new chat.

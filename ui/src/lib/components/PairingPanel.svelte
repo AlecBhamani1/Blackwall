@@ -2,6 +2,7 @@
   import { onDestroy, onMount, tick } from 'svelte';
   import { pairingClient, pairingError, type PairingClient, type PairedDevice } from '../pairing';
   import { isDesktop } from '../setup';
+  import { platform } from '../platform';
   export let mode: 'host' | 'client' = 'client';
   export let endpoint = '';
   export let model = '';
@@ -240,7 +241,7 @@
         <p>
           {mode === 'host'
             ? 'This stops its access and active requests. Other paired computers and guest links keep working. Pair again to restore access.'
-            : 'This removes the saved connection and its key from this Mac. The host can also remove this device from its own list.'}
+            : `This removes the saved connection and its key from this ${platform.device}. The host can also remove this device from its own list.`}
         </p>
         <div class="actions">
           <button

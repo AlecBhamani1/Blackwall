@@ -3,6 +3,7 @@
   import { persistence, type MemoryEntry } from '../persistence';
   import { createId } from '../id';
   import Icon from './Icon.svelte';
+  import { platform } from '../platform';
   export let onPreferences: (preferences: {
     memoryEnabled: boolean;
     contextWindow: number;
@@ -133,7 +134,7 @@
           rows="3"
           disabled={busy || !loaded}></textarea>
         <div class="editor-actions">
-          <span>Saved on this Mac. Editable at any time.</span>{#if editingId}<button
+          <span>Saved on this {platform.device}. Editable at any time.</span>{#if editingId}<button
               type="button"
               class="secondary"
               onclick={() => {

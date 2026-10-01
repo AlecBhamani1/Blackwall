@@ -142,6 +142,12 @@ async function publish() {
     const bytes = assetBytes(asset);
     if (name.endsWith('.sig')) signatures[name] = bytes.toString();
   }
+  // Optional signed installers, such as Debian packages, may add their own feed entries.
+  for (const asset of release.assets) {
+    if (asset.name.endsWith('.sig') && !(asset.name in signatures)) {
+      signatures[asset.name] = assetBytes(asset).toString();
+    }
+  }
   const manifest = validateManifest(release, feed(release), signatures, repository, version, channel);
   const compatibility = beta ? optional(`releases/tags/${feedTag}`) : api('releases/tags/main');
   const latest = beta ? null : api('releases/latest');
@@ -180,7 +186,7 @@ async function publish() {
     console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
     if (process.env.GITHUB_STEP_SUMMARY) {
       appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-        `Published [Blackwall ${tag}](https://github.com/${repository}/releases/tag/${tag}) from source commit \`${sha}\`.\n\nBoth architecture downloads, updater signatures, and the compatibility feed were verified.\n`);
+        `Published [Blackwall ${tag}](https://github.com/${repository}/releases/tag/${tag}) from source commit \`${sha}\`.\n\nEvery platform download, updater signature, and the compatibility feed were verified.\n`);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });

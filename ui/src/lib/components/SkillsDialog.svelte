@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { persistence, type Skill } from '../persistence';
   import Icon from './Icon.svelte';
+  import { platform } from '../platform';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
   let skills: Skill[] = [];
@@ -124,7 +125,7 @@
       </form>
     {:else}
       <div class="intro">
-        <span>Stored as Markdown files on this Mac.</span><button
+        <span>Stored as Markdown files on this {platform.device}.</span><button
           class="primary"
           onclick={() => {
             creating = true;

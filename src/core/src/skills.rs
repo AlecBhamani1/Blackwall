@@ -242,6 +242,8 @@ mod tests {
         store.remove(&skill.name).unwrap();
         store.seed().unwrap();
         assert!(store.read(&skill.name).is_err());
+        // Close the directory handle first; Windows cannot delete an open directory.
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
 }
