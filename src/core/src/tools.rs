@@ -548,6 +548,8 @@ mod tests {
                 .write_reviewed("escape/new.txt", None, "no")
                 .is_err());
         }
+        // Close the directory handle first; Windows cannot delete an open directory.
+        drop(workspace);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[cfg(unix)]

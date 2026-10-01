@@ -262,6 +262,8 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolResult { success: false, .. })));
+        // Close the workspace handle first; Windows cannot delete an open directory.
+        drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
     struct RepeatingTool {
@@ -365,6 +367,7 @@ mod tests {
             })
             .is_err());
         assert!(!directory.join("unchanged.txt").exists());
+        drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
     struct ConcurrentChildren {
