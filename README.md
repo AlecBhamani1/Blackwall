@@ -63,13 +63,22 @@ limits, memory, skills, and troubleshooting.
 
 ## Use Blackwall in your terminal
 
-With Rust 1.90+ installed, build the CLI from this checkout:
+On macOS, Linux, or Windows with a POSIX shell (such as Git Bash), install the latest CLI with
+Rust 1.90+ and Cargo available:
 
 ```sh
-cargo install --locked --path src/bw
+curl -fsSL https://raw.githubusercontent.com/AlecBhamani1/Blackwall/main/scripts/install-cli.sh | sh
+```
+
+The installer works from any directory and installs `bw` onto Cargo's executable path. Then run:
+
+```sh
 bw setup
 bw
 ```
+
+If Rust is not installed, follow the link printed by the installer to install it first. To build
+from a local checkout instead, use `cargo install --locked --path src/bw`.
 
 Setup asks for an existing OpenAI-compatible service address and its model ID, then saves your
 choices. Type `/commands` during chat to see the available controls. Change settings with

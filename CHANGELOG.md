@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add a one-line installer for the Blackwall CLI, available from any directory.
+
 ## [0.1.4] - 2026-10-01
 
 Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).
