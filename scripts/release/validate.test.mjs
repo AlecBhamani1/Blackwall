@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { betaVersion, compareReleaseVersions, releaseVersionParts, compareVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
+import { betaVersion, compareReleaseVersions, releaseVersionParts, compareVersions, desktopPlatforms, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
 
 const repository = 'example/blackwall';
 const version = '0.1.4';
@@ -12,12 +12,11 @@ function fixture() {
   }));
   const signatures = {};
   const platforms = {};
-  for (const [platform, arch] of [['darwin-aarch64', 'aarch64'], ['darwin-x86_64', 'x64']]) {
-    const name = `Blackwall_${version}_${arch}.app.tar.gz`;
-    signatures[name + '.sig'] = `signature-${arch}\n`;
-    const entry = { signature: `signature-${arch}`, url: assets.find(asset => asset.name === name).url };
+  for (const { platform, bundle, updater } of desktopPlatforms(version)) {
+    signatures[updater + '.sig'] = `signature-${platform}\n`;
+    const entry = { signature: `signature-${platform}`, url: assets.find(asset => asset.name === updater).url };
     platforms[platform] = { ...entry };
-    platforms[platform + '-app'] = { ...entry };
+    platforms[`${platform}-${bundle}`] = { ...entry };
   }
   return {
     release: { tag_name: `v${version}`, prerelease: false, assets },
@@ -68,6 +67,37 @@ test('every architecture needs its installer, updater archive, and signature', (
   assert.throws(() => validate(f), /Missing platform/);
 });
 
+test('covers macOS, Linux, and Windows on every supported architecture', () => {
+  assert.deepEqual(desktopPlatforms(version).map(entry => entry.platform),
+    ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64', 'linux-aarch64', 'windows-x86_64']);
+  assert(requiredAssets(version).includes('Blackwall_0.1.4_amd64.AppImage.sig'));
+  assert(requiredAssets(version).includes('Blackwall_0.1.4_arm64.deb'));
+  assert(requiredAssets(version).includes('Blackwall_0.1.4_x64-setup.exe.sig'));
+  for (const platform of ['linux-aarch64', 'windows-x86_64']) {
+    const f = fixture();
+    delete f.manifest.platforms[platform];
+    assert.throws(() => validate(f), /Missing platform/);
+  }
+});
+
+test('signed Debian packages may add their own verified feed entry', () => {
+  const f = fixture();
+  const deb = 'Blackwall_0.1.4_amd64.deb';
+  f.signatures[deb + '.sig'] = 'signature-deb\n';
+  f.manifest.platforms['linux-x86_64-deb'] = {
+    signature: 'signature-deb', url: f.release.assets.find(asset => asset.name === deb).url,
+  };
+  assert.equal(validate(f).platforms['linux-x86_64-deb'].url,
+    `https://github.com/${repository}/releases/download/v${version}/${deb}`);
+  f.manifest.platforms['linux-x86_64-deb'].signature = 'signature-linux-x86_64';
+  assert.throws(() => validate(f), /Signature mismatch/);
+  delete f.signatures[deb + '.sig'];
+  assert.throws(() => validate(f), /Missing signature/);
+  const windows = fixture();
+  windows.manifest.platforms['windows-x86_64-deb'] = windows.manifest.platforms['windows-x86_64'];
+  assert.throws(() => validate(windows), /Unexpected updater platform/);
+});
+
 test('GitHub temporary draft URLs become the final version URLs before feed publication', () => {
   const f = fixture();
   f.release.draft = true;
@@ -93,6 +123,7 @@ test('rejects stale, substituted, partial, and mismatched release metadata', () 
     f => { f.manifest.platforms['darwin-aarch64'].signature = 'wrong'; },
     f => { f.manifest.platforms['darwin-aarch64-app'].url = 'https://untrusted.example/build'; },
     f => { f.manifest.platforms.windows = {}; },
+    f => { f.manifest.platforms['windows-x86_64-nsis'].url = f.manifest.platforms['linux-x86_64'].url; },
     f => { f.release.assets[0].browser_download_url = 'https://untrusted.example/build'; },
   ];
   for (const mutate of mutations) {

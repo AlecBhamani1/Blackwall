@@ -13,6 +13,7 @@
   import PairingPanel from './PairingPanel.svelte';
   import { isPairedEndpoint } from '../pairing';
   import { isDesktop } from '../setup';
+  import { platform } from '../platform';
   import Icon from './Icon.svelte';
 
   export let onLock: () => Promise<void> = async () => {};
@@ -518,8 +519,8 @@
                   onchange={rememberRelayUrl}
                 />
                 <p class="relay-hint">
-                  Saved on this Mac. Change this origin whenever you move the relay to another
-                  server.
+                  Saved on this {platform.device}. Change this origin whenever you move the relay to
+                  another server.
                 </p>
 
                 <label for="relay-token">Relay token <span>(optional)</span></label>
@@ -534,7 +535,7 @@
                   disabled={busy === 'starting'}
                 />
                 <p class="relay-hint">
-                  Saved in macOS Keychain after the relay accepts it. Never included in guest links.
+                  Saved in {platform.storeName} after the relay accepts it. Never included in guest links.
                 </p>
               </div>
 

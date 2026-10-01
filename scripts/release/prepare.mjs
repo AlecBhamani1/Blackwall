@@ -18,13 +18,15 @@ TODO: Describe the release and link the v${version} milestone.
 
 ## Downloads
 
-Use the \`aarch64.dmg\` installer for Apple Silicon or the \`x64.dmg\` installer for Intel Macs.
+- macOS: \`aarch64.dmg\` for Apple Silicon or \`x64.dmg\` for Intel Macs.
+- Windows: \`x64-setup.exe\`.
+- Linux: \`amd64.AppImage\`/\`amd64.deb\` for x86-64 or \`aarch64.AppImage\`/\`arm64.deb\` for ARM64.
 Existing installations continue to receive update information through the original feed.
 
 ## Acceptance status
 
 TODO: Record automated checks, applicable native acceptance evidence, and any remaining limitations.
-Updater signatures authenticate updates; they do not establish Apple Developer ID signing or notarization.
+Updater signatures authenticate updates; they do not establish Apple Developer ID signing, notarization, or Windows code signing.
 `);
 writeFileSync('.github/release.json', JSON.stringify({ version }, null, 2) + '\n');
 console.log(`Prepared ${notesPath}. Complete the notes, update CHANGELOG.md, and assign the promotion PR to milestone v${version}.`);

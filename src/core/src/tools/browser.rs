@@ -77,15 +77,15 @@ impl Workspace {
                 continue;
             }
             let relative = root.join(name);
-            let Some(label) = relative.to_str() else {
+            let Some(label) = super::label(&relative) else {
                 continue;
             };
-            if Self::checked(label).is_err() {
+            if Self::checked(&label).is_err() {
                 continue;
             }
             entries.push(FileEntry {
                 name: name.into(),
-                path: label.into(),
+                path: label,
                 is_directory: kind.is_dir(),
             });
         }

@@ -1,8 +1,9 @@
-//! Native lock enforcement and Keychain-protected passphrase verification data.
+//! Native lock enforcement and passphrase verification data kept in the credential store.
 use serde::Serialize;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
+const LOCK_ACCOUNT: &str = "passphrase-v1";
 #[derive(Default)]
 struct Inner {
     initialized: bool,
@@ -101,46 +102,27 @@ impl AuthState {
 
 fn read_hash() -> Result<Option<String>, String> {
     let service = crate::identity::keychain_service("com.blackwall.lock");
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::{generic_password, PasswordOptions};
-        match generic_password(PasswordOptions::new_generic_password(
-            &service,
-            "passphrase-v1",
-        )) {
-            Ok(bytes) => String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| "The saved app lock is damaged.".into()),
-            Err(error) if error.code() == -25300 => Ok(None),
-            Err(_) => Err("Unlock your login keychain, then reopen Blackwall.".into()),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = service;
-        Ok(None)
-    }
+    crate::secrets::get(&service, LOCK_ACCOUNT).map_err(|error| match error {
+        crate::secrets::SecretError::Invalid => "The saved app lock is damaged.".into(),
+        error => error.explain(format!(
+            "Blackwall could not read its app lock from {}. {}, then reopen Blackwall.",
+            crate::secrets::STORE,
+            crate::secrets::RECOVER
+        )),
+    })
 }
 fn write_hash(hash: Option<&str>) -> Result<(), String> {
     let service = crate::identity::keychain_service("com.blackwall.lock");
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::{delete_generic_password, set_generic_password};
-        let result = match hash {
-            Some(hash) => set_generic_password(&service, "passphrase-v1", hash.as_bytes()),
-            None => delete_generic_password(&service, "passphrase-v1"),
-        };
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if hash.is_none() && error.code() == -25300 => Ok(()),
-            Err(_) => Err("The app lock could not be saved in Keychain.".into()),
-        }
+    match hash {
+        Some(hash) => crate::secrets::set(&service, LOCK_ACCOUNT, hash),
+        None => crate::secrets::delete(&service, LOCK_ACCOUNT),
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (hash, service);
-        Err("The app lock currently requires macOS Keychain.".into())
-    }
+    .map_err(|error| {
+        error.explain(format!(
+            "The app lock could not be saved in {}.",
+            crate::secrets::STORE
+        ))
+    })
 }
 #[tauri::command]
 pub async fn auth_status(state: State<'_, AuthState>) -> Result<AuthStatus, String> {

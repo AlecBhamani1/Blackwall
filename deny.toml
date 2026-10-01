@@ -1,11 +1,21 @@
 [graph]
 all-features = true
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 
 [advisories]
 unmaintained = "workspace"
 unsound = "all"
-ignore = []
+ignore = [
+    # glib 0.18 is pinned by Tauri's GTK 3 stack on Linux (gtk-rs ended GTK 3 bindings at 0.18).
+    # The unsound VariantStrIter API is not called by Tauri, wry, tao, muda, gtk, or Blackwall.
+    { id = "RUSTSEC-2024-0429", reason = "Linux-only transitive glib 0.18 via Tauri; affected API unused" },
+]
 
 [licenses]
 version = 2

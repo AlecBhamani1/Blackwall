@@ -18,6 +18,16 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 const MAX_FILE: usize = 64 * 1024;
+
+/// Project-relative labels use `/` everywhere; Windows file names cannot contain `\`.
+fn label(path: &Path) -> Option<String> {
+    let label = path.to_str()?;
+    Some(if cfg!(windows) {
+        label.replace('\\', "/")
+    } else {
+        label.to_owned()
+    })
+}
 mod browser;
 pub use browser::{DirectoryListing, FileEntry, FileSearch, FileSearchMatch, FileSearchMode};
 #[derive(Debug, Error)]
@@ -102,10 +112,10 @@ impl Workspace {
                 if kind.is_dir() && path.components().count() < 20 {
                     directories.push(path);
                 } else if kind.is_file() {
-                    let Some(label) = path.to_str() else {
+                    let Some(label) = label(&path) else {
                         continue;
                     };
-                    let Ok(text) = self.read(label) else {
+                    let Ok(text) = self.read(&label) else {
                         continue;
                     };
                     bytes += text.len();
@@ -233,12 +243,17 @@ impl Workspace {
     }
 }
 
+const SHELL_DESCRIPTION: &str = if cfg!(windows) {
+    "Propose a Windows PowerShell command in the project directory. Always requires user approval. Commands are not sandboxed."
+} else {
+    "Propose a shell command in the project directory. Always requires user approval. Commands are not sandboxed."
+};
 fn file_definitions() -> Vec<Value> {
     [("read_file","Read a UTF-8 text file inside the selected project.",json!({"path":{"type":"string"}}),vec!["path"]),
      ("list_files","List up to 500 entries in a project directory. Use '.' for the project root.",json!({"path":{"type":"string"}}),vec!["path"]),
      ("search_files","Search project text files for a literal string. Bounded to 2,000 entries, 8 MiB, and 100 matches; skips symlinks and dependency folders.",json!({"path":{"type":"string"},"query":{"type":"string"}}),vec!["path","query"]),
      ("write_file","Propose a complete text file replacement. The user reviews a diff before the write. Read existing files first.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
-     ("shell","Propose a shell command in the project directory. Always requires user approval. Commands are not sandboxed.",json!({"command":{"type":"string"}}),vec!["command"])]
+     ("shell",SHELL_DESCRIPTION,json!({"command":{"type":"string"}}),vec!["command"])]
         .into_iter().map(|(name,description,properties,required)|json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})).collect()
 }
 pub fn definitions(web_enabled: bool, children: bool) -> Vec<Value> {
@@ -356,27 +371,70 @@ impl Drop for ProcessGroup {
             .status();
     }
 }
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Windows has no process groups without unsafe job-object calls; stop the live process tree.
+#[cfg(windows)]
+struct ProcessGroup(u32);
+#[cfg(windows)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        use std::os::windows::process::CommandExt;
+        // Fixed executable and numeric process argument, never model-provided shell syntax.
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/T", "/F", "/PID", &self.0.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+#[cfg(unix)]
+fn shell_command(command: &str) -> tokio::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut process = tokio::process::Command::new("/bin/sh");
+    process.arg("-c").arg(command);
+    process.as_std_mut().process_group(0);
+    process
+}
+#[cfg(windows)]
+fn shell_command(command: &str) -> tokio::process::Command {
+    use base64::Engine;
+    // An encoded command avoids Windows argument re-quoting; UTF-8 output keeps capture lossless.
+    let script = format!(
+        "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8\n{command}"
+    );
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut process = tokio::process::Command::new("powershell.exe");
+    process
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+        ])
+        .arg(base64::engine::general_purpose::STANDARD.encode(bytes))
+        .creation_flags(CREATE_NO_WINDOW);
+    process
+}
 async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (directory, command);
         Err(ToolError::Execution(
-            "Shell tools currently require macOS or Linux.".into(),
+            "Shell tools are not supported on this platform.".into(),
         ))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::process::CommandExt;
-        let mut process = tokio::process::Command::new("/bin/sh");
+        let mut process = shell_command(command);
         process
-            .arg("-c")
-            .arg(command)
             .current_dir(directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        process.as_std_mut().process_group(0);
         // Do not inherit the model or relay secrets from Blackwall's environment.
         for key in [
             "BLACKWALL_MODEL_API_KEY",
@@ -502,6 +560,43 @@ mod tests {
         assert!(output.contains("Exit: 7"));
         assert!(output.contains("hello"));
         assert!(shell(&std::env::temp_dir(), "yes overflow").await.is_err());
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_quoting_unicode_and_exit_status() {
+        let output = shell(
+            &std::env::temp_dir(),
+            "Write-Output 'h\u{e9}llo \"quoted\" & | $literal'; exit 7",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(output.contains("Exit: 7"));
+        assert!(output.contains("h\u{e9}llo \"quoted\" & | $literal"));
+        assert!(shell(&std::env::temp_dir(), "while ($true) { 'overflow' }")
+            .await
+            .is_err());
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_windows_shell_stops_side_effects() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-shell-cancel-{}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            shell(
+                &directory,
+                "Start-Sleep -Seconds 1; New-Item -ItemType File late-write",
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!directory.join("late-write").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

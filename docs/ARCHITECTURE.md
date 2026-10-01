@@ -31,13 +31,21 @@ start the server software. Endpoint selection is, in order:
 4. the implementation-plan fallback `http://localhost:11434/v1`.
 
 Origins without a path receive `/v1`. Only HTTP and HTTPS are accepted, and embedded URL
-credentials are rejected. Model keys are resolved from macOS Keychain by normalized origin. `BLACKWALL_MODEL_API_KEY` is
-a fallback only for its configured origin. Model clients disable redirects to avoid forwarding
-credentials to another service. New keys are tested before replacing an existing Keychain entry.
+credentials are rejected. Model keys are resolved from the platform credential store by normalized
+origin. `BLACKWALL_MODEL_API_KEY` is a fallback only for its configured origin. Model clients disable
+redirects to avoid forwarding credentials to another service. New keys are tested before replacing
+an existing saved entry.
+
+`src/app/src/secrets.rs` is the only credential-store adapter: macOS Keychain through
+`security-framework`, Windows Credential Manager and the Linux Secret Service through `keyring`.
+Service and account names are identical on every platform, and there is no plain-text fallback when
+a store is unavailable. Platform-specific process launching is limited to the approved shell tool
+(`/bin/sh` with process groups on Unix, Windows PowerShell with process-tree termination on Windows)
+and the fixed browser opener used by guided setup.
 
 ## Guest share boundary
 
-Guest sharing uses a separately deployable relay; it does not expose the Mac or upstream
+Guest sharing uses a separately deployable relay; it does not expose the host computer or upstream
 OpenAI-compatible server directly. The desktop initiates the only connection from the owner side.
 
 ```text
@@ -126,7 +134,8 @@ are not stored. Browser-only development history keeps metadata without the full
 ## Current persistence and trust model
 
 Native history, preferences, and user-approved memory use versioned SQLite. Markdown skills live
-in a restricted local directory. Keychain holds model/relay secrets and the optional app-lock verifier.
+in a restricted local directory. The platform credential store holds model/relay secrets and the
+optional app-lock verifier.
 The data lifecycle and lock limits are described below.
 
 The configured model machine and the self-hosted relay are inside the user's trust boundary. Do not
@@ -134,7 +143,7 @@ expose the raw model listener to the public internet. The relay keeps endpoint c
 raw model address hidden behind an authenticated, expiring invite, but it can observe the chat
 content it forwards.
 
-Persistent pairing uses typed SQLite device records, per-address native Keychain services,
+Persistent pairing uses typed SQLite device records, per-address native credential-store services,
 five-minute host-approved exchanges, and renewable host tunnels. Permanent relay revocation
 markers reject stale reconnects. Pending approval records cannot start tunnels. One shared semaphore
 limits guest and paired model work to eight requests per desktop process.
@@ -179,9 +188,9 @@ enter agent context under a bounded budget. Only user-saved facts enter memory; 
 and the optional Postgres adapter are not implemented. Guests never receive owner memory, skills,
 workspace tools, or conversation history.
 
-The optional desktop lock stores a salted Argon2id verifier in Keychain, rate-limits failed attempts,
+The optional desktop lock stores a salted Argon2id verifier in the credential store, rate-limits failed attempts,
 and gates native data/model/tool commands. Locking cancels registered runs/downloads and revokes the
 active shares; the UI flushes saves before clearing its conversation state. It does not encrypt the
-SQLite database or protect against the same macOS account reading files or using `bw`. Native dialogs
+SQLite database or protect against the same user account reading files or using `bw`. Native dialogs
 recheck lock state after selection. Actions already accepted before a lock may finish; the lock is
 not a filesystem or process isolation boundary.

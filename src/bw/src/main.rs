@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use std::{
     env,
     io::{self, Write},
-    path::PathBuf,
     process::ExitCode,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -63,9 +62,8 @@ async fn run() -> Result<(), String> {
     if !matches!(command.as_str(), "run" | "resume" | "sessions") {
         return Err("Unknown command. Run bw --help.".into());
     }
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("Your home folder could not be found.")?;
+    // HOME on macOS/Linux and the user profile folder on Windows.
+    let home = env::home_dir().ok_or("Your home folder could not be found.")?;
     let store = LocalStore::open(&home.join(".blackwall")).map_err(|e| e.to_string())?;
     if command == "sessions" {
         for session in store.list_sessions().map_err(|e| e.to_string())? {

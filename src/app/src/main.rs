@@ -8,6 +8,7 @@ mod data;
 mod identity;
 mod keychain;
 mod pairing;
+mod secrets;
 mod setup;
 mod updates;
 
