@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Interactive `bw` chat and `bw setup`, with persisted CLI settings and `/commands`, `/model`,
+  `/endpoint`, `/settings`, `/web`, and `/memory` controls. Resume restores the saved Agent project;
+  graceful cancellation retains partial answers, and environment access keys stay scoped to their origin.
+
 - Run Blackwall on Windows 10/11 (x64) and Linux (x86-64 and ARM64, including NVIDIA DGX Spark),
   with signed installers and in-app updates. Access keys, pairing credentials, and the app lock use
   Windows Credential Manager or the Linux Secret Service, and Agent-mode shell commands run in

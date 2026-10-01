@@ -174,19 +174,53 @@ flow; do not enable the lock without retaining the passphrase securely.
 ## CLI
 
 ```sh
-cargo run --manifest-path src/Cargo.toml -p bw -- run "Explain this project's entry points"
-cargo run --manifest-path src/Cargo.toml -p bw -- sessions
-cargo run --manifest-path src/Cargo.toml -p bw -- resume SESSION_ID "Continue the investigation"
+cargo install --locked --path src/bw
+bw setup
+bw
+bw run "Explain this project's entry points"
+bw sessions
+bw resume SESSION_ID
+bw resume SESSION_ID "Continue the investigation"
 ```
 
-The CLI uses the current folder as its workspace, the same core tools and approval rules, native
-sessions, enabled memory, and skills. Type `yes` to authorize the exact displayed action once;
-other input denies it. Ctrl+C stops the run. Web access is disabled in the CLI. Successful answers
-are saved; interrupted CLI runs do not yet persist a partial transcript.
+`bw` or `bw chat` opens an interactive conversation in the current folder. Setup asks for your
+already-running model service address and model ID; it saves all choices together after valid input.
+Setup does not test connectivity or launch/download a model. `npm run cli -- setup` and
+`npm run cli` provide the same commands from a development checkout.
 
-Set `BLACKWALL_MODEL`, `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), and optionally
-`BLACKWALL_MODEL_API_KEY`. The CLI currently uses environment model credentials, not the desktop's
-saved connection selection. `bw request "prompt"` prints a protocol preview without calling a model.
+| Interactive command | Behavior |
+| --- | --- |
+| `/commands`, `/help` | List commands and their arguments |
+| `/settings` | Show effective settings and the current project |
+| `/settings <name> <value>` | Save a model, endpoint, web, or memory setting |
+| `/model <id>`, `/endpoint <url>` | Change the model or service for the next turn |
+| `/web on\|off`, `/memory on\|off` | Enable or disable web tools or saved memory injection |
+| `/workspace <path>` | Start a new conversation in another project; relative paths use the current project |
+| `/new` | Start a new conversation in the current project |
+| `/sessions`, `/resume <id>` | List conversations or restore an Agent conversation and its project |
+| `/quit`, `/exit` | Exit; EOF also exits |
+
+Type `//` to begin a literal message with `/`. Use `bw commands` to see the catalog outside chat.
+`bw config show` reviews settings, and `bw config set <name> <value>` changes them without entering
+chat. Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
+`BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), then the initial `llama3.2` and local Ollama defaults.
+CLI settings are separate from desktop preferences. They are stored in the same local SQLite
+database; `BLACKWALL_DATA_DIR` selects a different data folder, including its memory and skills.
+
+For an authenticated service, set `BLACKWALL_MODEL_API_KEY` and the matching
+`BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`). Environment keys are sent only to that origin, even
+after `/endpoint` changes. The CLI does not store keys or use desktop credential-store entries.
+Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol preview without a model call.
+
+The CLI shares core tools, approval rules, enabled memory, skills, and native sessions with desktop.
+Type `yes` to authorize the displayed action once; other input or EOF denies it. Web tools are off
+initially and every enabled web request still needs approval. Ctrl+C stops the active turn and
+returns to chat; at the idle prompt it exits. User turns are saved before work starts, and partial
+answers are retained on graceful cancellation or errors. A crash can still lose streamed text.
+New sessions record Agent mode and their project. Resume restores that project even when launched
+elsewhere; desktop Chat conversations cannot be resumed with CLI tools. Old `cli_` sessions without
+project metadata use the current project. Saved transcript prose and attachments are reused; past
+tool-call protocol messages are not replayed. The desktop app lock does not restrict the CLI.
 
 ## Release and remote-access gates
 

@@ -10,6 +10,7 @@
   "scripts": {
     "build": "npm --prefix ui run build",
     "check": "npm --prefix ui run check",
+    "cli": "cargo run --locked --manifest-path src/Cargo.toml -p bw --",
     "commitlint": "commitlint",
     "desktop": "cd src/app && ../../ui/node_modules/.bin/tauri dev",
     "desktop:build": "cd src/app && ../../ui/node_modules/.bin/tauri build",
