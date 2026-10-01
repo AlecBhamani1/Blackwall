@@ -1,6 +1,18 @@
 import { get, writable } from 'svelte/store';
 import type { DownloadEvent, Update } from '@tauri-apps/plugin-updater';
 
+export type AppUpdateChannel = 'stable' | 'beta';
+const CHANNEL_STORAGE_KEY = 'blackwall.update-channel.v1';
+
+function savedChannel(): AppUpdateChannel | null {
+  try {
+    const value = window.localStorage.getItem(CHANNEL_STORAGE_KEY);
+    return value === 'stable' || value === 'beta' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface AppUpdateInfo {
   currentVersion: string;
   version: string;
@@ -14,13 +26,7 @@ export interface AppUpdateProgress {
 }
 
 export type AppUpdateState =
-  | 'idle'
-  | 'checking'
-  | 'current'
-  | 'available'
-  | 'downloading'
-  | 'error'
-  | 'unsupported';
+  'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'error' | 'unsupported';
 
 function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__);
@@ -37,6 +43,7 @@ function errorMessage(error: unknown): string {
 }
 
 let pendingUpdate: Update | null = null;
+let latestCheck = 0;
 
 export const appUpdateClient = {
   supported(): boolean {
@@ -49,17 +56,33 @@ export const appUpdateClient = {
     return getVersion();
   },
 
-  async check(): Promise<AppUpdateInfo | null> {
+  async check(channel: AppUpdateChannel): Promise<AppUpdateInfo | null> {
     if (!isTauriRuntime()) return null;
-    await pendingUpdate?.close();
-    const { check } = await import('@tauri-apps/plugin-updater');
-    pendingUpdate = await check({ timeout: 15_000 });
-    if (!pendingUpdate) return null;
+    const request = ++latestCheck;
+    const previous = pendingUpdate;
+    pendingUpdate = null;
+    await previous?.close();
+    const [{ invoke }, { Update }] = await Promise.all([
+      import('@tauri-apps/api/core'),
+      import('@tauri-apps/plugin-updater'),
+    ]);
+    if (request !== latestCheck) return null;
+    const metadata = await invoke<ConstructorParameters<typeof Update>[0] | null>(
+      'check_app_update',
+      { channel },
+    );
+    const next = metadata ? new Update(metadata) : null;
+    if (request !== latestCheck) {
+      await next?.close();
+      return null;
+    }
+    pendingUpdate = next;
+    if (!next) return null;
     return {
-      currentVersion: pendingUpdate.currentVersion,
-      version: pendingUpdate.version,
-      date: pendingUpdate.date,
-      body: pendingUpdate.body,
+      currentVersion: next.currentVersion,
+      version: next.version,
+      date: next.date,
+      body: next.body,
     };
   },
 
@@ -80,6 +103,7 @@ export const appUpdateClient = {
     };
 
     await pendingUpdate.downloadAndInstall(handleEvent);
+    await pendingUpdate.close();
     pendingUpdate = null;
     const { relaunch } = await import('@tauri-apps/plugin-process');
     await relaunch();
@@ -89,6 +113,7 @@ export const appUpdateClient = {
 export type AppUpdateClient = typeof appUpdateClient;
 
 export function createAppUpdateController(client: AppUpdateClient = appUpdateClient) {
+  const channel = writable<AppUpdateChannel>(savedChannel() ?? 'stable');
   const state = writable<AppUpdateState>('idle');
   const currentVersion = writable('');
   const update = writable<AppUpdateInfo | null>(null);
@@ -97,6 +122,7 @@ export function createAppUpdateController(client: AppUpdateClient = appUpdateCli
   let checkVersion = 0;
 
   async function checkForUpdates(): Promise<boolean> {
+    if (get(state) === 'downloading') return false;
     if (!client.supported()) {
       state.set('unsupported');
       return false;
@@ -104,9 +130,10 @@ export function createAppUpdateController(client: AppUpdateClient = appUpdateCli
 
     const version = ++checkVersion;
     state.set('checking');
+    update.set(null);
     error.set('');
     try {
-      const next = await client.check();
+      const next = await client.check(get(channel));
       if (version !== checkVersion) return false;
       update.set(next);
       state.set(next ? 'available' : 'current');
@@ -122,10 +149,27 @@ export function createAppUpdateController(client: AppUpdateClient = appUpdateCli
 
   async function initialize(): Promise<void> {
     try {
-      currentVersion.set(await client.currentVersion());
+      const installed = await client.currentVersion();
+      currentVersion.set(installed);
+      if (!savedChannel() && installed.includes('-beta.')) channel.set('beta');
     } catch (cause) {
       error.set(errorMessage(cause));
     }
+    await checkForUpdates();
+  }
+
+  async function setChannel(next: AppUpdateChannel): Promise<void> {
+    if (get(state) === 'downloading' || (next !== 'stable' && next !== 'beta')) return;
+    try {
+      window.localStorage.setItem(CHANNEL_STORAGE_KEY, next);
+    } catch {
+      ++checkVersion;
+      update.set(null);
+      state.set('error');
+      error.set('Blackwall could not save your update channel. Try again.');
+      return;
+    }
+    channel.set(next);
     await checkForUpdates();
   }
 
@@ -143,6 +187,8 @@ export function createAppUpdateController(client: AppUpdateClient = appUpdateCli
   }
 
   return {
+    channel,
+    setChannel,
     state,
     currentVersion,
     update,

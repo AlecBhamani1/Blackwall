@@ -66,7 +66,7 @@ pub(super) trait RemovalStore {
     ) -> impl Future<Output = Result<(), String>> + Send;
 }
 
-/// Persist intent before changing Keychain. A failed cleanup must never leave an
+/// Persist intent before changing the credential store. A failed cleanup must never leave an
 /// active-looking record whose credential has already been deleted.
 pub(super) async fn remove_local(
     store: &impl RemovalStore,

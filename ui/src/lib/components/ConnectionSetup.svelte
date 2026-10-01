@@ -14,6 +14,7 @@
   import LogoMark from './LogoMark.svelte';
   import Icon from './Icon.svelte';
   import PairingPanel from './PairingPanel.svelte';
+  import { credentialStoreError, platform } from '../platform';
 
   export let onConnect: (endpoint: string, name?: string) => Promise<boolean>;
   export let connections: ConnectionProfile[] = [];
@@ -97,8 +98,8 @@
       const detail =
         cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '';
       error =
-        savingKey && /keychain/i.test(detail)
-          ? 'Blackwall could not save the access key in Keychain. Respond to any macOS Keychain prompt, unlock your login keychain if needed, then try again.'
+        savingKey && credentialStoreError.test(detail)
+          ? `Blackwall could not save the access key in ${platform.store}. ${platform.storeHelp}, then try again.`
           : connectionHelp(cause);
     } finally {
       savingKey = false;
@@ -143,7 +144,7 @@
     try {
       await client.openLink('download');
     } catch {
-      error = 'Your browser could not be opened. Visit ollama.com/download/mac to install Ollama.';
+      error = `Your browser could not be opened. Visit ${platform.ollamaDownload.replace('https://', '')} to install Ollama.`;
     }
   }
   async function openInvitation(event: SubmitEvent) {
@@ -293,8 +294,8 @@
         <div class="info">
           <strong>Set up Ollama to get started</strong>
           <p>
-            Ollama runs the model on your Mac. Install it, open it, then return here. If you already
-            use LM Studio, start its local server.
+            Ollama runs the model on your {platform.device}. Install it, open it, then return here.
+            If you already use LM Studio, start its local server.
           </p>
         </div>
         <div class="actions">
@@ -428,7 +429,8 @@
               disabled={busy}
             />
             <p class="footnote">
-              Saved securely in macOS Keychain for this service. Leave blank to use an existing key.
+              Saved securely in {platform.storeName} for this service. Leave blank to use an existing
+              key.
             </p>
           </details>{/if}
         <button class="primary" disabled={busy || !address.trim()} type="submit"
@@ -440,7 +442,7 @@
         >
         {#if savingKey}
           <p role="status">
-            Respond to any macOS Keychain prompt and wait for confirmation before retrying.
+            {platform.storeHelp}, and wait for confirmation before retrying.
           </p>
         {/if}
       </form>

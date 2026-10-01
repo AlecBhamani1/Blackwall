@@ -10,6 +10,20 @@ export const MAX_ATTACHMENT_COUNT = 8;
 export const MAX_ATTACHMENT_SIZE_BYTES = 15 * 1024 * 1024;
 export const MAX_ATTACHMENT_TOTAL_BYTES = 30 * 1024 * 1024;
 const MAX_TEXT_CONTENT_BYTES = 512 * 1024;
+const IMAGE_MIME_TYPES = new Map([
+  ['png', 'image/png'],
+  ['jpg', 'image/jpeg'],
+  ['jpeg', 'image/jpeg'],
+  ['gif', 'image/gif'],
+  ['webp', 'image/webp'],
+  ['avif', 'image/avif'],
+  ['bmp', 'image/bmp'],
+  ['svg', 'image/svg+xml'],
+  ['heic', 'image/heic'],
+  ['heif', 'image/heif'],
+  ['tif', 'image/tiff'],
+  ['tiff', 'image/tiff'],
+]);
 
 const TEXT_EXTENSIONS = new Set([
   'c',
@@ -49,9 +63,13 @@ function extensionOf(fileName: string): string {
 }
 
 export function attachmentKind(file: File): AttachmentKind {
-  if (file.type.startsWith('image/')) return 'image';
+  if (mimeTypeOf(file).startsWith('image/')) return 'image';
   if (file.type.startsWith('text/') || TEXT_EXTENSIONS.has(extensionOf(file.name))) return 'text';
   return 'file';
+}
+
+function mimeTypeOf(file: File): string {
+  return file.type || IMAGE_MIME_TYPES.get(extensionOf(file.name)) || 'application/octet-stream';
 }
 
 function fingerprint(file: File): string {
@@ -59,7 +77,8 @@ function fingerprint(file: File): string {
 }
 
 function makePreviewUrl(file: File): string | undefined {
-  if (!file.type.startsWith('image/') || typeof URL.createObjectURL !== 'function') return undefined;
+  if (attachmentKind(file) !== 'image' || typeof URL.createObjectURL !== 'function')
+    return undefined;
   return URL.createObjectURL(file);
 }
 
@@ -81,7 +100,10 @@ export function prepareAttachments(
     }
 
     if (existing.length + accepted.length >= MAX_ATTACHMENT_COUNT) {
-      rejected.push({ fileName: file.name, reason: `Up to ${MAX_ATTACHMENT_COUNT} files per message` });
+      rejected.push({
+        fileName: file.name,
+        reason: `Up to ${MAX_ATTACHMENT_COUNT} files per message`,
+      });
       continue;
     }
 
@@ -98,7 +120,7 @@ export function prepareAttachments(
     const pending: PendingAttachment = {
       id: createId('attachment'),
       name: file.name,
-      mimeType: file.type || 'application/octet-stream',
+      mimeType: mimeTypeOf(file),
       sizeBytes: file.size,
       kind: attachmentKind(file),
       previewUrl: makePreviewUrl(file),
@@ -114,16 +136,18 @@ export function prepareAttachments(
   return { accepted, rejected };
 }
 
-function readAsDataUrl(file: File): Promise<string> {
+function readAsDataUrl(file: File, mimeType: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
     reader.onload = () => resolve(String(reader.result));
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(file.type ? file : file.slice(0, file.size, mimeType));
   });
 }
 
-export async function materializeAttachment(attachment: PendingAttachment): Promise<AttachmentPayload> {
+export async function materializeAttachment(
+  attachment: PendingAttachment,
+): Promise<AttachmentPayload> {
   const payload: AttachmentPayload = {
     id: attachment.id,
     name: attachment.name,
@@ -135,7 +159,7 @@ export async function materializeAttachment(attachment: PendingAttachment): Prom
   if (attachment.kind === 'text' && attachment.sizeBytes <= MAX_TEXT_CONTENT_BYTES) {
     payload.textContent = await attachment.file.text();
   } else {
-    payload.dataUrl = await readAsDataUrl(attachment.file);
+    payload.dataUrl = await readAsDataUrl(attachment.file, attachment.mimeType);
   }
 
   return payload;

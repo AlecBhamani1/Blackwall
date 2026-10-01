@@ -5,6 +5,8 @@
     | 'chevron-down'
     | 'copy'
     | 'file'
+    | 'folder'
+    | 'search'
     | 'gear'
     | 'image'
     | 'chevron-right'
@@ -58,6 +60,11 @@
   {:else if name === 'file'}
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
     <path d="M14 2v6h6" />
+  {:else if name === 'folder'}
+    <path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+  {:else if name === 'search'}
+    <circle cx="10.5" cy="10.5" r="6.5" />
+    <path d="m16 16 5 5" />
   {:else if name === 'gear'}
     <circle cx="12" cy="12" r="3" />
     <path

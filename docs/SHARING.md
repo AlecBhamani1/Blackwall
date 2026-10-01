@@ -1,9 +1,10 @@
 # Hosted guest sharing
 
 Blackwall publishes temporary browser chats through a relay that runs on a separate, publicly
-reachable machine. The Mac never accepts an inbound guest connection: it opens an outbound
-WebSocket to the relay, receives authenticated guest requests there, sends them to the configured
-OpenAI-compatible model, and streams responses back over the same connection.
+reachable machine. The host computer (macOS, Windows, or Linux) never accepts an inbound guest
+connection: it opens an outbound WebSocket to the relay, receives authenticated guest requests
+there, sends them to the configured OpenAI-compatible model, and streams responses back over the
+same connection.
 
 The relay address is configuration, not a build-time constant. Moving to another server only
 requires changing **Settings → Share your model → Hosted relay URL**. The saved URL applies to
@@ -55,14 +56,15 @@ replaces the container while preserving its volume. It then verifies that an imp
 the original owner can reconnect, and raw credentials are absent from the database. Its temporary
 container and volume are removed afterward. This does not deploy a public relay or test public TLS.
 
-## Configure the Mac
+## Configure the host
 
 Open **Settings → Share your model** and enter:
 
 - **Hosted relay URL:** the origin only, such as `https://relay.example.com`. It is saved locally
   and can be changed whenever the relay moves.
 - **Relay token:** the value configured on the relay. After successful registration it is saved
-  to macOS Keychain for this relay origin and reused when the input is blank. It is never placed
+  to the platform credential store (Keychain, Windows Credential Manager, or Secret Service) for
+  this relay origin and reused when the input is blank. It is never placed
   in a guest URL. Manage removal under **Settings → Access keys**.
 
 The same values can be supplied when launching from a terminal:
@@ -97,7 +99,7 @@ still require device acceptance.
 ## Request flow
 
 ```text
-Guest browser                         Hosted relay                   Owner Mac
+Guest browser                         Hosted relay                   Owner computer
       │                                    │                            │
       │  HTTPS + Bearer invite key         │                            │
       ├───────────────────────────────────►│                            │
@@ -108,7 +110,7 @@ Guest browser                         Hosted relay                   Owner Mac
       │◄───────────────────────────────────┤                            │
 ```
 
-Creating a share generates three independent random values on the Mac:
+Creating a share generates three independent random values on the host:
 
 - a session identifier used in the public URL;
 - a host key used only to authenticate reconnects; and
@@ -153,7 +155,7 @@ and migrates the version 1 ownership registry without discarding reservations.
 - Guest request bodies are limited to 32 MiB and model responses to 64 MiB.
 - Invitations expire after at most seven days. Expiry ends unfinished requests as well as new access.
   Host disconnection removes the live session; the ownership reservation remains protected.
-- The model endpoint and its API key remain on the Mac and are never sent to the relay or guest.
+- The model endpoint and its API key remain on the host and are never sent to the relay or guest.
 - The deployment token authorizes hosts to register; the invite key separately authorizes guests.
 - Public deployments must use TLS. Do not expose the relay's plain HTTP listener directly.
 
@@ -168,14 +170,14 @@ Guided setup accepts a full invitation and opens it in the default browser witho
 secret. Persistent computer pairing uses its own desktop flow and per-device credentials.
 Named direct model connections remain available through advanced setup.
 
-The desktop resolves an upstream model key from macOS Keychain when starting a share. Environment
+The desktop resolves an upstream model key from the platform credential store when starting a share. Environment
 model and relay credentials are used only for their configured origin. Model redirects are disabled.
 Locking Blackwall stops guest links and paired host tunnels. Guests never receive the owner's memory, skills, project
-tools, saved conversations, or Keychain credentials.
+tools, saved conversations, or stored credentials.
 
 The current UI still needs a relay origin and, where configured, a registration token. No default
 Blackwall-operated relay is deployed by this change. Four named invitations can now be active together and revoked separately. **Stop sharing** revokes
-every active invitation. Relay tokens are saved in Keychain after successful registration. Native two-computer acceptance and default relay operation remain open
+every active invitation. Relay tokens are saved in the credential store after successful registration. Native two-computer acceptance and default relay operation remain open
 in [the delivery plan](DELIVERY_PLAN.md).
 
 
@@ -187,14 +189,31 @@ On the client, choose **Connect a computer**, paste the complete pairing invitat
 client. Compare the three-group confirmation code on both screens, check the confirmation box on
 the host, and approve. The client saves the computer and offers **Connect** after approval.
 
+### Across operating systems
+
+Pairing and guest links use the same relay protocol, credential format, and model API on macOS,
+Windows, and Linux, so any combination works. For example, to use a model on an NVIDIA DGX Spark
+from a Windows laptop:
+
+1. Install the Linux ARM64 build (`aarch64.AppImage` or `arm64.deb`) on the Spark, run Ollama or
+   another OpenAI-compatible server there, and connect Blackwall to it with **Use this computer**.
+2. On the Spark, choose **Pair another computer** and copy the invitation.
+3. On Windows, install `x64-setup.exe`, choose **Connect a computer**, paste the invitation, and
+   compare the confirmation code with the Spark before approving there.
+
+The Spark needs an unlocked desktop session with a running Secret Service keyring, because the host
+keeps its pairing keys there. Neither computer needs an inbound port; both connect outward to the
+relay. If both are on a trusted private network, the Windows computer can instead save the Spark's
+model address directly under advanced setup, without a relay or Blackwall running on the Spark.
+
 The invitation expires after five minutes and binds to the first candidate. A candidate creates its
 own random credential; the host and relay receive only its salted digest. The invitation cannot
 be used to recover that credential or add another device after approval. Pairing permits model
 requests only. The relay remains trusted with forwarded chat contents; there is no application-level
 end-to-end encryption.
 
-Both Macs store typed metadata in SQLite and independent raw secrets in native Keychain accounts
-scoped to the full paired endpoint, including the unique device address. Two computers on the same
+Both computers store typed metadata in SQLite and independent raw secrets in native credential-store
+accounts scoped to the full paired endpoint, including the unique device address. Two computers on the same
 relay therefore have separate credentials. On relaunch or unlock, approved host records reconnect
 using that same address and a renewable one-day registration lease. Reconnect uses bounded backoff
 with jitter and never resends a prompt. The selected model is retained without silent substitution.
@@ -203,8 +222,8 @@ with jitter and never resends a prompt. The selected model is retained without s
 a permanent revocation marker and disconnects that device's active requests. If the relay is offline,
 the card says removal is pending and retries; other computers and guest links remain available.
 A stale host credential cannot reopen a revoked address after relay restart. A second removal of an
-already revoked card deletes its local record and Keychain entry. Client-side removal deletes only
-that Mac's saved connection and credential; host-side revocation is separate.
+already revoked card deletes its local record and stored credential. Client-side removal deletes only
+that computer's saved connection and credential; host-side revocation is separate.
 
 An interrupted approval remains a visible **Approval incomplete** record and never automatically
 starts a tunnel. If the original exchange is still open, **Finish pairing** retries the same approval;

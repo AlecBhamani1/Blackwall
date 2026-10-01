@@ -56,10 +56,18 @@ pub fn cancel_request(request_id: String, state: State<'_, SetupState>) -> Resul
     state.jobs.cancel(&request_id)
 }
 
+const OLLAMA_DOWNLOAD: &str = if cfg!(target_os = "macos") {
+    "https://ollama.com/download/mac"
+} else if cfg!(windows) {
+    "https://ollama.com/download/windows"
+} else {
+    "https://ollama.com/download/linux"
+};
+
 #[tauri::command]
 pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result<(), String> {
     let target = match kind.as_str() {
-        "download" => "https://ollama.com/download/mac".to_owned(),
+        "download" => OLLAMA_DOWNLOAD.to_owned(),
         "invitation" => connection::validate_invitation(invitation.as_deref().unwrap_or_default())
             .map_err(|_| {
                 "Paste the complete invitation link from Blackwall, including its access key."
@@ -67,27 +75,27 @@ pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result
             .to_string(),
         _ => return Err("Unknown setup action.".into()),
     };
+    // Fixed system openers receive one validated URL argument, never shell syntax.
     #[cfg(target_os = "macos")]
-    {
-        let status = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new("/usr/bin/open")
-                .arg(&target)
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await
-        .map_err(|_| "The browser took too long to open.")?
-        .map_err(|_| "Your browser could not be opened.")?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err("Your browser could not be opened.".into())
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = target;
-        Err("Open this link in your browser. Native setup currently supports macOS.".into())
+    let mut opener = tokio::process::Command::new("/usr/bin/open");
+    #[cfg(windows)]
+    let mut opener = {
+        let mut command = tokio::process::Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut opener = tokio::process::Command::new("xdg-open");
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        opener.arg(&target).kill_on_drop(true).status(),
+    )
+    .await
+    .map_err(|_| "The browser took too long to open.")?
+    .map_err(|_| "Your browser could not be opened. Open this link in your browser instead.")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Your browser could not be opened. Open this link in your browser instead.".into())
     }
 }

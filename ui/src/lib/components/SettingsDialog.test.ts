@@ -54,6 +54,26 @@ describe('SettingsDialog', () => {
     expect(onInstallUpdate).toHaveBeenCalledOnce();
   });
 
+  it('offers beta and prevents switching channels during installation', async () => {
+    const user = userEvent.setup();
+    const onUpdateChannelChange = vi.fn().mockResolvedValue(undefined);
+    const view = render(SettingsDialog, {
+      props: {
+        open: true,
+        model: MODEL,
+        onClose: vi.fn(),
+        client: mockClient(),
+        updateChannel: 'stable',
+        onUpdateChannelChange,
+      },
+    });
+    await user.selectOptions(screen.getByLabelText('Update channel'), 'beta');
+    expect(onUpdateChannelChange).toHaveBeenCalledExactlyOnceWith('beta');
+    await view.rerender({ updateChannel: 'beta', updateState: 'downloading' });
+    expect(screen.getByLabelText('Update channel')).toBeDisabled();
+    expect(screen.getByText(/Beta builds may have bugs/)).toBeInTheDocument();
+  });
+
   it('saves and tests a model endpoint from settings', async () => {
     const user = userEvent.setup();
     const onConfigureEndpoint = vi.fn().mockResolvedValue(true);
@@ -73,10 +93,10 @@ describe('SettingsDialog', () => {
 
     const input = screen.getByLabelText('Endpoint URL');
     await user.clear(input);
-    await user.type(input, 'http://100.76.24.116:11434');
+    await user.type(input, 'http://192.0.2.10:11434');
     await user.click(screen.getByRole('button', { name: 'Save and reconnect' }));
 
-    expect(onConfigureEndpoint).toHaveBeenCalledWith('http://100.76.24.116:11434');
+    expect(onConfigureEndpoint).toHaveBeenCalledWith('http://192.0.2.10:11434');
     expect(
       await screen.findByText('Connected and loaded the available models.'),
     ).toBeInTheDocument();

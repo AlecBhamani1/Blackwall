@@ -7,8 +7,12 @@ mod credentials;
 mod data;
 mod identity;
 mod keychain;
+#[cfg(target_os = "macos")]
+mod lifecycle;
 mod pairing;
+mod secrets;
 mod setup;
+mod updates;
 
 use commands::AppState;
 use thiserror::Error;
@@ -24,7 +28,7 @@ fn run() -> Result<(), StartupError> {
     let mut context = tauri::generate_context!();
     identity::initialize(&context.config().identifier).map_err(StartupError::Identity)?;
     identity::configure_acceptance_webviews(context.config_mut());
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -32,8 +36,12 @@ fn run() -> Result<(), StartupError> {
         .manage(setup::SetupState::default())
         .manage(agent_commands::AgentState::default())
         .manage(auth::AuthState::default())
-        .manage(pairing::PairingState::default())
+        .manage(pairing::PairingState::default());
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_window_event(lifecycle::on_window_event);
+    let app = builder
         .invoke_handler(tauri::generate_handler![
+            updates::check_app_update,
             pairing::pairing_status,
             pairing::retry_paired_device,
             pairing::create_pairing,
@@ -46,6 +54,10 @@ fn run() -> Result<(), StartupError> {
             auth::set_passphrase,
             auth::lock_app,
             agent_commands::choose_workspace,
+            agent_commands::restore_workspace,
+            agent_commands::browse_workspace,
+            agent_commands::search_workspace,
+            agent_commands::read_workspace_file,
             agent_commands::resolve_approval,
             agent_commands::export_conversation,
             data::list_skills,
@@ -78,7 +90,11 @@ fn run() -> Result<(), StartupError> {
             commands::revoke_share,
             commands::stop_share,
         ])
-        .run(context)?;
+        .build(context)?;
+    #[cfg(target_os = "macos")]
+    app.run(lifecycle::on_run_event);
+    #[cfg(not(target_os = "macos"))]
+    app.run(|_, _| {});
     Ok(())
 }
 

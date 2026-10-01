@@ -1,4 +1,5 @@
-//! Model and relay credentials are stored in Keychain and bound to a normalized origin.
+//! Model and relay credentials are stored in the platform credential store and bound to a
+//! normalized origin.
 use blackwall_core::connection::normalize_endpoint;
 use reqwest::Url;
 
@@ -28,15 +29,15 @@ async fn read_key(service: &'static str, endpoint: &str) -> Result<Option<String
 async fn read_secret(service: &'static str, origin: String) -> Result<Option<String>, String> {
     let service = crate::identity::keychain_service(service);
     crate::keychain::read(move || {
-        #[cfg(target_os = "macos")]
-        { match security_framework::passwords::generic_password(security_framework::passwords::PasswordOptions::new_generic_password(&service, &origin)) {
-            Ok(value) => String::from_utf8(value).map(Some).map_err(|_| "The saved access key is not valid text.".into()),
-            Err(error) if error.code() == -25300 => Ok(None),
-            Err(_) => Err("Blackwall could not read the access key from Keychain. Unlock your login keychain and try again.".into()),
-        } }
-        #[cfg(not(target_os = "macos"))]
-        { let _ = (service, origin); Ok(None) }
-    }).await
+        crate::secrets::get(&service, &origin).map_err(|error| {
+            error.explain(format!(
+                "Blackwall could not read the access key from {}. {}, then try again.",
+                crate::secrets::STORE,
+                crate::secrets::RECOVER
+            ))
+        })
+    })
+    .await
 }
 fn paired_account(endpoint: &str) -> Result<String, String> {
     let endpoint = normalize_endpoint(endpoint).map_err(|_| "Invalid paired computer address.")?;
@@ -80,7 +81,7 @@ pub async fn save_model_key(
     if key.len() > 8192 || key.contains(['\n', '\r']) {
         return Err("This access key is not valid.".into());
     }
-    // Verify a replacement before overwriting a working Keychain entry.
+    // Verify a replacement before overwriting a working saved entry.
     if !key.trim().is_empty() {
         let endpoint = normalize_endpoint(&endpoint).map_err(|error| error.to_string())?;
         let client = reqwest::Client::builder()
@@ -115,38 +116,23 @@ async fn write_key(service: &'static str, origin: String, key: String) -> Result
     }
     let service = crate::identity::keychain_service(service);
     tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
-        {
-            let result = if key.trim().is_empty() {
-                security_framework::passwords::delete_generic_password(&service, &origin)
-            } else {
-                security_framework::passwords::set_generic_password(
-                    &service,
-                    &origin,
-                    key.trim().as_bytes(),
-                )
-            };
-            match result {
-                Ok(()) => Ok(()),
-                Err(error) if key.trim().is_empty() && error.code() == -25300 => Ok(()),
-                Err(_) if key.trim().is_empty() => Err(
-                    "Blackwall could not remove the access key from Keychain. Check Keychain access and try again."
-                        .into(),
-                ),
-                Err(_) => Err(
-                    "Blackwall could not save the access key in Keychain. Check Keychain access and try again."
-                        .into(),
-                ),
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (service, origin, key);
-            Err("Secure access key storage currently requires macOS.".into())
+        let (store, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
+        if key.trim().is_empty() {
+            crate::secrets::delete(&service, &origin).map_err(|error| {
+                error.explain(format!(
+                    "Blackwall could not remove the access key from {store}. {recover}, then try again."
+                ))
+            })
+        } else {
+            crate::secrets::set(&service, &origin, key.trim()).map_err(|error| {
+                error.explain(format!(
+                    "Blackwall could not save the access key in {store}. {recover}, then try again."
+                ))
+            })
         }
     })
     .await
-    .map_err(|_| "Keychain access could not finish.")?
+    .map_err(|_| format!("Access to {} could not finish.", crate::secrets::STORE))?
 }
 
 #[derive(serde::Deserialize)]
@@ -194,10 +180,9 @@ pub async fn remove_saved_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Opt-in because this exercises the current macOS login Keychain, not a mock.
-    #[cfg(target_os = "macos")]
+    /// Opt-in because this exercises the signed-in user's credential store, not a mock.
     #[tokio::test]
-    #[ignore = "Creates and removes disposable native Keychain device accounts"]
+    #[ignore = "Creates and removes disposable native credential-store device accounts"]
     async fn native_pair_credentials_round_trip_and_removal_are_isolated() {
         use blackwall_core::pairing::secret;
         let one = format!("https://pairing-tests.invalid/s/{}/v1", secret("bws_"));
@@ -206,8 +191,7 @@ mod tests {
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 for (service, account) in &self.0 {
-                    let _ =
-                        security_framework::passwords::delete_generic_password(service, account);
+                    let _ = crate::secrets::delete(service, account);
                 }
             }
         }
@@ -240,7 +224,7 @@ mod tests {
         }
     }
     #[test]
-    fn two_paired_computers_on_one_relay_have_different_keychain_accounts() {
+    fn two_paired_computers_on_one_relay_have_different_credential_accounts() {
         let first = blackwall_core::pairing::secret("bws_");
         let second = blackwall_core::pairing::secret("bws_");
         let one = format!("https://relay.example/s/{first}/v1");

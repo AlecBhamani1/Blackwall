@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [partial, main]
   pull_request:
+    branches: [partial, main]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +22,7 @@ jobs:
       rust: ${{ steps.paths.outputs.rust }}
       ui: ${{ steps.paths.outputs.ui }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: paths
         name: Detect buildable workspaces
         shell: bash
@@ -41,37 +42,48 @@ jobs:
   release-validation:
     name: Release workflow checks
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.3
       - name: Test release validation and publication failure recovery
-        run: node --test scripts/release/*.test.mjs
+        run: node --test scripts/release/*.test.mjs scripts/repository/*.test.mjs
 
   rust:
-    name: Rust quality
+    name: Rust quality (${{ matrix.os }})
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04, windows-latest]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy, rustfmt
+      - name: Install Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: ./scripts/install-linux-deps.sh
       - name: Check formatting
+        if: runner.os == 'macOS'
         run: cargo fmt --manifest-path src/Cargo.toml --all -- --check
       - name: Run Clippy
-        run: cargo clippy --manifest-path src/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path src/Cargo.toml --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
-        run: cargo test --manifest-path src/Cargo.toml --workspace --all-features
+        run: cargo test --locked --manifest-path src/Cargo.toml --workspace --all-features
 
   relay-linux:
     name: Relay deployment checks
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Test core and relay on Linux, including process restarts
@@ -79,7 +91,7 @@ jobs:
       - name: Build the production relay container
         run: docker build --tag blackwall-relay:ci --file deploy/relay/Dockerfile .
       - name: Install Node.js for container acceptance
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.3
       - name: Verify pairing and revocation across container replacement
@@ -90,8 +102,9 @@ jobs:
     needs: detect
     if: needs.detect.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -99,15 +112,27 @@ jobs:
           arguments: --all-features
           command: check
 
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
   ui:
     name: UI quality
     needs: detect
     if: needs.detect.outputs.ui == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.22.3
           cache: npm
@@ -120,3 +145,63 @@ jobs:
         run: npm --prefix ui run test:run
       - name: Build UI
         run: npm --prefix ui run build
+
+  desktop:
+    name: Desktop release build (${{ matrix.target }})
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, bundles: app }
+          - { os: macos-latest, target: x86_64-apple-darwin, bundles: app }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundles: 'appimage,deb' }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, bundles: 'appimage,deb' }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundles: nsis }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.22.3
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: ./scripts/install-linux-deps.sh
+      - run: npm ci --prefix ui
+      - name: Verify every desktop target without publication credentials
+        shell: bash
+        working-directory: src/app
+        run: |
+          version=$(node -p "require('../../.github/release.json').version")
+          ../../ui/node_modules/.bin/tauri build --target '${{ matrix.target }}' --bundles '${{ matrix.bundles }}' --config "{\"version\":\"$version\",\"bundle\":{\"createUpdaterArtifacts\":false}}"
+
+  quality-gate:
+    name: Quality gate
+    needs: [detect, release-validation, rust, relay-linux, dependencies, dependency-review, ui, desktop]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RESULTS: ${{ toJSON(needs) }}
+      DESKTOP_REQUIRED: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+      DEPENDENCY_REVIEW_REQUIRED: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Require every applicable check to succeed
+        run: |
+          node <<'NODE'
+          const jobs = JSON.parse(process.env.RESULTS);
+          const required = ['detect', 'release-validation', 'rust', 'relay-linux', 'dependencies', 'ui'];
+          if (process.env.DESKTOP_REQUIRED === 'true') required.push('desktop');
+          if (process.env.DEPENDENCY_REVIEW_REQUIRED === 'true') required.push('dependency-review');
+          const failed = required.filter(name => jobs[name].result !== 'success');
+          if (failed.length) {
+            console.error('Required checks did not succeed:', failed.join(', '));
+            process.exit(1);
+          }
+          NODE

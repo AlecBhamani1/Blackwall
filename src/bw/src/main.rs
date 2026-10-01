@@ -1,21 +1,53 @@
+mod input;
+mod session;
+mod settings;
+
 use blackwall_core::{
-    agent::Agent,
-    approvals::Approvals,
-    model::HttpModel,
-    protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
-    storage::LocalStore,
-    tools::Workspace,
-    ChatMessage, ChatRequest, MessageRole,
+    storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
 };
-use serde_json::{json, Value};
-use std::{
-    env,
-    io::{self, Write},
-    path::PathBuf,
-    process::ExitCode,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use input::Input;
+use session::Conversation;
+use settings::Settings;
+use std::{env, path::PathBuf, process::ExitCode};
+
+const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launches):
+  /commands, /help           Show these commands
+  /settings                 Show effective settings and workspace
+  /settings <name> <value>  Change model, endpoint, web, or memory
+  /model <model-id>         Select a model
+  /endpoint <url>           Set the OpenAI-compatible service address
+  /web on|off               Enable/disable approved web tools
+  /memory on|off            Include/exclude your saved memories
+  /workspace <path>         Start a new conversation in a project
+  /new                      Start a new conversation in this project
+  /sessions                 List saved conversations
+  /resume <session-id>      Resume an Agent conversation and its project
+  /quit, /exit              Exit Blackwall
+
+Type a message to ask the agent. Type // to start a message with a literal /.
+File tools stay in the project; edits, shell commands, and web requests need approval.
+At an approval, type yes to allow once; other input denies. Ctrl+C stops a turn.";
+
+const HELP: &str = "bw — Blackwall project assistant
+
+USAGE:
+  bw                         Start interactive chat in the current project
+  bw chat                    Start interactive chat
+  bw setup                   Configure endpoint, model, web, and memory
+  bw config [show]           Show effective settings
+  bw config set <name> <value>
+  bw commands                List interactive slash commands
+  bw run <prompt>            Run one task
+  bw resume <id> [prompt]    Continue a saved Agent conversation
+  bw sessions                List saved conversations
+  bw request <prompt>        Print a request preview without a model call
+
+Install: cargo install --locked --path src/bw
+Settings and sessions live in ~/.blackwall/ (BLACKWALL_DATA_DIR overrides the folder).
+Saved CLI settings take precedence over desktop settings, then environment defaults.
+BLACKWALL_MODEL and BLACKWALL_MODEL_ENDPOINT (or OLLAMA_HOST) supply initial defaults.
+BLACKWALL_MODEL_API_KEY is used only for the environment-configured service origin.
+Run bw commands for /commands and the other interactive controls.";
 
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
@@ -26,7 +58,6 @@ fn main() -> ExitCode {
         }
     };
     let result = runtime.block_on(run());
-    // A cancelled terminal approval may leave a stdin read waiting. It must not hold shutdown open.
     runtime.shutdown_background();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -36,154 +67,318 @@ fn main() -> ExitCode {
         }
     }
 }
+
 async fn run() -> Result<(), String> {
     let mut arguments = env::args().skip(1);
-    let command = arguments.next().unwrap_or_else(|| "help".into());
-    if matches!(command.as_str(), "help" | "--help" | "-h") {
-        println!("bw — Blackwall project assistant\n\nUSAGE:\n  bw run <prompt>\n  bw resume <session-id> <prompt>\n  bw sessions\n  bw request <prompt>\n\nRuns in the current project folder. File reads stay inside it; writes and shell commands require approval.\nWeb access is disabled in the CLI. Ctrl+C stops the whole run.\n\nENVIRONMENT:\n  BLACKWALL_MODEL          model id (default llama3.2)\n  BLACKWALL_MODEL_ENDPOINT model service address (or OLLAMA_HOST)\n  BLACKWALL_MODEL_API_KEY  optional access key for that service");
-        return Ok(());
-    }
-    let model = env::var("BLACKWALL_MODEL").unwrap_or_else(|_| "llama3.2".into());
-    if command == "request" {
-        let prompt = arguments.collect::<Vec<_>>().join(" ");
-        if prompt.trim().is_empty() {
-            return Err("A prompt is required.".into());
+    let command = arguments.next().unwrap_or_else(|| "chat".into());
+    let arguments = arguments.collect::<Vec<_>>();
+    match command.as_str() {
+        "help" | "--help" | "-h" => {
+            println!("{HELP}");
+            return Ok(());
         }
-        let request = ChatRequest::new(
+        "commands" => {
+            println!("{COMMANDS}");
+            return Ok(());
+        }
+        "--version" | "-V" => {
+            println!("bw {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" => {}
+        _ => return Err("Unknown command. Run bw --help.".into()),
+    }
+    let directory = match env::var_os("BLACKWALL_DATA_DIR") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => env::home_dir()
+            .ok_or("Your home folder could not be found.")?
+            .join(".blackwall"),
+    };
+    let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
+    if command == "sessions" {
+        require_no_arguments(&arguments)?;
+        return list_sessions(&store);
+    }
+    let mut settings = Settings::load(&store)?;
+    if command == "config" {
+        return configure(&store, &mut settings, &arguments);
+    }
+    if command == "request" {
+        let prompt = required_prompt(&arguments)?;
+        let mut request = ChatRequest::new(
             "cli-preview",
-            model,
+            settings.model,
             vec![ChatMessage::new(MessageRole::User, prompt)],
         );
+        request.endpoint = Some(settings.endpoint);
         println!(
             "{}",
-            serde_json::to_string_pretty(&request).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&request).map_err(|error| error.to_string())?
         );
         return Ok(());
     }
-    if !matches!(command.as_str(), "run" | "resume" | "sessions") {
-        return Err("Unknown command. Run bw --help.".into());
+    let mut input = Input::stdin();
+    if command == "setup" {
+        require_no_arguments(&arguments)?;
+        return setup(&store, &mut settings, &mut input).await;
     }
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("Your home folder could not be found.")?;
-    let store = LocalStore::open(&home.join(".blackwall")).map_err(|e| e.to_string())?;
-    if command == "sessions" {
-        for session in store.list_sessions().map_err(|e| e.to_string())? {
+    let workspace =
+        Workspace::open(&env::current_dir().map_err(|_| "The current folder is unavailable.")?)
+            .map_err(|error| error.to_string())?
+            .path;
+    let mut conversation = if command == "resume" {
+        Conversation::load(
+            &store,
+            arguments
+                .first()
+                .ok_or("A session identifier is required.")?,
+            &workspace,
+        )?
+    } else {
+        Conversation::new(workspace)?
+    };
+    if command == "run" || (command == "resume" && arguments.len() > 1) {
+        let prompt_arguments = if command == "resume" {
+            &arguments[1..]
+        } else {
+            &arguments[..]
+        };
+        let prompt = required_prompt(prompt_arguments)?;
+        return conversation
+            .turn(&store, &directory, &settings, &prompt, &mut input)
+            .await;
+    }
+    if command == "chat" {
+        require_no_arguments(&arguments)?;
+    }
+    chat(
+        &store,
+        &directory,
+        &mut settings,
+        &mut conversation,
+        &mut input,
+    )
+    .await
+}
+
+fn require_no_arguments(arguments: &[String]) -> Result<(), String> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        Err("Unexpected arguments. Run bw --help.".into())
+    }
+}
+
+fn required_prompt(arguments: &[String]) -> Result<String, String> {
+    let prompt = arguments.join(" ");
+    if prompt.trim().is_empty() {
+        Err("A prompt is required.".into())
+    } else {
+        Ok(prompt)
+    }
+}
+
+fn configure(
+    store: &LocalStore,
+    settings: &mut Settings,
+    arguments: &[String],
+) -> Result<(), String> {
+    match arguments {
+        [] => {}
+        [show] if show == "show" => {}
+        [set, key, values @ ..] if set == "set" && !values.is_empty() => {
+            settings.set(store, key, &values.join(" "))?;
+        }
+        _ => {
+            return Err(
+                "Use bw config show or bw config set <model|endpoint|web|memory> <value>.".into(),
+            )
+        }
+    }
+    println!("{}", settings.describe());
+    Ok(())
+}
+
+async fn setup(
+    store: &LocalStore,
+    settings: &mut Settings,
+    input: &mut Input,
+) -> Result<(), String> {
+    println!(
+        "Blackwall setup. Enter keeps the displayed value. Use an already-running model service."
+    );
+    let mut candidate = settings.clone();
+    for key in ["endpoint", "model", "web", "memory"] {
+        let current = match key {
+            "endpoint" => candidate.endpoint.clone(),
+            "model" => candidate.model.clone(),
+            "web" => if candidate.web_enabled { "on" } else { "off" }.into(),
+            _ => if candidate.memory_enabled {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+        };
+        input.prompt(&format!("{key} [{current}]: "))?;
+        let value = input
+            .next()
+            .await?
+            .ok_or("Setup cancelled. No settings were changed.")?;
+        let value = if value.trim().is_empty() {
+            current
+        } else {
+            value.trim().into()
+        };
+        match key {
+            "endpoint" => candidate.endpoint = value,
+            "model" => candidate.model = value,
+            "web" => candidate.web_enabled = parse_switch(&value)?,
+            _ => candidate.memory_enabled = parse_switch(&value)?,
+        }
+    }
+    candidate.validate()?;
+    candidate.save(store)?;
+    *settings = candidate;
+    println!(
+        "Saved CLI settings. Use bw to chat or bw config to review them.\n{}",
+        settings.describe()
+    );
+    Ok(())
+}
+
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("Choose on or off. Setup cancelled; no settings were changed.".into()),
+    }
+}
+
+fn list_sessions(store: &LocalStore) -> Result<(), String> {
+    let sessions = store.list_sessions().map_err(|error| error.to_string())?;
+    if sessions.is_empty() {
+        println!("No saved conversations yet.");
+    }
+    for session in sessions {
+        println!(
+            "{}  {}  {}",
+            session["id"].as_str().unwrap_or(""),
+            session["title"].as_str().unwrap_or(""),
+            session["workspace"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+async fn chat(
+    store: &LocalStore,
+    directory: &std::path::Path,
+    settings: &mut Settings,
+    conversation: &mut Conversation,
+    input: &mut Input,
+) -> Result<(), String> {
+    println!(
+        "Blackwall — {}\nProject: {}\nType /commands for settings and controls.",
+        settings.model,
+        conversation.workspace.display()
+    );
+    loop {
+        input.prompt("you> ")?;
+        let Some(line) = input.next().await? else {
+            return conversation.flush(store);
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let result =
+            if let Some(command) = line.strip_prefix('/').filter(|_| !line.starts_with("//")) {
+                let (name, value) = command
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((command, ""));
+                let value = value.trim();
+                if matches!(name, "quit" | "exit") && value.is_empty() {
+                    match conversation.flush(store) {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            eprintln!("bw: {error}");
+                            continue;
+                        }
+                    }
+                }
+                slash(store, settings, conversation, name, value)
+            } else {
+                let prompt = if line.starts_with("//") {
+                    &line[1..]
+                } else {
+                    line
+                };
+                conversation
+                    .turn(store, directory, settings, prompt, input)
+                    .await
+            };
+        if let Err(error) = result {
+            eprintln!("bw: {error}");
+        }
+    }
+}
+
+fn slash(
+    store: &LocalStore,
+    settings: &mut Settings,
+    conversation: &mut Conversation,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    match name {
+        "commands" | "help" if value.is_empty() => println!("{COMMANDS}"),
+        "settings" if value.is_empty() => println!(
+            "{}\nworkspace: {}",
+            settings.describe(),
+            conversation.workspace.display()
+        ),
+        "settings" => {
+            let (key, value) = value
+                .split_once(char::is_whitespace)
+                .ok_or("Use /settings <model|endpoint|web|memory> <value>.")?;
+            settings.set(store, key, value.trim())?;
+            println!("{}", settings.describe());
+        }
+        "model" | "endpoint" | "web" | "memory" => {
+            settings.set(store, name, value)?;
+            println!("{}", settings.describe());
+        }
+        "new" if value.is_empty() => {
+            conversation.flush(store)?;
+            *conversation = Conversation::new(conversation.workspace.clone())?;
+            println!("Started a new conversation.");
+        }
+        "workspace" if !value.is_empty() => {
+            conversation.flush(store)?;
+            let path = PathBuf::from(value);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                conversation.workspace.join(path)
+            };
+            let workspace = Workspace::open(&path)
+                .map_err(|error| error.to_string())?
+                .path;
+            *conversation = Conversation::new(workspace)?;
+            println!("Project: {}", conversation.workspace.display());
+        }
+        "sessions" if value.is_empty() => list_sessions(store)?,
+        "resume" if !value.is_empty() => {
+            conversation.flush(store)?;
+            *conversation = Conversation::load(store, value, &conversation.workspace)?;
             println!(
-                "{}  {}",
-                session["id"].as_str().unwrap_or(""),
-                session["title"].as_str().unwrap_or("")
+                "Resumed {}\nProject: {}",
+                conversation.id(),
+                conversation.workspace.display()
             );
         }
-        return Ok(());
+        _ => return Err("Unknown command or invalid arguments. Type /commands.".into()),
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "The system clock is invalid.")?
-        .as_millis() as u64;
-    let mut session = if command == "resume" {
-        let id = arguments
-            .next()
-            .ok_or("A session identifier is required.")?;
-        store
-            .load_session(&id)
-            .map_err(|e| e.to_string())?
-            .ok_or("That conversation was not found.")?
-    } else {
-        json!({"id":format!("cli_{}_{}",std::process::id(),now),"title":"CLI conversation","updatedAt":now,"messages":[]})
-    };
-    let prompt = arguments.collect::<Vec<_>>().join(" ");
-    if prompt.trim().is_empty() {
-        return Err("A prompt is required.".into());
-    }
-    if command == "run" {
-        session["title"] = json!(prompt.chars().take(80).collect::<String>());
-    }
-    let history = session["messages"]
-        .as_array_mut()
-        .ok_or("The saved conversation is invalid.")?;
-    history.push(json!({"id":format!("message_{now}"),"role":"user","content":prompt,"attachments":[],"status":"complete","createdAt":now}));
-    let mut messages = history
-        .iter()
-        .map(|message| json!({"role":message["role"],"content":message["content"]}))
-        .collect::<Vec<_>>();
-    let preferences: Value = store
-        .setting("preferences")
-        .map_err(|error| error.to_string())?
-        .map(|text| serde_json::from_str(&text))
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_else(|| json!({}));
-    if preferences["memoryEnabled"].as_bool() == Some(true) {
-        let context = blackwall_core::memory::context(
-            &store.memories("").map_err(|error| error.to_string())?,
-            4000,
-        );
-        if !context.is_empty() {
-            messages.insert(0, json!({"role":"system","content":context}));
-        }
-    }
-    let skills = blackwall_core::skills::SkillStore::open(&home.join(".blackwall/skills"))
-        .map_err(|error| error.to_string())?;
-    skills.seed().map_err(|error| error.to_string())?;
-    let (enabled, warnings) = skills.list().map_err(|error| error.to_string())?;
-    for warning in warnings {
-        eprintln!("Skill: {warning}");
-    }
-    let workflows = blackwall_core::skills::prompt(&enabled);
-    if !workflows.is_empty() {
-        messages.insert(0, json!({"role":"system","content":workflows}));
-    }
-    let endpoint = env::var("BLACKWALL_MODEL_ENDPOINT")
-        .or_else(|_| env::var("OLLAMA_HOST"))
-        .unwrap_or_else(|_| "http://localhost:11434/v1".into());
-    let backend = HttpModel::new(&endpoint, &model, env::var("BLACKWALL_MODEL_API_KEY").ok())
-        .map_err(|e| e.to_string())?;
-    let approvals = Approvals::default();
-    let decisions = approvals.clone();
-    let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-    let emit = Arc::new(move |event| {
-        let _ = events.send(event);
-    });
-    let directory = env::current_dir().map_err(|_| "The current project folder is unavailable.")?;
-    let agent = Agent {
-        backend: &backend,
-        workspace: Workspace::open(&directory).map_err(|e| e.to_string())?,
-        web_enabled: false,
-        approvals,
-        emit,
-    };
-    let request_id = format!("cli_run_{now}");
-    let work = agent.run(&request_id, messages);
-    tokio::pin!(work);
-    let answer = loop {
-        tokio::select! {
-            biased;
-            _=tokio::signal::ctrl_c()=>return Err("Task stopped.".into()),
-            event=incoming.recv()=>if let Some(event)=event{match event{
-                AgentEvent::AssistantDelta{delta,..}=>{print!("{delta}");let _=io::stdout().flush();},
-                AgentEvent::ToolCall{name,..}=>eprintln!("\n[{name}]"),
-                AgentEvent::ToolResult{success,output,..}=>if !success{eprintln!("{output}");},
-                AgentEvent::ApprovalRequest{request_id,approval_id,detail,..}=>{
-                    let decisions=decisions.clone();
-                    tokio::task::spawn_blocking(move||{
-                        eprintln!("\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies.");
-                        let mut line=String::new();let _=io::stdin().read_line(&mut line);
-                        let decision=if line.trim()=="yes"{ApprovalDecision::Allow}else{ApprovalDecision::Deny};
-                        let _=decisions.resolve(ResolveApprovalRequest{request_id,approval_id,decision});
-                    });
-                },_=>{}
-            }},
-            result=&mut work=>break result.map_err(|e|e.to_string())?,
-        }
-    };
-    println!();
-    session["messages"].as_array_mut().ok_or("The conversation is invalid.")?.push(json!({"id":format!("assistant_{now}"),"role":"assistant","content":answer,"attachments":[],"status":"complete","createdAt":now}));
-    session["updatedAt"] = Value::from(now);
-    store.save_session(&session).map_err(|e| e.to_string())?;
-    eprintln!(
-        "Saved conversation {}",
-        session["id"].as_str().unwrap_or("")
-    );
     Ok(())
 }

@@ -7,6 +7,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-01
+
+Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).
+Release details and acceptance limits: [0.1.4 notes](docs/releases/0.1.4.md).
+
+### Added
+
+- Interactive `bw` chat and `bw setup`, with persisted CLI settings and `/commands`, `/model`,
+  `/endpoint`, `/settings`, `/web`, and `/memory` controls. Resume restores the saved Agent project;
+  graceful cancellation retains partial answers, and environment access keys stay scoped to their origin.
+
+- Run Blackwall on Windows 10/11 (x64) and Linux (x86-64 and ARM64, including NVIDIA DGX Spark),
+  with installers and signed in-app updates. Access keys, pairing credentials, and the app lock use
+  Windows Credential Manager or the Linux Secret Service, and Agent-mode shell commands run in
+  Windows PowerShell on Windows. Pairing and guest links work between any mix of macOS, Windows,
+  and Linux computers.
+
+- Select Stable or Beta in App updates to test signed builds from `partial` before production,
+  with a saved channel preference and an explicit return to stable.
+
+- Browse project files in a right sidebar in Agent mode, with expandable folders, name and
+  content search, refresh controls, and bounded text previews inside the selected workspace.
+- Render inline and display LaTeX equations in assistant messages with bundled offline fonts.
+- Drop screenshots or files anywhere in the conversation to attach them, and use `@` to
+  select and reference files from the current chat, including names with spaces.
+
+- A protected `partial` integration branch and checked production promotions, tracked by version
+  milestones and release notes, with automatic versioned publication after production CI.
+- Both-architecture desktop build checks before promotion, dependency vulnerability review,
+  weekly dependency maintenance, issue/PR templates, and reproducible GitHub repository policy.
+
+- Copy buttons on individual Markdown code blocks, with success and failure feedback.
+
+### Fixed
+
+- Keep Blackwall running on macOS when the main window is closed, preserving active work and
+  restoring the window from the Dock. Quit and Cmd+Q still exit the app.
+
+- Stop Windows shell descendants on cancellation, timeout, and command completion even when
+  their parent PowerShell process has already exited.
+
+- Separate Chat and Agent histories, lock conversation mode and project after the first message,
+  restore each Agent conversation’s project, and clear the project when starting a new chat.
+
+### Changed
+
+- Reviewed development pull requests enter a checked merge queue before reaching `partial`.
+- Update Rust dependencies while preserving existing stored hashes; upgrade Vitest and coverage
+  together to version 5, and retain TypeScript 6 until the Svelte checker supports its successor.
+
+## [0.1.3] - 2026-09-24
+
 - Add signed in-app updates backed by continuous macOS builds from GitHub `main`.
 - Explicitly bundle the Blackwall logo for the app, Dock, and installer icons.
 - Replace direct private-network guest sharing with a configurable, self-hosted HTTPS relay and
@@ -14,7 +66,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Copy buttons on individual Markdown code blocks, with success and failure feedback.
 - Persistent computer pairing with five-minute invitations, matching-code host consent, per-device
   Keychain credentials, saved computer cards, automatic tunnel recovery, and durable individual revocation.
 - Relay pairing capability detection, bounded exchanges, and a shared eight-request guest/device budget.

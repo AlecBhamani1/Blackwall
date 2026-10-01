@@ -390,8 +390,11 @@ async function streamTauriChat(
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');
     await invoke('stream_chat', {
       request,
-      agentMode: request.agentMode ?? false,
-      webEnabled: request.webEnabled ?? false,
+      options: {
+        enabled: request.agentMode ?? false,
+        workspace: request.workspace ?? null,
+        webEnabled: request.webEnabled ?? false,
+      },
     });
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');
     if (remoteError) throw remoteError;

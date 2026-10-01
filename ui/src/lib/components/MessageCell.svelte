@@ -270,6 +270,13 @@
     color: var(--text-muted);
   }
 
+  .markdown :global(.katex-display) {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 0;
+  }
+
   .streaming-cursor {
     display: inline-block;
     width: 7px;

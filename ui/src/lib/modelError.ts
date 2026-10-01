@@ -1,3 +1,5 @@
+import { platform } from './platform';
+
 /** Native command rejections are serialized objects, not JavaScript Errors. */
 export class ModelRequestError extends Error {
   constructor(
@@ -26,8 +28,7 @@ export function nativeModelError(cause: unknown): ModelRequestError {
   const messages: Record<string, string> = {
     storage_error:
       'Blackwall could not access its local data. Check disk space and folder permissions, then retry saving. Keep Blackwall open to preserve unsaved work.',
-    credential_error:
-      'Blackwall could not access the saved key. Respond to any macOS Keychain prompt, unlock your login keychain if needed, then reconnect.',
+    credential_error: `Blackwall could not access the saved key. ${platform.storeHelp}, then reconnect.`,
     model_unavailable:
       'The model computer is unavailable. Open and unlock Blackwall on that computer, keep its model running, and reconnect.',
     model_access_denied:

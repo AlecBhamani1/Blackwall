@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-argon2 = "0.5"
+argon2 = "0.6"
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -23,11 +23,15 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng = "0.10.0"
 sha2.workspace = true
-similar = "2.7.0"
+similar = "3.2.0"
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop", "creation-flags"] }
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 tower.workspace = true

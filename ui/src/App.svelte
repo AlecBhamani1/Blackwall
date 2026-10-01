@@ -9,16 +9,21 @@
   import AppHeader from './lib/components/AppHeader.svelte';
   import ChatView from './lib/components/ChatView.svelte';
   import Composer from './lib/components/Composer.svelte';
+  import ChatDropZone from './lib/components/ChatDropZone.svelte';
+  import WorkspaceFiles from './lib/components/WorkspaceFiles.svelte';
+
   import Sidebar from './lib/components/Sidebar.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
 
+  let composer: Composer;
   const controller = createChatController();
   const updateController = createAppUpdateController();
   const {
     messages,
-    sessions,
+    visibleSessions,
+    sessionLocked,
     activeSessionId,
     runState,
     connectionState,
@@ -36,6 +41,7 @@
     preferences,
   } = controller;
   const {
+    channel: updateChannel,
     state: updateState,
     currentVersion,
     update: availableUpdate,
@@ -97,6 +103,7 @@
     }
   }
   let setupOpen = false;
+  let filesVisible = true;
   let sidebarVisible = typeof window === 'undefined' ? true : window.innerWidth > 760;
   const showHarnessDemo =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo');
@@ -161,12 +168,17 @@
         controller.preferences.update((current) => ({ ...current, ...patch }))}
       onLock={lock}
       visible={sidebarVisible}
-      sessions={$sessions}
+      sessions={$visibleSessions}
+      agentMode={$agentMode}
+      showModes={isDesktop()}
+      onModeChange={(mode) => controller.newChat(mode)}
       activeSessionId={$activeSessionId}
       connectionState={$connectionState}
       selectedModel={$selectedModel}
       endpoint={$endpoint}
       connectionError={$connectionError}
+      updateChannel={$updateChannel}
+      onUpdateChannelChange={updateController.setChannel}
       updateState={$updateState}
       currentVersion={$currentVersion}
       availableUpdate={$availableUpdate}
@@ -210,29 +222,35 @@
           <div class="mode-switch" aria-label="Conversation mode">
             <button
               class:active={!$agentMode}
-              disabled={$runState !== 'idle'}
-              onclick={() => agentMode.set(false)}>Chat</button
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
+              onclick={() => controller.chooseMode('chat')}>Chat</button
             ><button
               class:active={$agentMode}
-              disabled={$runState !== 'idle'}
-              onclick={() => ($workspace ? agentMode.set(true) : controller.chooseWorkspace())}
-              >Agent</button
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
+              onclick={() => controller.chooseMode('agent')}>Agent</button
             >
           </div>
-          <button
-            class="project-choice"
-            disabled={$runState !== 'idle'}
-            title={$workspace || 'Choose the folder Blackwall can work in'}
-            onclick={controller.chooseWorkspace}
-            >{$workspace
-              ? $workspace.split('/').filter(Boolean).at(-1)
-              : 'Choose project folder'}</button
-          ><span></span>{#if $agentMode}<label class="web-toggle"
+          {#if $agentMode}<button
+              class="project-choice"
+              disabled={$sessionLocked || $runState !== 'idle'}
+              title={$workspace || 'Choose the folder Blackwall can work in'}
+              onclick={controller.chooseWorkspace}
+              >{$workspace
+                ? $workspace.split('/').filter(Boolean).at(-1)
+                : 'Choose project folder'}</button
+            >{/if}<span></span>{#if $agentMode}<label class="web-toggle"
               ><input
                 type="checkbox"
                 bind:checked={$webEnabled}
                 disabled={$runState !== 'idle'}
               />Web access</label
+            ><button
+              class="export"
+              aria-pressed={filesVisible}
+              onclick={() => (filesVisible = !filesVisible)}
+              >{filesVisible ? 'Hide files' : 'Show files'}</button
             >{/if}{#if $messages.length}<button
               class="export"
               onclick={controller.exportConversation}>Export chat</button
@@ -262,19 +280,32 @@
               onclick={() => (setupOpen = false)}>Return to your conversation</button
             >{/if}
         {:else}
-          <ChatView messages={$messages} connectionState={$connectionState} {showHarnessDemo} />
-          {#if $approval}<ApprovalCard
-              approval={$approval}
-              onResolve={controller.resolveApproval}
-            />{/if}
-          <Composer
-            busy={$runState === 'streaming' || $runState === 'preparing'}
-            disabled={$connectionState !== 'ready'}
-            notice={$notice}
-            onDismissNotice={controller.dismissNotice}
-            onSend={controller.send}
-            onStop={controller.stop}
-          />
+          <div class="conversation-content">
+            <ChatDropZone
+              busy={$runState !== 'idle'}
+              onFiles={(files) => composer?.addFiles(files)}
+            >
+              <ChatView messages={$messages} connectionState={$connectionState} {showHarnessDemo} />
+              {#if $approval}<ApprovalCard
+                  approval={$approval}
+                  onResolve={controller.resolveApproval}
+                />{/if}
+              <Composer
+                bind:this={composer}
+                chatAttachments={$messages.flatMap((message) => message.attachments)}
+                sessionId={$activeSessionId}
+                busy={$runState === 'streaming' || $runState === 'preparing'}
+                disabled={$connectionState !== 'ready'}
+                notice={$notice}
+                onDismissNotice={controller.dismissNotice}
+                onSend={controller.send}
+                onStop={controller.stop}
+              />
+            </ChatDropZone>
+            {#if isDesktop() && $agentMode && $workspace && filesVisible}
+              <WorkspaceFiles workspace={$workspace} onClose={() => (filesVisible = false)} />
+            {/if}
+          </div>
         {/if}
       </section>
 
@@ -314,6 +345,18 @@
     min-height: 0;
     flex: 1;
     flex-direction: column;
+  }
+
+  .conversation-content {
+    position: relative;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+  }
+
+  .conversation-content :global(.chat-drop-zone) {
+    min-width: 0;
   }
 
   .web-toggle {

@@ -1,8 +1,11 @@
 import { get } from 'svelte/store';
+import { agentClient } from './agent';
 import { describe, expect, it, vi } from 'vitest';
 import type { LocalModelClient } from './ipc';
 import { createChatController } from './store';
 import { nativeModelError } from './modelError';
+import { prepareAttachments, MAX_ATTACHMENT_TOTAL_BYTES } from './attachments';
+import type { Attachment, SessionSummary } from './types';
 
 function mockClient(): LocalModelClient {
   return {
@@ -19,6 +22,208 @@ function mockClient(): LocalModelClient {
 }
 
 describe('chat controller', () => {
+  it.each(['chat', 'agent'] as const)(
+    'locks %s mode and its project after sending',
+    async (mode) => {
+      const pick = vi.spyOn(agentClient, 'chooseWorkspace').mockResolvedValue('/projects/first');
+      const client = mockClient();
+      const controller = createChatController(client);
+      await controller.initialize();
+      controller.chooseMode(mode);
+      if (mode === 'agent') await controller.chooseWorkspace();
+      await controller.send('Keep this mode', []);
+      await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+      controller.chooseMode(mode === 'agent' ? 'chat' : 'agent');
+      await controller.chooseWorkspace();
+      expect(get(controller.sessionLocked)).toBe(true);
+      expect(get(controller.agentMode)).toBe(mode === 'agent');
+      expect(get(controller.workspace)).toBe(mode === 'agent' ? '/projects/first' : '');
+      expect(pick).toHaveBeenCalledTimes(mode === 'agent' ? 1 : 0);
+      expect(get(controller.sessions)[0]).toMatchObject({ mode });
+      expect(vi.mocked(client.streamChat).mock.calls[0][0]).toMatchObject({
+        agentMode: mode === 'agent',
+        workspace: mode === 'agent' ? '/projects/first' : undefined,
+      });
+      controller.destroy();
+      pick.mockRestore();
+    },
+  );
+
+  it('clears projects on new chats and restores each saved Agent conversation after reload', async () => {
+    const pick = vi
+      .spyOn(agentClient, 'chooseWorkspace')
+      .mockResolvedValueOnce('/projects/first')
+      .mockResolvedValueOnce('/projects/second');
+    const controller = createChatController(mockClient());
+    await controller.initialize();
+    controller.chooseMode('agent');
+    expect(await controller.send('Needs a project', [])).toBe(false);
+    expect(get(controller.sessionLocked)).toBe(false);
+    await controller.chooseWorkspace();
+    await controller.send('First agent task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const first = get(controller.activeSessionId);
+    controller.webEnabled.set(true);
+    await controller.newChat();
+    expect(get(controller.agentMode)).toBe(true);
+    expect(get(controller.workspace)).toBe('');
+    expect(get(controller.webEnabled)).toBe(false);
+    expect(get(controller.sessionLocked)).toBe(false);
+    await controller.chooseWorkspace();
+    await controller.send('Second agent task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const second = get(controller.activeSessionId);
+    await controller.newChat('chat');
+    await controller.send('Plain chat', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const chat = get(controller.activeSessionId);
+    expect(get(controller.visibleSessions).map((session) => session.id)).toEqual([chat]);
+    await controller.openSession(first);
+    expect(get(controller.activeSessionId)).toBe(chat);
+    await controller.newChat('agent');
+    expect(get(controller.visibleSessions).map((session) => session.id)).toEqual([second, first]);
+    await controller.openSession(first);
+    expect(get(controller.workspace)).toBe('/projects/first');
+    await controller.openSession(second);
+    expect(get(controller.workspace)).toBe('/projects/second');
+    controller.destroy();
+    const reloaded = createChatController(mockClient());
+    reloaded.chooseMode('agent');
+    await reloaded.openSession(first);
+    expect(get(reloaded.workspace)).toBe('/projects/first');
+    expect(get(reloaded.sessionLocked)).toBe(true);
+    reloaded.removeSession(first);
+    expect(get(reloaded.workspace)).toBe('');
+    expect(get(reloaded.sessionLocked)).toBe(false);
+    reloaded.destroy();
+    pick.mockRestore();
+  });
+
+  it('treats legacy conversations as Chat with no project', async () => {
+    window.localStorage.setItem(
+      'blackwall.sessions.v1',
+      JSON.stringify([{ id: 'legacy', title: 'Old chat', updatedAt: 1, messages: [] }]),
+    );
+    const controller = createChatController(mockClient());
+    expect(get(controller.visibleSessions)[0].id).toBe('legacy');
+    controller.chooseMode('agent');
+    expect(get(controller.visibleSessions)).toEqual([]);
+    await controller.newChat('chat');
+    await controller.openSession('legacy');
+    expect(get(controller.agentMode)).toBe(false);
+    expect(get(controller.workspace)).toBe('');
+    controller.destroy();
+  });
+
+  it('ignores a project picker that finishes after starting another conversation', async () => {
+    let finish!: (path: string) => void;
+    const pick = vi.spyOn(agentClient, 'chooseWorkspace').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const controller = createChatController(mockClient());
+    controller.chooseMode('agent');
+    const selection = controller.chooseWorkspace();
+    await controller.newChat('chat');
+    finish('/projects/stale');
+    await selection;
+    expect(get(controller.agentMode)).toBe(false);
+    expect(get(controller.workspace)).toBe('');
+    controller.destroy();
+    pick.mockRestore();
+  });
+
+  it('resends the contents of a referenced screenshot without reuploading it', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    const pending = prepareAttachments([
+      new File(['pixels'], 'Screenshot 1.png', { type: 'image/png' }),
+    ]).accepted;
+    await controller.send('Describe this', pending);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const original = get(controller.messages)[0].attachments[0];
+    expect(original.dataUrl).toMatch(/^data:image\/png;base64,/);
+    await controller.send('Look again at @"Screenshot 1.png"', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const request = vi.mocked(client.streamChat).mock.calls[1][0];
+    expect(request.messages.at(-1)?.attachments).toEqual([
+      expect.objectContaining({ id: original.id, dataUrl: original.dataUrl }),
+    ]);
+    expect(get(controller.messages)[2].attachments[0].id).toBe(original.id);
+    controller.destroy();
+  });
+
+  it('counts both new attachments and references against the message limits', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    const attachments: Attachment[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `file-${i}`,
+      name: `file-${i}.txt`,
+      kind: 'text',
+      mimeType: 'text/plain',
+      sizeBytes: 1,
+      textContent: 'x',
+    }));
+    controller.messages.set([
+      {
+        id: 'previous',
+        role: 'user',
+        content: '',
+        attachments,
+        status: 'complete',
+        createdAt: 1,
+      },
+    ]);
+    const pending = prepareAttachments([new File(['extra'], 'extra.txt')]).accepted;
+    expect(
+      await controller.send(attachments.map((file) => `@${file.name}`).join(' '), pending),
+    ).toBe(false);
+    expect(get(controller.notice)).toContain('8 files');
+    controller.messages.update((messages) => [
+      {
+        ...messages[0],
+        attachments: attachments.slice(0, 3).map((attachment) => ({
+          ...attachment,
+          sizeBytes: MAX_ATTACHMENT_TOTAL_BYTES / 3,
+        })),
+      },
+    ]);
+    expect(await controller.send('@file-0.txt @file-1.txt @file-2.txt', pending)).toBe(false);
+    expect(get(controller.notice)).toContain('30 MB');
+    expect(client.streamChat).not.toHaveBeenCalled();
+    controller.destroy();
+  });
+
+  it('keeps references out of another conversation and explains missing retained contents', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    controller.messages.set([
+      {
+        id: 'previous',
+        role: 'user',
+        content: '',
+        status: 'complete',
+        createdAt: 1,
+        attachments: [
+          { id: 'file', name: 'legacy.txt', kind: 'text', mimeType: 'text/plain', sizeBytes: 3 },
+        ],
+      },
+    ]);
+    expect(await controller.send('Read @legacy.txt', [])).toBe(false);
+    expect(get(controller.notice)).toContain('Reattach legacy.txt');
+    expect(client.streamChat).not.toHaveBeenCalled();
+    await controller.newChat();
+    expect(await controller.send('Read @legacy.txt', [])).toBe(true);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].messages[0].attachments).toEqual([]);
+    controller.destroy();
+  });
+
   it('preserves saved pairing after a Keychain failure and reconnects without replay', async () => {
     const client = mockClient();
     const controller = createChatController(client);
@@ -139,7 +344,7 @@ describe('chat controller', () => {
   it('persists an endpoint override and uses it for discovery and chat', async () => {
     const client = mockClient();
     const controller = createChatController(client);
-    const endpoint = 'http://100.76.24.116:11434';
+    const endpoint = 'http://192.0.2.10:11434';
 
     await expect(controller.configureEndpoint(endpoint)).resolves.toBe(true);
     expect(client.discoverModels).toHaveBeenCalledWith(endpoint);
@@ -312,6 +517,95 @@ describe('native conversation persistence', () => {
       load: vi.fn().mockResolvedValue(null),
     };
   }
+  it('restores native Agent projects and retains the current chat if a project is unavailable', async () => {
+    const storage = await nativeStorage();
+    const first: SessionSummary = {
+      id: 'agent-first',
+      title: 'First',
+      mode: 'agent',
+      workspace: '/projects/first',
+      updatedAt: 1,
+      messages: [
+        {
+          id: 'user',
+          role: 'user',
+          content: 'Task',
+          status: 'complete',
+          createdAt: 1,
+          attachments: [],
+        },
+      ],
+    };
+    const second: SessionSummary = { ...first, id: 'agent-second', workspace: '/projects/second' };
+    storage.list.mockResolvedValue([first, second]);
+    storage.load.mockImplementation(async (id: string) => (id === first.id ? first : second));
+    const restore = vi
+      .spyOn(agentClient, 'restoreWorkspace')
+      .mockResolvedValueOnce('/projects/first')
+      .mockRejectedValueOnce(new Error('Folder missing'));
+    const controller = createChatController(mockClient(), storage);
+    await controller.initialize();
+    controller.chooseMode('agent');
+    await controller.openSession(first.id);
+    expect(restore).toHaveBeenCalledWith(first.id);
+    expect(get(controller.workspace)).toBe('/projects/first');
+    expect(get(controller.sessionLocked)).toBe(true);
+    await controller.openSession(second.id);
+    expect(get(controller.activeSessionId)).toBe(first.id);
+    expect(get(controller.workspace)).toBe('/projects/first');
+    expect(get(controller.persistenceError)).toContain('could not be opened');
+    controller.destroy();
+    restore.mockRestore();
+  });
+
+  it('references retained files after reopening a saved native conversation', async () => {
+    const storage = await nativeStorage();
+    const saved: SessionSummary = {
+      id: 'saved',
+      title: 'Files',
+      updatedAt: 1,
+      messages: [
+        {
+          id: 'previous',
+          role: 'user',
+          content: 'Two files',
+          status: 'complete',
+          createdAt: 1,
+          attachments: [
+            {
+              id: 'first',
+              name: 'notes.md',
+              kind: 'text',
+              mimeType: 'text/markdown',
+              sizeBytes: 3,
+              textContent: 'one',
+            },
+            {
+              id: 'second',
+              name: 'notes.md',
+              kind: 'text',
+              mimeType: 'text/markdown',
+              sizeBytes: 3,
+              textContent: 'two',
+            },
+          ],
+        },
+      ],
+    };
+    storage.list.mockResolvedValue([saved]);
+    storage.load.mockResolvedValue(saved);
+    const client = mockClient();
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    await controller.openSession(saved.id);
+    await controller.send('Read @"notes.md (2)"', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].messages.at(-1)?.attachments).toEqual([
+      expect.objectContaining({ id: 'second', textContent: 'two' }),
+    ]);
+    controller.destroy();
+  });
+
   it('blocks new turns when the native database cannot open', async () => {
     const storage = await nativeStorage();
     storage.list.mockRejectedValue(new Error('disk unavailable'));

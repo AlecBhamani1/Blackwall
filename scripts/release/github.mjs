@@ -4,13 +4,21 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { compareVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
+import { betaVersion, compareReleaseVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
+import { validateReleaseNotes } from './promotion.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
-const version = process.env.RELEASE_VERSION;
-const sha = process.env.GITHUB_SHA;
+const channel = process.env.RELEASE_CHANNEL ?? 'stable';
+assert(['stable', 'beta'].includes(channel), 'Unknown release channel');
+const beta = channel === 'beta';
+const branch = beta ? 'partial' : 'main';
+const feedTag = beta ? 'beta' : 'main';
+const baseVersion = JSON.parse(readFileSync('.github/release.json', 'utf8')).version;
+versionParts(baseVersion);
+const version = beta ? betaVersion(baseVersion, process.env.GITHUB_RUN_NUMBER) : baseVersion;
+if (process.env.RELEASE_VERSION) assert.equal(process.env.RELEASE_VERSION, version, 'Build version must match the committed release plan');
+const sha = process.env.RELEASE_COMMIT ?? process.env.GITHUB_SHA;
 assert.match(repository ?? '', /^[\w.-]+\/[\w.-]+$/);
-versionParts(version);
 assert.match(sha ?? '', /^[a-f0-9]{40}$/);
 const tag = `v${version}`;
 const prefix = `repos/${repository}`;
@@ -54,37 +62,74 @@ function assertReleaseCommit(release) {
   }
 }
 function assertCI() {
-  const result = api(`actions/workflows/ci.yml/runs?head_sha=${sha}&branch=main&event=push&per_page=100`);
-  requireSuccessfulCI(result.workflow_runs, sha);
+  const result = api(`actions/workflows/ci.yml/runs?head_sha=${sha}&branch=${branch}&event=push&per_page=100`);
+  requireSuccessfulCI(result.workflow_runs, sha, branch);
 }
 
 async function prepare() {
-  assert.equal(process.env.GITHUB_REF, 'refs/heads/main', 'Dispatch releases from main only');
-  assert.equal(process.env.RELEASE_APPROVED, 'true', 'Release acceptance must be explicitly confirmed');
+  assertReleaseTrigger();
+  if (!beta) assert.equal(process.env.RELEASE_APPROVED, 'true', 'Release acceptance must be explicitly confirmed');
   assertCI();
-  const notes = readFileSync(`docs/releases/${version}.md`, 'utf8').trim();
-  assert(notes.length >= 80, 'Commit meaningful release notes before publishing');
-  const current = feed(api('releases/tags/main'));
-  assert(compareVersions(version, current.version) > 0, 'Version must be newer than the current updater feed');
+  const notes = beta
+    ? `# Blackwall ${version}\n\nPreview of partial. Features may be unfinished and contain bugs.\n\n${readFileSync('CHANGELOG.md', 'utf8').split('## [Unreleased]')[1]?.split(/\n## \[/)[0]?.trim() ?? ''}`
+    : readFileSync(`docs/releases/${version}.md`, 'utf8').trim();
+  if (!beta) validateReleaseNotes(notes + '\n', version);
   const existing = findRelease(tag);
+  const compatibility = beta ? optional(`releases/tags/${feedTag}`) : api('releases/tags/main');
+  if (compatibility?.assets.some(asset => asset.name === 'latest.json')) {
+    const current = feed(compatibility);
+    const comparison = compareReleaseVersions(version, current.version);
+    assert(existing && !existing.draft ? comparison >= 0 : comparison > 0,
+      'Version must be newer than the feed, or a retry of its published version');
+  } else if (!beta) {
+    assert(existing && !existing.draft && api('releases/latest').id === existing.id,
+      'Only the published Latest release may repair a missing feed');
+  }
+  if (beta) assertLatestBeta();
+  if (existing && !existing.draft && !beta) {
+    assert.equal(api('releases/latest').id, existing.id, 'Only the current Latest release may be retried');
+  }
   let release;
   if (existing) {
-    assert(existing.draft, 'A published version must never be rebuilt or overwritten');
     assertReleaseCommit(existing);
     release = existing;
   } else {
     assert(!optional(`git/ref/tags/${tag}`), 'Tag already exists; choose an unused version');
     release = api('releases', 'POST', {
       tag_name: tag, target_commitish: sha, name: `Blackwall ${tag}`,
-      body: `${notes}\n\nSource commit: ${sha}.`, draft: true, prerelease: false, make_latest: 'false',
+      body: `${notes}\n\nSource commit: ${sha}.`, draft: true, prerelease: beta, make_latest: 'false',
     });
   }
-  appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${release.id}\nversion=${version}\ncommit=${sha}\n`);
+  appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${release.id}\nversion=${version}\ncommit=${sha}\nbuild_required=${release.draft}\n`);
+}
+
+function assertReleaseTrigger() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_run') {
+    const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+    assert.equal(event.workflow_run.event, 'push');
+    assert.equal(event.workflow_run.head_branch, branch);
+    assert.equal(event.workflow_run.head_repository.full_name, repository);
+    assert.equal(event.workflow_run.conclusion, 'success');
+    assert.equal(event.workflow_run.head_sha, sha);
+  } else {
+    assert.equal(process.env.GITHUB_EVENT_NAME, 'workflow_dispatch', 'Unsupported release event');
+    assert.equal(process.env.GITHUB_REF, `refs/heads/${branch}`, `Dispatch releases from ${branch} only`);
+  }
+}
+
+// An old beta job may resume after a newer job published. Never move its feed back.
+function assertLatestBeta() {
+  const pages = JSON.parse(gh(['api', `${prefix}/releases?per_page=100`, '--paginate', '--slurp']));
+  for (const release of pages.flat()) {
+    if (release.draft || !release.prerelease || !/^v\d+\.\d+\.\d+-beta\.\d+$/.test(release.tag_name)) continue;
+    assert(compareReleaseVersions(version, release.tag_name.slice(1)) >= 0,
+      'A newer beta version is already published');
+  }
 }
 
 async function publish() {
-  assert.equal(process.env.GITHUB_REF, 'refs/heads/main');
-  assert.equal(process.env.RELEASE_APPROVED, 'true');
+  assertReleaseTrigger();
+  if (!beta) assert.equal(process.env.RELEASE_APPROVED, 'true');
   assertCI();
   const release = findRelease(tag);
   assert(release, 'Draft release is missing');
@@ -97,21 +142,28 @@ async function publish() {
     const bytes = assetBytes(asset);
     if (name.endsWith('.sig')) signatures[name] = bytes.toString();
   }
-  const manifest = validateManifest(release, feed(release), signatures, repository, version);
-  const compatibility = api('releases/tags/main');
-  const latest = api('releases/latest');
-  if (latest.tag_name !== 'main') {
-    assert(compareVersions(version, latest.tag_name.replace(/^v/, '')) >= 0,
+  // Optional signed installers, such as Debian packages, may add their own feed entries.
+  for (const asset of release.assets) {
+    if (asset.name.endsWith('.sig') && !(asset.name in signatures)) {
+      signatures[asset.name] = assetBytes(asset).toString();
+    }
+  }
+  const manifest = validateManifest(release, feed(release), signatures, repository, version, channel);
+  const compatibility = beta ? optional(`releases/tags/${feedTag}`) : api('releases/tags/main');
+  const latest = beta ? null : api('releases/latest');
+  if (beta) assertLatestBeta();
+  if (latest && latest.tag_name !== 'main') {
+    assert(compareReleaseVersions(version, latest.tag_name.replace(/^v/, '')) >= 0,
       'A newer version is already published');
   }
-  if (compatibility.assets.some(asset => asset.name === 'latest.json')) {
+  if (compatibility?.assets.some(asset => asset.name === 'latest.json')) {
     const current = feed(compatibility);
-    const comparison = compareVersions(version, current.version);
+    const comparison = compareReleaseVersions(version, current.version);
     assert(comparison >= 0, 'Refusing to downgrade the updater feed');
     if (comparison === 0) {
       assert.deepEqual(current, manifest, 'This version is already served with different update metadata');
     }
-  } else {
+  } else if (!beta) {
     // gh --clobber deletes the old asset before uploading its replacement. If that
     // upload failed, only the already-published Latest release may repair the feed.
     assert(!release.draft && latest.id === release.id,
@@ -122,11 +174,20 @@ async function publish() {
     const path = join(directory, 'latest.json');
     writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
     if (release.draft) {
-      api(`releases/${release.id}`, 'PATCH', { draft: false, make_latest: 'true' });
+      api(`releases/${release.id}`, 'PATCH', { draft: false, make_latest: beta ? 'false' : 'true' });
     }
-    gh(['release', 'upload', 'main', path, '--clobber', '--repo', repository]);
-    assert.deepEqual(feed(api('releases/tags/main')), manifest, 'Feed verification failed');
+    if (beta && !compatibility) {
+      api('releases', 'POST', { tag_name: feedTag, target_commitish: sha, name: 'Blackwall beta updates',
+        body: 'Signed preview builds from partial. See the versioned beta releases for downloads and changes.',
+        draft: false, prerelease: true, make_latest: 'false' });
+    }
+    gh(['release', 'upload', feedTag, path, '--clobber', '--repo', repository]);
+    assert.deepEqual(feed(api(`releases/tags/${feedTag}`)), manifest, 'Feed verification failed');
     console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+        `Published [Blackwall ${tag}](https://github.com/${repository}/releases/tag/${tag}) from source commit \`${sha}\`.\n\nEvery platform download, updater signature, and the compatibility feed were verified.\n`);
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

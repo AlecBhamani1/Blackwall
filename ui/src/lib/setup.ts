@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { createId } from './id';
 import { nativeModelError } from './modelError';
+import { platform } from './platform';
 
 export interface LocalService {
   name: string;
@@ -107,7 +108,7 @@ export const setupClient = {
   },
   async openLink(kind: 'download' | 'invitation', invitation?: string): Promise<void> {
     const target =
-      kind === 'invitation' ? invitationUrl(invitation ?? '') : 'https://ollama.com/download/mac';
+      kind === 'invitation' ? invitationUrl(invitation ?? '') : platform.ollamaDownload;
     if (!isDesktop()) {
       const opened = window.open(target, '_blank', 'noopener,noreferrer');
       // noopener may return null even when the browser successfully opens the tab.

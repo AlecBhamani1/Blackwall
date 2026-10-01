@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
   import { credentialClient, type CredentialKind } from '../credentials';
+  import { platform } from '../platform';
 
   export let endpoint: string;
   export let kind: CredentialKind = 'model';
@@ -30,7 +31,7 @@
       ? cause.message
       : typeof cause === 'string'
         ? cause
-        : 'Keychain could not be updated. Try again.';
+        : `${platform.store} could not be updated. Try again.`;
   }
   async function refresh() {
     const operation = ++version;
@@ -68,8 +69,8 @@
       key = '';
       confirming = false;
       feedback = remove
-        ? 'Saved key removed from Keychain.'
-        : 'Access key verified and saved in Keychain.';
+        ? `Saved key removed from ${platform.store}.`
+        : `Access key verified and saved in ${platform.store}.`;
     } catch (cause) {
       if (operation === version) error = message(cause);
     } finally {
@@ -96,7 +97,7 @@
           ? 'Checking…'
           : 'Status unavailable'
         : saved
-          ? 'Saved in Keychain'
+          ? `Saved in ${platform.store}`
           : 'No saved key'}</span
     >
   </div>
@@ -155,12 +156,12 @@
   {/if}
   {#if mutating}
     <p role="status">
-      Working on your saved key. Respond to any macOS Keychain prompt and wait for confirmation
-      before retrying.
+      Working on your saved key. {platform.storeHelp}, and wait for confirmation before retrying.
     </p>
   {/if}
   {#if error}<p role="alert" class="error" tabindex="-1" bind:this={resultMessage}>{error}</p>
-    {#if saved === null}<button disabled={busy} onclick={refresh}>Retry Keychain</button>{/if}{/if}
+    {#if saved === null}<button disabled={busy} onclick={refresh}>Retry {platform.store}</button
+      >{/if}{/if}
   {#if feedback}<p role="status" class="feedback" tabindex="-1" bind:this={resultMessage}>
       {feedback}
     </p>{/if}
