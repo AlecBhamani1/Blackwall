@@ -9,6 +9,7 @@ mod identity;
 mod keychain;
 mod pairing;
 mod setup;
+mod updates;
 
 use commands::AppState;
 use thiserror::Error;
@@ -34,6 +35,7 @@ fn run() -> Result<(), StartupError> {
         .manage(auth::AuthState::default())
         .manage(pairing::PairingState::default())
         .invoke_handler(tauri::generate_handler![
+            updates::check_app_update,
             pairing::pairing_status,
             pairing::retry_paired_device,
             pairing::create_pairing,

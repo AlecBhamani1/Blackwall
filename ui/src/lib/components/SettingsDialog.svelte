@@ -2,7 +2,12 @@
   import { onDestroy, tick } from 'svelte';
   import { guestShareClient, multiShareClient, type GuestShareClient } from '../ipc';
   import type { ConnectionState, ShareExpiryMinutes, ShareStatus } from '../types';
-  import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
+  import type {
+    AppUpdateChannel,
+    AppUpdateInfo,
+    AppUpdateProgress,
+    AppUpdateState,
+  } from '../updates';
   import LockSettings from './LockSettings.svelte';
   import CredentialSettings from './CredentialSettings.svelte';
   import PairingPanel from './PairingPanel.svelte';
@@ -18,6 +23,8 @@
   export let connectionState: ConnectionState = 'checking';
   export let connectionError = '';
   export let onConfigureEndpoint: (endpoint: string) => Promise<boolean> = async () => false;
+  export let updateChannel: AppUpdateChannel = 'stable';
+  export let onUpdateChannelChange: (channel: AppUpdateChannel) => Promise<void> = async () => {};
   export let updateState: AppUpdateState = 'idle';
   export let currentVersion = '';
   export let availableUpdate: AppUpdateInfo | null = null;
@@ -640,12 +647,31 @@
           <div class="section-heading">
             <div>
               <h3 id="update-heading">App updates</h3>
-              <p>Signed builds are checked against Blackwall’s latest GitHub release.</p>
+              <p>Choose stable releases or try upcoming features in beta.</p>
             </div>
             {#if currentVersion}
               <span class="version-badge">{versionLabel(currentVersion)}</span>
             {/if}
           </div>
+
+          <label class="channel-label" for="update-channel">Update channel</label>
+          <select
+            id="update-channel"
+            value={updateChannel}
+            disabled={updateState === 'downloading' || updateState === 'unsupported'}
+            onchange={(event) =>
+              onUpdateChannelChange(event.currentTarget.value as AppUpdateChannel)}
+          >
+            <option value="stable">Stable</option>
+            <option value="beta">Beta</option>
+          </select>
+          <p class="channel-help">
+            {#if updateChannel === 'beta'}
+              Try features before they reach the stable release. Beta builds may have bugs.
+            {:else}
+              Get tested releases. Switching from beta offers the latest stable version.
+            {/if}
+          </p>
 
           {#if updateState === 'downloading'}
             <div class="update-card" role="status">
@@ -690,7 +716,9 @@
                 <span>Checking GitHub for a signed update…</span>
               {:else if updateState === 'current'}
                 <Icon name="check" size={15} />
-                <span>Blackwall is up to date.</span>
+                <span
+                  >Blackwall is up to date on the {updateChannel === 'beta' ? 'beta' : 'stable'} channel.</span
+                >
               {:else if updateState === 'unsupported'}
                 <span>Updates are available in the installed desktop app.</span>
               {:else if updateState === 'error'}
@@ -876,6 +904,27 @@
     display: flex;
     flex-direction: column;
     gap: 17px;
+  }
+
+  #update-channel {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .channel-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .channel-help {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
   }
 
   .connection-section,

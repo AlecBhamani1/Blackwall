@@ -101,6 +101,13 @@ preserving unrelated policies. See GitHub's [event policy guidance](https://docs
 Start each new task from `origin/partial`. Completed feature branches are historical snapshots;
 they do not need continuous updates. The queue updates open PRs, not local worktrees.
 
+## Test integration builds
+
+Successful `partial` push CI automatically publishes a signed beta prerelease for both macOS
+architectures. In Blackwall, choose **Settings → App updates → Beta** to try integration features
+before promotion. Stable remains the default and its feed changes only through the production
+process. See [UPDATES.md](UPDATES.md) for beta downloads, versions, and recovery.
+
 ## Promote a release batch
 
 1. Check the version milestone: intended issues are complete and deferred work is explicitly
@@ -155,7 +162,8 @@ If publication succeeded but the compatibility feed failed, retry the publish jo
 dispatch **Publish versioned release** from `main` with acceptance confirmed. A full retry now
 skips builds of an already-published version and verifies/repairs its feed. Never replace published
 files or move a version tag. For a bad application release, revert the affected change through a
-PR into `partial` and publish a **new, higher patch version**; the updater refuses downgrades.
+PR into `partial` and publish a **new, higher patch version**; ordinary stable updates refuse downgrades. Selecting Stable while
+running a beta explicitly offers a return to the production version.
 
 ## GitHub setup and bootstrap
 

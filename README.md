@@ -98,7 +98,9 @@ requires an Apple Developer signing identity and notarization.
 ## In-app updates
 
 Blackwall checks for signed updates when the desktop app starts. Open **Settings → App updates** to
-check manually, review the available version, and choose **Install update and restart**. Approved
+choose **Stable** or **Beta**, review the available version, and choose **Install update and restart**.
+Beta delivers signed preview builds from `partial` after CI passes, before features reach main.
+Switch back to Stable to install the latest production release. Approved
 `partial` → `main` promotions publish a versioned release after production CI and signed builds pass.
 Existing installations need
 one final manual replacement with an updater-enabled build; later updates install in place. See

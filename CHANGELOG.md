@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Select Stable or Beta in App updates to test signed builds from `partial` before production,
+  with a saved channel preference and an explicit return to stable.
+
 - Browse project files in a right sidebar in Agent mode, with expandable folders, name and
   content search, refresh controls, and bounded text previews inside the selected workspace.
 - Render inline and display LaTeX equations in assistant messages with bundled offline fonts.

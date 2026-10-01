@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compareVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
+import { betaVersion, compareReleaseVersions, releaseVersionParts, compareVersions, requiredAssets, requireSuccessfulCI, validateManifest, versionParts } from './validate.mjs';
 
 const repository = 'example/blackwall';
 const version = '0.1.4';
@@ -100,4 +100,19 @@ test('rejects stale, substituted, partial, and mismatched release metadata', () 
     mutate(f);
     assert.throws(() => validate(f));
   }
+});
+
+
+test('beta versions increase numerically and sort before their production version', () => {
+  assert.equal(betaVersion('0.1.4', '42'), '0.1.5-beta.42');
+  assert.equal(compareReleaseVersions('0.1.5-beta.10', '0.1.5-beta.9'), 1);
+  assert.equal(compareReleaseVersions('0.1.5-beta.42', '0.1.4'), 1);
+  assert.equal(compareReleaseVersions('0.1.5', '0.1.5-beta.42'), 1);
+  assert.equal(compareReleaseVersions('0.1.5-beta.42', '0.1.5'), -1);
+  assert.equal(compareReleaseVersions('0.1.5-beta.42', '0.1.5-beta.42'), 0);
+  for (const value of ['0.1.5-beta.0', '0.1.5-beta.01', '0.1.5-beta', '../beta', '0.1.5-rc.1']) {
+    assert.throws(() => releaseVersionParts(value));
+  }
+  assert.throws(() => betaVersion('0.1.4', undefined));
+  assert.throws(() => betaVersion('0.1.4', '01'));
 });

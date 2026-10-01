@@ -14,16 +14,42 @@ export function compareVersions(left, right) {
   return 0;
 }
 
-export function requireSuccessfulCI(runs, sha) {
+// Beta versions use the next patch above the committed production plan. The
+// publication workflow run number orders snapshots and remains fixed on retries.
+export function betaVersion(base, runNumber) {
+  const [major, minor, patch] = versionParts(base);
+  assert.match(String(runNumber ?? ''), /^[1-9]\d*$/, 'Missing beta workflow run number');
+  return `${major}.${minor}.${patch + 1n}-beta.${runNumber}`;
+}
+
+export function releaseVersionParts(version) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.([1-9]\d*))?$/.exec(version ?? '');
+  assert(match, 'Use a stable version or a numbered beta version');
+  return [...match.slice(1, 4).map(BigInt), match[4] ? BigInt(match[4]) : null];
+}
+
+export function compareReleaseVersions(left, right) {
+  const a = releaseVersionParts(left);
+  const b = releaseVersionParts(right);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1;
+  }
+  if (a[3] === b[3]) return 0;
+  if (a[3] === null) return 1;
+  if (b[3] === null) return -1;
+  return a[3] > b[3] ? 1 : -1;
+}
+
+export function requireSuccessfulCI(runs, sha, branch = 'main') {
   const latest = runs
-    .filter(run => run.head_sha === sha && run.event === 'push' && run.head_branch === 'main')
+    .filter(run => run.head_sha === sha && run.event === 'push' && run.head_branch === branch)
     .sort((a, b) => b.run_number - a.run_number || b.run_attempt - a.run_attempt)[0];
   assert(latest?.status === 'completed' && latest.conclusion === 'success',
-    'The latest main-branch CI run for this exact commit must finish successfully first');
+    `The latest ${branch}-branch CI run for this exact commit must finish successfully first`);
 }
 
 export function requiredAssets(version) {
-  versionParts(version);
+  releaseVersionParts(version);
   return ['aarch64', 'x64'].flatMap(arch => [
     `Blackwall_${version}_${arch}.dmg`,
     `Blackwall_${version}_${arch}.app.tar.gz`,
@@ -33,10 +59,14 @@ export function requiredAssets(version) {
 
 // Convert Tauri's API asset URLs into stable, version-specific public downloads.
 // Both architecture entries and their signatures must match this release's files.
-export function validateManifest(release, manifest, signatures, repository, version) {
-  versionParts(version);
+export function validateManifest(release, manifest, signatures, repository, version, channel = 'stable') {
+  assert(['stable', 'beta'].includes(channel));
+  if (channel === 'stable') versionParts(version);
+  else {
+    assert(releaseVersionParts(version)[3] !== null, 'Beta releases require a beta version');
+  }
   assert.equal(release.tag_name, `v${version}`);
-  assert.equal(release.prerelease, false);
+  assert.equal(release.prerelease, channel === 'beta');
   assert.equal(manifest.version, version);
   assert(Number.isFinite(Date.parse(manifest.pub_date)), 'Missing updater publication date');
   assert.equal(typeof manifest.notes, 'string');

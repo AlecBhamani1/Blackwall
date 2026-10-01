@@ -2,7 +2,12 @@
   import { tick } from 'svelte';
   import { relativeTime } from '../format';
   import type { ConnectionState, ConversationMode, SessionSummary } from '../types';
-  import type { AppUpdateInfo, AppUpdateProgress, AppUpdateState } from '../updates';
+  import type {
+    AppUpdateChannel,
+    AppUpdateInfo,
+    AppUpdateProgress,
+    AppUpdateState,
+  } from '../updates';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
@@ -24,6 +29,8 @@
   export let selectedModel = '';
   export let endpoint = '';
   export let connectionError = '';
+  export let updateChannel: AppUpdateChannel = 'stable';
+  export let onUpdateChannelChange: (channel: AppUpdateChannel) => Promise<void> = async () => {};
   export let updateState: AppUpdateState = 'idle';
   export let currentVersion = '';
   export let availableUpdate: AppUpdateInfo | null = null;
@@ -161,6 +168,8 @@
   {endpoint}
   {connectionState}
   {connectionError}
+  {updateChannel}
+  {onUpdateChannelChange}
   {updateState}
   {currentVersion}
   {availableUpdate}
