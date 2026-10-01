@@ -50,6 +50,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Keep Blackwall running on macOS when the main window is closed, preserving active work and
+  restoring the window from the Dock. Quit and Cmd+Q still exit the app.
+
 - Stop Windows shell descendants on cancellation, timeout, and command completion even when
   their parent PowerShell process has already exited.
 
