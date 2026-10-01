@@ -10,5 +10,5 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 printf '%s\n' 'Installing Blackwall CLI (bw)...'
-cargo install --git "$REPOSITORY" --locked --force --package bw
+cargo install --git "$REPOSITORY" --branch partial --locked --force --package bw
 printf '\n%s\n' 'Installed. Run `bw setup` to configure your model connection, then `bw` to chat.'

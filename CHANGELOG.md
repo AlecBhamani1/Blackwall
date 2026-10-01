@@ -9,7 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Add a one-line installer for the Blackwall CLI, available from any directory.
+- Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
 ## [0.1.4] - 2026-10-01
 
