@@ -44,7 +44,7 @@ a SmartScreen or Gatekeeper warning.
 - Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - User-managed local memory and reusable Markdown skills
-- CLI `bw run`, `bw resume`, and `bw sessions` using the same core agent runtime
+- Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
 For everyday setup, open **Settings → Set up a connection → Use this computer**. Blackwall detects
@@ -60,6 +60,26 @@ Temporary guest invitations open browser chat and have their own expiry and remo
 
 See [the user and operator guide](docs/RUNTIME_GUIDE.md) for project tools, data storage, app-lock
 limits, memory, skills, and troubleshooting.
+
+## Use Blackwall in your terminal
+
+With Rust 1.90+ installed, build the CLI from this checkout:
+
+```sh
+cargo install --locked --path src/bw
+bw setup
+bw
+```
+
+Setup asks for an existing OpenAI-compatible service address and its model ID, then saves your
+choices. Type `/commands` during chat to see the available controls. Change settings with
+`/model <id>`, `/endpoint <url>`, `/web on|off`, `/memory on|off`, or `/settings <name> <value>`.
+Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+
+For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
+`bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
+an Agent conversation in its saved project. See the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for
+credentials, approvals, and configuration precedence.
 
 ## Run the desktop app
 
