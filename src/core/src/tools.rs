@@ -371,25 +371,6 @@ impl Drop for ProcessGroup {
             .status();
     }
 }
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Windows has no process groups without unsafe job-object calls; stop the live process tree.
-#[cfg(windows)]
-struct ProcessGroup(u32);
-#[cfg(windows)]
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        use std::os::windows::process::CommandExt;
-        // Fixed executable and numeric process argument, never model-provided shell syntax.
-        let _ = std::process::Command::new("taskkill.exe")
-            .args(["/T", "/F", "/PID", &self.0.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
 #[cfg(unix)]
 fn shell_command(command: &str) -> tokio::process::Command {
     use std::os::unix::process::CommandExt;
@@ -414,14 +395,20 @@ fn shell_command(command: &str) -> tokio::process::Command {
             "-NonInteractive",
             "-EncodedCommand",
         ])
-        .arg(base64::engine::general_purpose::STANDARD.encode(bytes))
-        .creation_flags(CREATE_NO_WINDOW);
+        .arg(base64::engine::general_purpose::STANDARD.encode(bytes));
     process
 }
 async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
+    shell_with_timeout(directory, command, Duration::from_secs(120)).await
+}
+async fn shell_with_timeout(
+    directory: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, ToolError> {
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (directory, command);
+        let _ = (directory, command, timeout);
         Err(ToolError::Execution(
             "Shell tools are not supported on this platform.".into(),
         ))
@@ -444,16 +431,44 @@ async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
         ] {
             process.env_remove(key);
         }
+        #[cfg(unix)]
         let mut child = process
             .spawn()
             .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+        #[cfg(unix)]
         let _group = ProcessGroup(
             child
                 .id()
                 .ok_or(ToolError::Execution("The command did not start.".into()))?,
         );
+        #[cfg(windows)]
+        let mut job = {
+            use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+            use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+            let mut process = CommandWrap::from(process);
+            // The wrapper spawns suspended, assigns the process to a kill-on-close job,
+            // then resumes it. Descendants cannot escape before assignment or by parent exit.
+            process
+                .wrap(CreationFlags(CREATE_NO_WINDOW))
+                .wrap(KillOnDrop)
+                .wrap(JobObject);
+            process
+                .spawn()
+                .map_err(|_| ToolError::Execution("The command could not start.".into()))?
+        };
+        #[cfg(windows)]
+        // Wait on the shell itself; retain the owning job until capture ends or is cancelled.
+        // Dropping it kills remaining descendants even if the shell has already been reaped.
+        let child = job.inner_mut();
+        #[cfg(unix)]
         let stdout = child.stdout.take().ok_or(ToolError::File)?;
+        #[cfg(windows)]
+        let stdout = child.stdout().take().ok_or(ToolError::File)?;
+        #[cfg(unix)]
         let stderr = child.stderr.take().ok_or(ToolError::File)?;
+        #[cfg(windows)]
+        let stderr = child.stderr().take().ok_or(ToolError::File)?;
         let mut out_task = Box::pin(async {
             let mut bytes = vec![];
             stdout
@@ -472,7 +487,7 @@ async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
         });
         let capture = async {
             // A completed capped read reports overflow immediately, rather than waiting for a
-            // child blocked on a full pipe. The process-group guard kills descendants on return.
+            // child blocked on a full pipe. The process group/job kills descendants on return.
             let mut out = None;
             let mut err = None;
             let mut status = None;
@@ -499,13 +514,11 @@ async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
                 Err(ToolError::Execution(output))
             }
         };
-        tokio::time::timeout(Duration::from_secs(120), capture)
-            .await
-            .map_err(|_| {
-                ToolError::Execution(
-                    "The command exceeded its two-minute limit and was stopped.".into(),
-                )
-            })?
+        tokio::time::timeout(timeout, capture).await.map_err(|_| {
+            ToolError::Execution(
+                "The command exceeded its two-minute limit and was stopped.".into(),
+            )
+        })?
     }
 }
 
@@ -580,25 +593,151 @@ mod tests {
             .is_err());
     }
     #[cfg(windows)]
-    #[tokio::test]
-    async fn cancelling_windows_shell_stops_side_effects() {
+    fn windows_shell_test_directory() -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "blackwall-shell-cancel-{}",
             UnwrapErr(SysRng).next_u64()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_millis(30),
-            shell(
-                &directory,
-                "Start-Sleep -Seconds 1; New-Item -ItemType File late-write",
-            ),
-        )
-        .await;
-        assert!(result.is_err());
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        assert!(!directory.join("late-write").exists());
+        directory
+    }
+    #[cfg(windows)]
+    async fn wait_for_windows_shell_start(
+        run: &mut std::pin::Pin<Box<impl std::future::Future<Output = Result<String, ToolError>>>>,
+        directory: &Path,
+    ) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                tokio::select! {
+                    result = run.as_mut() => panic!("Shell finished before readiness: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        if std::fs::read_to_string(directory.join("ready"))
+                            .is_ok_and(|pid| pid.trim().parse::<u32>().is_ok())
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[cfg(windows)]
+    async fn assert_windows_shell_stopped(directory: &Path) {
+        let pid: u32 = std::fs::read_to_string(directory.join("ready"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Release any surviving process so a broken cleanup produces a visible side effect.
+        // Wait for termination rather than assuming it finishes within a fixed sleep.
+        // Kill a survivor on failure so the regression itself cannot leave an orphan.
+        let probe = format!(
+            "Set-Content release go; \
+             $process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+             if ($process -and -not $process.WaitForExit(5000)) {{ \
+                 Stop-Process -Id {pid} -Force; exit 1 \
+             }}; \
+             if (Test-Path late-write) {{ exit 2 }}; exit 0"
+        );
+        let result = shell_with_timeout(directory, &probe, Duration::from_secs(15)).await;
+        let wrote = directory.join("late-write").exists();
         std::fs::remove_dir_all(directory).unwrap();
+        assert!(result.is_ok(), "Process survived cleanup: {result:?}");
+        assert!(!wrote);
+    }
+    #[cfg(windows)]
+    const WINDOWS_WAIT_FOR_RELEASE: &str = r#"
+$deadline = [DateTime]::UtcNow.AddSeconds(30)
+while (-not (Test-Path release)) {
+    if ([DateTime]::UtcNow -gt $deadline) { exit 4 }
+    Start-Sleep -Milliseconds 20
+}
+Set-Content late-write done
+"#;
+    #[cfg(windows)]
+    fn windows_orphan_command() -> String {
+        // The child inherits the output pipes, and signals readiness only after the parent
+        // exits. Cancelling before PowerShell or its descendant starts cannot pass this test.
+        format!(
+            r#"
+$childScript = @'
+$parent = Get-Process -Id __PARENT__ -ErrorAction SilentlyContinue
+if ($parent -and -not $parent.WaitForExit(15000)) {{ exit 3 }}
+Set-Content ready.tmp $PID
+Move-Item ready.tmp ready
+{WINDOWS_WAIT_FOR_RELEASE}
+'@
+$childScript = $childScript.Replace('__PARENT__', [string]$PID)
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+Start-Process powershell.exe -NoNewWindow -ArgumentList "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+exit 0
+"#
+        )
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_windows_shell_stops_side_effects() {
+        let directory = windows_shell_test_directory();
+        let command = format!(
+            "Set-Content ready.tmp $PID\nMove-Item ready.tmp ready\n{WINDOWS_WAIT_FOR_RELEASE}"
+        );
+        let mut run = Box::pin(shell(&directory, &command));
+        wait_for_windows_shell_start(&mut run, &directory).await;
+        drop(run);
+        assert_windows_shell_stopped(&directory).await;
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_windows_shell_stops_children_after_parent_exit() {
+        let directory = windows_shell_test_directory();
+        let command = windows_orphan_command();
+        let mut run = Box::pin(shell(&directory, &command));
+        wait_for_windows_shell_start(&mut run, &directory).await;
+        drop(run);
+        assert_windows_shell_stopped(&directory).await;
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_timeout_stops_children_after_parent_exit() {
+        let directory = windows_shell_test_directory();
+        let command = windows_orphan_command();
+        let mut run = Box::pin(shell_with_timeout(
+            &directory,
+            &command,
+            Duration::from_secs(10),
+        ));
+        wait_for_windows_shell_start(&mut run, &directory).await;
+        let result = run.await;
+        assert_windows_shell_stopped(&directory).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("limit")));
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_completion_stops_remaining_children() {
+        let directory = windows_shell_test_directory();
+        // Redirect the child's streams so the shell can finish while the child is alive.
+        let command = format!(
+            r#"
+$childScript = @'
+Set-Content ready.tmp $PID
+Move-Item ready.tmp ready
+{WINDOWS_WAIT_FOR_RELEASE}
+'@
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+Start-Process powershell.exe -ArgumentList "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" -RedirectStandardOutput child-out -RedirectStandardError child-err
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while (-not (Test-Path ready)) {{
+    if ([DateTime]::UtcNow -gt $deadline) {{ exit 3 }}
+    Start-Sleep -Milliseconds 20
+}}
+exit 0
+"#
+        );
+        let result = shell_with_timeout(&directory, &command, Duration::from_secs(20)).await;
+        assert_windows_shell_stopped(&directory).await;
+        assert!(result.is_ok(), "Shell did not complete: {result:?}");
     }
     #[cfg(unix)]
     #[tokio::test]

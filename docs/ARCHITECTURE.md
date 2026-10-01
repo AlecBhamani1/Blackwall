@@ -40,7 +40,7 @@ an existing saved entry.
 `security-framework`, Windows Credential Manager and the Linux Secret Service through `keyring`.
 Service and account names are identical on every platform, and there is no plain-text fallback when
 a store is unavailable. Platform-specific process launching is limited to the approved shell tool
-(`/bin/sh` with process groups on Unix, Windows PowerShell with process-tree termination on Windows)
+(`/bin/sh` with process groups on Unix, Windows PowerShell in a kill-on-close Job Object on Windows)
 and the fixed browser opener used by guided setup.
 
 ## Guest share boundary

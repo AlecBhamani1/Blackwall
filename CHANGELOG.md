@@ -50,6 +50,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Stop Windows shell descendants on cancellation, timeout, and command completion even when
+  their parent PowerShell process has already exited.
+
 - Separate Chat and Agent histories, lock conversation mode and project after the first message,
   restore each Agent conversation’s project, and clear the project when starting a new chat.
 

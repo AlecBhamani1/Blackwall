@@ -102,7 +102,8 @@ permanent project or domain policy. Expired and cancelled approval handles canno
 
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they have a two-minute
-limit, and cancellation terminates their process group (on Windows, the live process tree). Review the command itself when
+limit, and cancellation terminates their process group or Windows Job Object, including children
+whose parent shell has already exited. Review the command itself when
 deciding; the selected project folder does not constrain what an approved shell command can access.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
