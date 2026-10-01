@@ -9,6 +9,39 @@ Do not delete that release or move its tag. Its feed points to the latest approv
 The desktop app checks at startup and exposes a manual check under **Settings → App updates**.
 An available update is downloaded only after the user selects **Install update and restart**.
 
+## Testing partial with Beta
+
+![Beta update channel in Settings](screenshots/beta-update-channel.png)
+
+Open **Settings → App updates → Update channel**, select **Beta**, then choose
+**Install update and restart** when a build is available. The choice is saved across restarts.
+Stable is the default; a manually installed beta defaults to Beta unless a channel was already saved.
+Select **Stable** to return to the latest production release, even when its version is older than
+an installed beta. Changing channels checks immediately; it never installs automatically.
+
+After CI succeeds for a trusted push to `partial`, **Publish beta release** creates a commit-pinned
+prerelease with signed Apple Silicon and Intel builds. It reuses the production signing secrets.
+Versions use the next patch above `.github/release.json`, followed by `-beta.<workflow run number>`;
+for a `0.1.4` production plan, a preview is `0.1.5-beta.42`. Each workflow retry retains its version.
+Beta notes include the Unreleased changelog and source commit. Beta does not require production
+acceptance and may contain unfinished features or bugs.
+
+The workflow verifies both architectures and signatures before publishing and advancing
+`beta/latest.json`. It creates the `beta` feed release on first publication, keeps versioned files
+immutable, and never changes GitHub Latest or `main/latest.json`. A failed upload is repaired by
+rerunning the failed job; published builds are not rebuilt. A newer published beta blocks an older
+retry from moving the feed backward, including when a feed upload was interrupted.
+
+Once this change merges into `partial`, passing push CI starts the first beta build. To retry
+manually, run **Publish beta release** from **partial**; successful push CI for that exact commit
+is still required. Existing apps without the channel selector need one manual installation of a
+beta download (or a stable release containing this selector). Download a numbered prerelease's
+DMG from GitHub Releases; the `beta` release itself hosts only the updater feed.
+
+Beta and stable replace the same application and use the same local data. An older stable build
+may not understand data formats introduced by a future beta; back up local data before testing
+versions that change storage formats.
+
 ## Publishing an approved version
 
 `partial` is integration and `main` is production. A checked `partial` → `main` promotion

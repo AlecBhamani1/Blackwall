@@ -54,6 +54,26 @@ describe('SettingsDialog', () => {
     expect(onInstallUpdate).toHaveBeenCalledOnce();
   });
 
+  it('offers beta and prevents switching channels during installation', async () => {
+    const user = userEvent.setup();
+    const onUpdateChannelChange = vi.fn().mockResolvedValue(undefined);
+    const view = render(SettingsDialog, {
+      props: {
+        open: true,
+        model: MODEL,
+        onClose: vi.fn(),
+        client: mockClient(),
+        updateChannel: 'stable',
+        onUpdateChannelChange,
+      },
+    });
+    await user.selectOptions(screen.getByLabelText('Update channel'), 'beta');
+    expect(onUpdateChannelChange).toHaveBeenCalledExactlyOnceWith('beta');
+    await view.rerender({ updateChannel: 'beta', updateState: 'downloading' });
+    expect(screen.getByLabelText('Update channel')).toBeDisabled();
+    expect(screen.getByText(/Beta builds may have bugs/)).toBeInTheDocument();
+  });
+
   it('saves and tests a model endpoint from settings', async () => {
     const user = userEvent.setup();
     const onConfigureEndpoint = vi.fn().mockResolvedValue(true);

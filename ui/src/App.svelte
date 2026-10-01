@@ -41,6 +41,7 @@
     preferences,
   } = controller;
   const {
+    channel: updateChannel,
     state: updateState,
     currentVersion,
     update: availableUpdate,
@@ -176,6 +177,8 @@
       selectedModel={$selectedModel}
       endpoint={$endpoint}
       connectionError={$connectionError}
+      updateChannel={$updateChannel}
+      onUpdateChannelChange={updateController.setChannel}
       updateState={$updateState}
       currentVersion={$currentVersion}
       availableUpdate={$availableUpdate}
