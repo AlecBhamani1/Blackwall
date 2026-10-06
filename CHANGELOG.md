@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Load scoped `AGENTS.md` and `AGENTS.override.md` guidance in CLI and desktop Agent tasks,
+  with bounded discovery, visible source lists and warnings, and a reviewed `/init` proposal
+  that preserves existing project instructions.
+
 - Review agent-proposed preferences, project conventions, and environment lessons in desktop Memory
   or `bw memory`. Proposals show their source and replacement text; approval, editing, rejection,
   and forgetting persist across clients. Scoped injection stays bounded, disabled memory blocks
@@ -19,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transcripts, and separate resumable checkpoints that never restore historical approvals.
 
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
+
+### Fixed
+
+- Use portable paths in instruction source lists and directory scopes on Windows.
 
 ## [0.1.4] - 2026-10-01
 

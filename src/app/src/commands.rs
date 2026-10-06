@@ -209,6 +209,11 @@ impl From<blackwall_core::agent::AgentError> for CommandError {
                 message: error.to_string(),
                 retryable: false,
             },
+            AgentError::Instructions | AgentError::Tool(_) => Self {
+                code: "agent_error",
+                message: error.to_string(),
+                retryable: false,
+            },
             AgentError::Context => Self {
                 code: "context_limit",
                 message: error.to_string(),
@@ -499,6 +504,12 @@ pub(crate) async fn stream_chat(
             .map(|model| model.with_sampling(request.temperature, request.max_tokens))
             .map_err(CommandError::from)?;
         let event_app = app.clone();
+        let instruction_directory =
+            crate::identity::data_directory(&app).map_err(|message| CommandError {
+                code: "storage_error",
+                message,
+                retryable: false,
+            })?;
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,
@@ -511,7 +522,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run_context_with_memory(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact },memory.as_ref())=>result.map(|_|()).map_err(CommandError::from),
+            result=runner.run_context_with_guidance(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact },memory.as_ref(),Some(&instruction_directory))=>result.map(|_|()).map_err(CommandError::from),
         }
     } else {
         inject_memory(&app, &mut request, None).await?;

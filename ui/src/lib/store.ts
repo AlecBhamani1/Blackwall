@@ -712,6 +712,35 @@ export function createChatController(
           {
             onEvent(event) {
               if (generation !== runGeneration || controller.signal.aborted || destroyed) return;
+              if (event.type === 'instructions_loaded')
+                messages.update((current) =>
+                  current.map((message) =>
+                    message.id === assistantId
+                      ? {
+                          ...message,
+                          tools: [
+                            ...(message.tools ?? []).filter(
+                              (tool) =>
+                                tool.id !==
+                                `instructions${event.agentId ? `_${event.agentId}` : ''}`,
+                            ),
+                            {
+                              id: `instructions${event.agentId ? `_${event.agentId}` : ''}`,
+                              name: 'project_instructions',
+                              arguments: JSON.stringify({
+                                path: event.sources.join(', ') || 'None',
+                              }),
+                              output: [
+                                `Loaded instructions: ${event.sources.join(', ') || 'None'}`,
+                                ...event.warnings.map((warning) => `Warning: ${warning}`),
+                              ].join('\n'),
+                              status: 'complete',
+                            },
+                          ],
+                        }
+                      : message,
+                  ),
+                );
               if (event.type === 'context_updated') {
                 contextState.set(event.state);
                 saveCurrentSession();

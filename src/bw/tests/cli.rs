@@ -643,6 +643,61 @@ fn environment_access_keys_are_sent_only_to_the_configured_origin() {
     );
 }
 
+#[test]
+fn init_reviews_diff_offline_and_preserves_existing_guidance() {
+    let fixture = Fixture::new();
+    let model = OfflineGuard::start();
+    fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
+    let denied = fixture.run(&["chat"], "/init\nno\n/quit\n");
+    assert!(denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("+## Development"));
+    assert!(!fixture.project.join("AGENTS.md").exists());
+    let allowed = fixture.success(&["chat"], "/init\nyes\n/init\n/quit\n");
+    assert!(allowed.contains("Created AGENTS.md"));
+    assert!(allowed.contains("Existing AGENTS.md preserved"));
+    let content = fs::read_to_string(fixture.project.join("AGENTS.md")).unwrap();
+    let preserved = fixture.success(&["run", "/init"], "");
+    assert!(preserved.contains("Existing AGENTS.md preserved"));
+    assert_eq!(
+        fs::read_to_string(fixture.project.join("AGENTS.md")).unwrap(),
+        content
+    );
+    model.assert_unused();
+}
+
+#[test]
+fn agent_request_loads_user_and_project_guidance_and_reports_sources() {
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    fs::create_dir_all(fixture.root.join("data")).unwrap();
+    fs::write(
+        fixture.root.join("data/AGENTS.md"),
+        "User fixture conventions",
+    )
+    .unwrap();
+    fs::write(fixture.project.join("AGENTS.md"), "Shadowed guidance").unwrap();
+    fs::write(
+        fixture.project.join("AGENTS.override.md"),
+        "Project fixture conventions",
+    )
+    .unwrap();
+    let model = ModelServer::start(vec![answer("guided answer")]);
+    fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
+    let output = fixture.run(&["run", "inspect conventions"], "");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("User guidance: AGENTS.md, AGENTS.override.md"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Project fixture conventions"));
+    let requests = model.finish();
+    let system = message_contents(&requests[0], "system").join("\n");
+    assert!(system.contains("User fixture conventions"));
+    assert!(system.contains("Project fixture conventions"));
+    assert!(!system.contains("Shadowed guidance"));
+}
+
 fn proposed_memory(content: &str) -> Vec<Value> {
     vec![
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fixture-memory","type":"function","function":{"name":"memory_propose","arguments":json!({"scope":"project","key":"test-command","content":content}).to_string()}}]},"finish_reason":"tool_calls"}]}),
@@ -805,6 +860,16 @@ fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
     let fixture = Fixture::new();
     fixture.configure_model();
     fixture.success(&["config", "set", "memory", "on"], "");
+    fs::write(
+        fixture.project.join("AGENTS.md"),
+        "Original project guidance.",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("data/AGENTS.md"),
+        "Current user guidance.",
+    )
+    .unwrap();
     let server = ModelServer::start(vec![
         proposed_memory("Run offline tests."),
         answer(&"Historical result. ".repeat(800)),
@@ -830,6 +895,9 @@ fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
     fixture.success(&["resume", session_id, "Continue the task"], "");
     fixture.success(&["resume", session_id, "Continue again"], "");
     for request in server.finish() {
+        let system = message_contents(&request, "system").join("\n");
+        assert!(system.contains("Original project guidance."));
+        assert!(system.contains("Current user guidance."));
         assert!(message_contents(&request, "system")
             .iter()
             .any(|text| text.contains("Current testing convention.")));
@@ -874,12 +942,21 @@ fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
         .unwrap()
         .iter()
         .all(|message| message["role"] != "system"));
+    fs::write(
+        fixture.project.join("AGENTS.md"),
+        "Updated project guidance.",
+    )
+    .unwrap();
     fixture.success(&["memory", "forget", &proposal.entry.id], "");
     fixture.success(&["config", "set", "memory", "off"], "");
     let server = ModelServer::start(vec![answer("Resumed after forgetting.")]);
     fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
     fixture.success(&["resume", session_id, "Continue safely"], "");
     let request = server.finish().remove(0);
+    let system = message_contents(&request, "system").join("\n");
+    assert!(system.contains("Updated project guidance."));
+    assert!(system.contains("Current user guidance."));
+    assert!(!system.contains("Original project guidance."));
     assert!(!message_contents(&request, "system").iter().any(|text| text
         .contains("saved_memories")
         || text.contains("Current testing convention.")));

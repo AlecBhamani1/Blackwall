@@ -21,6 +21,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /memory on|off            Include/exclude your saved memories
   /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
+  /init                     Review a proposed AGENTS.md (preserves existing guidance)
   /context                  Show estimated budget and last server token usage
   /compact                  Summarize older context; retain the original transcript
   /settings context <n>     Configure model context limit in tokens
@@ -321,6 +322,11 @@ async fn chat(
                     }
                 }
                 match name {
+                    "init" if value.is_empty() => {
+                        conversation
+                            .turn(store, directory, settings, "/init", input)
+                            .await
+                    }
                     "compact" if value.is_empty() => {
                         conversation
                             .compact(store, directory, settings, input)
