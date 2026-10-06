@@ -3,6 +3,7 @@
   import Icon from './Icon.svelte';
   export let tools: ToolEntry[] = [];
   const labels: Record<string, string> = {
+    project_instructions: 'Project instructions',
     read_file: 'Read file',
     search_files: 'Search files',
     list_files: 'List files',

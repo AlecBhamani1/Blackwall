@@ -417,6 +417,12 @@ pub(crate) async fn stream_chat(
                 retryable: true,
             })?;
         let event_app = app.clone();
+        let instruction_directory =
+            crate::identity::data_directory(&app).map_err(|message| CommandError {
+                code: "storage_error",
+                message,
+                retryable: false,
+            })?;
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,
@@ -429,7 +435,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run(&request_id,blackwall_core::model::messages(&request))=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
+            result=runner.run_with_user_instructions(&request_id,blackwall_core::model::messages(&request),Some(&instruction_directory))=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
         }
     } else {
         tokio::select! {

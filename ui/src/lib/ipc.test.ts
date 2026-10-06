@@ -35,6 +35,45 @@ describe('native chat failure boundary', () => {
     );
   });
 
+  it('delivers validated instruction provenance through native streaming events', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          type: 'instructions_loaded',
+          requestId: 'guidance',
+          sources: ['AGENTS.md'],
+          warnings: ['Skipped malformed guidance.'],
+        },
+      });
+      listener({
+        payload: {
+          type: 'instructions_loaded',
+          requestId: 'guidance',
+          sources: [123],
+          warnings: [],
+        },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'guidance' } });
+      return { requestId: 'guidance' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'guidance', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledTimes(2);
+    expect(onEvent).toHaveBeenCalledWith({
+      type: 'instructions_loaded',
+      requestId: 'guidance',
+      sources: ['AGENTS.md'],
+      warnings: ['Skipped malformed guidance.'],
+    });
+  });
+
   it('reports local storage failure without blaming the model or exposing native details', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

@@ -312,6 +312,15 @@ pub enum SubagentState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Instruction provenance and safe discovery warnings, without file contents.
+    InstructionsLoaded {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        sources: Vec<String>,
+        warnings: Vec<String>,
+    },
     /// Incremental assistant text from a streaming model response.
     AssistantDelta {
         /// Identifier of the request producing this delta.
@@ -429,7 +438,8 @@ impl AgentEvent {
     /// Returns the correlation identifier shared by every event variant.
     pub fn request_id(&self) -> &str {
         match self {
-            Self::AssistantDelta { request_id, .. }
+            Self::InstructionsLoaded { request_id, .. }
+            | Self::AssistantDelta { request_id, .. }
             | Self::ToolCall { request_id, .. }
             | Self::ToolResult { request_id, .. }
             | Self::ApprovalRequest { request_id, .. }
@@ -569,6 +579,12 @@ mod tests {
     fn every_event_variant_round_trips_and_retains_request_id() {
         let message = ChatMessage::new(MessageRole::Assistant, "Done");
         let events = vec![
+            AgentEvent::InstructionsLoaded {
+                request_id: "r1".into(),
+                agent_id: None,
+                sources: vec!["AGENTS.md".into()],
+                warnings: vec!["Nested guidance was skipped.".into()],
+            },
             AgentEvent::AssistantDelta {
                 request_id: "r1".to_owned(),
                 delta: "Hello".to_owned(),

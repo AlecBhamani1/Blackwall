@@ -286,6 +286,21 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
   const type = String(event.type ?? event.event ?? '');
   const requestId = String(event.requestId ?? event.request_id ?? '');
 
+  if (
+    type === 'instructions_loaded' &&
+    Array.isArray(event.sources) &&
+    event.sources.every((source) => typeof source === 'string') &&
+    Array.isArray(event.warnings) &&
+    event.warnings.every((warning) => typeof warning === 'string')
+  ) {
+    return {
+      type,
+      requestId,
+      ...(typeof event.agentId === 'string' ? { agentId: event.agentId } : {}),
+      sources: event.sources,
+      warnings: event.warnings,
+    };
+  }
   if (type === 'assistant_delta') {
     return { type, requestId, delta: String(event.delta ?? event.content ?? '') };
   }

@@ -90,6 +90,14 @@ For development, `npm run cli -- setup` and `npm run cli` run the CLI without in
 an Agent conversation in its saved project. See the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for
 credentials, approvals, and configuration precedence.
 
+## Project working agreements
+
+CLI and desktop Agent tasks discover `AGENTS.md` guidance, with `AGENTS.override.md` taking
+precedence in each directory. Source lists and discovery warnings are visible in both clients.
+Use `/init` to review a starter instruction file before writing it. See
+[Project instructions](docs/PROJECT_INSTRUCTIONS.md) for ordering, nested scopes, bounds,
+and approval behavior.
+
 ## Run the desktop app
 
 Prerequisites are Node.js 22.12+, npm, the stable Rust toolchain, and the

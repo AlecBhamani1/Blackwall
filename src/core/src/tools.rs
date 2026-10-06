@@ -49,7 +49,7 @@ pub enum ToolError {
 }
 #[derive(Clone)]
 pub struct Workspace {
-    directory: Arc<Dir>,
+    pub(crate) directory: Arc<Dir>,
     pub path: PathBuf,
 }
 impl Workspace {
@@ -62,7 +62,7 @@ impl Workspace {
             path,
         })
     }
-    fn checked(path: &str) -> Result<&Path, ToolError> {
+    pub(crate) fn checked(path: &str) -> Result<&Path, ToolError> {
         let path = Path::new(path);
         if path.as_os_str().len() > 2048
             || path.is_absolute()
@@ -165,7 +165,7 @@ impl Workspace {
         }
         String::from_utf8(bytes).map_err(|_| ToolError::Limit)
     }
-    fn original(&self, path: &str) -> Result<Option<String>, ToolError> {
+    pub(crate) fn original(&self, path: &str) -> Result<Option<String>, ToolError> {
         let checked = Self::checked(path)?;
         match self.directory.symlink_metadata(checked) {
             Ok(metadata) if metadata.file_type().is_symlink() => Err(ToolError::Path),

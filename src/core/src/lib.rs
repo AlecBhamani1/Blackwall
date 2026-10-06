@@ -19,6 +19,7 @@ pub use protocol::{
 
 pub mod agent;
 pub mod approvals;
+pub mod instructions;
 pub mod model;
 pub mod tools;
 

@@ -68,6 +68,13 @@ export interface ChatRequest {
 }
 
 export type AgentEvent =
+  | {
+      type: 'instructions_loaded';
+      requestId: string;
+      agentId?: string;
+      sources: string[];
+      warnings: string[];
+    }
   | { type: 'assistant_delta'; requestId: string; delta: string }
   | { type: 'turn_complete'; requestId: string; finishReason?: string }
   | { type: 'error'; requestId: string; message: string; code?: string }

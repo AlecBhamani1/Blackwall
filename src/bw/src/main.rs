@@ -19,6 +19,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /web on|off               Enable/disable approved web tools
   /memory on|off            Include/exclude your saved memories
   /workspace <path>         Start a new conversation in a project
+  /init                     Review a proposed AGENTS.md (preserves existing guidance)
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -307,7 +308,13 @@ async fn chat(
                         }
                     }
                 }
-                slash(store, settings, conversation, name, value)
+                if name == "init" && value.is_empty() {
+                    conversation
+                        .turn(store, directory, settings, "/init", input)
+                        .await
+                } else {
+                    slash(store, settings, conversation, name, value)
+                }
             } else {
                 let prompt = if line.starts_with("//") {
                     &line[1..]

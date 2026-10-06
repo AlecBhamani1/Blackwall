@@ -372,6 +372,44 @@ describe('chat controller', () => {
     expect(get(controller.notice)).toBe(get(controller.connectionError));
   });
 
+  it('shows instruction sources and warnings and replaces them when nested guidance loads', async () => {
+    const client = mockClient();
+    client.streamChat = vi.fn(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        sources: ['AGENTS.md'],
+        warnings: [],
+      });
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        sources: ['AGENTS.md', 'src/AGENTS.override.md'],
+        warnings: ['Skipped oversized guidance.'],
+      });
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        agentId: 'child',
+        sources: ['AGENTS.md', 'nested/AGENTS.md'],
+        warnings: [],
+      });
+      callbacks.onDelta('Applied project conventions.');
+    });
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Inspect this project', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const tools = get(controller.messages).at(-1)?.tools;
+    expect(tools).toHaveLength(2);
+    expect(tools?.[1]).toMatchObject({ id: 'instructions_child', status: 'complete' });
+    expect(tools?.[1].output).toContain('nested/AGENTS.md');
+    expect(tools?.[0]).toMatchObject({ name: 'project_instructions', status: 'complete' });
+    expect(tools?.[0].output).toContain('AGENTS.md, src/AGENTS.override.md');
+    expect(tools?.[0].output).toContain('Warning: Skipped oversized guidance.');
+    controller.destroy();
+  });
+
   it('finishes visible tool and child activity when the parent request fails', async () => {
     const client = mockClient();
     client.streamChat = vi.fn(async (request, callbacks) => {

@@ -142,8 +142,15 @@ impl Conversation {
             .save_session(&candidate)
             .map_err(|error| error.to_string())?;
         self.session = candidate;
-        let (answer, result) =
-            execute(&backend, workspace, settings.web_enabled, messages, input).await;
+        let (answer, result) = execute(
+            &backend,
+            workspace,
+            settings.web_enabled,
+            messages,
+            input,
+            directory,
+        )
+        .await;
         let status = if result.is_ok() { "complete" } else { "error" };
         let content = if answer.is_empty() {
             result.as_ref().err().cloned().unwrap_or_default()
@@ -224,6 +231,7 @@ async fn execute(
     web_enabled: bool,
     messages: Vec<Value>,
     input: &mut Input,
+    directory: &Path,
 ) -> (String, Result<(), String>) {
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -238,7 +246,7 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let work = agent.run(&request_id, messages);
+    let work = agent.run_with_user_instructions(&request_id, messages, Some(directory));
     tokio::pin!(work);
     let mut answer = String::new();
     let mut pending: Option<ResolveApprovalRequest> = None;
@@ -257,17 +265,7 @@ async fn execute(
                     Err(error) => break Err(error),
                 }
             }
-            event = incoming.recv() => if let Some(event) = event { match event {
-                AgentEvent::AssistantDelta { delta, .. } => { answer.push_str(&delta); print!("{delta}"); let _ = io::stdout().flush(); }
-                AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
-                AgentEvent::ToolResult { success: false, output, .. } => eprintln!("{output}"),
-                AgentEvent::ApprovalRequest { request_id, approval_id, detail, .. } => {
-                    eprintln!("\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies.");
-                    pending = Some(ResolveApprovalRequest { request_id, approval_id, decision: ApprovalDecision::Deny });
-                }
-                AgentEvent::SubagentStatus { state, summary, .. } => eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default()),
-                _ => {}
-            } },
+            event = incoming.recv() => if let Some(event) = event { render_event(event, &mut answer, &mut pending); },
             result = &mut work => match result {
                 Ok(complete) => break Ok(complete),
                 Err(error) => break Err(error.to_string()),
@@ -275,12 +273,9 @@ async fn execute(
         }
     };
     // A ready model future can enqueue events and complete in one poll. Render those
-    // deltas before returning so even a fast final response reaches stdout.
+    // events before returning so fast completions retain text and instruction provenance.
     while let Ok(event) = incoming.try_recv() {
-        if let AgentEvent::AssistantDelta { delta, .. } = event {
-            answer.push_str(&delta);
-            print!("{delta}");
-        }
+        render_event(event, &mut answer, &mut pending);
     }
     let _ = io::stdout().flush();
     let result = result.map(|complete| {
@@ -288,6 +283,66 @@ async fn execute(
     });
     println!();
     (answer, result)
+}
+
+fn render_event(
+    event: AgentEvent,
+    answer: &mut String,
+    pending: &mut Option<ResolveApprovalRequest>,
+) {
+    match event {
+        AgentEvent::AssistantDelta { delta, .. } => {
+            answer.push_str(&delta);
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        }
+        AgentEvent::InstructionsLoaded {
+            sources,
+            warnings,
+            agent_id,
+            ..
+        } => {
+            eprintln!(
+                "\n{}Instructions: {}",
+                agent_id
+                    .map(|id| format!("[agent {id}] "))
+                    .unwrap_or_default(),
+                if sources.is_empty() {
+                    "none".into()
+                } else {
+                    sources.join(", ")
+                }
+            );
+            for warning in warnings {
+                eprintln!("Instruction warning: {warning}");
+            }
+        }
+        AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
+        AgentEvent::ToolResult {
+            success: false,
+            output,
+            ..
+        } => eprintln!("{output}"),
+        AgentEvent::ApprovalRequest {
+            request_id,
+            approval_id,
+            detail,
+            ..
+        } => {
+            eprintln!(
+                "\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies."
+            );
+            *pending = Some(ResolveApprovalRequest {
+                request_id,
+                approval_id,
+                decision: ApprovalDecision::Deny,
+            });
+        }
+        AgentEvent::SubagentStatus { state, summary, .. } => {
+            eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default())
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

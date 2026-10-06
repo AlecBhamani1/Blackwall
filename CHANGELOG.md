@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Load scoped `AGENTS.md` and `AGENTS.override.md` guidance in CLI and desktop Agent tasks,
+  with bounded discovery, visible source lists and warnings, and a reviewed `/init` proposal
+  that preserves existing project instructions.
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
 ## [0.1.4] - 2026-10-01
