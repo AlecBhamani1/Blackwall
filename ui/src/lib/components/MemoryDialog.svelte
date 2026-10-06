@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type MemoryEntry } from '../persistence';
+  import { persistence, type MemoryEntry, type Preferences } from '../persistence';
   import { createId } from '../id';
   import Icon from './Icon.svelte';
   import { platform } from '../platform';
+  export let contextPreferences: Preferences = {};
   export let onPreferences: (preferences: {
     memoryEnabled: boolean;
     contextWindow: number;
+    outputTokens: number;
+    autoCompact: boolean;
   }) => void = () => {};
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
@@ -18,6 +21,8 @@
   let busy = false;
   let enabled = false;
   let contextWindow = 32000;
+  let outputTokens = 4096;
+  let autoCompact = false;
   let loaded = false;
   let savedPreferences: Awaited<ReturnType<typeof persistence.preferences>> = {};
   const desktop = persistence.available();
@@ -70,11 +75,19 @@
     busy = true;
     error = '';
     try {
-      await persistence.savePreferences({
+      if (desktop)
+        await persistence.savePreferences({
+          memoryEnabled: enabled,
+          contextWindow: Number(contextWindow),
+          outputTokens: Number(outputTokens),
+          autoCompact,
+        });
+      onPreferences({
         memoryEnabled: enabled,
         contextWindow: Number(contextWindow),
+        outputTokens: Number(outputTokens),
+        autoCompact,
       });
-      onPreferences({ memoryEnabled: enabled, contextWindow: Number(contextWindow) });
     } catch {
       error = 'These settings could not be saved. Try again.';
     } finally {
@@ -83,12 +96,22 @@
   }
   onMount(() => {
     dialog.showModal();
-    if (!desktop) return;
+    if (!desktop) {
+      contextWindow = contextPreferences.contextWindow ?? 32000;
+      outputTokens =
+        contextPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
+      autoCompact = contextPreferences.autoCompact ?? false;
+      loaded = true;
+      return;
+    }
     void (async () => {
       try {
         savedPreferences = await persistence.preferences();
         enabled = savedPreferences.memoryEnabled ?? false;
         contextWindow = savedPreferences.contextWindow ?? 32000;
+        outputTokens =
+          savedPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
+        autoCompact = savedPreferences.autoCompact ?? false;
         await refresh();
         loaded = true;
       } catch {
@@ -182,28 +205,52 @@
             </article>{/each}
         </div>
       {/if}
-      <details>
-        <summary>Advanced · Context window</summary><label for="context-window"
-          >Model context limit (tokens)</label
-        ><input
-          id="context-window"
-          type="number"
-          min="2048"
-          max="1000000"
-          step="1024"
-          bind:value={contextWindow}
-          disabled={busy || !loaded}
-        />
-        <p class="hint">
-          Use the limit configured in your model service. The status bar shows an estimate.
-        </p>
-        <button
-          class="secondary"
-          disabled={busy || !loaded || contextWindow < 2048 || contextWindow > 1000000}
-          onclick={saveSettings}>Save context limit</button
-        >
-      </details>
     {/if}
+    <details>
+      <summary>Advanced · Context window</summary><label for="context-window"
+        >Model context limit (tokens)</label
+      ><input
+        id="context-window"
+        type="number"
+        min="2048"
+        max="1000000"
+        step="1024"
+        bind:value={contextWindow}
+        disabled={busy || !loaded}
+      />
+      <p class="hint">
+        Use the limit configured in your model service. Requests reserve room for tools, output, and
+        a 5% safety margin. Token counts are estimates.
+      </p>
+      <label for="output-tokens">Output reserve (tokens)</label>
+      <input
+        id="output-tokens"
+        type="number"
+        min="1"
+        max="32768"
+        bind:value={outputTokens}
+        disabled={busy || !loaded}
+      />
+      <label
+        ><input type="checkbox" bind:checked={autoCompact} disabled={busy || !loaded} /> Automatically
+        compact older context near the limit</label
+      >
+      <p class="hint">
+        Use /context to see usage and /compact to summarize older turns. Original transcripts are
+        retained.
+      </p>
+      <button
+        class="secondary"
+        disabled={busy ||
+          !loaded ||
+          contextWindow < 2048 ||
+          contextWindow > 1000000 ||
+          outputTokens < 1 ||
+          outputTokens > 32768 ||
+          Number(outputTokens) + Math.floor(contextWindow / 20) >= contextWindow}
+        onclick={saveSettings}>Save context limit</button
+      >
+    </details>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
   </div>
 </dialog>

@@ -26,6 +26,18 @@ export function nativeModelError(cause: unknown): ModelRequestError {
   const code = typeof record.code === 'string' ? record.code : '';
   // Allowlisted copy also protects against raw URLs/bodies from older native builds.
   const messages: Record<string, string> = {
+    context_budget_invalid:
+      'Choose a valid model context limit and a smaller, positive output reserve.',
+    context_limit:
+      'The estimated request exceeds the model context budget. Use /compact, increase the configured limit, or shorten the task.',
+    context_history_invalid:
+      'The saved model history or checkpoint is invalid. The original conversation has been retained.',
+    context_summary_invalid:
+      'The model returned an invalid or oversized summary. Previous context has been retained.',
+    context_nothing_to_compact:
+      'There is no older context to compact; the two most recent user turns are retained.',
+    agent_iteration_limit:
+      'The agent reached its 20-step limit. Review its progress before continuing.',
     storage_error:
       'Blackwall could not access its local data. Check disk space and folder permissions, then retry saving. Keep Blackwall open to preserve unsaved work.',
     credential_error: `Blackwall could not access the saved key. ${platform.storeHelp}, then reconnect.`,

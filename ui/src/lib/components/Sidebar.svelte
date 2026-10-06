@@ -8,16 +8,15 @@
     AppUpdateProgress,
     AppUpdateState,
   } from '../updates';
+  import type { Preferences } from '../persistence';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
-  export let onPreferences: (preferences: {
-    memoryEnabled: boolean;
-    contextWindow: number;
-  }) => void = () => {};
+  export let contextPreferences: Preferences = {};
+  export let onPreferences: (preferences: Preferences) => void = () => {};
   export let onLock: () => Promise<void> = async () => {};
   export let visible = true;
   export let showModes = false;
@@ -159,7 +158,11 @@
 </aside>
 
 {#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
-{#if memoryOpen}<MemoryDialog {onPreferences} onClose={() => (memoryOpen = false)} />{/if}
+{#if memoryOpen}<MemoryDialog
+    {onPreferences}
+    {contextPreferences}
+    onClose={() => (memoryOpen = false)}
+  />{/if}
 
 <SettingsDialog
   {onLock}

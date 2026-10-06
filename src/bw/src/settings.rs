@@ -11,6 +11,7 @@ pub struct Settings {
     pub model: String,
     pub web_enabled: bool,
     pub memory_enabled: bool,
+    pub budget: blackwall_core::context::ContextBudget,
 }
 
 impl Settings {
@@ -20,6 +21,7 @@ impl Settings {
 
     /// Check all fields before changing either normalized value.
     pub fn validate(&mut self) -> Result<(), String> {
+        self.budget.validate().map_err(|error| error.to_string())?;
         let endpoint = validated_endpoint(&self.endpoint)?;
         let model = validated_model(&self.model)?;
         self.endpoint = endpoint;
@@ -35,6 +37,7 @@ impl Settings {
             "model": validated.model,
             "webEnabled": validated.web_enabled,
             "memoryEnabled": validated.memory_enabled,
+            "contextBudget": validated.budget,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -57,7 +60,23 @@ impl Settings {
             "model" => updated.model = value.into(),
             "web" => updated.web_enabled = on_or_off(value)?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
-            _ => return Err("Choose a setting: model, endpoint, web, or memory.".into()),
+            "context" => {
+                updated.budget.context_window = value
+                    .parse()
+                    .map_err(|_| "Enter a context limit in tokens.")?
+            }
+            "output" => {
+                updated.budget.output_tokens = value
+                    .parse()
+                    .map_err(|_| "Enter an output reserve in tokens.")?
+            }
+            "compact" => updated.budget.auto_compact = on_or_off(value)?,
+            _ => {
+                return Err(
+                    "Choose a setting: model, endpoint, web, memory, context, output, or compact."
+                        .into(),
+                )
+            }
         }
         updated.validate()?;
         persist(&updated)?;
@@ -72,9 +91,11 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
+            self.budget.context_window, self.budget.output_tokens,
+            if self.budget.auto_compact { "on" } else { "off" },
         )
     }
 }
@@ -122,6 +143,34 @@ fn load_with_environment(
         model,
         web_enabled: false,
         memory_enabled,
+        budget: blackwall_core::context::ContextBudget {
+            context_window: object
+                .get("contextWindow")
+                .map(|v| v.as_u64().ok_or("Invalid context limit."))
+                .transpose()?
+                .unwrap_or(32000),
+            output_tokens: object
+                .get("outputTokens")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid output reserve.")
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    (object
+                        .get("contextWindow")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(32000)
+                        / 4)
+                    .min(4096) as u32
+                }),
+            auto_compact: object
+                .get("autoCompact")
+                .map(|v| v.as_bool().ok_or("Invalid automatic compaction setting."))
+                .transpose()?
+                .unwrap_or(false),
+        },
     };
     settings.validate()?;
     Ok(settings)
@@ -134,12 +183,17 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "endpoint" | "model" | "webEnabled" | "memoryEnabled"
+            "endpoint" | "model" | "webEnabled" | "memoryEnabled" | "contextBudget"
         )
     }) {
         return Err(invalid.into());
     }
     let mut settings = Settings {
+        budget: object
+            .get("contextBudget")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
         endpoint: object
             .get("endpoint")
             .and_then(Value::as_str)
@@ -249,6 +303,7 @@ mod tests {
                 model: DEFAULT_MODEL.into(),
                 web_enabled: false,
                 memory_enabled: false,
+                budget: Default::default(),
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -327,6 +382,9 @@ mod tests {
             .unwrap();
         settings.set(&store, "model", " trimmed-model ").unwrap();
         settings.set(&store, "web", "ON").unwrap();
+        settings.set(&store, "context", "8192").unwrap();
+        settings.set(&store, "output", "1024").unwrap();
+        settings.set(&store, "compact", "on").unwrap();
         assert_eq!(settings.endpoint, "https://models.example/v1");
         assert_eq!(settings.model, "trimmed-model");
         drop(store);
@@ -334,7 +392,11 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 4);
+        assert_eq!(saved.as_object().unwrap().len(), 5);
+        assert_eq!(
+            saved["contextBudget"],
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true})
+        );
         assert!(saved.get("apiKey").is_none());
     }
 
@@ -428,6 +490,7 @@ mod tests {
             model: "\u{1b}[31msecret".into(),
             web_enabled: true,
             memory_enabled: false,
+            budget: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());

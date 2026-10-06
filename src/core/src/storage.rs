@@ -399,6 +399,12 @@ fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), Storag
             ));
         }
     }
+    if let Some(context) = session.get("contextState").filter(|v| !v.is_null()) {
+        let state: crate::context::ContextState = serde_json::from_value(context.clone())?;
+        state
+            .validate()
+            .map_err(|_| StorageError::Invalid("Invalid saved model context."))?;
+    }
     let body = serde_json::to_string(session)?;
     if body.len() > MAX_SESSION_BYTES {
         return Err(StorageError::Invalid(
@@ -539,5 +545,55 @@ mod tests {
         assert_eq!(db.memories("detailed").unwrap().len(), 1);
         db.delete_memory(&entry.id).unwrap();
         assert!(db.memories("detailed").unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod context_tests {
+    use super::*;
+    use crate::context::{fingerprint, Checkpoint, ContextState, Summary};
+    #[test]
+    fn checkpoints_persist_separately_from_original_transcripts_and_invalid_updates_are_atomic() {
+        let db = LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        let messages = json!([{"role":"user","content":"Keep instructions","attachments":[]},{"role":"assistant","content":"Original response","attachments":[]},{"role":"user","content":"Continue","attachments":[]}]);
+        let source = vec![
+            json!({"role":"user","content":"Keep instructions"}),
+            json!({"role":"assistant","content":"Original response"}),
+            json!({"role":"user","content":"Continue"}),
+        ];
+        let mut state = ContextState::restore(&source, None).unwrap();
+        state.checkpoints.push(Checkpoint {
+            through: 2,
+            source_hash: fingerprint(&source[..2]),
+            summary: Summary {
+                task_requirements: vec!["Keep instructions".into()],
+                corrections: vec![],
+                decisions: vec![],
+                changed_files: vec![],
+                checks: vec![],
+                unfinished_work: vec!["Continue".into()],
+                relevant_context: vec![],
+            },
+        });
+        let session = json!({"id":"context_session","title":"Compacted","updatedAt":123,"messages":messages,"contextState":state});
+        db.save_session(&session).unwrap();
+        let loaded = db.load_session("context_session").unwrap().unwrap();
+        assert_eq!(loaded["messages"], messages);
+        assert_eq!(loaded["contextState"]["transcript"], json!(source));
+        assert_eq!(
+            loaded["contextState"]["checkpoints"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut invalid = session.clone();
+        invalid["contextState"]["checkpoints"][0]["sourceHash"] = json!("tampered");
+        assert!(db.save_session(&invalid).is_err());
+        assert_eq!(
+            db.load_session("context_session").unwrap().unwrap(),
+            session
+        );
     }
 }

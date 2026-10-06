@@ -3,6 +3,7 @@ use blackwall_core::{
     agent::Agent,
     approvals::Approvals,
     connection::{normalize_endpoint, same_origin},
+    context::{ContextRun, ContextState},
     model::{self, HttpModel},
     protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
     skills::SkillStore,
@@ -108,6 +109,89 @@ impl Conversation {
         Ok(())
     }
 
+    fn saved_context(&self) -> Result<Option<ContextState>, String> {
+        self.session
+            .get("contextState")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|_| "The saved context is invalid.".into())
+            })
+            .transpose()
+    }
+    pub fn context_report(
+        &self,
+        store: &LocalStore,
+        directory: &Path,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        let messages = context(store, directory, settings, &self.session)?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, self.saved_context()?.as_ref())
+            .map_err(|e| e.to_string())?;
+        let mut messages = instructions;
+        messages.insert(
+            0,
+            blackwall_core::agent::default_instructions(
+                &Workspace::open(&self.workspace).map_err(|e| e.to_string())?,
+            ),
+        );
+        messages.extend(state.effective());
+        let report = settings.budget.report(
+            &messages,
+            &blackwall_core::tools::definitions(settings.web_enabled, true),
+            state.server_usage,
+        );
+        println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
+        Ok(())
+    }
+    pub async fn compact(
+        &mut self,
+        store: &LocalStore,
+        directory: &Path,
+        settings: &Settings,
+        input: &mut Input,
+    ) -> Result<(), String> {
+        self.flush(store)?;
+        let backend = HttpModel::new(
+            &settings.endpoint,
+            &settings.model,
+            environment_key(&settings.endpoint),
+        )
+        .and_then(|m| m.with_budget(settings.budget))
+        .map_err(|e| e.to_string())?;
+        let messages = context(store, directory, settings, &self.session)?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, self.saved_context()?.as_ref())
+            .map_err(|e| e.to_string())?;
+        let (_, snapshot, result) = execute(
+            &backend,
+            Workspace::open(&self.workspace).map_err(|e| e.to_string())?,
+            settings.web_enabled,
+            ContextRun {
+                source,
+                state,
+                budget: settings.budget,
+                instructions,
+                compact: true,
+            },
+            input,
+        )
+        .await;
+        result?;
+        if let Some(snapshot) = snapshot {
+            let mut candidate = self.session.clone();
+            candidate["contextState"] = json!(snapshot);
+            candidate["updatedAt"] = json!(now()?);
+            store.save_session(&candidate).map_err(|e| e.to_string())?;
+            self.session = candidate;
+        }
+        println!("Context compacted. Original transcript retained.");
+        Ok(())
+    }
+
     pub async fn turn(
         &mut self,
         store: &LocalStore,
@@ -122,6 +206,7 @@ impl Conversation {
             &settings.model,
             environment_key(&settings.endpoint),
         )
+        .and_then(|backend| backend.with_budget(settings.budget))
         .map_err(|error| error.to_string())?;
         let workspace = Workspace::open(&self.workspace).map_err(|error| error.to_string())?;
         let timestamp = now()?;
@@ -142,8 +227,27 @@ impl Conversation {
             .save_session(&candidate)
             .map_err(|error| error.to_string())?;
         self.session = candidate;
-        let (answer, result) =
-            execute(&backend, workspace, settings.web_enabled, messages, input).await;
+        let saved = self.saved_context()?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, saved.as_ref()).map_err(|e| e.to_string())?;
+        let (answer, snapshot, result) = execute(
+            &backend,
+            workspace,
+            settings.web_enabled,
+            ContextRun {
+                source,
+                state,
+                budget: settings.budget,
+                instructions,
+                compact: false,
+            },
+            input,
+        )
+        .await;
+        if let Some(snapshot) = snapshot {
+            self.session["contextState"] = json!(snapshot);
+        }
         let status = if result.is_ok() { "complete" } else { "error" };
         let content = if answer.is_empty() {
             result.as_ref().err().cloned().unwrap_or_default()
@@ -170,7 +274,9 @@ fn context(
     let history: Vec<ChatMessage> = serde_json::from_value(session["messages"].clone())
         .map_err(|_| "The saved conversation is invalid.")?;
     let request = ChatRequest::new("cli-context", &settings.model, history);
-    request.validate().map_err(|error| error.to_string())?;
+    if !request.messages.is_empty() {
+        request.validate().map_err(|error| error.to_string())?;
+    }
     let mut messages = model::messages(&request);
     if settings.memory_enabled {
         let memory = blackwall_core::memory::context(
@@ -222,9 +328,9 @@ async fn execute(
     backend: &HttpModel,
     workspace: Workspace,
     web_enabled: bool,
-    messages: Vec<Value>,
+    run: ContextRun,
     input: &mut Input,
-) -> (String, Result<(), String>) {
+) -> (String, Option<ContextState>, Result<(), String>) {
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
     let emit = Arc::new(move |event| {
@@ -238,9 +344,10 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let work = agent.run(&request_id, messages);
+    let work = agent.run_context(&request_id, run);
     tokio::pin!(work);
     let mut answer = String::new();
+    let mut snapshot = None;
     let mut pending: Option<ResolveApprovalRequest> = None;
     let result = loop {
         tokio::select! {
@@ -258,6 +365,7 @@ async fn execute(
                 }
             }
             event = incoming.recv() => if let Some(event) = event { match event {
+                AgentEvent::ContextUpdated { state, .. } => snapshot = Some(state),
                 AgentEvent::AssistantDelta { delta, .. } => { answer.push_str(&delta); print!("{delta}"); let _ = io::stdout().flush(); }
                 AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
                 AgentEvent::ToolResult { success: false, output, .. } => eprintln!("{output}"),
@@ -277,9 +385,13 @@ async fn execute(
     // A ready model future can enqueue events and complete in one poll. Render those
     // deltas before returning so even a fast final response reaches stdout.
     while let Ok(event) = incoming.try_recv() {
-        if let AgentEvent::AssistantDelta { delta, .. } = event {
-            answer.push_str(&delta);
-            print!("{delta}");
+        match event {
+            AgentEvent::AssistantDelta { delta, .. } => {
+                answer.push_str(&delta);
+                print!("{delta}");
+            }
+            AgentEvent::ContextUpdated { state, .. } => snapshot = Some(state),
+            _ => {}
         }
     }
     let _ = io::stdout().flush();
@@ -287,7 +399,7 @@ async fn execute(
         answer = complete;
     });
     println!();
-    (answer, result)
+    (answer, snapshot, result)
 }
 
 #[cfg(test)]
