@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Review agent-proposed preferences, project conventions, and environment lessons in desktop Memory
+  or `bw memory`. Proposals show their source and replacement text; approval, editing, rejection,
+  and forgetting persist across clients. Scoped injection stays bounded, disabled memory blocks
+  learning, and guest chats never receive owner memories.
+
 - Budget model requests for tool definitions, generated output, and a safety reserve. Add `/context`
   and `/compact` to the CLI and chat composer, with optional automatic compaction, retained original
   transcripts, and separate resumable checkpoints that never restore historical approvals.

@@ -4,10 +4,12 @@ use blackwall_core::{
     approvals::Approvals,
     connection::{normalize_endpoint, same_origin},
     context::{ContextRun, ContextState},
+    memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
     protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
     skills::SkillStore,
     storage::LocalStore,
+    storage::MemorySource,
     tools::Workspace,
     ChatMessage, ChatRequest,
 };
@@ -109,6 +111,23 @@ impl Conversation {
         Ok(())
     }
 
+    fn memory_tools(&self, directory: &Path) -> Option<MemoryTools> {
+        let message_id = self.session["messages"]
+            .as_array()?
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")?["id"]
+            .as_str()?;
+        Some(MemoryTools {
+            directory: directory.into(),
+            client: MemoryClient::Cli,
+            workspace: Some(self.workspace.to_string_lossy().into_owned()),
+            source: MemorySource {
+                session_id: self.id().into(),
+                message_id: message_id.into(),
+            },
+        })
+    }
     fn saved_context(&self) -> Result<Option<ContextState>, String> {
         self.session
             .get("contextState")
@@ -138,11 +157,17 @@ impl Conversation {
             ),
         );
         messages.extend(state.effective());
-        let report = settings.budget.report(
-            &messages,
-            &blackwall_core::tools::definitions(settings.web_enabled, true),
-            state.server_usage,
-        );
+        let mut definitions = blackwall_core::tools::definitions(settings.web_enabled, true);
+        if self.memory_tools(directory).is_some()
+            && store
+                .memory_enabled(MemoryClient::Cli)
+                .map_err(|e| e.to_string())?
+        {
+            definitions.extend(blackwall_core::memory::definitions());
+        }
+        let report = settings
+            .budget
+            .report(&messages, &definitions, state.server_usage);
         println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
         Ok(())
     }
@@ -166,6 +191,7 @@ impl Conversation {
             messages.into_iter().partition(|m| m["role"] == "system");
         let state = ContextState::restore(&source, self.saved_context()?.as_ref())
             .map_err(|e| e.to_string())?;
+        let memory = self.memory_tools(directory);
         let (_, snapshot, result) = execute(
             &backend,
             Workspace::open(&self.workspace).map_err(|e| e.to_string())?,
@@ -178,6 +204,7 @@ impl Conversation {
                 compact: true,
             },
             input,
+            memory.as_ref(),
         )
         .await;
         result?;
@@ -227,6 +254,7 @@ impl Conversation {
             .save_session(&candidate)
             .map_err(|error| error.to_string())?;
         self.session = candidate;
+        let memory = self.memory_tools(directory);
         let saved = self.saved_context()?;
         let (instructions, source): (Vec<_>, Vec<_>) =
             messages.into_iter().partition(|m| m["role"] == "system");
@@ -243,6 +271,7 @@ impl Conversation {
                 compact: false,
             },
             input,
+            memory.as_ref(),
         )
         .await;
         if let Some(snapshot) = snapshot {
@@ -278,14 +307,11 @@ fn context(
         request.validate().map_err(|error| error.to_string())?;
     }
     let mut messages = model::messages(&request);
-    if settings.memory_enabled {
-        let memory = blackwall_core::memory::context(
-            &store.memories("").map_err(|error| error.to_string())?,
-            4000,
-        );
-        if !memory.is_empty() {
-            messages.insert(0, json!({"role":"system","content":memory}));
-        }
+    let memory = store
+        .memory_context(MemoryClient::Cli, session["workspace"].as_str(), 4000)
+        .map_err(|error| error.to_string())?;
+    if !memory.is_empty() {
+        messages.insert(0, json!({"role":"system","content":memory}));
     }
     let skills = SkillStore::open(&directory.join("skills")).map_err(|error| error.to_string())?;
     skills.seed().map_err(|error| error.to_string())?;
@@ -330,6 +356,7 @@ async fn execute(
     web_enabled: bool,
     run: ContextRun,
     input: &mut Input,
+    memory: Option<&MemoryTools>,
 ) -> (String, Option<ContextState>, Result<(), String>) {
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -344,7 +371,7 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let work = agent.run_context(&request_id, run);
+    let work = agent.run_context_with_memory(&request_id, run, memory);
     tokio::pin!(work);
     let mut answer = String::new();
     let mut snapshot = None;

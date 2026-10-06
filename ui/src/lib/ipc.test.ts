@@ -18,6 +18,8 @@ describe('native chat failure boundary', () => {
     await localModelClient.streamChat(
       {
         requestId: 'agent-test',
+        sessionId: 'session-test',
+        sourceMessageId: 'message-test',
         model: 'model',
         messages: [],
         agentMode: true,
@@ -30,7 +32,13 @@ describe('native chat failure boundary', () => {
     expect(native.invoke).toHaveBeenCalledWith(
       'stream_chat',
       expect.objectContaining({
-        options: { enabled: true, workspace: '/projects/current', webEnabled: false },
+        options: {
+          enabled: true,
+          workspace: '/projects/current',
+          webEnabled: false,
+          sessionId: 'session-test',
+          sourceMessageId: 'message-test',
+        },
       }),
     );
   });

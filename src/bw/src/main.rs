@@ -1,4 +1,5 @@
 mod input;
+mod memory;
 mod session;
 mod settings;
 
@@ -18,6 +19,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /endpoint <url>           Set the OpenAI-compatible service address
   /web on|off               Enable/disable approved web tools
   /memory on|off            Include/exclude your saved memories
+  /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
   /context                  Show estimated budget and last server token usage
   /compact                  Summarize older context; retain the original transcript
@@ -45,6 +47,7 @@ USAGE:
   bw run <prompt>            Run one task
   bw resume <id> [prompt]    Continue a saved Agent conversation
   bw sessions                List saved conversations
+  bw memory <action>         Review or manage saved memories (bw memory for list)
   bw request <prompt>        Print a request preview without a model call
 
 Install: cargo install --locked --path src/bw
@@ -90,7 +93,7 @@ async fn run() -> Result<(), String> {
             println!("bw {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" => {}
+        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -99,6 +102,9 @@ async fn run() -> Result<(), String> {
             .ok_or("Your home folder could not be found.")?
             .join(".blackwall"),
     };
+    if command == "memory" {
+        return memory::run(&directory, &arguments);
+    }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "sessions" {
         require_no_arguments(&arguments)?;
@@ -323,7 +329,7 @@ async fn chat(
                     "context" if value.is_empty() => {
                         conversation.context_report(store, directory, settings)
                     }
-                    _ => slash(store, settings, conversation, name, value),
+                    _ => slash(store, directory, settings, conversation, name, value),
                 }
             } else {
                 let prompt = if line.starts_with("//") {
@@ -343,6 +349,7 @@ async fn chat(
 
 fn slash(
     store: &LocalStore,
+    directory: &std::path::Path,
     settings: &mut Settings,
     conversation: &mut Conversation,
     name: &str,
@@ -362,6 +369,13 @@ fn slash(
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());
         }
+        "memory" if !matches!(value, "on" | "off") => memory::run(
+            directory,
+            &value
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )?,
         "model" | "endpoint" | "web" | "memory" => {
             settings.set(store, name, value)?;
             println!("{}", settings.describe());

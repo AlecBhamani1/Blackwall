@@ -1,6 +1,5 @@
 //! Versioned local SQLite persistence. All values are bounded and writes are transactional.
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
 use thiserror::Error;
@@ -23,15 +22,13 @@ pub enum StorageError {
 pub struct LocalStore {
     connection: Connection,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryEntry {
-    pub id: String,
-    pub content: String,
-    pub updated_at: i64,
-}
+mod memory;
+pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 
 impl LocalStore {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
         if fs::symlink_metadata(directory).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(StorageError::Invalid(
@@ -76,20 +73,35 @@ impl LocalStore {
         Self::initialize(connection)
     }
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(StorageError::Invalid(
                 "This data was created by a newer Blackwall version. Update the app to open it.",
             ));
         }
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;
-            BEGIN IMMEDIATE;
+        connection.execute_batch("
             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at INTEGER NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, content);
             CREATE TABLE IF NOT EXISTS paired_devices (id TEXT PRIMARY KEY, body TEXT NOT NULL);
-            PRAGMA user_version=2; COMMIT;")?;
+            ")?;
+        if version < 3 {
+            connection.execute_batch(
+                "
+                ALTER TABLE memory ADD COLUMN scope TEXT NOT NULL DEFAULT 'user';
+                ALTER TABLE memory ADD COLUMN workspace TEXT NOT NULL DEFAULT '';
+                ALTER TABLE memory ADD COLUMN fact_key TEXT NOT NULL DEFAULT '';
+                ALTER TABLE memory ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE memory ADD COLUMN source TEXT;
+                UPDATE memory SET fact_key=id;
+                CREATE UNIQUE INDEX memory_fact ON memory(scope,workspace,fact_key);
+                CREATE TABLE memory_proposals (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+                PRAGMA user_version=3;",
+            )?;
+        }
+        connection.execute_batch("COMMIT;")?;
         Ok(Self { connection })
     }
     pub fn paired_devices(&self) -> Result<Vec<crate::pairing::PairedDevice>, StorageError> {
@@ -287,67 +299,6 @@ impl LocalStore {
         self.connection.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key,value])?;
         Ok(())
     }
-    pub fn memories(&self, query: &str) -> Result<Vec<MemoryEntry>, StorageError> {
-        let query = query.trim();
-        if query.len() > 1024 {
-            return Err(StorageError::Invalid("Use a shorter memory search."));
-        }
-        let (sql, parameter) = if query.is_empty() {
-            ("SELECT id,content,updated_at FROM memory WHERE ?1='' ORDER BY updated_at DESC LIMIT 200", String::new())
-        } else {
-            // Quote search terms to avoid treating user text as FTS operators.
-            let phrase = query
-                .split_whitespace()
-                .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            ("SELECT memory.id,memory.content,memory.updated_at FROM memory JOIN memory_search ON memory.id=memory_search.id WHERE memory_search MATCH ?1 ORDER BY rank LIMIT 50", phrase)
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map([parameter], |r| {
-            Ok(MemoryEntry {
-                id: r.get(0)?,
-                content: r.get(1)?,
-                updated_at: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-    pub fn save_memory(&mut self, entry: &MemoryEntry) -> Result<(), StorageError> {
-        validate_id(&entry.id)?;
-        if entry.content.trim().is_empty() || entry.content.len() > 8000 || entry.updated_at < 0 {
-            return Err(StorageError::Invalid(
-                "A memory must contain between 1 and 8,000 bytes of text.",
-            ));
-        }
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM memory WHERE id != ?1",
-            [&entry.id],
-            |r| r.get(0),
-        )?;
-        if count >= 2000 {
-            return Err(StorageError::Invalid(
-                "Memory is full. Remove an older memory first.",
-            ));
-        }
-        let transaction = self.connection.transaction()?;
-        transaction.execute("INSERT INTO memory(id,content,updated_at) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET content=excluded.content,updated_at=excluded.updated_at", params![entry.id,entry.content,entry.updated_at])?;
-        transaction.execute("DELETE FROM memory_search WHERE id=?1", [&entry.id])?;
-        transaction.execute(
-            "INSERT INTO memory_search(id,content) VALUES (?1,?2)",
-            [&entry.id, &entry.content],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-    pub fn delete_memory(&mut self, id: &str) -> Result<(), StorageError> {
-        validate_id(id)?;
-        let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM memory_search WHERE id=?1", [id])?;
-        transaction.execute("DELETE FROM memory WHERE id=?1", [id])?;
-        transaction.commit()?;
-        Ok(())
-    }
 }
 
 fn validate_id(id: &str) -> Result<(), StorageError> {
@@ -466,7 +417,7 @@ mod tests {
         let conversation = session("before_pairing");
         db.save_session(&conversation).unwrap();
         db.connection
-            .execute_batch("DROP TABLE paired_devices; PRAGMA user_version=1;")
+            .execute_batch("DROP TABLE paired_devices; DROP TABLE memory; DROP TABLE memory_proposals; CREATE TABLE memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at INTEGER NOT NULL); PRAGMA user_version=1;")
             .unwrap();
         let upgraded = LocalStore::initialize(db.connection).unwrap();
         assert_eq!(
@@ -478,10 +429,10 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         upgraded
             .connection
-            .pragma_update(None, "user_version", 3)
+            .pragma_update(None, "user_version", 4)
             .unwrap();
         assert!(LocalStore::initialize(upgraded.connection).is_err());
     }
@@ -536,9 +487,11 @@ mod tests {
             id: "memory_one".into(),
             content: "I prefer concise answers".into(),
             updated_at: 1,
+            ..Default::default()
         };
         db.save_memory(&entry).unwrap();
         assert_eq!(db.memories("concise").unwrap().len(), 1);
+        entry = db.memories("").unwrap().remove(0);
         entry.content = "I prefer detailed answers".into();
         db.save_memory(&entry).unwrap();
         assert!(db.memories("concise").unwrap().is_empty());

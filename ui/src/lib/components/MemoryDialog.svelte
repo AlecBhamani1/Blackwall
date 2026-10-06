@@ -1,6 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type MemoryEntry, type Preferences } from '../persistence';
+  import {
+    persistence,
+    type MemoryEntry,
+    type MemoryProposal,
+    type Preferences,
+  } from '../persistence';
   import { createId } from '../id';
   import Icon from './Icon.svelte';
   import { platform } from '../platform';
@@ -16,6 +21,10 @@
   let entries: MemoryEntry[] = [];
   let content = '';
   let editingId = '';
+  let editingEntry: MemoryEntry | undefined;
+  let proposals: MemoryProposal[] = [];
+  let drafts: Record<string, string> = {};
+  let sourceMessages: Record<string, string> = {};
   let query = '';
   let error = '';
   let busy = false;
@@ -30,8 +39,14 @@
   async function refresh() {
     const version = ++searchVersion;
     try {
-      const result = await persistence.memories(query);
-      if (version === searchVersion) entries = result;
+      const [result, pending] = await Promise.all([
+        persistence.memories(query),
+        persistence.memoryProposals(),
+      ]);
+      if (version === searchVersion) {
+        entries = result;
+        proposals = pending;
+      }
     } catch {
       error = 'Your memories could not be loaded. Existing data has been left in place.';
     }
@@ -42,15 +57,20 @@
     error = '';
     try {
       await persistence.saveMemory({
+        ...editingEntry,
         id: editingId || createId('memory'),
         content: content.trim(),
         updatedAt: Date.now(),
       });
       content = '';
       editingId = '';
+      editingEntry = undefined;
       await refresh();
-    } catch {
-      error = 'This memory could not be saved. Check disk space and try again.';
+    } catch (cause) {
+      error =
+        typeof cause === 'string'
+          ? cause
+          : 'This memory could not be saved. Check disk space and try again.';
     } finally {
       busy = false;
     }
@@ -62,11 +82,41 @@
       await persistence.removeMemory(id);
       if (editingId === id) {
         editingId = '';
+        editingEntry = undefined;
         content = '';
       }
       await refresh();
     } catch {
       error = 'This memory could not be deleted. Try again.';
+    } finally {
+      busy = false;
+    }
+  }
+  async function showSource(id: string, source: { sessionId: string; messageId: string }) {
+    try {
+      const session = await persistence.load(source.sessionId);
+      const message = session?.messages.find((message) => message.id === source.messageId);
+      sourceMessages[id] = message
+        ? message.content.slice(0, 2000) + (message.content.length > 2000 ? '\n[excerpt]' : '')
+        : 'The source conversation or message is no longer available.';
+    } catch {
+      sourceMessages[id] = 'The source conversation could not be opened.';
+    }
+  }
+  async function review(proposal: MemoryProposal, approve: boolean) {
+    busy = true;
+    error = '';
+    try {
+      if (approve)
+        await persistence.approveMemory(proposal.id, drafts[proposal.id] ?? proposal.entry.content);
+      else await persistence.rejectMemory(proposal.id);
+      delete drafts[proposal.id];
+      await refresh();
+    } catch (cause) {
+      error =
+        typeof cause === 'string'
+          ? cause
+          : 'This proposal could not be reviewed. Refresh and try again; a saved memory may have changed.';
     } finally {
       busy = false;
     }
@@ -137,7 +187,10 @@
       <div class="preference">
         <div>
           <strong>Use saved memories in chat</strong>
-          <p>Only memories you save here are included. Shared guest chats never receive them.</p>
+          <p>
+            Only saved or approved memories are included. Turning this off also disables agent
+            learning. Shared guest chats never receive them.
+          </p>
         </div>
         <input
           aria-label="Use saved memories in chat"
@@ -147,6 +200,55 @@
           onchange={saveSettings}
         />
       </div>
+      {#if proposals.length}
+        <section aria-label="Pending memory proposals" class="proposals">
+          <h3>Pending review · {proposals.length}</h3>
+          <p class="hint">
+            The agent suggested these facts. Review or edit them before they enter future context.
+          </p>
+          {#each proposals as proposal (proposal.id)}
+            <article>
+              <strong>{proposal.entry.scope} · {proposal.entry.key}</strong>
+              {#if proposal.entry.workspace}<p class="hint">
+                  Project: {proposal.entry.workspace}
+                </p>{/if}
+              <p class="hint">
+                Source session: {proposal.source.sessionId}<br />Message: {proposal.source
+                  .messageId}
+              </p>
+              <button
+                class="secondary"
+                disabled={busy}
+                onclick={() => showSource(proposal.id, proposal.source)}>View source message</button
+              >
+              {#if sourceMessages[proposal.id]}<pre>{sourceMessages[proposal.id]}</pre>{/if}
+              <label for={`before-${proposal.id}`}>Saved text (−)</label>
+              <pre id={`before-${proposal.id}`}>{proposal.before?.content ?? '(new fact)'}</pre>
+              <label for={`proposal-${proposal.id}`}>Proposed text (+) · editable</label>
+              <textarea
+                id={`proposal-${proposal.id}`}
+                aria-label={`Edit proposal: ${proposal.entry.key}`}
+                value={drafts[proposal.id] ?? proposal.entry.content}
+                oninput={(event) => {
+                  drafts[proposal.id] = event.currentTarget.value;
+                }}
+                rows="3"
+                maxlength="8000"
+                disabled={busy}></textarea>
+              <div class="review-actions">
+                <button
+                  class="primary"
+                  disabled={busy || !(drafts[proposal.id] ?? proposal.entry.content).trim()}
+                  onclick={() => review(proposal, true)}>Approve</button
+                >
+                <button class="secondary" disabled={busy} onclick={() => review(proposal, false)}
+                  >Reject</button
+                >
+              </div>
+            </article>
+          {/each}
+        </section>
+      {/if}
       <form onsubmit={save} class="editor">
         <label for="memory-content">{editingId ? 'Edit memory' : 'Remember something'}</label
         ><textarea
@@ -162,6 +264,7 @@
               class="secondary"
               onclick={() => {
                 editingId = '';
+                editingEntry = undefined;
                 content = '';
               }}>Cancel</button
             >{/if}<button class="primary" disabled={busy || !loaded || !content.trim()}
@@ -186,6 +289,19 @@
         </p>{:else}
         <div class="memories">
           {#each entries as entry (entry.id)}<article>
+              <strong>{(entry.scope ?? 'user') + (entry.key ? ' · ' + entry.key : '')}</strong>
+              {#if entry.workspace}<p class="hint">Project: {entry.workspace}</p>{/if}
+              {#if entry.source}<p class="hint">
+                  Source session: {entry.source.sessionId}<br />Message: {entry.source.messageId}
+                </p>{/if}
+              {#if entry.source}
+                <button
+                  class="secondary"
+                  disabled={busy}
+                  onclick={() => showSource(entry.id, entry.source!)}>View source message</button
+                >
+                {#if sourceMessages[entry.id]}<pre>{sourceMessages[entry.id]}</pre>{/if}
+              {/if}
               <p>{entry.content}</p>
               <div>
                 <button
@@ -193,13 +309,14 @@
                   disabled={busy}
                   onclick={() => {
                     editingId = entry.id;
+                    editingEntry = entry;
                     content = entry.content;
                   }}>Edit</button
                 ><button
                   class="delete"
                   aria-label={`Delete memory: ${entry.content.slice(0, 40)}`}
                   disabled={busy}
-                  onclick={() => remove(entry.id)}><Icon name="trash" size={14} />Delete</button
+                  onclick={() => remove(entry.id)}><Icon name="trash" size={14} />Forget</button
                 >
               </div>
             </article>{/each}
@@ -256,6 +373,28 @@
 </dialog>
 
 <style>
+  .proposals {
+    margin-bottom: 24px;
+  }
+  h3 {
+    font-size: 14px;
+    margin: 0 0 8px;
+  }
+  pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 12px;
+    background: var(--bg-base);
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .proposals label {
+    margin-top: 12px;
+  }
+  .review-actions {
+    margin-top: 10px;
+  }
   dialog {
     width: min(620px, calc(100vw - 32px));
     max-height: calc(100vh - 48px);

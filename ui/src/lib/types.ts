@@ -94,6 +94,8 @@ export interface ContextState {
 
 export interface ChatRequest {
   requestId: string;
+  sessionId?: string;
+  sourceMessageId?: string;
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;

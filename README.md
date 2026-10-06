@@ -43,7 +43,7 @@ a SmartScreen or Gatekeeper warning.
 - Optional desktop passphrase lock that stops active work and guest sharing
 - Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
-- User-managed local memory and reusable Markdown skills
+- Reviewed agent learning and user-managed local memory, plus reusable Markdown skills
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
@@ -83,6 +83,8 @@ from a local checkout instead, use `cargo install --locked --path src/bw`.
 Setup asks for an existing OpenAI-compatible service address and its model ID, then saves your
 choices. Type `/commands` during chat to see the available controls. Change settings with
 `/model <id>`, `/endpoint <url>`, `/web on|off`, `/memory on|off`, or `/settings <name> <value>`.
+Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
+reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.

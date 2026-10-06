@@ -689,12 +689,17 @@ export function createChatController(
     const controller = new AbortController();
     activeRequest = controller;
     const requestId = createId('request');
+    const sourceSessionId = get(activeSessionId);
 
     void (async () => {
       try {
+        if (native && storageReady && get(agentMode) && get(preferences).memoryEnabled) await saves;
+        if (generation !== runGeneration || controller.signal.aborted || destroyed) return;
         await client.streamChat(
           {
             requestId,
+            sessionId: sourceSessionId,
+            sourceMessageId: userMessage.id,
             contextState: get(contextState),
             contextBudget: budget(),
             agentMode: get(agentMode),

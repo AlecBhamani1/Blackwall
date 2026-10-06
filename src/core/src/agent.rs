@@ -60,6 +60,14 @@ impl Agent<'_> {
         request_id: &str,
         run: crate::context::ContextRun,
     ) -> Result<String, AgentError> {
+        self.run_context_with_memory(request_id, run, None).await
+    }
+    pub async fn run_context_with_memory(
+        &self,
+        request_id: &str,
+        run: crate::context::ContextRun,
+        memory: Option<&crate::memory::MemoryTools>,
+    ) -> Result<String, AgentError> {
         let crate::context::ContextRun {
             source,
             mut state,
@@ -73,7 +81,15 @@ impl Agent<'_> {
             request_id: request_id.into(),
         };
         instructions.insert(0, default_instructions(&self.workspace));
-        let definitions = tools::definitions(self.web_enabled, true);
+        let memory = match memory {
+            Some(memory) if memory.available().await.unwrap_or(false) => Some(memory),
+            _ => None,
+        };
+        let mut definitions = tools::definitions(self.web_enabled, true);
+        if memory.is_some() {
+            definitions.extend(crate::memory::definitions());
+        }
+
         let mut answer = String::new();
         let mut usage = TokenUsage::default();
         if compact {
@@ -197,6 +213,17 @@ impl Agent<'_> {
                         });
                         let result = if !permitted {
                             Err(tools::ToolError::Denied)
+                        } else if matches!(
+                            call.function.name.as_str(),
+                            "memory_list" | "memory_propose"
+                        ) {
+                            match memory {
+                                Some(memory) => memory
+                                    .execute(&call.function.name, &call.function.arguments)
+                                    .await
+                                    .map_err(tools::ToolError::Execution),
+                                None => Err(tools::ToolError::Denied),
+                            }
                         } else if call.function.name == "spawn_agent" {
                             let args: Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
