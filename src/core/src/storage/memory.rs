@@ -451,13 +451,20 @@ mod tests {
     use super::*;
     use crate::memory::MemoryClient;
     use serde_json::json;
+    // Native absolute paths include the drive prefix required on Windows.
+    fn workspace(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("blackwall-memory-test-{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
     fn store() -> LocalStore {
         let store =
             LocalStore::initialize(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
         store
             .save_setting("preferences", r#"{"memoryEnabled":true}"#)
             .unwrap();
-        store.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"mode":"agent","workspace":"/project","messages":[{"id":"message","role":"user","content":"Use these conventions","attachments":[]}]})).unwrap();
+        store.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"mode":"agent","workspace":workspace("project"),"messages":[{"id":"message","role":"user","content":"Use these conventions","attachments":[]}]})).unwrap();
         store
     }
     fn propose(
@@ -473,7 +480,7 @@ mod tests {
                 content: content.into(),
                 replaces: None,
             },
-            Some("/project"),
+            Some(&workspace("project")),
             MemorySource {
                 session_id: "session".into(),
                 message_id: "message".into(),
@@ -491,20 +498,20 @@ mod tests {
         ] {
             let proposal = propose(&mut store, scope, key, content).unwrap();
             assert!(!store
-                .memory_context(MemoryClient::Desktop, Some("/project"), 4000)
+                .memory_context(MemoryClient::Desktop, Some(&workspace("project")), 4000)
                 .unwrap()
                 .contains(content));
             store.approve_memory(&proposal.id, None).unwrap();
         }
         assert_eq!(
             store
-                .agent_memories(MemoryClient::Desktop, Some("/project"))
+                .agent_memories(MemoryClient::Desktop, Some(&workspace("project")))
                 .unwrap()
                 .len(),
             3
         );
         let other = store
-            .memory_context(MemoryClient::Desktop, Some("/other"), 4000)
+            .memory_context(MemoryClient::Desktop, Some(&workspace("other")), 4000)
             .unwrap();
         assert!(other.contains("Concise answers"));
         assert!(!other.contains("offline tests"));
@@ -578,7 +585,7 @@ mod tests {
                     content: "Detailed answers".into(),
                     replaces: Some(first.entry.id.clone()),
                 },
-                Some("/project"),
+                Some(&workspace("project")),
                 first.source.clone(),
                 MemoryClient::Desktop,
             )
@@ -613,14 +620,14 @@ mod tests {
         let pending = propose(&mut store, MemoryScope::User, "style", "Preference").unwrap();
         store.approve_memory(&pending.id, None).unwrap();
         assert!(store
-            .agent_memories(MemoryClient::Guest, Some("/project"))
+            .agent_memories(MemoryClient::Guest, Some(&workspace("project")))
             .unwrap()
             .is_empty());
         store
             .save_setting("preferences", r#"{"memoryEnabled":false}"#)
             .unwrap();
         assert!(store
-            .memory_context(MemoryClient::Desktop, Some("/project"), 4000)
+            .memory_context(MemoryClient::Desktop, Some(&workspace("project")), 4000)
             .unwrap()
             .is_empty());
         assert!(propose(&mut store, MemoryScope::User, "new", "Other fact").is_err());
@@ -645,7 +652,12 @@ mod tests {
             message_id: "invented".into(),
         };
         assert!(store
-            .propose_memory(input, Some("/project"), invalid, MemoryClient::Desktop)
+            .propose_memory(
+                input,
+                Some(&workspace("project")),
+                invalid,
+                MemoryClient::Desktop
+            )
             .is_err());
         assert!(store
             .propose_memory(
@@ -655,7 +667,7 @@ mod tests {
                     content: "Fact".into(),
                     replaces: None
                 },
-                Some("/other"),
+                Some(&workspace("other")),
                 source,
                 MemoryClient::Desktop
             )
@@ -675,7 +687,7 @@ mod tests {
         store
             .save_setting("preferences", r#"{"memoryEnabled":true}"#)
             .unwrap();
-        store.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"workspace":"/project","messages":[{"id":"message","role":"user","content":"Convention","attachments":[]}]})).unwrap();
+        store.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"workspace":workspace("project"),"messages":[{"id":"message","role":"user","content":"Convention","attachments":[]}]})).unwrap();
         let accepted = propose(&mut store, MemoryScope::Project, "tests", "Run tests").unwrap();
         store.approve_memory(&accepted.id, None).unwrap();
         let pending = propose(&mut store, MemoryScope::User, "style", "Concise answers").unwrap();
@@ -727,7 +739,7 @@ mod tests {
         desktop
             .save_setting("preferences", r#"{"memoryEnabled":true}"#)
             .unwrap();
-        desktop.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"workspace":"/project","messages":[{"id":"message","role":"user","content":"Correction","attachments":[]}]})).unwrap();
+        desktop.save_session(&json!({"id":"session","title":"Example","updatedAt":1,"workspace":workspace("project"),"messages":[{"id":"message","role":"user","content":"Correction","attachments":[]}]})).unwrap();
         let proposal = propose(
             &mut desktop,
             MemoryScope::User,
