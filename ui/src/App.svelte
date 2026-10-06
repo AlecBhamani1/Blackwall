@@ -164,8 +164,11 @@
 {:else}
   <div class="app-shell" inert={authBusy} aria-busy={authBusy}>
     <Sidebar
-      onPreferences={(patch) =>
-        controller.preferences.update((current) => ({ ...current, ...patch }))}
+      contextPreferences={$preferences}
+      onPreferences={(patch) => {
+        if (isDesktop()) controller.preferences.update((current) => ({ ...current, ...patch }));
+        else controller.savePreferences(patch);
+      }}
       onLock={lock}
       visible={sidebarVisible}
       sessions={$visibleSessions}

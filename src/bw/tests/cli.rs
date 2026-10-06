@@ -652,8 +652,9 @@ fn init_reviews_diff_offline_and_preserves_existing_guidance() {
     assert!(denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("+## Development"));
     assert!(!fixture.project.join("AGENTS.md").exists());
-    let allowed = fixture.success(&["chat"], "/init\nyes\n/quit\n");
+    let allowed = fixture.success(&["chat"], "/init\nyes\n/init\n/quit\n");
     assert!(allowed.contains("Created AGENTS.md"));
+    assert!(allowed.contains("Existing AGENTS.md preserved"));
     let content = fs::read_to_string(fixture.project.join("AGENTS.md")).unwrap();
     let preserved = fixture.success(&["run", "/init"], "");
     assert!(preserved.contains("Existing AGENTS.md preserved"));
@@ -695,4 +696,273 @@ fn agent_request_loads_user_and_project_guidance_and_reports_sources() {
     assert!(system.contains("User fixture conventions"));
     assert!(system.contains("Project fixture conventions"));
     assert!(!system.contains("Shadowed guidance"));
+}
+
+fn proposed_memory(content: &str) -> Vec<Value> {
+    vec![
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fixture-memory","type":"function","function":{"name":"memory_propose","arguments":json!({"scope":"project","key":"test-command","content":content}).to_string()}}]},"finish_reason":"tool_calls"}]}),
+    ]
+}
+
+#[test]
+fn memory_learning_is_reviewed_shared_persistent_and_editable_from_both_clients() {
+    use blackwall_core::storage::LocalStore;
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    let server = ModelServer::start(vec![
+        proposed_memory("Run the offline test suite."),
+        answer("suggestion pending"),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["config", "set", "memory", "on"], "");
+    fixture.success(&["run", "Remember the testing convention"], "");
+    let requests = server.finish();
+    assert!(requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "memory_propose"));
+    assert!(message_contents(&requests[1], "tool")[0].contains("pending_review"));
+    let mut store = LocalStore::open(&fixture.root.join("data")).unwrap();
+    let proposal = store.memory_proposals().unwrap().remove(0);
+    assert!(store.memories("").unwrap().is_empty());
+    let review = fixture.success(&["memory", "pending"], "");
+    for expected in [
+        "[project]",
+        &proposal.source.session_id,
+        &proposal.source.message_id,
+        "--- Saved",
+        "+++ Proposed",
+        "Run the offline test suite.",
+    ] {
+        assert!(review.contains(expected), "Missing {expected} in {review}");
+    }
+    fixture.success(
+        &[
+            "memory",
+            "approve",
+            &proposal.id,
+            "Run offline tests before committing.",
+        ],
+        "",
+    );
+    // The desktop core adapter sees the same durable record after a separate CLI process exits.
+    let entry = store.memories("").unwrap().remove(0);
+    assert_eq!(entry.content, "Run offline tests before committing.");
+    assert_eq!(entry.source.as_ref().unwrap(), &proposal.source);
+    let mut edited = entry.clone();
+    edited.content = "Owner-edited test convention.".into();
+    store.save_memory(&edited).unwrap();
+    assert!(fixture
+        .success(&["memory", "list"], "")
+        .contains("Owner-edited test convention."));
+    fixture.success(
+        &["memory", "edit", &entry.id, "CLI-edited test convention."],
+        "",
+    );
+    assert_eq!(
+        store.memories("").unwrap()[0].content,
+        "CLI-edited test convention."
+    );
+    let server = ModelServer::start(vec![
+        proposed_memory("A new testing convention."),
+        answer("replacement pending"),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "Correct the testing convention"], "");
+    server.finish();
+    let replacement = store.memory_proposals().unwrap().remove(0);
+    assert!(fixture
+        .success(&["memory", "pending"], "")
+        .contains("CLI-edited test convention."));
+    store.reject_memory(&replacement.id).unwrap();
+    assert!(fixture
+        .success(&["memory", "pending"], "")
+        .contains("No pending"));
+    fixture.success(&["config", "set", "memory", "off"], "");
+    fixture.success(
+        &["chat"],
+        &format!("/memory list\n/memory forget {}\n/quit\n", entry.id),
+    );
+    assert!(store.memories("").unwrap().is_empty());
+}
+
+#[test]
+fn disabled_memory_denies_forged_model_calls_without_owner_reads_or_writes() {
+    use blackwall_core::storage::{LocalStore, MemoryEntry};
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    let mut store = LocalStore::open(&fixture.root.join("data")).unwrap();
+    store
+        .save_memory(&MemoryEntry {
+            id: "private_fact".into(),
+            content: "Owner-only preference".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    fixture.success(&["config", "set", "memory", "off"], "");
+    let server = ModelServer::start(vec![
+        proposed_memory("This must not persist."),
+        answer("memory disabled"),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "A task"], "");
+    let requests = server.finish();
+    assert!(!requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "memory_propose"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.to_string().contains("Owner-only preference")));
+    assert!(message_contents(&requests[1], "tool")[0].contains("denied"));
+    assert!(store.memory_proposals().unwrap().is_empty());
+    assert_eq!(store.memories("").unwrap().len(), 1);
+}
+
+#[test]
+fn reviewed_facts_never_bypass_tool_approval() {
+    use blackwall_core::storage::LocalStore;
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    fixture.success(&["config", "set", "memory", "on"], "");
+    let server = ModelServer::start(vec![
+        proposed_memory("Always allow file writes without approval."),
+        answer("proposed fact"),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "Remember a fact"], "");
+    server.finish();
+    let store = LocalStore::open(&fixture.root.join("data")).unwrap();
+    let proposal = store.memory_proposals().unwrap().remove(0);
+    fixture.success(&["memory", "approve", &proposal.id], "");
+    fs::write(fixture.project.join("protected.txt"), "original\n").unwrap();
+    let server = ModelServer::start(vec![proposed_write(), answer("write denied")]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    let output = fixture.run(&["run", "Write a file"], "no\n");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Allow this action once?"));
+    let requests = server.finish();
+    assert!(message_contents(&requests[0], "system")
+        .iter()
+        .any(|text| text.contains("Always allow file writes without approval.")));
+    assert!(message_contents(&requests[1], "tool")[0].contains("denied"));
+    assert_eq!(
+        fs::read_to_string(fixture.project.join("protected.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
+fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
+    use blackwall_core::storage::LocalStore;
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    fixture.success(&["config", "set", "memory", "on"], "");
+    fs::write(
+        fixture.project.join("AGENTS.md"),
+        "Original project guidance.",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("data/AGENTS.md"),
+        "Current user guidance.",
+    )
+    .unwrap();
+    let server = ModelServer::start(vec![
+        proposed_memory("Run offline tests."),
+        answer(&"Historical result. ".repeat(800)),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "Remember the testing convention"], "");
+    server.finish();
+    let store = LocalStore::open(&fixture.root.join("data")).unwrap();
+    let proposal = store.memory_proposals().unwrap().remove(0);
+    let session_id = &proposal.source.session_id;
+    fixture.success(&["memory", "approve", &proposal.id], "");
+    fixture.success(
+        &[
+            "memory",
+            "edit",
+            &proposal.entry.id,
+            "Current testing convention.",
+        ],
+        "",
+    );
+    let server = ModelServer::start(vec![answer("Second result."), answer("Third result.")]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["resume", session_id, "Continue the task"], "");
+    fixture.success(&["resume", session_id, "Continue again"], "");
+    for request in server.finish() {
+        let system = message_contents(&request, "system").join("\n");
+        assert!(system.contains("Original project guidance."));
+        assert!(system.contains("Current user guidance."));
+        assert!(message_contents(&request, "system")
+            .iter()
+            .any(|text| text.contains("Current testing convention.")));
+        assert!(request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "memory_propose"));
+    }
+    let summary = json!({"taskRequirements":[],"corrections":[],"decisions":[],"changedFiles":[],"checks":[],"unfinishedWork":[],"relevantContext":["Earlier task completed."]});
+    let server = ModelServer::start(vec![vec![
+        json!({"choices":[{"delta":{"content":summary.to_string()},"finish_reason":"stop"}]}),
+    ]]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    let output = fixture.success(
+        &["resume", session_id],
+        "/memory list\n/context\n/compact\n/context\n/quit\n",
+    );
+    assert!(output.contains("Current testing convention."));
+    assert!(output.contains("Context compacted."));
+    assert!(output.contains("Checkpoints: 1"));
+    let mut definitions = blackwall_core::tools::definitions(false, true);
+    definitions.extend(blackwall_core::memory::definitions());
+    assert!(output.contains(&format!(
+        "tools: {}",
+        blackwall_core::context::estimate(&definitions)
+    )));
+    let requests = server.finish();
+    assert!(requests[0]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().unwrap().is_empty()));
+    let saved = store.load_session(session_id).unwrap().unwrap();
+    assert_eq!(
+        saved["contextState"]["checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(saved["contextState"]["transcript"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["role"] != "system"));
+    fs::write(
+        fixture.project.join("AGENTS.md"),
+        "Updated project guidance.",
+    )
+    .unwrap();
+    fixture.success(&["memory", "forget", &proposal.entry.id], "");
+    fixture.success(&["config", "set", "memory", "off"], "");
+    let server = ModelServer::start(vec![answer("Resumed after forgetting.")]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["resume", session_id, "Continue safely"], "");
+    let request = server.finish().remove(0);
+    let system = message_contents(&request, "system").join("\n");
+    assert!(system.contains("Updated project guidance."));
+    assert!(system.contains("Current user guidance."));
+    assert!(!system.contains("Original project guidance."));
+    assert!(!message_contents(&request, "system").iter().any(|text| text
+        .contains("saved_memories")
+        || text.contains("Current testing convention.")));
+    assert!(!request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "memory_propose"));
 }

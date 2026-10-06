@@ -57,14 +57,54 @@ export interface ModelMessage {
   attachments?: AttachmentPayload[];
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+export interface ContextBudget {
+  contextWindow: number;
+  outputTokens: number;
+  autoCompact: boolean;
+}
+export interface ContextReport {
+  estimatedPromptTokens: number;
+  toolTokens: number;
+  outputTokens: number;
+  safetyTokens: number;
+  contextWindow: number;
+  serverUsage?: TokenUsage;
+}
+export interface ContextSummary {
+  taskRequirements: string[];
+  corrections: string[];
+  decisions: string[];
+  changedFiles: string[];
+  checks: string[];
+  unfinishedWork: string[];
+  relevantContext: string[];
+}
+export interface ContextState {
+  transcript: Record<string, unknown>[];
+  checkpoints: Array<{ through: number; sourceHash: string; summary: ContextSummary }>;
+  coveredMessages: number;
+  sourceHash: string;
+  serverUsage?: TokenUsage;
+}
+
 export interface ChatRequest {
   requestId: string;
+  sessionId?: string;
+  sourceMessageId?: string;
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;
   endpoint?: string;
   model?: string;
   messages: ModelMessage[];
+  contextBudget?: ContextBudget;
+  contextState?: ContextState;
+  compact?: boolean;
 }
 
 export type AgentEvent =
@@ -75,8 +115,10 @@ export type AgentEvent =
       sources: string[];
       warnings: string[];
     }
+  | { type: 'context_report'; requestId: string; report: ContextReport }
+  | { type: 'context_updated'; requestId: string; state: ContextState }
   | { type: 'assistant_delta'; requestId: string; delta: string }
-  | { type: 'turn_complete'; requestId: string; finishReason?: string }
+  | { type: 'turn_complete'; requestId: string; finishReason?: string; usage?: TokenUsage }
   | { type: 'error'; requestId: string; message: string; code?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
@@ -124,6 +166,8 @@ export interface SessionSummary {
   title: string;
   updatedAt: number;
   messages: ChatMessage[];
+  contextState?: ContextState;
+  contextReport?: ContextReport;
 }
 
 export interface AttachmentRejection {

@@ -5,6 +5,7 @@
 //! serde protocol exported here.
 
 pub mod connection;
+pub mod context;
 pub mod jobs;
 pub mod memory;
 pub mod protocol;

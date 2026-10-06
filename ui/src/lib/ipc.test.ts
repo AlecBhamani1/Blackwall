@@ -18,6 +18,8 @@ describe('native chat failure boundary', () => {
     await localModelClient.streamChat(
       {
         requestId: 'agent-test',
+        sessionId: 'session-test',
+        sourceMessageId: 'message-test',
         model: 'model',
         messages: [],
         agentMode: true,
@@ -30,7 +32,13 @@ describe('native chat failure boundary', () => {
     expect(native.invoke).toHaveBeenCalledWith(
       'stream_chat',
       expect.objectContaining({
-        options: { enabled: true, workspace: '/projects/current', webEnabled: false },
+        options: {
+          enabled: true,
+          workspace: '/projects/current',
+          webEnabled: false,
+          sessionId: 'session-test',
+          sourceMessageId: 'message-test',
+        },
       }),
     );
   });
@@ -115,5 +123,75 @@ describe('native chat failure boundary', () => {
       'private',
     );
     expect(nativeModelError('private key').message).not.toContain('private');
+  });
+});
+
+describe('browser model context transport', () => {
+  it('caps generated output and retains separately reported server usage', async () => {
+    const { webcrypto } = await import('node:crypto');
+    vi.stubGlobal('crypto', webcrypto);
+    const response =
+      'data: {"choices":[{"delta":{"content":"Answer"},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":77,"completion_tokens":12,"total_tokens":89}}\n\ndata: [DONE]\n\n';
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(response, { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const event = vi.fn();
+    const delta = vi.fn();
+    await localModelClient.streamChat(
+      {
+        requestId: 'browser-budget',
+        model: 'fixture',
+        messages: [{ role: 'user', content: 'Task' }],
+        contextBudget: { contextWindow: 8192, outputTokens: 1024, autoCompact: false },
+      },
+      { onDelta: delta, onEvent: event },
+      new AbortController().signal,
+    );
+    const payload = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(payload.max_tokens).toBe(1024);
+    expect(payload.stream_options).toEqual({ include_usage: true });
+    expect(delta).toHaveBeenCalledWith('Answer');
+    expect(event).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'context_report',
+        report: expect.objectContaining({
+          serverUsage: { promptTokens: 77, completionTokens: 12, totalTokens: 89 },
+        }),
+      }),
+    );
+    expect(event).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'context_updated',
+        state: expect.objectContaining({ coveredMessages: 2, checkpoints: [] }),
+      }),
+    );
+    vi.unstubAllGlobals();
+  });
+  it('rejects an unfinished stream without committing a history snapshot', async () => {
+    const { webcrypto } = await import('node:crypto');
+    vi.stubGlobal('crypto', webcrypto);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('data: {"choices":[{"delta":{"content":"Partial"}}]}\n\n', { status: 200 }),
+      ),
+    );
+    const event = vi.fn();
+    await expect(
+      localModelClient.streamChat(
+        {
+          requestId: 'incomplete',
+          model: 'fixture',
+          messages: [{ role: 'user', content: 'Task' }],
+        },
+        { onDelta: vi.fn(), onEvent: event },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('incomplete');
+    expect(event.mock.calls.some(([entry]) => entry.type === 'context_updated')).toBe(false);
+    vi.unstubAllGlobals();
   });
 });

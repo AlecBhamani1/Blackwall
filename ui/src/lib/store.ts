@@ -23,11 +23,14 @@ import type {
   PendingApproval,
   SessionSummary,
   ConversationMode,
+  ContextState,
+  ContextReport,
 } from './types';
 
 const SESSION_STORAGE_KEY = 'blackwall.sessions.v1';
 const MODEL_STORAGE_KEY = 'blackwall.model.v1';
 const ENDPOINT_STORAGE_KEY = 'blackwall.endpoint.v1';
+const CONTEXT_STORAGE_KEY = 'blackwall.context-preferences.v1';
 const MAX_SAVED_SESSIONS = 30;
 
 function canUseStorage(): boolean {
@@ -54,6 +57,31 @@ function storedSessions(): SessionSummary[] {
       .slice(0, MAX_SAVED_SESSIONS);
   } catch {
     return [];
+  }
+}
+
+function storedContextPreferences(): Preferences {
+  if (!canUseStorage()) return {};
+  try {
+    const value = JSON.parse(window.localStorage.getItem(CONTEXT_STORAGE_KEY) ?? '{}');
+    if (
+      !Number.isInteger(value.contextWindow) ||
+      value.contextWindow < 2048 ||
+      value.contextWindow > 1000000 ||
+      !Number.isInteger(value.outputTokens) ||
+      value.outputTokens < 1 ||
+      value.outputTokens > 32768 ||
+      value.outputTokens + Math.floor(value.contextWindow / 20) >= value.contextWindow ||
+      typeof value.autoCompact !== 'boolean'
+    )
+      return {};
+    return {
+      contextWindow: value.contextWindow,
+      outputTokens: value.outputTokens,
+      autoCompact: value.autoCompact,
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -139,6 +167,8 @@ export function createChatController(
   const native = storage.available();
   const initialSessionId = createId('session');
   const messages = writable<ChatMessage[]>([]);
+  const contextState = writable<ContextState | undefined>();
+  const contextReport = writable<ContextReport | undefined>();
   const sessions = writable<SessionSummary[]>(storedSessions());
   const activeSessionId = writable(initialSessionId);
   const runState = writable<RunState>('idle');
@@ -199,6 +229,8 @@ export function createChatController(
       title: sessionTitle(get(messages)),
       updatedAt: Date.now(),
       messages: persistedMessages(get(messages), true),
+      contextState: get(contextState),
+      contextReport: get(contextReport),
     };
     try {
       if (native) {
@@ -225,7 +257,11 @@ export function createChatController(
   const endpoint = writable(storedEndpoint());
   const notice = writable('');
   const persistenceError = writable('');
-  const preferences = writable<Preferences>({ contextWindow: 32000, memoryEnabled: false });
+  const preferences = writable<Preferences>({
+    contextWindow: 32000,
+    memoryEnabled: false,
+    ...(!native ? storedContextPreferences() : {}),
+  });
   let storageReady = !native;
   let storageInitialization: Promise<void> | null = null;
   let saves = Promise.resolve();
@@ -293,23 +329,119 @@ export function createChatController(
     preferences.update((current) => {
       const merged = { ...current, ...next };
       if (native && storageReady) queueWrite(() => storage.savePreferences(next));
+      if (!native && canUseStorage()) {
+        try {
+          window.localStorage.setItem(
+            CONTEXT_STORAGE_KEY,
+            JSON.stringify({
+              contextWindow: merged.contextWindow ?? 32000,
+              outputTokens:
+                merged.outputTokens ??
+                Math.min(4096, Math.floor((merged.contextWindow ?? 32000) / 4)),
+              autoCompact: merged.autoCompact ?? false,
+            }),
+          );
+        } catch {
+          /* In-memory preferences remain usable. */
+        }
+      }
       return merged;
     });
   }
   const connectionError = writable('');
   let activeRequest: AbortController | null = null;
+  let compacting = false;
   let connectionAttempt = 0;
   let runGeneration = 0;
   let destroyed = false;
 
-  const contextPercent = derived([messages, preferences], ([$messages, $preferences]) => {
-    const characters = $messages.reduce((total, message) => total + message.content.length, 0);
-    const estimatedTokens = Math.ceil(characters / 4);
-    return Math.min(
-      100,
-      Math.round((estimatedTokens / ($preferences.contextWindow ?? 32000)) * 100),
+  function budget() {
+    const settings = get(preferences);
+    return {
+      contextWindow: settings.contextWindow ?? 32000,
+      outputTokens:
+        settings.outputTokens ?? Math.min(4096, Math.floor((settings.contextWindow ?? 32000) / 4)),
+      autoCompact: settings.autoCompact ?? false,
+    };
+  }
+  const contextPercent = derived(
+    [messages, preferences, contextReport],
+    ([$messages, $preferences, $report]) => {
+      const estimate = $report
+        ? $report.estimatedPromptTokens + $report.toolTokens
+        : Math.ceil(
+            new TextEncoder().encode(JSON.stringify(asModelMessages($messages))).length / 3,
+          );
+      return Math.min(100, Math.round((estimate / ($preferences.contextWindow ?? 32000)) * 100));
+    },
+  );
+  function showContext(): void {
+    const report = get(contextReport);
+    const currentBudget = budget();
+    const usage = report?.serverUsage;
+    notice.set(
+      `Estimated last prompt: ${report?.estimatedPromptTokens ?? 'unavailable'} tokens; tools: ${report?.toolTokens ?? 'unavailable'}. Configured context: ${currentBudget.contextWindow}; output reserve: ${currentBudget.outputTokens}; safety reserve: ${Math.floor(currentBudget.contextWindow / 20)}. Server-reported last request: ${usage ? `${usage.promptTokens} prompt, ${usage.completionTokens} generated` : 'unavailable'}. ${get(contextState)?.checkpoints.length ?? 0} checkpoints. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image.`,
     );
-  });
+  }
+  async function compact(): Promise<boolean> {
+    if (!get(selectedModel) || get(connectionState) !== 'ready') {
+      notice.set('Connect your model endpoint before compacting.');
+      return false;
+    }
+    if (get(runState) !== 'idle' || !get(messages).length || writeFailed) return false;
+    const generation = ++runGeneration;
+    const controller = new AbortController();
+    activeRequest = controller;
+    runState.set('preparing');
+    notice.set('Compacting older context…');
+    compacting = true;
+    let candidate: ContextState | undefined;
+    let report: ContextReport | undefined;
+    try {
+      await client.streamChat(
+        {
+          requestId: createId('compact'),
+          agentMode: get(agentMode),
+          workspace: get(workspace) || undefined,
+          webEnabled: get(webEnabled),
+          endpoint: get(endpoint) || undefined,
+          model: get(selectedModel),
+          messages: asModelMessages(get(messages)),
+          contextState: get(contextState),
+          contextBudget: budget(),
+          compact: true,
+        },
+        {
+          onDelta() {},
+          onEvent(event) {
+            if (event.type === 'context_updated') candidate = event.state;
+            if (event.type === 'context_report') report = event.report;
+          },
+        },
+        controller.signal,
+      );
+      if (generation !== runGeneration || destroyed || controller.signal.aborted) return false;
+      if (!candidate)
+        throw new Error('The model did not return a valid checkpoint. Previous context retained.');
+      contextState.set(candidate);
+      contextReport.set(report);
+      saveCurrentSession();
+      notice.set('Context compacted. The original transcript is retained.');
+      return true;
+    } catch (error) {
+      if (generation === runGeneration && !destroyed)
+        notice.set(
+          error instanceof Error ? error.message : 'Compaction failed. Previous context retained.',
+        );
+      return false;
+    } finally {
+      if (generation === runGeneration) {
+        activeRequest = null;
+        compacting = false;
+        runState.set('idle');
+      }
+    }
+  }
 
   function saveCurrentSession(nextMessages = get(messages)): void {
     if (nextMessages.length === 0) return;
@@ -319,6 +451,8 @@ export function createChatController(
       title: sessionTitle(nextMessages),
       updatedAt: Date.now(),
       messages: persistedMessages(nextMessages, native),
+      contextState: get(contextState),
+      contextReport: get(contextReport),
     };
     sessions.update((current) => {
       const next = [session, ...current.filter((item) => item.id !== session.id)].slice(
@@ -452,6 +586,11 @@ export function createChatController(
   async function send(text: string, pending: PendingAttachment[]): Promise<boolean> {
     const content = text.trim();
     if ((!content && pending.length === 0) || get(runState) !== 'idle') return false;
+    if (pending.length === 0 && content === '/context') {
+      showContext();
+      return true;
+    }
+    if (pending.length === 0 && content === '/compact') return compact();
     if (writeFailed) {
       notice.set('Retry saving or export this conversation before continuing.');
       return false;
@@ -550,12 +689,19 @@ export function createChatController(
     const controller = new AbortController();
     activeRequest = controller;
     const requestId = createId('request');
+    const sourceSessionId = get(activeSessionId);
 
     void (async () => {
       try {
+        if (native && storageReady && get(agentMode) && get(preferences).memoryEnabled) await saves;
+        if (generation !== runGeneration || controller.signal.aborted || destroyed) return;
         await client.streamChat(
           {
             requestId,
+            sessionId: sourceSessionId,
+            sourceMessageId: userMessage.id,
+            contextState: get(contextState),
+            contextBudget: budget(),
             agentMode: get(agentMode),
             workspace: get(agentMode) ? get(workspace) : undefined,
             webEnabled: get(webEnabled),
@@ -595,6 +741,11 @@ export function createChatController(
                       : message,
                   ),
                 );
+              if (event.type === 'context_updated') {
+                contextState.set(event.state);
+                saveCurrentSession();
+              }
+              if (event.type === 'context_report') contextReport.set(event.report);
               if (event.type === 'subagent_status')
                 messages.update((current) =>
                   current.map((message) =>
@@ -734,6 +885,8 @@ export function createChatController(
   }
 
   function stop(): void {
+    if (compacting) notice.set('Compaction stopped. Previous context retained.');
+    compacting = false;
     runGeneration += 1;
     approval.set(null);
     activeRequest?.abort();
@@ -780,6 +933,8 @@ export function createChatController(
     }
     releaseMessagePreviews(get(messages));
     messages.set([]);
+    contextState.set(undefined);
+    contextReport.set(undefined);
     workspace.set('');
     agentMode.set(mode === 'agent');
     webEnabled.set(false);
@@ -826,6 +981,8 @@ export function createChatController(
         return;
     }
     releaseMessagePreviews(get(messages));
+    contextState.set(session.contextState);
+    contextReport.set(session.contextReport);
     messages.set(
       structuredClone(session.messages).map((message) => ({
         ...message,
@@ -862,6 +1019,8 @@ export function createChatController(
       stop();
       releaseMessagePreviews(get(messages));
       messages.set([]);
+      contextState.set(undefined);
+      contextReport.set(undefined);
       workspace.set('');
       webEnabled.set(false);
       activeSessionId.set(createId('session'));
@@ -889,6 +1048,8 @@ export function createChatController(
       throw new Error('Retry saving or export your conversation before locking Blackwall.');
     releaseMessagePreviews(get(messages));
     messages.set([]);
+    contextState.set(undefined);
+    contextReport.set(undefined);
     sessions.set([]);
     approval.set(null);
     workspace.set('');
@@ -928,6 +1089,9 @@ export function createChatController(
     selectedModel,
     endpoint,
     contextPercent,
+    contextReport: readonly(contextReport),
+    showContext,
+    compact,
     notice,
     persistenceError,
     preferences,

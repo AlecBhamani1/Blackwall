@@ -44,6 +44,9 @@ pub struct ModelTurn {
     pub usage: Option<TokenUsage>,
 }
 pub trait ModelBackend: Send + Sync {
+    fn context_budget(&self) -> crate::context::ContextBudget {
+        Default::default()
+    }
     fn generate<'a>(
         &'a self,
         messages: &'a [Value],
@@ -56,6 +59,9 @@ pub struct HttpModel {
     endpoint: String,
     key: Option<String>,
     model: String,
+    budget: crate::context::ContextBudget,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
 }
 impl HttpModel {
     pub fn new(endpoint: &str, model: &str, key: Option<String>) -> Result<Self, ModelError> {
@@ -68,10 +74,31 @@ impl HttpModel {
             endpoint: normalize_endpoint(endpoint).map_err(|_| ModelError::Invalid)?,
             key,
             model: model.into(),
+            budget: Default::default(),
+            temperature: None,
+            max_tokens: None,
         })
     }
 }
+impl HttpModel {
+    pub fn with_sampling(mut self, temperature: Option<f32>, max_tokens: Option<u32>) -> Self {
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+        self
+    }
+    pub fn with_budget(
+        mut self,
+        budget: crate::context::ContextBudget,
+    ) -> Result<Self, ModelError> {
+        budget.validate().map_err(|_| ModelError::Limit)?;
+        self.budget = budget;
+        Ok(self)
+    }
+}
 impl ModelBackend for HttpModel {
+    fn context_budget(&self) -> crate::context::ContextBudget {
+        self.budget
+    }
     fn generate<'a>(
         &'a self,
         messages: &'a [Value],
@@ -79,7 +106,20 @@ impl ModelBackend for HttpModel {
         delta: &'a mut (dyn FnMut(String) + Send),
     ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
         Box::pin(async move {
-            let mut payload = json!({"model":self.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+            if self
+                .max_tokens
+                .is_some_and(|n| n == 0 || n > self.budget.output_tokens)
+                || self.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t))
+            {
+                return Err(ModelError::Invalid);
+            }
+            self.budget
+                .check(messages, tools)
+                .map_err(|_| ModelError::Limit)?;
+            let mut payload = json!({"model":self.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"max_tokens":self.max_tokens.unwrap_or(self.budget.output_tokens)});
+            if let Some(temperature) = self.temperature {
+                payload["temperature"] = json!(temperature);
+            }
             if !tools.is_empty() {
                 payload["tools"] = json!(tools);
             }

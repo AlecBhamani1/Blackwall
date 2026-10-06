@@ -1,4 +1,5 @@
 mod input;
+mod memory;
 mod session;
 mod settings;
 
@@ -13,13 +14,19 @@ use std::{env, path::PathBuf, process::ExitCode};
 const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launches):
   /commands, /help           Show these commands
   /settings                 Show effective settings and workspace
-  /settings <name> <value>  Change model, endpoint, web, or memory
+  /settings <name> <value>  Change connection, tools, memory, or budget
   /model <model-id>         Select a model
   /endpoint <url>           Set the OpenAI-compatible service address
   /web on|off               Enable/disable approved web tools
   /memory on|off            Include/exclude your saved memories
+  /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
   /init                     Review a proposed AGENTS.md (preserves existing guidance)
+  /context                  Show estimated budget and last server token usage
+  /compact                  Summarize older context; retain the original transcript
+  /settings context <n>     Configure model context limit in tokens
+  /settings output <n>      Reserve generated output tokens
+  /settings compact on|off  Automatically compact near the context limit
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -41,6 +48,7 @@ USAGE:
   bw run <prompt>            Run one task
   bw resume <id> [prompt]    Continue a saved Agent conversation
   bw sessions                List saved conversations
+  bw memory <action>         Review or manage saved memories (bw memory for list)
   bw request <prompt>        Print a request preview without a model call
 
 Install: cargo install --locked --path src/bw
@@ -86,7 +94,7 @@ async fn run() -> Result<(), String> {
             println!("bw {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" => {}
+        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -95,6 +103,9 @@ async fn run() -> Result<(), String> {
             .ok_or("Your home folder could not be found.")?
             .join(".blackwall"),
     };
+    if command == "memory" {
+        return memory::run(&directory, &arguments);
+    }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "sessions" {
         require_no_arguments(&arguments)?;
@@ -111,6 +122,8 @@ async fn run() -> Result<(), String> {
             settings.model,
             vec![ChatMessage::new(MessageRole::User, prompt)],
         );
+        request.context_budget = settings.budget;
+        request.max_tokens = Some(settings.budget.output_tokens);
         request.endpoint = Some(settings.endpoint);
         println!(
             "{}",
@@ -192,7 +205,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|web|memory> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|web|memory|context|output|compact> <value>.".into(),
             )
         }
     }
@@ -308,12 +321,21 @@ async fn chat(
                         }
                     }
                 }
-                if name == "init" && value.is_empty() {
-                    conversation
-                        .turn(store, directory, settings, "/init", input)
-                        .await
-                } else {
-                    slash(store, settings, conversation, name, value)
+                match name {
+                    "init" if value.is_empty() => {
+                        conversation
+                            .turn(store, directory, settings, "/init", input)
+                            .await
+                    }
+                    "compact" if value.is_empty() => {
+                        conversation
+                            .compact(store, directory, settings, input)
+                            .await
+                    }
+                    "context" if value.is_empty() => {
+                        conversation.context_report(store, directory, settings)
+                    }
+                    _ => slash(store, directory, settings, conversation, name, value),
                 }
             } else {
                 let prompt = if line.starts_with("//") {
@@ -333,6 +355,7 @@ async fn chat(
 
 fn slash(
     store: &LocalStore,
+    directory: &std::path::Path,
     settings: &mut Settings,
     conversation: &mut Conversation,
     name: &str,
@@ -346,12 +369,19 @@ fn slash(
             conversation.workspace.display()
         ),
         "settings" => {
-            let (key, value) = value
-                .split_once(char::is_whitespace)
-                .ok_or("Use /settings <model|endpoint|web|memory> <value>.")?;
+            let (key, value) = value.split_once(char::is_whitespace).ok_or(
+                "Use /settings <model|endpoint|web|memory|context|output|compact> <value>.",
+            )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());
         }
+        "memory" if !matches!(value, "on" | "off") => memory::run(
+            directory,
+            &value
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )?,
         "model" | "endpoint" | "web" | "memory" => {
             settings.set(store, name, value)?;
             println!("{}", settings.describe());

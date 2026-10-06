@@ -1,23 +1,37 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type MemoryEntry } from '../persistence';
+  import {
+    persistence,
+    type MemoryEntry,
+    type MemoryProposal,
+    type Preferences,
+  } from '../persistence';
   import { createId } from '../id';
   import Icon from './Icon.svelte';
   import { platform } from '../platform';
+  export let contextPreferences: Preferences = {};
   export let onPreferences: (preferences: {
     memoryEnabled: boolean;
     contextWindow: number;
+    outputTokens: number;
+    autoCompact: boolean;
   }) => void = () => {};
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
   let entries: MemoryEntry[] = [];
   let content = '';
   let editingId = '';
+  let editingEntry: MemoryEntry | undefined;
+  let proposals: MemoryProposal[] = [];
+  let drafts: Record<string, string> = {};
+  let sourceMessages: Record<string, string> = {};
   let query = '';
   let error = '';
   let busy = false;
   let enabled = false;
   let contextWindow = 32000;
+  let outputTokens = 4096;
+  let autoCompact = false;
   let loaded = false;
   let savedPreferences: Awaited<ReturnType<typeof persistence.preferences>> = {};
   const desktop = persistence.available();
@@ -25,8 +39,14 @@
   async function refresh() {
     const version = ++searchVersion;
     try {
-      const result = await persistence.memories(query);
-      if (version === searchVersion) entries = result;
+      const [result, pending] = await Promise.all([
+        persistence.memories(query),
+        persistence.memoryProposals(),
+      ]);
+      if (version === searchVersion) {
+        entries = result;
+        proposals = pending;
+      }
     } catch {
       error = 'Your memories could not be loaded. Existing data has been left in place.';
     }
@@ -37,15 +57,20 @@
     error = '';
     try {
       await persistence.saveMemory({
+        ...editingEntry,
         id: editingId || createId('memory'),
         content: content.trim(),
         updatedAt: Date.now(),
       });
       content = '';
       editingId = '';
+      editingEntry = undefined;
       await refresh();
-    } catch {
-      error = 'This memory could not be saved. Check disk space and try again.';
+    } catch (cause) {
+      error =
+        typeof cause === 'string'
+          ? cause
+          : 'This memory could not be saved. Check disk space and try again.';
     } finally {
       busy = false;
     }
@@ -57,6 +82,7 @@
       await persistence.removeMemory(id);
       if (editingId === id) {
         editingId = '';
+        editingEntry = undefined;
         content = '';
       }
       await refresh();
@@ -66,15 +92,52 @@
       busy = false;
     }
   }
+  async function showSource(id: string, source: { sessionId: string; messageId: string }) {
+    try {
+      const session = await persistence.load(source.sessionId);
+      const message = session?.messages.find((message) => message.id === source.messageId);
+      sourceMessages[id] = message
+        ? message.content.slice(0, 2000) + (message.content.length > 2000 ? '\n[excerpt]' : '')
+        : 'The source conversation or message is no longer available.';
+    } catch {
+      sourceMessages[id] = 'The source conversation could not be opened.';
+    }
+  }
+  async function review(proposal: MemoryProposal, approve: boolean) {
+    busy = true;
+    error = '';
+    try {
+      if (approve)
+        await persistence.approveMemory(proposal.id, drafts[proposal.id] ?? proposal.entry.content);
+      else await persistence.rejectMemory(proposal.id);
+      delete drafts[proposal.id];
+      await refresh();
+    } catch (cause) {
+      error =
+        typeof cause === 'string'
+          ? cause
+          : 'This proposal could not be reviewed. Refresh and try again; a saved memory may have changed.';
+    } finally {
+      busy = false;
+    }
+  }
   async function saveSettings() {
     busy = true;
     error = '';
     try {
-      await persistence.savePreferences({
+      if (desktop)
+        await persistence.savePreferences({
+          memoryEnabled: enabled,
+          contextWindow: Number(contextWindow),
+          outputTokens: Number(outputTokens),
+          autoCompact,
+        });
+      onPreferences({
         memoryEnabled: enabled,
         contextWindow: Number(contextWindow),
+        outputTokens: Number(outputTokens),
+        autoCompact,
       });
-      onPreferences({ memoryEnabled: enabled, contextWindow: Number(contextWindow) });
     } catch {
       error = 'These settings could not be saved. Try again.';
     } finally {
@@ -83,12 +146,22 @@
   }
   onMount(() => {
     dialog.showModal();
-    if (!desktop) return;
+    if (!desktop) {
+      contextWindow = contextPreferences.contextWindow ?? 32000;
+      outputTokens =
+        contextPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
+      autoCompact = contextPreferences.autoCompact ?? false;
+      loaded = true;
+      return;
+    }
     void (async () => {
       try {
         savedPreferences = await persistence.preferences();
         enabled = savedPreferences.memoryEnabled ?? false;
         contextWindow = savedPreferences.contextWindow ?? 32000;
+        outputTokens =
+          savedPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
+        autoCompact = savedPreferences.autoCompact ?? false;
         await refresh();
         loaded = true;
       } catch {
@@ -114,7 +187,10 @@
       <div class="preference">
         <div>
           <strong>Use saved memories in chat</strong>
-          <p>Only memories you save here are included. Shared guest chats never receive them.</p>
+          <p>
+            Only saved or approved memories are included. Turning this off also disables agent
+            learning. Shared guest chats never receive them.
+          </p>
         </div>
         <input
           aria-label="Use saved memories in chat"
@@ -124,6 +200,55 @@
           onchange={saveSettings}
         />
       </div>
+      {#if proposals.length}
+        <section aria-label="Pending memory proposals" class="proposals">
+          <h3>Pending review · {proposals.length}</h3>
+          <p class="hint">
+            The agent suggested these facts. Review or edit them before they enter future context.
+          </p>
+          {#each proposals as proposal (proposal.id)}
+            <article>
+              <strong>{proposal.entry.scope} · {proposal.entry.key}</strong>
+              {#if proposal.entry.workspace}<p class="hint">
+                  Project: {proposal.entry.workspace}
+                </p>{/if}
+              <p class="hint">
+                Source session: {proposal.source.sessionId}<br />Message: {proposal.source
+                  .messageId}
+              </p>
+              <button
+                class="secondary"
+                disabled={busy}
+                onclick={() => showSource(proposal.id, proposal.source)}>View source message</button
+              >
+              {#if sourceMessages[proposal.id]}<pre>{sourceMessages[proposal.id]}</pre>{/if}
+              <label for={`before-${proposal.id}`}>Saved text (−)</label>
+              <pre id={`before-${proposal.id}`}>{proposal.before?.content ?? '(new fact)'}</pre>
+              <label for={`proposal-${proposal.id}`}>Proposed text (+) · editable</label>
+              <textarea
+                id={`proposal-${proposal.id}`}
+                aria-label={`Edit proposal: ${proposal.entry.key}`}
+                value={drafts[proposal.id] ?? proposal.entry.content}
+                oninput={(event) => {
+                  drafts[proposal.id] = event.currentTarget.value;
+                }}
+                rows="3"
+                maxlength="8000"
+                disabled={busy}></textarea>
+              <div class="review-actions">
+                <button
+                  class="primary"
+                  disabled={busy || !(drafts[proposal.id] ?? proposal.entry.content).trim()}
+                  onclick={() => review(proposal, true)}>Approve</button
+                >
+                <button class="secondary" disabled={busy} onclick={() => review(proposal, false)}
+                  >Reject</button
+                >
+              </div>
+            </article>
+          {/each}
+        </section>
+      {/if}
       <form onsubmit={save} class="editor">
         <label for="memory-content">{editingId ? 'Edit memory' : 'Remember something'}</label
         ><textarea
@@ -139,6 +264,7 @@
               class="secondary"
               onclick={() => {
                 editingId = '';
+                editingEntry = undefined;
                 content = '';
               }}>Cancel</button
             >{/if}<button class="primary" disabled={busy || !loaded || !content.trim()}
@@ -163,6 +289,19 @@
         </p>{:else}
         <div class="memories">
           {#each entries as entry (entry.id)}<article>
+              <strong>{(entry.scope ?? 'user') + (entry.key ? ' · ' + entry.key : '')}</strong>
+              {#if entry.workspace}<p class="hint">Project: {entry.workspace}</p>{/if}
+              {#if entry.source}<p class="hint">
+                  Source session: {entry.source.sessionId}<br />Message: {entry.source.messageId}
+                </p>{/if}
+              {#if entry.source}
+                <button
+                  class="secondary"
+                  disabled={busy}
+                  onclick={() => showSource(entry.id, entry.source!)}>View source message</button
+                >
+                {#if sourceMessages[entry.id]}<pre>{sourceMessages[entry.id]}</pre>{/if}
+              {/if}
               <p>{entry.content}</p>
               <div>
                 <button
@@ -170,45 +309,92 @@
                   disabled={busy}
                   onclick={() => {
                     editingId = entry.id;
+                    editingEntry = entry;
                     content = entry.content;
                   }}>Edit</button
                 ><button
                   class="delete"
                   aria-label={`Delete memory: ${entry.content.slice(0, 40)}`}
                   disabled={busy}
-                  onclick={() => remove(entry.id)}><Icon name="trash" size={14} />Delete</button
+                  onclick={() => remove(entry.id)}><Icon name="trash" size={14} />Forget</button
                 >
               </div>
             </article>{/each}
         </div>
       {/if}
-      <details>
-        <summary>Advanced · Context window</summary><label for="context-window"
-          >Model context limit (tokens)</label
-        ><input
-          id="context-window"
-          type="number"
-          min="2048"
-          max="1000000"
-          step="1024"
-          bind:value={contextWindow}
-          disabled={busy || !loaded}
-        />
-        <p class="hint">
-          Use the limit configured in your model service. The status bar shows an estimate.
-        </p>
-        <button
-          class="secondary"
-          disabled={busy || !loaded || contextWindow < 2048 || contextWindow > 1000000}
-          onclick={saveSettings}>Save context limit</button
-        >
-      </details>
     {/if}
+    <details>
+      <summary>Advanced · Context window</summary><label for="context-window"
+        >Model context limit (tokens)</label
+      ><input
+        id="context-window"
+        type="number"
+        min="2048"
+        max="1000000"
+        step="1024"
+        bind:value={contextWindow}
+        disabled={busy || !loaded}
+      />
+      <p class="hint">
+        Use the limit configured in your model service. Requests reserve room for tools, output, and
+        a 5% safety margin. Token counts are estimates.
+      </p>
+      <label for="output-tokens">Output reserve (tokens)</label>
+      <input
+        id="output-tokens"
+        type="number"
+        min="1"
+        max="32768"
+        bind:value={outputTokens}
+        disabled={busy || !loaded}
+      />
+      <label
+        ><input type="checkbox" bind:checked={autoCompact} disabled={busy || !loaded} /> Automatically
+        compact older context near the limit</label
+      >
+      <p class="hint">
+        Use /context to see usage and /compact to summarize older turns. Original transcripts are
+        retained.
+      </p>
+      <button
+        class="secondary"
+        disabled={busy ||
+          !loaded ||
+          contextWindow < 2048 ||
+          contextWindow > 1000000 ||
+          outputTokens < 1 ||
+          outputTokens > 32768 ||
+          Number(outputTokens) + Math.floor(contextWindow / 20) >= contextWindow}
+        onclick={saveSettings}>Save context limit</button
+      >
+    </details>
     {#if error}<p role="alert" class="error">{error}</p>{/if}
   </div>
 </dialog>
 
 <style>
+  .proposals {
+    margin-bottom: 24px;
+  }
+  h3 {
+    font-size: 14px;
+    margin: 0 0 8px;
+  }
+  pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 12px;
+    background: var(--bg-base);
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .proposals label {
+    margin-top: 12px;
+  }
+  .review-actions {
+    margin-top: 10px;
+  }
   dialog {
     width: min(620px, calc(100vw - 32px));
     max-height: calc(100vh - 48px);

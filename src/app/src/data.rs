@@ -82,6 +82,28 @@ pub async fn delete_memory(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn list_memory_proposals(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::storage::MemoryProposal>, String> {
+    with_store(&app, |store| store.memory_proposals()).await
+}
+#[tauri::command]
+pub async fn approve_memory_proposal(
+    app: AppHandle,
+    id: String,
+    content: Option<String>,
+) -> Result<(), String> {
+    with_store(&app, move |store| {
+        store.approve_memory(&id, content.as_deref())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn reject_memory_proposal(app: AppHandle, id: String) -> Result<(), String> {
+    with_store(&app, move |store| store.reject_memory(&id)).await
+}
+
+#[tauri::command]
 pub async fn load_preferences(app: AppHandle) -> Result<Value, String> {
     with_store(&app, |store| {
         Ok(store
@@ -104,6 +126,8 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "connectionName"
                 | "relayUrl"
                 | "contextWindow"
+                | "outputTokens"
+                | "autoCompact"
                 | "memoryEnabled"
                 | "workspace"
                 | "connections"
@@ -124,6 +148,18 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         {
             return Err("Choose a context window between 2,048 and 1,000,000 tokens.".into());
         }
+    }
+    if object
+        .get("autoCompact")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid automatic compaction setting.".into());
+    }
+    if object
+        .get("outputTokens")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=32768).contains(&n)))
+    {
+        return Err("Choose an output reserve between 1 and 32,768 tokens.".into());
     }
     if object
         .values()
