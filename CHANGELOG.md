@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that preserves existing project instructions.
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
+### Fixed
+
+- Use portable paths in instruction source lists and directory scopes on Windows.
+
 ## [0.1.4] - 2026-10-01
 
 Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).

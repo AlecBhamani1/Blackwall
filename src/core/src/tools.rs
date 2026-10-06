@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: usize = 64 * 1024;
 
 /// Project-relative labels use `/` everywhere; Windows file names cannot contain `\`.
-fn label(path: &Path) -> Option<String> {
+pub(crate) fn label(path: &Path) -> Option<String> {
     let label = path.to_str()?;
     Some(if cfg!(windows) {
         label.replace('\\', "/")

@@ -75,7 +75,7 @@ impl Instructions {
                 continue;
             }
             ancestor.push(component);
-            let label = ancestor.to_string_lossy().into_owned();
+            let label = instruction_label(&ancestor);
             self.directory(
                 workspace,
                 &label,
@@ -107,11 +107,7 @@ impl Instructions {
             let source = if origin == "user" {
                 format!("User guidance: {name}")
             } else {
-                relative
-                    .strip_prefix(".")
-                    .unwrap_or(&relative)
-                    .to_string_lossy()
-                    .into_owned()
+                instruction_label(relative.strip_prefix(".").unwrap_or(&relative))
             };
             let metadata = match workspace.directory.symlink_metadata(&relative) {
                 Ok(metadata) => metadata,
@@ -192,6 +188,10 @@ impl Instructions {
     }
 }
 
+fn instruction_label(path: &Path) -> String {
+    crate::tools::label(path).unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 pub const INIT_TEMPLATE: &str = "# Project working agreements\n\n## Development\n\n- Read the README and contributor documentation before changing the project.\n- Follow existing code style and keep changes focused on the requested task.\n- Use the project's documented build, lint, and test commands.\n\n## Verification\n\n- Add meaningful offline tests for behavior changes and security boundaries.\n- Report what changed, what was checked, and any unresolved limitations.\n\n## Safety\n\n- Keep secrets, credentials, private data, and generated build output out of commits.\n- Project guidance does not grant tool permissions or approve actions.\n";
 
 #[cfg(test)]
@@ -266,6 +266,23 @@ mod tests {
         assert!(!prompt.contains("outside must not load"));
         assert!(!prompt.contains("irrelevant sibling"));
         assert!(!instructions.for_tool(&workspace, &call("read_file", "src/deep/file.rs")));
+        #[cfg(windows)]
+        assert!(!instructions.for_tool(&workspace, &call("read_file", r"src\deep\file.rs")));
+        assert!(instructions.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_backslashes_in_unix_directory_names_are_preserved() {
+        let fixture = Fixture::new();
+        fixture.write(r"project/back\slash/AGENTS.md", "directory conventions");
+        let workspace = fixture.workspace();
+        let mut instructions = Instructions::discover(&workspace, None);
+        assert!(instructions.for_tool(&workspace, &call("read_file", r"back\slash/file.rs")));
+        assert_eq!(instructions.sources(), [r"back\slash/AGENTS.md"]);
+        assert!(instructions
+            .prompt()
+            .contains(r"Scope: back\slash/ and descendants"));
         assert!(instructions.warnings.is_empty());
     }
 

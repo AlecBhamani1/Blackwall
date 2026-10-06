@@ -48,7 +48,7 @@ Warnings are bounded and do not include instruction contents.
 The CLI prints contributing file paths and warnings. Desktop Agent messages show a
 **Project instructions** activity entry; expand it to inspect the source list and warnings.
 Provenance contains filenames, not guidance bodies. User files are labeled `User guidance:`;
-project files are labeled relative to the workspace.
+project files are labeled relative to the workspace with `/` separators on every platform.
 
 ![Instruction sources and a discovery warning in the desktop activity entry](images/project-instructions.png)
 
