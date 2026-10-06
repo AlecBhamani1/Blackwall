@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Review agent-proposed preferences, project conventions, and environment lessons in desktop Memory
+  or `bw memory`. Proposals show their source and replacement text; approval, editing, rejection,
+  and forgetting persist across clients. Scoped injection stays bounded, disabled memory blocks
+  learning, and guest chats never receive owner memories.
+
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
 ## [0.1.4] - 2026-10-01

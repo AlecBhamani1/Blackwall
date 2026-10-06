@@ -394,6 +394,8 @@ async function streamTauriChat(
         enabled: request.agentMode ?? false,
         workspace: request.workspace ?? null,
         webEnabled: request.webEnabled ?? false,
+        sessionId: request.sessionId ?? null,
+        sourceMessageId: request.sourceMessageId ?? null,
       },
     });
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');

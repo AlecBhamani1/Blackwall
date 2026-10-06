@@ -3,10 +3,12 @@ use blackwall_core::{
     agent::Agent,
     approvals::Approvals,
     connection::{normalize_endpoint, same_origin},
+    memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
     protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
     skills::SkillStore,
     storage::LocalStore,
+    storage::MemorySource,
     tools::Workspace,
     ChatMessage, ChatRequest,
 };
@@ -142,8 +144,29 @@ impl Conversation {
             .save_session(&candidate)
             .map_err(|error| error.to_string())?;
         self.session = candidate;
-        let (answer, result) =
-            execute(&backend, workspace, settings.web_enabled, messages, input).await;
+        let source_message = self.session["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["id"].as_str())
+            .ok_or("Missing source message.")?;
+        let memory = MemoryTools {
+            directory: directory.into(),
+            client: MemoryClient::Cli,
+            workspace: Some(workspace.path.to_string_lossy().into_owned()),
+            source: MemorySource {
+                session_id: self.id().into(),
+                message_id: source_message.into(),
+            },
+        };
+        let (answer, result) = execute(
+            &backend,
+            workspace,
+            settings.web_enabled,
+            messages,
+            input,
+            &memory,
+        )
+        .await;
         let status = if result.is_ok() { "complete" } else { "error" };
         let content = if answer.is_empty() {
             result.as_ref().err().cloned().unwrap_or_default()
@@ -172,14 +195,11 @@ fn context(
     let request = ChatRequest::new("cli-context", &settings.model, history);
     request.validate().map_err(|error| error.to_string())?;
     let mut messages = model::messages(&request);
-    if settings.memory_enabled {
-        let memory = blackwall_core::memory::context(
-            &store.memories("").map_err(|error| error.to_string())?,
-            4000,
-        );
-        if !memory.is_empty() {
-            messages.insert(0, json!({"role":"system","content":memory}));
-        }
+    let memory = store
+        .memory_context(MemoryClient::Cli, session["workspace"].as_str(), 4000)
+        .map_err(|error| error.to_string())?;
+    if !memory.is_empty() {
+        messages.insert(0, json!({"role":"system","content":memory}));
     }
     let skills = SkillStore::open(&directory.join("skills")).map_err(|error| error.to_string())?;
     skills.seed().map_err(|error| error.to_string())?;
@@ -224,6 +244,7 @@ async fn execute(
     web_enabled: bool,
     messages: Vec<Value>,
     input: &mut Input,
+    memory: &MemoryTools,
 ) -> (String, Result<(), String>) {
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -238,7 +259,7 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let work = agent.run(&request_id, messages);
+    let work = agent.run_with_memory(&request_id, messages, Some(memory));
     tokio::pin!(work);
     let mut answer = String::new();
     let mut pending: Option<ResolveApprovalRequest> = None;

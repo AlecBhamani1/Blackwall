@@ -269,17 +269,18 @@ pub(crate) async fn discover_models(
     })
 }
 
-async fn inject_memory(app: &AppHandle, request: &mut ChatRequest) -> Result<(), CommandError> {
-    let memory = crate::data::with_store(app, |store| {
-        let preferences: serde_json::Value = store
-            .setting("preferences")?
-            .map(|text| serde_json::from_str(&text))
-            .transpose()?
-            .unwrap_or_default();
-        if preferences.get("memoryEnabled").and_then(|v| v.as_bool()) != Some(true) {
-            return Ok(String::new());
-        }
-        Ok(blackwall_core::memory::context(&store.memories("")?, 4000))
+async fn inject_memory(
+    app: &AppHandle,
+    request: &mut ChatRequest,
+    workspace: Option<&str>,
+) -> Result<(), CommandError> {
+    let workspace = workspace.map(str::to_owned);
+    let memory = crate::data::with_store(app, move |store| {
+        store.memory_context(
+            blackwall_core::memory::MemoryClient::Desktop,
+            workspace.as_deref(),
+            4000,
+        )
     })
     .await
     .map_err(|message| CommandError {
@@ -313,7 +314,7 @@ pub(crate) async fn chat(
             message,
             retryable: false,
         })?;
-    inject_memory(&app, &mut request).await?;
+    inject_memory(&app, &mut request, None).await?;
     validate_attachment_target(&request).map_err(CommandError::from)?;
     let selected =
         selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
@@ -333,6 +334,8 @@ pub(crate) struct AgentOptions {
     workspace: Option<String>,
     #[serde(default)]
     web_enabled: bool,
+    session_id: Option<String>,
+    source_message_id: Option<String>,
 }
 
 /// Runs a model stream, emitting typed events until completion.
@@ -370,7 +373,6 @@ pub(crate) async fn stream_chat(
             message,
             retryable: false,
         })?;
-    inject_memory(&app, &mut request).await?;
     let api_key = scoped_api_key(&state, &selected).await?;
     let stopped = || CommandError {
         code: "request_stopped",
@@ -396,6 +398,25 @@ pub(crate) async fn stream_chat(
                     }
                 })
             })?;
+        inject_memory(&app, &mut request, Some(&workspace.path.to_string_lossy())).await?;
+        let memory = match (options.session_id, options.source_message_id) {
+            (Some(session_id), Some(message_id)) => Some(blackwall_core::memory::MemoryTools {
+                directory: crate::identity::data_directory(&app).map_err(|message| {
+                    CommandError {
+                        code: "storage_error",
+                        message,
+                        retryable: true,
+                    }
+                })?,
+                client: blackwall_core::memory::MemoryClient::Desktop,
+                workspace: Some(workspace.path.to_string_lossy().into_owned()),
+                source: blackwall_core::storage::MemorySource {
+                    session_id,
+                    message_id,
+                },
+            }),
+            _ => None,
+        };
         let skill_context = crate::data::with_skills(&app, |store| {
             Ok(blackwall_core::skills::prompt(&store.list()?.0))
         })
@@ -429,9 +450,10 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run(&request_id,blackwall_core::model::messages(&request))=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
+            result=runner.run_with_memory(&request_id,blackwall_core::model::messages(&request),memory.as_ref())=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
         }
     } else {
+        inject_memory(&app, &mut request, None).await?;
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),

@@ -59,6 +59,8 @@ export interface ModelMessage {
 
 export interface ChatRequest {
   requestId: string;
+  sessionId?: string;
+  sourceMessageId?: string;
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;
