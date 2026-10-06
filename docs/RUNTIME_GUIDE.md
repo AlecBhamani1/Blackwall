@@ -1,6 +1,6 @@
 # Using the current Blackwall development build
 
-Updated 2026-09-30. This guide describes the code in this checkout. It does not imply that a
+Updated 2026-10-06. This guide describes the code in this checkout. It does not imply that a
 published installer contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
 
 Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
@@ -68,6 +68,54 @@ Browser screenshots of the development UI, using a deterministic model fixture:
 [conversation drop target](screenshots/chat-file-drop.png) and
 [file reference picker](screenshots/chat-file-references.png). These demonstrate the browser flow;
 Finder and macOS screenshot-thumbnail drops still require packaged native acceptance.
+
+## Budget and compact conversations
+
+Open **Memory → Advanced · Context window** to set the context limit configured in your selected
+model service and the output reserve. Settings apply to the selected connection's future requests;
+check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
+tokens, and automatic compaction off. The browser development UI also saves these controls locally.
+
+Type `/context` in the composer or CLI to see estimated prompt and tool-definition tokens, the
+output reserve, the 5% safety reserve, and separately labeled server-reported usage when available.
+Server usage describes the last conversation request (excluding summary calls), rather than a
+running total or an exact measurement of the current checkpoint. Estimates use serialized UTF-8
+text bytes divided by three plus message framing, including text attachments. Image inputs use a
+4,096-token estimate per image rather than counting encoded image bytes as text. They are not tokenizer
+counts and cannot guarantee that every model accepts a request. The configured budget supplements
+the existing serialized size ceilings; output requests send an explicit `max_tokens` cap.
+
+Type `/compact` to summarize older assistant/tool context. The two most recent user turns, every
+user requirement and correction, initial instructions, and current memory/skill instructions stay
+intact. Older assistant/tool material becomes a structured checkpoint covering requirements,
+corrections, decisions, changed files, checks, unfinished work, and relevant context. Completed
+recent tool-call/result groups remain intact. Optional automatic compaction attempts this at 90%
+of the available prompt budget, including tool definitions. Large retained instructions, attachments,
+or recent turns can still exceed the budget; shorten them or select an appropriate configured limit.
+
+The full visible conversation and original model transcript remain saved. Checkpoints live in a
+separate `contextState.checkpoints` array in the saved session record and resume through the same
+transactional session store; no database schema migration is needed. Checkpoint hashes bind them
+to their original transcript prefix. Session exports include both originals and checkpoints.
+Summaries run without tools. Historical actions are data, never executed during resume, and approval
+rules are scoped to their original run. Invalid, failed, or cancelled summaries leave the previous
+context intact. Existing saved conversations without checkpoints continue normally.
+
+CLI equivalents:
+
+```sh
+bw config set context 32000
+bw config set output 4096
+bw config set compact on
+```
+
+During interactive CLI chat, use `/settings context <tokens>`, `/settings output <tokens>`, and
+`/settings compact on|off`. `/compact` does not add a user or assistant message. Ctrl+C cancels
+summary generation. The original transcript remains subject to the conversation store's size limit;
+compaction releases model prompt space, not disk space.
+
+Scripted browser verification: [budget controls](screenshots/context-budget.png) and
+[separate estimates and server usage](screenshots/context-usage.png).
 
 ## Share with guests
 

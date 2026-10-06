@@ -67,6 +67,7 @@ pub async fn run(
     let result: Result<String,String>=async {
         for _ in 0..8 {
             if serde_json::to_vec(&messages).map_err(|_| "Invalid child context.")?.len() > 8 * 1024 * 1024 { return Err("The child task reached its context size limit.".into()); }
+            backend.context_budget().check(&messages, &definitions).map_err(|error|error.to_string())?;
             let turn=backend.generate(&messages,&definitions,&mut |_|{}).await.map_err(|error|error.to_string())?;
             if turn.calls.is_empty(){return Ok(turn.content.chars().take(32000).collect());}
             messages.push(json!({"role":"assistant","content":turn.content,"tool_calls":turn.calls.iter().map(|call|call.as_json()).collect::<Vec<_>>()}));

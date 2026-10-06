@@ -764,3 +764,102 @@ describe('native conversation persistence', () => {
     controller.destroy();
   });
 });
+
+describe('context commands', () => {
+  it('sends the configured budget and keeps compaction checkpoints separate from the transcript', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    controller.savePreferences({ contextWindow: 8192, outputTokens: 1024, autoCompact: true });
+    await controller.send('Initial task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].contextBudget).toEqual({
+      contextWindow: 8192,
+      outputTokens: 1024,
+      autoCompact: true,
+    });
+    const original = structuredClone(get(controller.messages));
+    const snapshot = {
+      transcript: [{ role: 'user', content: 'Initial task' }],
+      checkpoints: [],
+      coveredMessages: 1,
+      sourceHash: 'fixture',
+      serverUsage: { promptTokens: 77, completionTokens: 12, totalTokens: 89 },
+    };
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      expect(request.compact).toBe(true);
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: snapshot,
+      });
+      callbacks.onEvent?.({
+        type: 'context_report',
+        requestId: request.requestId,
+        report: {
+          estimatedPromptTokens: 101,
+          toolTokens: 20,
+          outputTokens: 1024,
+          safetyTokens: 409,
+          contextWindow: 8192,
+          serverUsage: snapshot.serverUsage,
+        },
+      });
+    });
+    expect(await controller.send('/compact', [])).toBe(true);
+    expect(get(controller.messages)).toEqual(original);
+    expect(get(controller.sessions)[0].contextState).toEqual(snapshot);
+    await controller.send('/context', []);
+    expect(get(controller.notice)).toContain('101 tokens');
+    expect(get(controller.notice)).toContain('77 prompt, 12 generated');
+    expect(client.streamChat).toHaveBeenCalledTimes(2);
+    await controller.newChat();
+    await controller.send('New task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[2][0].contextState).toBeUndefined();
+    controller.destroy();
+  });
+  it('does not commit a failed or cancelled compaction candidate', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Initial task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const original = structuredClone(get(controller.sessions)[0]);
+    const candidate = {
+      transcript: [],
+      checkpoints: [],
+      coveredMessages: 0,
+      sourceHash: 'candidate',
+    };
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: candidate,
+      });
+      throw new Error('Invalid summary');
+    });
+    expect(await controller.send('/compact', [])).toBe(false);
+    expect(get(controller.sessions)[0]).toEqual(original);
+    let release!: () => void;
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: candidate,
+      });
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const work = controller.send('/compact', []);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    controller.stop();
+    release();
+    expect(await work).toBe(false);
+    expect(get(controller.sessions)[0].contextState).toBeUndefined();
+    expect(get(controller.messages)).toEqual(original.messages);
+    controller.destroy();
+  });
+});
