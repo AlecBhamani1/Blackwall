@@ -798,3 +798,94 @@ fn reviewed_facts_never_bypass_tool_approval() {
         "original\n"
     );
 }
+
+#[test]
+fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
+    use blackwall_core::storage::LocalStore;
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    fixture.success(&["config", "set", "memory", "on"], "");
+    let server = ModelServer::start(vec![
+        proposed_memory("Run offline tests."),
+        answer(&"Historical result. ".repeat(800)),
+    ]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "Remember the testing convention"], "");
+    server.finish();
+    let store = LocalStore::open(&fixture.root.join("data")).unwrap();
+    let proposal = store.memory_proposals().unwrap().remove(0);
+    let session_id = &proposal.source.session_id;
+    fixture.success(&["memory", "approve", &proposal.id], "");
+    fixture.success(
+        &[
+            "memory",
+            "edit",
+            &proposal.entry.id,
+            "Current testing convention.",
+        ],
+        "",
+    );
+    let server = ModelServer::start(vec![answer("Second result."), answer("Third result.")]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["resume", session_id, "Continue the task"], "");
+    fixture.success(&["resume", session_id, "Continue again"], "");
+    for request in server.finish() {
+        assert!(message_contents(&request, "system")
+            .iter()
+            .any(|text| text.contains("Current testing convention.")));
+        assert!(request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "memory_propose"));
+    }
+    let summary = json!({"taskRequirements":[],"corrections":[],"decisions":[],"changedFiles":[],"checks":[],"unfinishedWork":[],"relevantContext":["Earlier task completed."]});
+    let server = ModelServer::start(vec![vec![
+        json!({"choices":[{"delta":{"content":summary.to_string()},"finish_reason":"stop"}]}),
+    ]]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    let output = fixture.success(
+        &["resume", session_id],
+        "/memory list\n/context\n/compact\n/context\n/quit\n",
+    );
+    assert!(output.contains("Current testing convention."));
+    assert!(output.contains("Context compacted."));
+    assert!(output.contains("Checkpoints: 1"));
+    let mut definitions = blackwall_core::tools::definitions(false, true);
+    definitions.extend(blackwall_core::memory::definitions());
+    assert!(output.contains(&format!(
+        "tools: {}",
+        blackwall_core::context::estimate(&definitions)
+    )));
+    let requests = server.finish();
+    assert!(requests[0]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().unwrap().is_empty()));
+    let saved = store.load_session(session_id).unwrap().unwrap();
+    assert_eq!(
+        saved["contextState"]["checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(saved["contextState"]["transcript"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["role"] != "system"));
+    fixture.success(&["memory", "forget", &proposal.entry.id], "");
+    fixture.success(&["config", "set", "memory", "off"], "");
+    let server = ModelServer::start(vec![answer("Resumed after forgetting.")]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["resume", session_id, "Continue safely"], "");
+    let request = server.finish().remove(0);
+    assert!(!message_contents(&request, "system").iter().any(|text| text
+        .contains("saved_memories")
+        || text.contains("Current testing convention.")));
+    assert!(!request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "memory_propose"));
+}

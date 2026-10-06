@@ -13,6 +13,8 @@ export interface Preferences {
   connectionName?: string;
   relayUrl?: string;
   contextWindow?: number;
+  outputTokens?: number;
+  autoCompact?: boolean;
   memoryEnabled?: boolean;
   workspace?: string;
 }

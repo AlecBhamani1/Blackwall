@@ -14,13 +14,18 @@ use std::{env, path::PathBuf, process::ExitCode};
 const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launches):
   /commands, /help           Show these commands
   /settings                 Show effective settings and workspace
-  /settings <name> <value>  Change model, endpoint, web, or memory
+  /settings <name> <value>  Change connection, tools, memory, or budget
   /model <model-id>         Select a model
   /endpoint <url>           Set the OpenAI-compatible service address
   /web on|off               Enable/disable approved web tools
   /memory on|off            Include/exclude your saved memories
   /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
+  /context                  Show estimated budget and last server token usage
+  /compact                  Summarize older context; retain the original transcript
+  /settings context <n>     Configure model context limit in tokens
+  /settings output <n>      Reserve generated output tokens
+  /settings compact on|off  Automatically compact near the context limit
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -116,6 +121,8 @@ async fn run() -> Result<(), String> {
             settings.model,
             vec![ChatMessage::new(MessageRole::User, prompt)],
         );
+        request.context_budget = settings.budget;
+        request.max_tokens = Some(settings.budget.output_tokens);
         request.endpoint = Some(settings.endpoint);
         println!(
             "{}",
@@ -197,7 +204,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|web|memory> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|web|memory|context|output|compact> <value>.".into(),
             )
         }
     }
@@ -313,7 +320,17 @@ async fn chat(
                         }
                     }
                 }
-                slash(store, directory, settings, conversation, name, value)
+                match name {
+                    "compact" if value.is_empty() => {
+                        conversation
+                            .compact(store, directory, settings, input)
+                            .await
+                    }
+                    "context" if value.is_empty() => {
+                        conversation.context_report(store, directory, settings)
+                    }
+                    _ => slash(store, directory, settings, conversation, name, value),
+                }
             } else {
                 let prompt = if line.starts_with("//") {
                     &line[1..]
@@ -346,9 +363,9 @@ fn slash(
             conversation.workspace.display()
         ),
         "settings" => {
-            let (key, value) = value
-                .split_once(char::is_whitespace)
-                .ok_or("Use /settings <model|endpoint|web|memory> <value>.")?;
+            let (key, value) = value.split_once(char::is_whitespace).ok_or(
+                "Use /settings <model|endpoint|web|memory|context|output|compact> <value>.",
+            )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());
         }

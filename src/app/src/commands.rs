@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt, mem, str, time::Duration};
+use std::{borrow::Cow, fmt, time::Duration};
 
 use blackwall_core::protocol::{
     AgentEvent, Attachment, ChatMessage, ChatRequest, ChatResponse, MessageRole, ModelCatalog,
@@ -21,11 +21,10 @@ const API_KEY_ENVIRONMENT_VARIABLE: &str = "BLACKWALL_MODEL_API_KEY";
 const MAX_ERROR_BODY_BYTES: usize = 1_000;
 const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+
 const MODEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_CHAT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const MODEL_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Process-wide dependencies shared by Tauri commands.
 pub(crate) struct AppState {
@@ -129,9 +128,7 @@ impl CommandError {
                 _ => "model_http_error",
             },
             BridgeError::ModelError(_) => "model_error",
-            BridgeError::Decode(_) | BridgeError::InvalidEventEncoding(_) => {
-                "invalid_model_response"
-            }
+            BridgeError::Decode(_) => "invalid_model_response",
             BridgeError::ResponseTooLarge { .. } => "model_response_too_large",
             BridgeError::EmptyModelResponse => "empty_model_response",
             BridgeError::Emit(_) => "event_bridge_error",
@@ -153,6 +150,70 @@ impl CommandError {
                 _ => "The model could not complete the request. Try again or check the model service.",
             }.into(),
             retryable,
+        }
+    }
+}
+
+impl From<blackwall_core::model::ModelError> for CommandError {
+    fn from(error: blackwall_core::model::ModelError) -> Self {
+        use blackwall_core::model::ModelError;
+        match error {
+            ModelError::Http(code) => Self::from_bridge(BridgeError::HttpStatus {
+                status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                body: String::new(),
+            }),
+            ModelError::Network => Self {
+                code: "model_unavailable",
+                message: error.to_string(),
+                retryable: true,
+            },
+            ModelError::Invalid => Self {
+                code: "invalid_model_response",
+                message: error.to_string(),
+                retryable: false,
+            },
+            ModelError::Limit => Self {
+                code: "context_limit",
+                message: error.to_string(),
+                retryable: false,
+            },
+        }
+    }
+}
+impl From<blackwall_core::context::ContextError> for CommandError {
+    fn from(error: blackwall_core::context::ContextError) -> Self {
+        use blackwall_core::context::ContextError;
+        let code = match error {
+            ContextError::Model(model) => return model.into(),
+            ContextError::Budget => "context_budget_invalid",
+            ContextError::Limit => "context_limit",
+            ContextError::History => "context_history_invalid",
+            ContextError::Summary => "context_summary_invalid",
+            ContextError::Nothing => "context_nothing_to_compact",
+        };
+        Self {
+            code,
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+}
+impl From<blackwall_core::agent::AgentError> for CommandError {
+    fn from(error: blackwall_core::agent::AgentError) -> Self {
+        use blackwall_core::agent::AgentError;
+        match error {
+            AgentError::Budget(error) => error.into(),
+            AgentError::Model(error) => error.into(),
+            AgentError::Iterations => Self {
+                code: "agent_iteration_limit",
+                message: error.to_string(),
+                retryable: false,
+            },
+            AgentError::Context => Self {
+                code: "context_limit",
+                message: error.to_string(),
+                retryable: false,
+            },
         }
     }
 }
@@ -199,8 +260,6 @@ enum BridgeError {
     ModelError(String),
     #[error("model endpoint returned invalid JSON: {0}")]
     Decode(#[source] serde_json::Error),
-    #[error("model stream contained invalid UTF-8: {0}")]
-    InvalidEventEncoding(#[source] str::Utf8Error),
     #[error("model response exceeded the {maximum_bytes}-byte safety limit")]
     ResponseTooLarge { maximum_bytes: usize },
     #[error("model endpoint returned no assistant choice")]
@@ -373,6 +432,10 @@ pub(crate) async fn stream_chat(
             message,
             retryable: false,
         })?;
+    let source = blackwall_core::model::messages(&request);
+    let context =
+        blackwall_core::context::ContextState::restore(&source, request.context_state.as_ref())
+            .map_err(CommandError::from)?;
     let api_key = scoped_api_key(&state, &selected).await?;
     let stopped = || CommandError {
         code: "request_stopped",
@@ -432,11 +495,9 @@ pub(crate) async fn stream_chat(
                 .insert(0, ChatMessage::new(MessageRole::System, skill_context));
         }
         let backend = blackwall_core::model::HttpModel::new(&selected, &request.model, api_key)
-            .map_err(|error| CommandError {
-                code: "model_error",
-                message: error.to_string(),
-                retryable: true,
-            })?;
+            .and_then(|model| model.with_budget(request.context_budget))
+            .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+            .map_err(CommandError::from)?;
         let event_app = app.clone();
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
@@ -450,14 +511,14 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run_with_memory(&request_id,blackwall_core::model::messages(&request),memory.as_ref())=>result.map(|_|()).map_err(|error|CommandError{code:"agent_error",message:error.to_string(),retryable:false}),
+            result=runner.run_context_with_memory(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact },memory.as_ref())=>result.map(|_|()).map_err(CommandError::from),
         }
     } else {
         inject_memory(&app, &mut request, None).await?;
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=stream_chat_events(&state.client,api_key.as_deref(),&state.default_endpoint,&app,request)=>result.map_err(CommandError::from),
+            result=stream_chat_events(api_key.as_deref(),&state.default_endpoint,&app,request,&source,context)=>result,
         }
     };
     if let Err(error) = stream_result {
@@ -564,13 +625,21 @@ async fn complete_chat(
     request: ChatRequest,
 ) -> Result<ChatResponse, BridgeError> {
     let endpoint = selected_endpoint(&request, default_endpoint)?;
+    request
+        .context_budget
+        .check(&blackwall_core::model::messages(&request), &[])
+        .map_err(|error| BridgeError::ModelError(error.to_string()))?;
     let messages = build_api_messages(&request)?;
     let payload = ApiCompletionRequest {
         model: &request.model,
         messages,
         stream: false,
         temperature: request.temperature,
-        max_tokens: request.max_tokens,
+        max_tokens: Some(
+            request
+                .max_tokens
+                .unwrap_or(request.context_budget.output_tokens),
+        ),
         stream_options: None,
     };
     let response = authorized_request(
@@ -608,135 +677,43 @@ async fn complete_chat(
 }
 
 async fn stream_chat_events(
-    client: &Client,
     api_key: Option<&str>,
     default_endpoint: &str,
     app: &AppHandle,
     request: ChatRequest,
-) -> Result<(), BridgeError> {
-    let endpoint = selected_endpoint(&request, default_endpoint)?;
-    let messages = build_api_messages(&request)?;
-    let payload = ApiCompletionRequest {
-        model: &request.model,
-        messages,
-        stream: true,
-        temperature: request.temperature,
-        max_tokens: request.max_tokens,
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }),
-    };
-    let response = authorized_request(
-        client
-            .post(format!("{endpoint}/chat/completions"))
-            .timeout(MODEL_STREAM_TIMEOUT)
-            .json(&payload),
-        api_key,
+    source: &[serde_json::Value],
+    context: blackwall_core::context::ContextState,
+) -> Result<(), CommandError> {
+    let endpoint = selected_endpoint(&request, default_endpoint).map_err(CommandError::from)?;
+    let backend = blackwall_core::model::HttpModel::new(
+        &endpoint,
+        &request.model,
+        api_key.map(str::to_owned),
     )
-    .send()
-    .await
-    .map_err(BridgeError::Request)?;
-    let response = require_success(response).await?;
-    let mut bytes = response.bytes_stream();
-    let mut decoder = SseDecoder::default();
-    let mut content = String::new();
-    let mut finish_reason = None;
-    let mut usage = None;
-    let mut done = false;
-    let mut received_bytes = 0_usize;
-
-    while let Some(chunk) = bytes.next().await {
-        let chunk = chunk.map_err(BridgeError::Request)?;
-        received_bytes = received_bytes.saturating_add(chunk.len());
-        if received_bytes > MAX_MODEL_RESPONSE_BYTES {
-            return Err(BridgeError::ResponseTooLarge {
-                maximum_bytes: MAX_MODEL_RESPONSE_BYTES,
-            });
-        }
-        decoder.push(&chunk);
-        while let Some(frame) = decoder.next_frame() {
-            if consume_stream_frame(
-                app,
-                &request.request_id,
-                &frame,
-                &mut content,
-                &mut finish_reason,
-                &mut usage,
-            )? {
-                done = true;
-                break;
-            }
-        }
-        if decoder.len() > MAX_SSE_FRAME_BYTES {
-            return Err(BridgeError::ResponseTooLarge {
-                maximum_bytes: MAX_SSE_FRAME_BYTES,
-            });
-        }
-        if done {
-            break;
-        }
-    }
-
-    if let Some(frame) = decoder.take_remainder().filter(|_| !done) {
-        let _done = consume_stream_frame(
-            app,
-            &request.request_id,
-            &frame,
-            &mut content,
-            &mut finish_reason,
-            &mut usage,
-        )?;
-    }
-
-    emit_event(
-        app,
-        &AgentEvent::TurnComplete {
-            request_id: request.request_id,
-            message: ChatMessage::new(MessageRole::Assistant, content),
-            finish_reason,
-            usage,
+    .and_then(|model| model.with_budget(request.context_budget))
+    .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+    .map_err(CommandError::from)?;
+    let instructions: Vec<_> = blackwall_core::model::messages(&request)
+        .into_iter()
+        .take(request.messages.len().saturating_sub(source.len()))
+        .collect();
+    blackwall_core::context::chat(
+        &backend,
+        &request.request_id,
+        blackwall_core::context::ContextRun {
+            source: source.to_vec(),
+            state: context,
+            budget: request.context_budget,
+            instructions,
+            compact: request.compact,
+        },
+        &|event| {
+            let _ = emit_event(app, &event);
         },
     )
-}
-
-fn consume_stream_frame(
-    app: &AppHandle,
-    request_id: &str,
-    frame: &[u8],
-    content: &mut String,
-    finish_reason: &mut Option<String>,
-    usage: &mut Option<TokenUsage>,
-) -> Result<bool, BridgeError> {
-    let Some(data) = sse_data(frame)? else {
-        return Ok(false);
-    };
-    if data.trim() == "[DONE]" {
-        return Ok(true);
-    }
-
-    let chunk: ApiCompletionChunk = serde_json::from_str(&data).map_err(BridgeError::Decode)?;
-    if let Some(error) = chunk.error {
-        return Err(BridgeError::ModelError(error.into_message()));
-    }
-    if let Some(chunk_usage) = chunk.usage {
-        *usage = Some(chunk_usage);
-    }
-    for choice in chunk.choices {
-        if let Some(reason) = choice.finish_reason {
-            *finish_reason = Some(reason);
-        }
-        if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
-            content.push_str(&delta);
-            emit_event(
-                app,
-                &AgentEvent::AssistantDelta {
-                    request_id: request_id.to_owned(),
-                    delta,
-                },
-            )?;
-        }
-    }
-    Ok(false)
+    .await
+    .map(|_| ())
+    .map_err(CommandError::from)
 }
 
 fn emit_event(app: &AppHandle, event: &AgentEvent) -> Result<(), BridgeError> {
@@ -968,73 +945,6 @@ fn multimodal_content(message: &ChatMessage, attachments: &[&Attachment]) -> Api
     ApiContent::Parts(parts)
 }
 
-fn sse_data(frame: &[u8]) -> Result<Option<String>, BridgeError> {
-    let frame = str::from_utf8(frame).map_err(BridgeError::InvalidEventEncoding)?;
-    let mut data_lines = Vec::new();
-    for line in frame.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
-        }
-    }
-    if data_lines.is_empty() {
-        let raw = frame.trim();
-        if raw.starts_with('{') || raw == "[DONE]" {
-            return Ok(Some(raw.to_owned()));
-        }
-        return Ok(None);
-    }
-    Ok(Some(data_lines.join("\n")))
-}
-
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn next_frame(&mut self) -> Option<Vec<u8>> {
-        let (position, separator_length) = frame_separator(&self.buffer)?;
-        let mut frame = mem::take(&mut self.buffer);
-        self.buffer = frame.split_off(position + separator_length);
-        frame.truncate(position);
-        Some(frame)
-    }
-
-    fn take_remainder(&mut self) -> Option<Vec<u8>> {
-        if self.buffer.iter().all(u8::is_ascii_whitespace) {
-            self.buffer.clear();
-            None
-        } else {
-            Some(mem::take(&mut self.buffer))
-        }
-    }
-}
-
-fn frame_separator(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| (position, 2));
-    let crlf = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, 4));
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-        (Some(separator), None) | (None, Some(separator)) => Some(separator),
-        (None, None) => None,
-    }
-}
-
 #[derive(Deserialize)]
 struct ApiModelCatalog {
     #[serde(default)]
@@ -1123,16 +1033,6 @@ struct ApiIncomingMessage {
 }
 
 #[derive(Deserialize)]
-struct ApiCompletionChunk {
-    #[serde(default)]
-    choices: Vec<ApiStreamChoice>,
-    #[serde(default)]
-    usage: Option<TokenUsage>,
-    #[serde(default)]
-    error: Option<ApiErrorPayload>,
-}
-
-#[derive(Deserialize)]
 #[serde(untagged)]
 enum ApiErrorPayload {
     Object { message: String },
@@ -1145,20 +1045,6 @@ impl ApiErrorPayload {
             Self::Object { message } | Self::Text(message) => message,
         }
     }
-}
-
-#[derive(Deserialize)]
-struct ApiStreamChoice {
-    #[serde(default)]
-    delta: ApiDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct ApiDelta {
-    #[serde(default)]
-    content: Option<String>,
 }
 
 #[cfg(test)]
@@ -1205,22 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn sse_decoder_preserves_frames_split_across_chunks() {
-        let mut decoder = SseDecoder::default();
-        decoder.push(b"data: {\"choices\":[{\"delta\":{");
-        assert!(decoder.next_frame().is_none());
-        decoder.push(b"\"content\":\"hi\"}}]}\n\ndata: [DONE]\r\n\r\n");
-
-        let first = decoder.next_frame().unwrap();
-        let second = decoder.next_frame().unwrap();
-        assert!(sse_data(&first)
-            .unwrap()
-            .unwrap()
-            .contains("\"content\":\"hi\""));
-        assert_eq!(sse_data(&second).unwrap().as_deref(), Some("[DONE]"));
-    }
-
-    #[test]
     fn image_attachments_become_openai_content_parts() {
         let request = ChatRequest {
             request_id: "r1".to_owned(),
@@ -1237,6 +1107,9 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            context_budget: Default::default(),
+            context_state: None,
+            compact: false,
         };
 
         let messages = build_api_messages(&request).unwrap();
