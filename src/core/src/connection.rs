@@ -144,9 +144,7 @@ async fn probe(name: &str, origin: &str, ollama: bool) -> LocalService {
 /// endpoints on Ollama's default port are asked; other services, unloaded models, and
 /// unreachable hosts keep the configured budget.
 pub async fn served_budget(endpoint: &str, model: &str, budget: ContextBudget) -> ContextBudget {
-    let Some(origin) = endpoint.strip_suffix("/v1").filter(|origin| {
-        Url::parse(origin).is_ok_and(|url| url.port_or_known_default() == Some(11434))
-    }) else {
+    let Some(origin) = ollama_origin(endpoint) else {
         return budget;
     };
     let fetch = async {
@@ -163,20 +161,32 @@ pub async fn served_budget(endpoint: &str, model: &str, budget: ContextBudget) -
     }
 }
 
+fn ollama_origin(endpoint: &str) -> Option<&str> {
+    endpoint.strip_suffix("/v1").filter(|origin| {
+        Url::parse(origin).is_ok_and(|url| url.port_or_known_default() == Some(11434))
+    })
+}
+
 fn sized_to_loaded(budget: ContextBudget, value: &serde_json::Value, model: &str) -> ContextBudget {
+    // Ollama reports untagged names with their implied `:latest` tag.
+    let tagged = if model.contains(':') {
+        model.to_owned()
+    } else {
+        format!("{model}:latest")
+    };
     let window = value
         .get("models")
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(model))
+        .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(tagged.as_str()))
         .and_then(|item| item.get("context_length"))
         .and_then(|v| v.as_u64());
     let Some(window) = window else {
         return budget;
     };
     let sized = ContextBudget {
-        context_window: window,
+        context_window: window.min(1_000_000),
         output_tokens: (window / 4).min(32_768) as u32,
         ..budget
     };
@@ -382,6 +392,34 @@ mod tests {
             );
         }
         assert_eq!(sized_to_loaded(configured, &ps, "missing"), configured);
+        assert_eq!(
+            sized_to_loaded(configured, &ps, "other").context_window,
+            8192
+        );
+        let huge =
+            serde_json::json!({"models": [{"name": "big:latest", "context_length": 2_000_000}]});
+        assert_eq!(
+            sized_to_loaded(configured, &huge, "big").context_window,
+            1_000_000
+        );
+    }
+    #[test]
+    fn only_ollama_default_port_endpoints_are_probed() {
+        assert_eq!(
+            ollama_origin("http://127.0.0.1:11434/v1"),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(
+            ollama_origin("http://gpu-box:11434/v1"),
+            Some("http://gpu-box:11434")
+        );
+        for other in [
+            "http://127.0.0.1:1234/v1",
+            "https://api.example.com/v1",
+            "http://127.0.0.1:11434/proxy",
+        ] {
+            assert_eq!(ollama_origin(other), None, "{other}");
+        }
     }
     #[test]
     fn invitations_reject_unsafe_schemes_and_malformed_secrets() {
