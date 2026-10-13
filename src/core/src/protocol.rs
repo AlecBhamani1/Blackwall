@@ -490,8 +490,8 @@ impl AgentEvent {
 /// Protocol validation failure detected before I/O.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ProtocolError {
-    /// Invalid model context or output reservation.
-    #[error("Invalid context budget or output reserve.")]
+    /// Invalid model context, output reservation, or agent limits.
+    #[error("Invalid context budget, output reserve, or agent limits.")]
     InvalidContextBudget,
     /// No request correlation identifier was provided.
     #[error("requestId must not be empty")]

@@ -27,6 +27,8 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings context <n>     Configure model context limit in tokens
   /settings output <n>      Reserve generated output tokens
   /settings compact on|off  Automatically compact near the context limit
+  /settings iterations <n>  Limit model/tool iterations per Agent run
+  /settings timeout <n>     Limit each shell command in seconds
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -205,7 +207,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|web|memory|context|output|compact> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|web|memory|context|output|compact|iterations|timeout> <value>.".into(),
             )
         }
     }
@@ -370,7 +372,7 @@ fn slash(
         ),
         "settings" => {
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
-                "Use /settings <model|endpoint|web|memory|context|output|compact> <value>.",
+                "Use /settings <model|endpoint|web|memory|context|output|compact|iterations|timeout> <value>.",
             )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());

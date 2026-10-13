@@ -24,6 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
+- Configure the Agent iteration limit and shell command time limit next to the context controls in
+  desktop Memory and `bw config`. Defaults remain 20 iterations and two minutes.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
