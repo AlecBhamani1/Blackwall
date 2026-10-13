@@ -389,7 +389,8 @@ export function createChatController(
         : Math.ceil(
             new TextEncoder().encode(JSON.stringify(asModelMessages($messages))).length / 3,
           );
-      return Math.min(100, Math.round((estimate / ($preferences.contextWindow ?? 32000)) * 100));
+      const window = $report?.contextWindow ?? $preferences.contextWindow ?? 32000;
+      return Math.min(100, Math.round((estimate / window) * 100));
     },
   );
   function showContext(): void {

@@ -310,7 +310,7 @@ pub async fn execute(
                 workspace.path.display()
             );
             if !approvals
-                .request(request_id, ApprovalKind::File, detail, emit)
+                .request(request_id, ApprovalKind::File, path, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {
@@ -326,7 +326,7 @@ pub async fn execute(
             }
             let detail=format!("Project: {}\nCommand: {command}\n\nThis command runs with your account permissions. It can access files outside the project and use the network.",workspace.path.display());
             if !approvals
-                .request(request_id, ApprovalKind::Exec, detail, emit)
+                .request(request_id, ApprovalKind::Exec, command, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {

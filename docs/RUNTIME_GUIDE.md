@@ -74,7 +74,11 @@ Finder and macOS screenshot-thumbnail drops still require packaged native accept
 Open **Memory → Advanced · Context window** to set the context limit configured in your selected
 model service and the output reserve. Settings apply to the selected connection's future requests;
 check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
-tokens, and automatic compaction off. The same section sets the Agent iteration limit (1–100, default
+tokens, and automatic compaction off. The browser development UI also saves these controls locally.
+When an Ollama service on its default port (11434) has the model loaded, CLI and desktop requests
+use the context window it reports instead, reserving a quarter of it (up to 32,768 tokens) for
+output. Ollama sets that window itself (for example with `OLLAMA_CONTEXT_LENGTH`); requests cannot
+change it. The same section sets the Agent iteration limit (1–100, default
 20) and the command time limit (10–3,600 seconds, default 120). The browser development UI also saves
 these controls locally.
 
@@ -152,6 +156,28 @@ is the authority for file tools; a folder must be selected again after reopening
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
+
+To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
+(`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
+`deny`), a `kind` (`exec`, `file`, or `network`), and one matching field:
+
+```json
+{"rules":[
+  {"decision":"allow","kind":"exec","command":"cargo test"},
+  {"decision":"deny","kind":"file","path":".git"},
+  {"decision":"allow","kind":"network","host":"*.docs.rs"}
+]}
+```
+
+`command` matches the leading words of a shell command, `path` matches a workspace-relative path and
+everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. Ask and deny
+path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
+and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
+prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
+instead of matching an allow rule. Edits inside the data folder always ask, even when the project
+contains it. Rules load when a run starts. If the file is invalid, every action asks and the prompt
+shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
+common credential forms redacted; the log rotates at 1 MiB.
 
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
