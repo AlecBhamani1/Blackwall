@@ -248,7 +248,6 @@ fn validate(tools: Vec<CommandTool>) -> Result<Vec<CommandTool>, &'static str> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
 
     async fn load(body: &str) -> (CommandTools, std::path::PathBuf) {
         let directory =
@@ -304,6 +303,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn arguments_are_passed_without_a_shell_and_options_are_rejected() {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
         let (tools, directory) = load(
             r#"{"tools":[{"name":"echo_back","description":"Echo","command":["echo","{text}"]}]}"#,
         )
