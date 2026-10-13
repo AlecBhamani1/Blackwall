@@ -179,6 +179,24 @@ contains it. Rules load when a run starts. If the file is invalid, every action 
 shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
 common credential forms redacted; the log rotates at 1 MiB.
 
+To let Agent mode call other programs, such as another coding assistant's command line, list them
+in `tools.json` in the same data folder:
+
+```json
+{"tools":[
+  {"name":"ask_claude","description":"Ask Claude a question","command":["claude","-p","{prompt}"]}
+]}
+```
+
+Each tool runs its program directly, without a shell, in the project folder. The program must be a
+name found in an absolute `PATH` directory or an absolute path. Batch files (`.bat`, `.cmd`) are
+refused, and on Windows the program must be an `.exe`. An argument written as a whole `{name}` becomes a text parameter the model
+fills in; values that start with `-` (or `/` on Windows) are rejected so the model cannot add
+options. Every call needs Exec approval and is matched by rules
+against the configured command, so `{"decision":"allow","kind":"exec","command":"claude -p"}` allows
+it without a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
+owner tools are offered and the run shows a warning.
+
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
 configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children
