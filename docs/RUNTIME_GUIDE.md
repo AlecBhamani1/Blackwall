@@ -75,6 +75,10 @@ Open **Memory → Advanced · Context window** to set the context limit configur
 model service and the output reserve. Settings apply to the selected connection's future requests;
 check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
 tokens, and automatic compaction off. The browser development UI also saves these controls locally.
+When an Ollama service on its default port (11434) has the model loaded, CLI and desktop requests
+use the context window it reports instead, reserving a quarter of it (up to 32,768 tokens) for
+output. Ollama sets that window itself (for example with `OLLAMA_CONTEXT_LENGTH`); requests cannot
+change it.
 
 Type `/context` in the composer or CLI to see estimated prompt and tool-definition tokens, the
 output reserve, the 5% safety reserve, and separately labeled server-reported usage when available.

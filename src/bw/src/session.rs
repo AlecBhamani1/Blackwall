@@ -2,7 +2,7 @@ use crate::{input::Input, settings::Settings};
 use blackwall_core::{
     agent::Agent,
     approvals::Approvals,
-    connection::{normalize_endpoint, same_origin},
+    connection::{normalize_endpoint, same_origin, served_budget},
     context::{ContextRun, ContextState},
     memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
@@ -180,12 +180,13 @@ impl Conversation {
         input: &mut Input,
     ) -> Result<(), String> {
         self.flush(store)?;
+        let budget = served_budget(&settings.endpoint, &settings.model, settings.budget).await;
         let backend = HttpModel::new(
             &settings.endpoint,
             &settings.model,
             environment_key(&settings.endpoint),
         )
-        .and_then(|m| m.with_budget(settings.budget))
+        .and_then(|m| m.with_budget(budget))
         .map_err(|e| e.to_string())?;
         let messages = context(store, directory, settings, &self.session)?;
         let (instructions, source): (Vec<_>, Vec<_>) =
@@ -200,7 +201,7 @@ impl Conversation {
             ContextRun {
                 source,
                 state,
-                budget: settings.budget,
+                budget,
                 instructions,
                 compact: true,
             },
@@ -230,12 +231,13 @@ impl Conversation {
         input: &mut Input,
     ) -> Result<(), String> {
         self.flush(store)?;
+        let budget = served_budget(&settings.endpoint, &settings.model, settings.budget).await;
         let backend = HttpModel::new(
             &settings.endpoint,
             &settings.model,
             environment_key(&settings.endpoint),
         )
-        .and_then(|backend| backend.with_budget(settings.budget))
+        .and_then(|backend| backend.with_budget(budget))
         .map_err(|error| error.to_string())?;
         let workspace = Workspace::open(&self.workspace).map_err(|error| error.to_string())?;
         let timestamp = now()?;
@@ -268,7 +270,7 @@ impl Conversation {
             ContextRun {
                 source,
                 state,
-                budget: settings.budget,
+                budget,
                 instructions,
                 compact: false,
             },
