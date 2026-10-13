@@ -75,10 +75,23 @@ function storedContextPreferences(): Preferences {
       typeof value.autoCompact !== 'boolean'
     )
       return {};
+    const limits =
+      Number.isInteger(value.maxIterations) &&
+      value.maxIterations >= 1 &&
+      value.maxIterations <= 100 &&
+      Number.isInteger(value.commandTimeoutSeconds) &&
+      value.commandTimeoutSeconds >= 10 &&
+      value.commandTimeoutSeconds <= 3600
+        ? {
+            maxIterations: value.maxIterations,
+            commandTimeoutSeconds: value.commandTimeoutSeconds,
+          }
+        : {};
     return {
       contextWindow: value.contextWindow,
       outputTokens: value.outputTokens,
       autoCompact: value.autoCompact,
+      ...limits,
     };
   } catch {
     return {};
@@ -339,6 +352,8 @@ export function createChatController(
                 merged.outputTokens ??
                 Math.min(4096, Math.floor((merged.contextWindow ?? 32000) / 4)),
               autoCompact: merged.autoCompact ?? false,
+              maxIterations: merged.maxIterations ?? 20,
+              commandTimeoutSeconds: merged.commandTimeoutSeconds ?? 120,
             }),
           );
         } catch {
@@ -362,6 +377,8 @@ export function createChatController(
       outputTokens:
         settings.outputTokens ?? Math.min(4096, Math.floor((settings.contextWindow ?? 32000) / 4)),
       autoCompact: settings.autoCompact ?? false,
+      maxIterations: settings.maxIterations ?? 20,
+      commandTimeoutSeconds: settings.commandTimeoutSeconds ?? 120,
     };
   }
   const contextPercent = derived(

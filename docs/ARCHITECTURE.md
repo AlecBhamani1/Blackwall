@@ -161,7 +161,7 @@ project are rejected. Literal search is bounded and skips dependency folders. Ed
 diff and compare the original file again before an atomic replacement.
 
 Shell actions display the exact command and working directory. They run with the user's account
-permissions, **without an OS sandbox**. Each command has a two-minute deadline, separate 64 KiB
+permissions, **without an OS sandbox**. Each command has a configurable deadline (two minutes by default), separate 64 KiB
 stdout/stderr limits, and a process-group guard that kills descendants on cancellation. Known model,
 relay, and signing secrets are removed from the inherited environment. Other account access remains
 possible and is covered by the explicit command approval.

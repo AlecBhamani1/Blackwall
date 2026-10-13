@@ -24,6 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
+- Configure the Agent iteration limit and shell command time limit next to the context controls in
+  desktop Memory and `bw config`. Defaults remain 20 iterations and two minutes.
+  
 - Decide agent actions with owner-defined allow, ask, and deny rules in `~/.blackwall/policy.json`.
   Projects cannot add rules, chained shell commands never match an allow rule, invalid files fall
   back to asking, and every decision is recorded in a redacted local audit log.

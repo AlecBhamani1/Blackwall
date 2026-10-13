@@ -66,6 +66,9 @@ export interface ContextBudget {
   contextWindow: number;
   outputTokens: number;
   autoCompact: boolean;
+  /** Omitted limits use the runtime defaults of 20 iterations and 120 seconds. */
+  maxIterations?: number;
+  commandTimeoutSeconds?: number;
 }
 export interface ContextReport {
   estimatedPromptTokens: number;

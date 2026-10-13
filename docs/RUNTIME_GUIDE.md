@@ -78,7 +78,9 @@ tokens, and automatic compaction off. The browser development UI also saves thes
 When an Ollama service on its default port (11434) has the model loaded, CLI and desktop requests
 use the context window it reports instead, reserving a quarter of it (up to 32,768 tokens) for
 output. Ollama sets that window itself (for example with `OLLAMA_CONTEXT_LENGTH`); requests cannot
-change it.
+change it. The same section sets the Agent iteration limit (1–100, default
+20) and the command time limit (10–3,600 seconds, default 120). The browser development UI also saves
+these controls locally.
 
 Type `/context` in the composer or CLI to see estimated prompt and tool-definition tokens, the
 output reserve, the 5% safety reserve, and separately labeled server-reported usage when available.
@@ -111,10 +113,13 @@ CLI equivalents:
 bw config set context 32000
 bw config set output 4096
 bw config set compact on
+bw config set iterations 20
+bw config set timeout 120
 ```
 
-During interactive CLI chat, use `/settings context <tokens>`, `/settings output <tokens>`, and
-`/settings compact on|off`. `/compact` does not add a user or assistant message. Ctrl+C cancels
+During interactive CLI chat, use `/settings context <tokens>`, `/settings output <tokens>`,
+`/settings compact on|off`, `/settings iterations <count>`, and `/settings timeout <seconds>`.
+`/compact` does not add a user or assistant message. Ctrl+C cancels
 summary generation. The original transcript remains subject to the conversation store's size limit;
 compaction releases model prompt space, not disk space.
 
@@ -175,13 +180,13 @@ shows the problem. Each rule decision and approval outcome is appended to `polic
 common credential forms redacted; the log rotates at 1 MiB.
 
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
-`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they have a two-minute
-limit, and cancellation terminates their process group or Windows Job Object, including children
+`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
+configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children
 whose parent shell has already exited. Review the command itself when
 deciding; the selected project folder does not constrain what an approved shell command can access.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
-20 model/tool iterations; each child stops after eight. Pure child batches have a maximum concurrency
+the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency
 of three. The selected model must support OpenAI-compatible tool calls for Agent mode to work well.
 
 Tool entries are collapsed by default and can be expanded to inspect results. Restored transcripts
