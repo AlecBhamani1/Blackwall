@@ -437,6 +437,15 @@ pub(crate) async fn stream_chat(
             message,
             retryable: false,
         })?;
+    request.context_budget = blackwall_core::connection::served_budget(
+        &selected,
+        &request.model,
+        request.context_budget,
+    )
+    .await;
+    request.max_tokens = request
+        .max_tokens
+        .map(|tokens| tokens.min(request.context_budget.output_tokens));
     let source = blackwall_core::model::messages(&request);
     let context =
         blackwall_core::context::ContextState::restore(&source, request.context_state.as_ref())

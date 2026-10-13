@@ -28,6 +28,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
 
+- Size requests to the context window Ollama loaded the selected model with, reserving a quarter
+  of it (up to 32,768 tokens) for output, so long replies are no longer cut off at 4,096 tokens.
+
 ## [0.1.4] - 2026-10-01
 
 Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).
