@@ -808,13 +808,21 @@ describe('context commands', () => {
     const client = mockClient();
     const controller = createChatController(client);
     await controller.initialize();
-    controller.savePreferences({ contextWindow: 8192, outputTokens: 1024, autoCompact: true });
+    controller.savePreferences({
+      contextWindow: 8192,
+      outputTokens: 1024,
+      autoCompact: true,
+      maxIterations: 40,
+      commandTimeoutSeconds: 600,
+    });
     await controller.send('Initial task', []);
     await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
     expect(vi.mocked(client.streamChat).mock.calls[0][0].contextBudget).toEqual({
       contextWindow: 8192,
       outputTokens: 1024,
       autoCompact: true,
+      maxIterations: 40,
+      commandTimeoutSeconds: 600,
     });
     const original = structuredClone(get(controller.messages));
     const snapshot = {

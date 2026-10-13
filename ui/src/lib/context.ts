@@ -29,6 +29,9 @@ export const estimateTokens = (messages: Message[]): number =>
       images * 4096
     );
   }, 0);
+function optionalInRange(value: number | undefined, min: number, max: number): boolean {
+  return value === undefined || (Number.isInteger(value) && value >= min && value <= max);
+}
 export function contextBudget(request: ChatRequest): ContextBudget {
   const budget = request.contextBudget ?? {
     contextWindow: 32000,
@@ -41,9 +44,11 @@ export function contextBudget(request: ChatRequest): ContextBudget {
     budget.contextWindow > 1000000 ||
     !Number.isInteger(budget.outputTokens) ||
     budget.outputTokens < 1 ||
-    budget.outputTokens + Math.floor(budget.contextWindow / 20) >= budget.contextWindow
+    budget.outputTokens + Math.floor(budget.contextWindow / 20) >= budget.contextWindow ||
+    !optionalInRange(budget.maxIterations, 1, 100) ||
+    !optionalInRange(budget.commandTimeoutSeconds, 10, 3600)
   )
-    throw new Error('Invalid model context limit or output reserve.');
+    throw new Error('Invalid model context limit, output reserve, or agent limits.');
   return budget;
 }
 export function checkBudget(messages: Message[], budget: ContextBudget): void {

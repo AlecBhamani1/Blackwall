@@ -92,7 +92,13 @@ pub async fn fetch(
     for redirects in 0..=2 {
         let detail=format!("Read web page\nGET {url}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.");
         if !approvals
-            .request(request_id, ApprovalKind::Network, detail, emit)
+            .request(
+                request_id,
+                ApprovalKind::Network,
+                url.host_str().unwrap_or_default(),
+                detail,
+                emit,
+            )
             .await
             .map_err(ToolError::Execution)?
         {

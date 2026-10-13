@@ -14,6 +14,8 @@ pub struct ContextBudget {
     pub context_window: u64,
     pub output_tokens: u32,
     pub auto_compact: bool,
+    pub max_iterations: u32,
+    pub command_timeout_seconds: u64,
 }
 impl Default for ContextBudget {
     fn default() -> Self {
@@ -21,6 +23,8 @@ impl Default for ContextBudget {
             context_window: 32_000,
             output_tokens: 4096,
             auto_compact: false,
+            max_iterations: 20,
+            command_timeout_seconds: 120,
         }
     }
 }
@@ -30,6 +34,8 @@ impl ContextBudget {
             || self.output_tokens == 0
             || self.output_tokens > 32768
             || u64::from(self.output_tokens) + self.safety_tokens() >= self.context_window
+            || !(1..=100).contains(&self.max_iterations)
+            || !(10..=3600).contains(&self.command_timeout_seconds)
         {
             return Err(ContextError::Budget);
         }
@@ -163,7 +169,7 @@ pub struct ContextState {
 #[derive(Debug, Error)]
 pub enum ContextError {
     #[error(
-        "Choose a context limit of 2,048–1,000,000 tokens and a smaller, positive output reserve."
+        "Choose a context limit of 2,048–1,000,000 tokens, a smaller positive output reserve, 1–100 iterations, and a 10–3,600 second command time limit."
     )]
     Budget,
     #[error("The estimated request exceeds the model context budget. Use /compact, increase the configured limit, or shorten the task.")]
@@ -301,6 +307,7 @@ impl ContextState {
                 context_window: 1_000_000,
                 output_tokens: 32768,
                 auto_compact: false,
+                ..Default::default()
             })?;
             previous = checkpoint.through;
         }
@@ -546,6 +553,7 @@ mod tests {
                 context_window: 8192,
                 output_tokens: 1024,
                 auto_compact: false,
+                ..Default::default()
             },
         }
     }
@@ -693,6 +701,7 @@ mod tests {
                     context_window: 8192,
                     output_tokens: 1024,
                     auto_compact: true,
+                    ..Default::default()
                 };
                 budget.check(messages, &[]).unwrap();
                 if messages[0]["content"]
@@ -734,6 +743,7 @@ mod tests {
                 context_window: 8192,
                 output_tokens: 1024,
                 auto_compact: true,
+                ..Default::default()
             },
             instructions: vec![],
             compact: false,
@@ -805,6 +815,7 @@ mod tests {
             context_window: 2048,
             output_tokens: 512,
             auto_compact: false,
+            ..Default::default()
         };
         let messages = vec![json!({"role":"user","content":"x".repeat(3000)})];
         assert!(budget.check(&messages, &[]).is_ok());
@@ -818,6 +829,34 @@ mod tests {
         }
         .validate()
         .is_err());
+        for invalid in [
+            ContextBudget {
+                max_iterations: 0,
+                ..budget
+            },
+            ContextBudget {
+                max_iterations: 101,
+                ..budget
+            },
+            ContextBudget {
+                command_timeout_seconds: 9,
+                ..budget
+            },
+            ContextBudget {
+                command_timeout_seconds: 3601,
+                ..budget
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        let older: ContextBudget = serde_json::from_value(
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":false}),
+        )
+        .unwrap();
+        assert_eq!(
+            (older.max_iterations, older.command_timeout_seconds),
+            (20, 120)
+        );
         let usage = TokenUsage {
             prompt_tokens: 17,
             completion_tokens: 4,

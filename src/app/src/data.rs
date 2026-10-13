@@ -128,6 +128,8 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "contextWindow"
                 | "outputTokens"
                 | "autoCompact"
+                | "maxIterations"
+                | "commandTimeoutSeconds"
                 | "memoryEnabled"
                 | "workspace"
                 | "connections"
@@ -160,6 +162,18 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=32768).contains(&n)))
     {
         return Err("Choose an output reserve between 1 and 32,768 tokens.".into());
+    }
+    if object
+        .get("maxIterations")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=100).contains(&n)))
+    {
+        return Err("Choose an iteration limit between 1 and 100.".into());
+    }
+    if object
+        .get("commandTimeoutSeconds")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (10..=3600).contains(&n)))
+    {
+        return Err("Choose a command time limit between 10 and 3,600 seconds.".into());
     }
     if object
         .values()

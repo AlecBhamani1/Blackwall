@@ -283,6 +283,7 @@ pub async fn execute(
     request_id: &str,
     approvals: &Approvals,
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    command_timeout: Duration,
 ) -> Result<String, ToolError> {
     let arguments: Value =
         serde_json::from_str(&call.function.arguments).map_err(|_| ToolError::Arguments)?;
@@ -309,7 +310,7 @@ pub async fn execute(
                 workspace.path.display()
             );
             if !approvals
-                .request(request_id, ApprovalKind::File, detail, emit)
+                .request(request_id, ApprovalKind::File, path, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {
@@ -325,13 +326,13 @@ pub async fn execute(
             }
             let detail=format!("Project: {}\nCommand: {command}\n\nThis command runs with your account permissions. It can access files outside the project and use the network.",workspace.path.display());
             if !approvals
-                .request(request_id, ApprovalKind::Exec, detail, emit)
+                .request(request_id, ApprovalKind::Exec, command, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {
                 return Err(ToolError::Denied);
             }
-            shell(&workspace.path, command).await
+            shell_with_timeout(&workspace.path, command, command_timeout).await
         }
         "web_fetch" => {
             crate::web::fetch(
@@ -398,6 +399,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
         .arg(base64::engine::general_purpose::STANDARD.encode(bytes));
     process
 }
+#[cfg(test)]
 async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
     shell_with_timeout(directory, command, Duration::from_secs(120)).await
 }
@@ -526,9 +528,7 @@ async fn shell_with_timeout(
             }
         };
         tokio::time::timeout(timeout, capture).await.map_err(|_| {
-            ToolError::Execution(
-                "The command exceeded its two-minute limit and was stopped.".into(),
-            )
+            ToolError::Execution("The command exceeded its time limit and was stopped.".into())
         })?
     }
 }

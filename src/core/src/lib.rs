@@ -22,6 +22,7 @@ pub mod agent;
 pub mod approvals;
 pub mod instructions;
 pub mod model;
+pub mod policy;
 pub mod tools;
 
 pub mod web;
