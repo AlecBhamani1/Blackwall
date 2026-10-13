@@ -164,7 +164,7 @@ fn is_option(value: &str) -> bool {
 /// An absolute program, or a bare name found in an absolute `PATH` directory, so a relative
 /// `PATH` entry can never select a program from the project folder. On Windows the `.exe` is
 /// resolved here, so the approved path is exactly the one that runs.
-fn resolve_program(program: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
     let name = if cfg!(windows) && Path::new(program).extension().is_none() {
         format!("{program}.exe")
     } else {
@@ -209,7 +209,7 @@ fn placeholder(arg: &str) -> Option<&str> {
 
 /// A bare name or absolute path. On Windows only `.exe` programs are accepted: batch files run
 /// through `cmd.exe`, which expands their arguments in ways separate arguments cannot make safe.
-fn valid_program(program: &str) -> bool {
+pub(crate) fn valid_program(program: &str) -> bool {
     let path = Path::new(program);
     let extension = path.extension().and_then(|extension| extension.to_str());
     let batch = extension.is_some_and(|extension| {

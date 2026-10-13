@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Run owner-defined command tools from `~/.blackwall/tools.json` in Agent mode, such as another
   assistant's command line, without a shell and behind Exec approval and owner rules.
 
+- Connect local MCP servers listed in `~/.blackwall/mcp.json` to Agent runs. Their tools are named
+  by server, can be limited per server, and every call needs Exec approval or an owner rule.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.

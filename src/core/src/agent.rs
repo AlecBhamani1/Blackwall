@@ -122,6 +122,7 @@ impl Agent<'_> {
             Some(directory) => crate::command_tools::CommandTools::load(directory).await,
             None => Default::default(),
         };
+        let mcp_directory = user_directory.map(std::path::Path::to_path_buf);
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
@@ -129,7 +130,6 @@ impl Agent<'_> {
         })
         .await?;
         guidance.warnings.extend(command_tools.error.clone());
-        self.report_instructions(request_id, &guidance);
         if !compact
             && source.last().is_some_and(|message| {
                 message["role"] == "user"
@@ -138,6 +138,7 @@ impl Agent<'_> {
                         .is_some_and(|text| text.trim() == "/init")
             })
         {
+            self.report_instructions(request_id, &guidance);
             let answer = self.init(request_id).await?;
             (self.emit)(AgentEvent::AssistantDelta {
                 request_id: request_id.into(),
@@ -176,6 +177,15 @@ impl Agent<'_> {
         }
         let mut answer = String::new();
         let mut usage = TokenUsage::default();
+        let mcp = match (&mcp_directory, compact) {
+            (Some(directory), false) => {
+                crate::mcp::McpServers::start(directory, &definitions).await
+            }
+            _ => Default::default(),
+        };
+        guidance.warnings.extend(mcp.warnings.iter().cloned());
+        self.report_instructions(request_id, &guidance);
+        definitions.extend(mcp.definitions());
         if compact {
             let checkpoint = state
                 .compact(self.backend, budget, &definitions, &instructions)
@@ -318,6 +328,7 @@ impl Agent<'_> {
                     let deferred = &deferred;
                     let guidance = &guidance;
                     let command_tools = &command_tools;
+                    let mcp = &mcp;
                     async move {
                         let ui_id = format!("{iteration}_{index}_{}", call.id);
                         (self.emit)(AgentEvent::ToolCall {
@@ -359,6 +370,16 @@ impl Agent<'_> {
                             )
                             .await
                             .map_err(tools::ToolError::Execution)
+                        } else if mcp.handles(&call.function.name) {
+                            mcp.call(
+                                &call.function.name,
+                                &call.function.arguments,
+                                request_id,
+                                &self.approvals,
+                                self.emit.as_ref(),
+                                std::time::Duration::from_secs(budget.command_timeout_seconds),
+                            )
+                            .await
                         } else if let Some(tool) = command_tools.get(&call.function.name) {
                             tool.run(
                                 &self.workspace.path,

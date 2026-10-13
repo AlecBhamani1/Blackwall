@@ -197,6 +197,29 @@ against the configured command, so `{"decision":"allow","kind":"exec","command":
 it without a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
 owner tools are offered and the run shows a warning.
 
+Local MCP servers that use standard input and output can be listed in `mcp.json` in the same data
+folder:
+
+```json
+{"servers":[
+  {"name":"files","command":["npx","-y","@modelcontextprotocol/server-filesystem","/path/to/folder"],"denyTools":["write_file"]}
+]}
+```
+
+Each enabled server starts when an Agent run starts, in the data folder, without a shell, and stops
+when the run ends; pass a project path as an argument when a server needs one. Programs follow the
+same rules as command tools, so on Windows a server needs an `.exe` launcher such as `node` rather
+than `npx`. Server names use lowercase letters, digits, and `-`. Its tools are offered
+as `server__tool`, such as `files__read_text_file`; `allowTools` limits a server to the listed
+tools, `denyTools` hides tools, and `"enabled":false` keeps a server from starting. Tools whose
+names are invalid or already used are skipped with a warning. Every call needs Exec approval, and
+rules match the namespaced name, so `{"decision":"allow","kind":"exec","command":"files__read_text_file"}`
+allows that tool; server descriptions and hints never grant permission. Calls use the command time
+limit, and a server that times out is not used again in that run. Text results are returned to the
+model; other content is noted but omitted. Servers inherit your environment without the
+credentials Blackwall itself uses, and `mcp.json` cannot store secrets yet. If the file is invalid
+or a server does not start, the run continues without those tools and shows a warning.
+
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
 configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children
