@@ -320,17 +320,22 @@ pub(crate) async fn discover_models(
 
     Ok(ModelCatalog {
         endpoint,
-        models: payload
-            .data
-            .into_iter()
-            .filter(|model| !model.id.trim().is_empty())
-            .map(|model| ModelInfo {
-                id: model.id,
-                name: model.name,
-                owned_by: model.owned_by,
-            })
-            .collect(),
+        models: catalog_models(payload.data),
     })
+}
+
+/// Ollama 0.40 can list one model id once per runner; the picker needs unique ids.
+fn catalog_models(models: Vec<ApiModel>) -> Vec<ModelInfo> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .into_iter()
+        .filter(|model| !model.id.trim().is_empty() && seen.insert(model.id.clone()))
+        .map(|model| ModelInfo {
+            id: model.id,
+            name: model.name,
+            owned_by: model.owned_by,
+        })
+        .collect()
 }
 
 async fn inject_memory(
@@ -1092,6 +1097,28 @@ mod tests {
             assert!(!error.message.contains("private"));
             assert!(!error.message.contains("secret"));
         }
+    }
+
+    #[test]
+    fn model_catalog_lists_each_id_once() {
+        let catalog: ApiModelCatalog = serde_json::from_value(serde_json::json!({"data": [
+            {"id": "qwen3.6:latest"},
+            {"id": "qwen3.6:latest", "name": "duplicate"},
+            {"id": ""},
+            {"id": "llama3.2:1b"}
+        ]}))
+        .unwrap();
+        let ids: Vec<_> = catalog_models(catalog.data)
+            .into_iter()
+            .map(|model| (model.id, model.name))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("qwen3.6:latest".into(), None),
+                ("llama3.2:1b".into(), None)
+            ]
+        );
     }
 
     #[test]

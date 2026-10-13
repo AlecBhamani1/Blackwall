@@ -124,16 +124,7 @@ async fn probe(name: &str, origin: &str, ollama: bool) -> LocalService {
             .and_then(|v| v.as_array())
         {
             result.available = true;
-            result.models = items
-                .iter()
-                .filter_map(|item| {
-                    item.get(if ollama { "name" } else { "id" })
-                        .and_then(|v| v.as_str())
-                })
-                .filter(|name| !name.trim().is_empty() && name.len() <= 256)
-                .take(200)
-                .map(str::to_owned)
-                .collect();
+            result.models = model_names(items, ollama);
         }
     }
     result
@@ -195,6 +186,22 @@ fn sized_to_loaded(budget: ContextBudget, value: &serde_json::Value, model: &str
     } else {
         budget
     }
+}
+
+/// Bounded, non-empty model names in service order. Ollama 0.40 can list one name once per
+/// runner, so only the first occurrence is kept.
+fn model_names(items: &[serde_json::Value], ollama: bool) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get(if ollama { "name" } else { "id" })
+                .and_then(|v| v.as_str())
+        })
+        .filter(|name| !name.trim().is_empty() && name.len() <= 256 && seen.insert(*name))
+        .take(200)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Only probes known loopback services. Never scans a network or uses remote credentials.
@@ -420,6 +427,26 @@ mod tests {
         ] {
             assert_eq!(ollama_origin(other), None, "{other}");
         }
+    }
+    #[test]
+    fn discovered_model_names_are_listed_once() {
+        let tags = [
+            serde_json::json!({"name": "qwen3.6:latest"}),
+            serde_json::json!({"name": "qwen3.6:latest"}),
+            serde_json::json!({"name": " "}),
+            serde_json::json!({"name": "llama3.2:1b"}),
+        ];
+        assert_eq!(model_names(&tags, true), ["qwen3.6:latest", "llama3.2:1b"]);
+        assert_eq!(
+            model_names(
+                &[
+                    serde_json::json!({"id": "a"}),
+                    serde_json::json!({"id": "a"})
+                ],
+                false
+            ),
+            ["a"]
+        );
     }
     #[test]
     fn invitations_reject_unsafe_schemes_and_malformed_secrets() {

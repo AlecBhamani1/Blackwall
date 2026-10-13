@@ -41,6 +41,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Size requests to the context window Ollama loaded the selected model with, reserving a quarter
   of it (up to 32,768 tokens) for output, so long replies are no longer cut off at 4,096 tokens.
 
+- List each discovered model once in the desktop picker, first-run setup, and browser client, so
+  Ollama models with several runner variants no longer make the picker unavailable.
+
 ## [0.1.4] - 2026-10-01
 
 Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).
