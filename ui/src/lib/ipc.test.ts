@@ -8,6 +8,7 @@ import { ModelRequestError, nativeModelError } from './modelError';
 afterEach(() => {
   delete window.__TAURI_INTERNALS__;
   vi.resetAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('native chat failure boundary', () => {
@@ -123,6 +124,32 @@ describe('native chat failure boundary', () => {
       'private',
     );
     expect(nativeModelError('private key').message).not.toContain('private');
+  });
+});
+
+describe('browser model discovery', () => {
+  it('lists each model id once', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).endsWith('/api/tags')
+          ? Response.json({
+              models: [
+                { name: 'qwen3.6:latest', size: 2 },
+                { name: 'qwen3.6:latest', size: 2 },
+                { name: 'llama3.2:1b', size: 1 },
+              ],
+            })
+          : Response.json({ data: [{ id: 'a' }, { id: 'a' }, { id: 'b' }] }),
+      ),
+    );
+    expect((await localModelClient.discoverModels()).map(({ id }) => id)).toEqual([
+      'llama3.2:1b',
+      'qwen3.6:latest',
+    ]);
+    expect(
+      (await localModelClient.discoverModels('https://models.example/api')).map(({ id }) => id),
+    ).toEqual(['a', 'b']);
   });
 });
 

@@ -131,6 +131,16 @@ function browserModelRoutes(endpoint?: string): { models: string; tags?: string;
   };
 }
 
+/** Ollama 0.40 can list one model id once per runner; keep the first. */
+function uniqueModels(models: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>();
+  return models.filter(({ id }) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
 async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
   const routes = browserModelRoutes(endpoint);
   try {
@@ -138,16 +148,17 @@ async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
     const tagsResponse = await fetchWithTimeout(routes.tags, MODEL_DISCOVERY_TIMEOUT_MS);
     if (tagsResponse.ok) {
       const payload = (await tagsResponse.json()) as OllamaTagsResponse;
-      const models = (payload.models ?? [])
-        .map((model): ModelInfo | null => {
-          const id = model.model || model.name;
-          return id ? { id, name: id, sizeBytes: model.size } : null;
-        })
-        .filter((model): model is ModelInfo => model !== null)
-        .sort(
-          (a, b) =>
-            (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER),
-        );
+      const models = uniqueModels(
+        (payload.models ?? [])
+          .map((model): ModelInfo | null => {
+            const id = model.model || model.name;
+            return id ? { id, name: id, sizeBytes: model.size } : null;
+          })
+          .filter((model): model is ModelInfo => model !== null),
+      ).sort(
+        (a, b) =>
+          (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER),
+      );
 
       if (models.length > 0) return models;
     }
@@ -161,9 +172,13 @@ async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
   }
 
   const payload = (await response.json()) as OpenAIModelsResponse;
-  return (payload.data ?? [])
-    .filter((model): model is Required<Pick<OpenAIModel, 'id'>> & OpenAIModel => Boolean(model.id))
-    .map((model) => ({ id: model.id, name: model.id, ownedBy: model.owned_by }));
+  return uniqueModels(
+    (payload.data ?? [])
+      .filter((model): model is Required<Pick<OpenAIModel, 'id'>> & OpenAIModel =>
+        Boolean(model.id),
+      )
+      .map((model) => ({ id: model.id, name: model.id, ownedBy: model.owned_by })),
+  );
 }
 
 function attachmentContext(attachments: AttachmentPayload[]): string {
