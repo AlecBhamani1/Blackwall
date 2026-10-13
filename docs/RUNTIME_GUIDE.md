@@ -148,6 +148,28 @@ For each proposed change, choose **Deny**, **Allow once**, or **Allow identical 
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
 
+To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
+(`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
+`deny`), a `kind` (`exec`, `file`, or `network`), and one matching field:
+
+```json
+{"rules":[
+  {"decision":"allow","kind":"exec","command":"cargo test"},
+  {"decision":"deny","kind":"file","path":".git"},
+  {"decision":"allow","kind":"network","host":"*.docs.rs"}
+]}
+```
+
+`command` matches the leading words of a shell command, `path` matches a workspace-relative path and
+everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. Ask and deny
+path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
+and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
+prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
+instead of matching an allow rule. Edits inside the data folder always ask, even when the project
+contains it. Rules load when a run starts. If the file is invalid, every action asks and the prompt
+shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
+common credential forms redacted; the log rotates at 1 MiB.
+
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they have a two-minute
 limit, and cancellation terminates their process group or Windows Job Object, including children

@@ -24,6 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add a one-line installer for the latest development Blackwall CLI, available from any directory.
 
+- Decide agent actions with owner-defined allow, ask, and deny rules in `~/.blackwall/policy.json`.
+  Projects cannot add rules, chained shell commands never match an allow rule, invalid files fall
+  back to asking, and every decision is recorded in a redacted local audit log.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
