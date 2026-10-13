@@ -1,8 +1,12 @@
 //! Exact-action approvals tied to a live run. Dropping a wait invalidates its decision handle.
-use crate::protocol::{AgentEvent, ApprovalDecision, ApprovalKind, ResolveApprovalRequest};
+use crate::{
+    policy::{Decision, Policy},
+    protocol::{AgentEvent, ApprovalDecision, ApprovalKind, ResolveApprovalRequest},
+};
 use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -16,6 +20,7 @@ struct Pending {
 struct Registry {
     pending: HashMap<String, Pending>,
     allowed: HashSet<(String, String)>,
+    policies: HashMap<String, Arc<Policy>>,
 }
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Registry>>);
@@ -31,7 +36,56 @@ impl Drop for Waiting {
     }
 }
 impl Approvals {
+    /// Apply the owner's rules in `directory` to this run until the run is cleared.
+    pub async fn load_policy(
+        &self,
+        request_id: &str,
+        directory: &Path,
+        workspace: &Path,
+    ) -> Result<(), String> {
+        let policy = Arc::new(Policy::load(directory, workspace).await);
+        self.0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .policies
+            .insert(request_id.into(), policy);
+        Ok(())
+    }
+    /// `subject` is the command, workspace-relative path, or host that rules match.
     pub async fn request(
+        &self,
+        request_id: &str,
+        kind: ApprovalKind,
+        subject: &str,
+        detail: String,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<bool, String> {
+        let policy = self
+            .0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .policies
+            .get(request_id)
+            .cloned();
+        let Some(policy) = policy else {
+            return self.ask(request_id, kind, detail, emit).await;
+        };
+        let decision = policy.decide(kind, subject);
+        let allowed = match decision {
+            Decision::Allow => true,
+            Decision::Deny => false,
+            Decision::Ask => {
+                let detail = match &policy.error {
+                    Some(error) => format!("{error}\n\n{detail}"),
+                    None => detail,
+                };
+                self.ask(request_id, kind, detail, emit).await?
+            }
+        };
+        policy.record(kind, subject, decision, allowed).await;
+        Ok(allowed)
+    }
+    async fn ask(
         &self,
         request_id: &str,
         kind: ApprovalKind,
@@ -111,6 +165,7 @@ impl Approvals {
                 .pending
                 .retain(|_, pending| pending.request_id != request_id);
             state.allowed.retain(|(id, _)| id != request_id);
+            state.policies.remove(request_id);
         }
     }
 }
@@ -124,7 +179,13 @@ mod tests {
         let events = Arc::new(Mutex::new(vec![]));
         let captured = events.clone();
         let emit = move |e| captured.lock().unwrap().push(e);
-        let wait = approvals.request("run1", ApprovalKind::Exec, "echo test".into(), &emit);
+        let wait = approvals.request(
+            "run1",
+            ApprovalKind::Exec,
+            "echo test",
+            "echo test".into(),
+            &emit,
+        );
         tokio::pin!(wait);
         tokio::select! { _=&mut wait => panic!("must await decision"), _=tokio::time::sleep(Duration::from_millis(1)) => {} }
         let event = events.lock().unwrap()[0].clone();
@@ -147,6 +208,91 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn owner_rules_decide_before_prompting_and_end_with_the_run() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-rules-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(
+            directory.join(crate::policy::POLICY_FILE),
+            r#"{"rules":[
+                {"decision":"allow","kind":"exec","command":"cargo test"},
+                {"decision":"deny","kind":"file","path":".git"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, Path::new("/workspace"))
+            .await
+            .unwrap();
+        let never = |_| panic!("a matched rule must not prompt");
+        assert!(approvals
+            .request(
+                "run",
+                ApprovalKind::Exec,
+                "cargo test",
+                "detail".into(),
+                &never
+            )
+            .await
+            .unwrap());
+        assert!(!approvals
+            .request(
+                "run",
+                ApprovalKind::File,
+                ".git/HEAD",
+                "detail".into(),
+                &never
+            )
+            .await
+            .unwrap());
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        assert_eq!(audit.lines().count(), 2);
+        approvals.clear_run("run");
+        let prompts = Arc::new(Mutex::new(0));
+        let counted = prompts.clone();
+        let count = move |_| *counted.lock().unwrap() += 1;
+        let wait = approvals.request(
+            "run",
+            ApprovalKind::Exec,
+            "cargo test",
+            "detail".into(),
+            &count,
+        );
+        tokio::pin!(wait);
+        tokio::select! { _=&mut wait => panic!("must ask after the run ends"), _=tokio::time::sleep(Duration::from_millis(1)) => {} }
+        assert_eq!(*prompts.lock().unwrap(), 1);
+
+        tokio::fs::write(directory.join(crate::policy::POLICY_FILE), "{")
+            .await
+            .unwrap();
+        approvals
+            .load_policy("broken", &directory, Path::new("/workspace"))
+            .await
+            .unwrap();
+        let details = Arc::new(Mutex::new(vec![]));
+        let captured = details.clone();
+        let capture = move |event| {
+            if let AgentEvent::ApprovalRequest { detail, .. } = event {
+                captured.lock().unwrap().push(detail);
+            }
+        };
+        let wait = approvals.request(
+            "broken",
+            ApprovalKind::Exec,
+            "cargo test",
+            "detail".into(),
+            &capture,
+        );
+        tokio::pin!(wait);
+        tokio::select! { _=&mut wait => panic!("an invalid policy must ask"), _=tokio::time::sleep(Duration::from_millis(1)) => {} }
+        assert!(details.lock().unwrap()[0].starts_with("The policy file is not valid."));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+    #[tokio::test]
     async fn remembered_permission_is_exact_and_expires_with_run() {
         let approvals = Approvals::default();
         let decisions = approvals.clone();
@@ -167,13 +313,20 @@ mod tests {
             }
         };
         assert!(approvals
-            .request("one", ApprovalKind::Exec, "exact command".into(), &allow)
+            .request(
+                "one",
+                ApprovalKind::Exec,
+                "exact command",
+                "exact command".into(),
+                &allow
+            )
             .await
             .unwrap());
         assert!(approvals
             .request(
                 "one",
                 ApprovalKind::Exec,
+                "exact command",
                 "exact command".into(),
                 &|_| panic!("identical action should use the run permission")
             )
@@ -197,12 +350,24 @@ mod tests {
             }
         };
         assert!(!approvals
-            .request("one", ApprovalKind::Exec, "different command".into(), &deny)
+            .request(
+                "one",
+                ApprovalKind::Exec,
+                "different command",
+                "different command".into(),
+                &deny
+            )
             .await
             .unwrap());
         approvals.clear_run("one");
         assert!(!approvals
-            .request("two", ApprovalKind::Exec, "exact command".into(), &deny)
+            .request(
+                "two",
+                ApprovalKind::Exec,
+                "exact command",
+                "exact command".into(),
+                &deny
+            )
             .await
             .unwrap());
     }

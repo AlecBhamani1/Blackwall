@@ -31,6 +31,26 @@ describe('memory management', () => {
     expect(input).toHaveValue('');
     expect(persistence.memories).toHaveBeenCalledTimes(2);
   });
+  it('saves agent limits only within their ranges', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const iterations = await screen.findByLabelText('Agent iteration limit');
+    await vi.waitFor(() => expect(iterations).toBeEnabled());
+    const timeout = screen.getByLabelText('Command time limit (seconds)');
+    const button = screen.getByRole('button', { name: 'Save context limit' });
+    await user.clear(iterations);
+    await user.type(iterations, '0');
+    expect(button).toBeDisabled();
+    await user.clear(iterations);
+    await user.type(iterations, '40');
+    await user.clear(timeout);
+    await user.type(timeout, '600');
+    await user.click(button);
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ maxIterations: 40, commandTimeoutSeconds: 600 }),
+    );
+  });
   it('keeps the draft available when saving fails', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'saveMemory').mockRejectedValue(new Error('disk full'));

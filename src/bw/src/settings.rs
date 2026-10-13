@@ -71,12 +71,24 @@ impl Settings {
                     .map_err(|_| "Enter an output reserve in tokens.")?
             }
             "compact" => updated.budget.auto_compact = on_or_off(value)?,
-            _ => {
-                return Err(
-                    "Choose a setting: model, endpoint, web, memory, context, output, or compact."
-                        .into(),
-                )
+            "iterations" => {
+                updated.budget.max_iterations = value
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=100).contains(n))
+                    .ok_or("Enter an iteration limit between 1 and 100.")?
             }
+            "timeout" => {
+                updated.budget.command_timeout_seconds = value
+                    .parse()
+                    .ok()
+                    .filter(|n| (10..=3600).contains(n))
+                    .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
+            }
+            _ => return Err(
+                "Choose a setting: model, endpoint, web, memory, context, output, compact, iterations, or timeout."
+                    .into(),
+            ),
         }
         updated.validate()?;
         persist(&updated)?;
@@ -91,11 +103,12 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
+            self.budget.max_iterations, self.budget.command_timeout_seconds,
         )
     }
 }
@@ -170,6 +183,20 @@ fn load_with_environment(
                 .map(|v| v.as_bool().ok_or("Invalid automatic compaction setting."))
                 .transpose()?
                 .unwrap_or(false),
+            max_iterations: object
+                .get("maxIterations")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid iteration limit.")
+                })
+                .transpose()?
+                .unwrap_or(20),
+            command_timeout_seconds: object
+                .get("commandTimeoutSeconds")
+                .map(|v| v.as_u64().ok_or("Invalid command time limit."))
+                .transpose()?
+                .unwrap_or(120),
         },
     };
     settings.validate()?;
@@ -385,6 +412,8 @@ mod tests {
         settings.set(&store, "context", "8192").unwrap();
         settings.set(&store, "output", "1024").unwrap();
         settings.set(&store, "compact", "on").unwrap();
+        settings.set(&store, "iterations", "40").unwrap();
+        settings.set(&store, "timeout", "600").unwrap();
         assert_eq!(settings.endpoint, "https://models.example/v1");
         assert_eq!(settings.model, "trimmed-model");
         drop(store);
@@ -395,7 +424,7 @@ mod tests {
         assert_eq!(saved.as_object().unwrap().len(), 5);
         assert_eq!(
             saved["contextBudget"],
-            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true})
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
         );
         assert!(saved.get("apiKey").is_none());
     }
@@ -418,6 +447,10 @@ mod tests {
             ("model", "model\u{1b}[31m"),
             ("web", "yes"),
             ("memory", "sometimes"),
+            ("iterations", "0"),
+            ("iterations", "101"),
+            ("timeout", "9"),
+            ("timeout", "3601"),
             ("apiKey", "secret"),
         ] {
             let error = settings.set(&store, key, value).unwrap_err();
@@ -427,6 +460,14 @@ mod tests {
         }
         assert!(settings.set(&store, "model", &"a".repeat(257)).is_err());
         assert_eq!(settings, before);
+        assert!(settings
+            .set(&store, "iterations", "101")
+            .unwrap_err()
+            .contains("between 1 and 100"));
+        assert!(settings
+            .set(&store, "timeout", "9")
+            .unwrap_err()
+            .contains("between 10 and 3,600 seconds"));
     }
 
     #[test]

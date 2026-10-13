@@ -15,6 +15,8 @@
     contextWindow: number;
     outputTokens: number;
     autoCompact: boolean;
+    maxIterations: number;
+    commandTimeoutSeconds: number;
   }) => void = () => {};
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
@@ -32,6 +34,8 @@
   let contextWindow = 32000;
   let outputTokens = 4096;
   let autoCompact = false;
+  let maxIterations = 20;
+  let commandTimeoutSeconds = 120;
   let loaded = false;
   let savedPreferences: Awaited<ReturnType<typeof persistence.preferences>> = {};
   const desktop = persistence.available();
@@ -131,12 +135,16 @@
           contextWindow: Number(contextWindow),
           outputTokens: Number(outputTokens),
           autoCompact,
+          maxIterations: Number(maxIterations),
+          commandTimeoutSeconds: Number(commandTimeoutSeconds),
         });
       onPreferences({
         memoryEnabled: enabled,
         contextWindow: Number(contextWindow),
         outputTokens: Number(outputTokens),
         autoCompact,
+        maxIterations: Number(maxIterations),
+        commandTimeoutSeconds: Number(commandTimeoutSeconds),
       });
     } catch {
       error = 'These settings could not be saved. Try again.';
@@ -151,6 +159,8 @@
       outputTokens =
         contextPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
       autoCompact = contextPreferences.autoCompact ?? false;
+      maxIterations = contextPreferences.maxIterations ?? 20;
+      commandTimeoutSeconds = contextPreferences.commandTimeoutSeconds ?? 120;
       loaded = true;
       return;
     }
@@ -162,6 +172,8 @@
         outputTokens =
           savedPreferences.outputTokens ?? Math.min(4096, Math.floor(contextWindow / 4));
         autoCompact = savedPreferences.autoCompact ?? false;
+        maxIterations = savedPreferences.maxIterations ?? 20;
+        commandTimeoutSeconds = savedPreferences.commandTimeoutSeconds ?? 120;
         await refresh();
         loaded = true;
       } catch {
@@ -356,6 +368,24 @@
         Use /context to see usage and /compact to summarize older turns. Original transcripts are
         retained.
       </p>
+      <label for="max-iterations">Agent iteration limit</label>
+      <input
+        id="max-iterations"
+        type="number"
+        min="1"
+        max="100"
+        bind:value={maxIterations}
+        disabled={busy || !loaded}
+      />
+      <label for="command-timeout">Command time limit (seconds)</label>
+      <input
+        id="command-timeout"
+        type="number"
+        min="10"
+        max="3600"
+        bind:value={commandTimeoutSeconds}
+        disabled={busy || !loaded}
+      />
       <button
         class="secondary"
         disabled={busy ||
@@ -364,7 +394,13 @@
           contextWindow > 1000000 ||
           outputTokens < 1 ||
           outputTokens > 32768 ||
-          Number(outputTokens) + Math.floor(contextWindow / 20) >= contextWindow}
+          Number(outputTokens) + Math.floor(contextWindow / 20) >= contextWindow ||
+          !Number.isInteger(Number(maxIterations)) ||
+          maxIterations < 1 ||
+          maxIterations > 100 ||
+          !Number.isInteger(Number(commandTimeoutSeconds)) ||
+          commandTimeoutSeconds < 10 ||
+          commandTimeoutSeconds > 3600}
         onclick={saveSettings}>Save context limit</button
       >
     </details>

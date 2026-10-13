@@ -16,7 +16,7 @@ pub enum AgentError {
     Budget(#[from] crate::context::ContextError),
     #[error(transparent)]
     Model(#[from] ModelError),
-    #[error("The agent reached its 20-step limit. Review its progress before continuing.")]
+    #[error("The agent reached its iteration limit. Review its progress before continuing.")]
     Iterations,
     #[error("The conversation is too large for this agent run. Start a new conversation with a shorter task.")]
     Context,
@@ -112,6 +112,12 @@ impl Agent<'_> {
             approvals: self.approvals.clone(),
             request_id: request_id.into(),
         };
+        if let Some(directory) = user_directory {
+            self.approvals
+                .load_policy(request_id, directory, &self.workspace.path)
+                .await
+                .map_err(tools::ToolError::Execution)?;
+        }
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
@@ -181,7 +187,7 @@ impl Agent<'_> {
             });
             return Ok(String::new());
         }
-        for iteration in 0..20 {
+        for iteration in 0..budget.max_iterations {
             let mut messages = instructions.clone();
             messages.extend(state.effective());
             if budget.auto_compact
@@ -353,6 +359,7 @@ impl Agent<'_> {
                                 request_id,
                                 &self.approvals,
                                 self.emit.as_ref(),
+                                std::time::Duration::from_secs(budget.command_timeout_seconds),
                             )
                             .await
                         };
@@ -418,6 +425,7 @@ impl Agent<'_> {
             .request(
                 request_id,
                 crate::protocol::ApprovalKind::File,
+                "AGENTS.md",
                 detail,
                 self.emit.as_ref(),
             )
@@ -614,6 +622,44 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
+    }
+    #[tokio::test]
+    async fn configured_iteration_limit_ends_the_run() {
+        let backend = RepeatingTool {
+            name: "web_fetch",
+            arguments: r#"{"url":"https://example.com","purpose":"test"}"#,
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let agent = Agent {
+            backend: &backend,
+            workspace: Workspace::open(&std::env::temp_dir()).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(move |event| output.lock().unwrap().push(event)),
+        };
+        let run = crate::context::ContextRun {
+            source: vec![],
+            state: crate::context::ContextState::restore(&[], None).unwrap(),
+            budget: crate::context::ContextBudget {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            instructions: vec![],
+            compact: false,
+        };
+        assert!(matches!(
+            agent.run_context("limited", run).await,
+            Err(AgentError::Iterations)
+        ));
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolResult { .. }))
+                .count(),
+            3
+        );
     }
     #[tokio::test]
     async fn cancellation_revokes_pending_write_without_changing_file() {
@@ -1107,6 +1153,7 @@ mod tests {
             context_window: 4096,
             output_tokens: 1,
             auto_compact: false,
+            ..Default::default()
         };
         let available = budget.context_window - budget.safety_tokens();
         assert!(baseline_tokens + 128 < available);

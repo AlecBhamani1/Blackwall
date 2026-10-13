@@ -15,6 +15,8 @@ export interface Preferences {
   contextWindow?: number;
   outputTokens?: number;
   autoCompact?: boolean;
+  maxIterations?: number;
+  commandTimeoutSeconds?: number;
   memoryEnabled?: boolean;
   workspace?: string;
 }
