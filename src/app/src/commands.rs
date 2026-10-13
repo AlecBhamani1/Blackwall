@@ -429,6 +429,12 @@ pub(crate) async fn stream_chat(
 
     let selected =
         selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
+    request.context_budget = blackwall_core::connection::served_budget(
+        &selected,
+        &request.model,
+        request.context_budget,
+    )
+    .await;
     let mut job = jobs
         .jobs
         .start(&request_id)

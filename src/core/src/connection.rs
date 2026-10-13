@@ -6,6 +6,8 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::context::ContextBudget;
+
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_FRAME: usize = 16 * 1024;
 pub const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
@@ -135,6 +137,54 @@ async fn probe(name: &str, origin: &str, ollama: bool) -> LocalService {
         }
     }
     result
+}
+
+/// Size `budget` to the context window Ollama loaded `model` with. Ollama's OpenAI-compatible
+/// route ignores context options, so its `/api/ps` report is the limit that applies. Only
+/// endpoints on Ollama's default port are asked; other services, unloaded models, and
+/// unreachable hosts keep the configured budget.
+pub async fn served_budget(endpoint: &str, model: &str, budget: ContextBudget) -> ContextBudget {
+    let Some(origin) = endpoint.strip_suffix("/v1").filter(|origin| {
+        Url::parse(origin).is_ok_and(|url| url.port_or_known_default() == Some(11434))
+    }) else {
+        return budget;
+    };
+    let fetch = async {
+        let response = client()?
+            .get(format!("{origin}/api/ps"))
+            .send()
+            .await
+            .map_err(|_| ConnectionError::Unavailable)?;
+        bounded_json(response).await
+    };
+    match tokio::time::timeout(Duration::from_secs(3), fetch).await {
+        Ok(Ok(value)) => sized_to_loaded(budget, &value, model),
+        _ => budget,
+    }
+}
+
+fn sized_to_loaded(budget: ContextBudget, value: &serde_json::Value, model: &str) -> ContextBudget {
+    let window = value
+        .get("models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(model))
+        .and_then(|item| item.get("context_length"))
+        .and_then(|v| v.as_u64());
+    let Some(window) = window else {
+        return budget;
+    };
+    let sized = ContextBudget {
+        context_window: window,
+        output_tokens: (window / 4).min(32_768) as u32,
+        ..budget
+    };
+    if sized.validate().is_ok() {
+        sized
+    } else {
+        budget
+    }
 }
 
 /// Only probes known loopback services. Never scans a network or uses remote credentials.
@@ -306,6 +356,32 @@ mod tests {
         assert!(ProgressDecoder::default()
             .push(&vec![b'x'; MAX_FRAME + 1])
             .is_err());
+    }
+    #[test]
+    fn budgets_follow_the_loaded_context_window() {
+        let configured = ContextBudget::default();
+        let ps = serde_json::json!({"models": [
+            {"name": "other:latest", "context_length": 8192},
+            {"name": "qwen3.6:35b", "context_length": 102_400}
+        ]});
+        let sized = sized_to_loaded(configured, &ps, "qwen3.6:35b");
+        assert_eq!(sized.context_window, 102_400);
+        assert_eq!(sized.output_tokens, 25_600);
+        assert_eq!(
+            sized_to_loaded(configured, &ps, "other:latest").output_tokens,
+            2048
+        );
+        for unusable in [
+            serde_json::json!({}),
+            serde_json::json!({"models": [{"name": "qwen3.6:35b"}]}),
+            serde_json::json!({"models": [{"name": "qwen3.6:35b", "context_length": 512}]}),
+        ] {
+            assert_eq!(
+                sized_to_loaded(configured, &unusable, "qwen3.6:35b"),
+                configured
+            );
+        }
+        assert_eq!(sized_to_loaded(configured, &ps, "missing"), configured);
     }
     #[test]
     fn invitations_reject_unsafe_schemes_and_malformed_secrets() {
