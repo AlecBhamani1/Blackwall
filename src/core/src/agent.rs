@@ -112,6 +112,12 @@ impl Agent<'_> {
             approvals: self.approvals.clone(),
             request_id: request_id.into(),
         };
+        if let Some(directory) = user_directory {
+            self.approvals
+                .load_policy(request_id, directory, &self.workspace.path)
+                .await
+                .map_err(tools::ToolError::Execution)?;
+        }
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
@@ -418,6 +424,7 @@ impl Agent<'_> {
             .request(
                 request_id,
                 crate::protocol::ApprovalKind::File,
+                "AGENTS.md",
                 detail,
                 self.emit.as_ref(),
             )
