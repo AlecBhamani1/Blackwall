@@ -233,7 +233,13 @@ not start, the run continues without those tools and shows a warning.
 
 In the desktop app, **MCP servers** in the sidebar lists the servers with enable and disable
 toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
-password field. It uses the same validation and credential store as the CLI.
+password field. It uses the same validation and credential store as the CLI. **Add server** offers
+suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
+thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
+form with a pinned package version; filesystem and remote ask for a folder or address at the end of
+the command. The list ships with the app and is never downloaded, but `npx -y` downloads the pinned
+package from npm the first time the server starts, without asking again. Suggestions start with
+`npx`, so they are not offered on Windows.
 
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
 an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,

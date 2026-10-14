@@ -57,6 +57,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or every project. The choice is saved as an owner rule with new `tool` and `project` fields, and
   **MCP servers** lists and removes these rules.
 
+- Suggest common MCP servers in the desktop **Add server** form. Picking one fills in its name and
+  a pinned `npx` command; the list ships with the app and is not offered on Windows.
+
 ### Fixed
 
 - Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
