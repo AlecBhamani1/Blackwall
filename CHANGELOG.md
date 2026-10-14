@@ -55,6 +55,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
+  when the macOS app is opened from the Dock, using the login shell's `PATH`.
+
 - Use portable paths in instruction source lists and directory scopes on Windows.
 
 - Size requests to the context window Ollama loaded the selected model with, reserving a quarter

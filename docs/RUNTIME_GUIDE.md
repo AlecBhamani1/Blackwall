@@ -236,6 +236,11 @@ for example `pbpaste | bw mcp secret jira JIRA_API_TOKEN` on macOS, saves it in 
 and adds the name to the server; it refuses to read from a terminal, where the value would be shown.
 Add `--delete` to remove one, and `bw mcp remove` deletes a server's saved secrets.
 
+On macOS, the desktop app finds programs for command tools, MCP servers, and shell commands with
+your login shell's `PATH`, so tools installed with Homebrew or npm work when Blackwall is opened from
+the Dock. It asks the shell once at startup and keeps the system default if that takes more than
+five seconds.
+
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
 configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children

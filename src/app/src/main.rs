@@ -28,6 +28,8 @@ fn run() -> Result<(), StartupError> {
     let mut context = tauri::generate_context!();
     identity::initialize(&context.config().identifier).map_err(StartupError::Identity)?;
     identity::configure_acceptance_webviews(context.config_mut());
+    #[cfg(target_os = "macos")]
+    lifecycle::adopt_login_path();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())

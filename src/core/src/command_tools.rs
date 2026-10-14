@@ -175,7 +175,7 @@ pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
     if path.is_absolute() {
         return executable(path).then(|| path.to_path_buf());
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
+    std::env::split_paths(&crate::tools::search_path()?)
         .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join(&name))
         .find(|candidate| candidate.is_absolute() && executable(candidate))
