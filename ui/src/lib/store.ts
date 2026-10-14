@@ -750,9 +750,12 @@ export function createChatController(
                               }),
                               output: [
                                 `Loaded instructions: ${event.sources.join(', ') || 'None'}`,
-                                ...event.warnings.map((warning) => `Warning: ${warning}`),
+                                ...event.warnings.map(
+                                  (warning) => `Warning: ${warning.replace(/\s*\n\s*/g, ' ')}`,
+                                ),
                               ].join('\n'),
-                              status: 'complete',
+                              // Warnings, such as an MCP server that did not start, stay visible.
+                              status: event.warnings.length ? 'error' : 'complete',
                             },
                           ],
                         }

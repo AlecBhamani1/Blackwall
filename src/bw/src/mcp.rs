@@ -37,7 +37,7 @@ pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
             }
         }
         "add" if args.len() >= 3 => {
-            mcp::add_server(directory, name, args[2..].to_vec())?;
+            let name = mcp::add_server(directory, name, args[2..].to_vec())?;
             println!("MCP server {name} added. It starts with the next Agent run.");
         }
         "enable" | "disable" if args.len() == 2 => {
@@ -104,7 +104,15 @@ mod tests {
         run(&directory, &args("add files npx -y server-filesystem /tmp")).unwrap();
         run(&directory, &args("add jira jira-mcp")).unwrap();
         assert!(run(&directory, &args("add jira other")).is_err());
-        assert!(run(&directory, &args("add Bad! x")).is_err());
+        let invalid = run(&directory, &args("add Bad! x")).unwrap_err();
+        assert!(invalid.contains("lowercase letters"), "{invalid}");
+        run(&directory, &args("add Context7 npx")).unwrap();
+        assert!(mcp::read_config(&directory)
+            .unwrap()
+            .iter()
+            .any(|server| server.name == "context7"));
+        run(&directory, &args("disable Context7")).unwrap();
+        run(&directory, &args("remove Context7")).unwrap();
         assert!(run(&directory, &args("add batch run.cmd")).is_err());
         run(&directory, &args("disable files")).unwrap();
         assert!(run(&directory, &args("enable missing")).is_err());
