@@ -70,6 +70,7 @@ fn run() -> Result<(), StartupError> {
             data::save_mcp_secret,
             data::delete_mcp_secret,
             data::list_sessions,
+            data::search_sessions,
             data::load_session,
             data::save_session,
             data::delete_session,

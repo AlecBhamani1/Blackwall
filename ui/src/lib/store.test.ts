@@ -555,6 +555,71 @@ describe('native conversation persistence', () => {
       load: vi.fn().mockResolvedValue(null),
     };
   }
+  it('recalls across modes without model calls or replaying historical tools and clears recall on lock', async () => {
+    const storage = await nativeStorage();
+    const saved: SessionSummary = {
+      id: 'saved-agent',
+      title: 'Saved agent',
+      mode: 'agent',
+      workspace: '/project',
+      updatedAt: 1,
+      messages: [
+        {
+          id: 'old-message',
+          role: 'assistant',
+          content: 'Historical answer',
+          status: 'complete',
+          createdAt: 1,
+          attachments: [],
+          tools: [
+            {
+              id: 'old-tool',
+              name: 'shell',
+              arguments: '{"command":"touch replayed"}',
+              status: 'running',
+            },
+          ],
+        },
+      ],
+    };
+    storage.list.mockResolvedValue([]);
+    storage.load.mockImplementation(async (id: string) =>
+      id === saved.id ? saved : { ...saved, id, mode: 'chat' },
+    );
+    storage.search = vi.fn().mockResolvedValue({ results: [], remainingSessions: 0 });
+    const restore = vi.spyOn(agentClient, 'restoreWorkspace').mockResolvedValue('/project');
+    const run = vi.spyOn(agentClient, 'resolve').mockResolvedValue(undefined);
+    const client = mockClient();
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    expect(get(controller.agentMode)).toBe(false);
+    expect(await controller.send('/recall historical', [])).toBe(true);
+    expect(get(controller.recallText)).toBe('historical');
+    await controller.searchRecall({ query: 'historical' });
+    expect(storage.search).toHaveBeenCalledWith({ query: 'historical' });
+    await controller.openRecallResult(saved.id, 0);
+    expect(get(controller.agentMode)).toBe(true);
+    expect(get(controller.workspace)).toBe('/project');
+    expect(get(controller.focusedMessageId)).toBe('old-message');
+    expect(get(controller.messages)[0]).toMatchObject({
+      historical: true,
+      tools: [{ status: 'stopped' }],
+    });
+    expect(get(controller.approval)).toBeNull();
+    expect(run).not.toHaveBeenCalled();
+    expect(client.streamChat).not.toHaveBeenCalled();
+    await controller.openRecallResult('saved-chat', 0);
+    expect(get(controller.agentMode)).toBe(false);
+    expect(get(controller.workspace)).toBe('');
+    expect(restore).toHaveBeenCalledTimes(1);
+    controller.showRecall();
+    await controller.suspend();
+    expect(get(controller.recallText)).toBeNull();
+    controller.destroy();
+    restore.mockRestore();
+    run.mockRestore();
+  });
+
   it('restores native Agent projects and retains the current chat if a project is unavailable', async () => {
     const storage = await nativeStorage();
     const first: SessionSummary = {
