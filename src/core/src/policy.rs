@@ -61,7 +61,7 @@ impl Policy {
                 normalize(&relative.to_string_lossy().to_lowercase())
             });
         let path = directory.join(POLICY_FILE);
-        let parsed = match tokio::time::timeout(IO_TIMEOUT, read_bounded(&path))
+        let parsed = match tokio::time::timeout(IO_TIMEOUT, read_bounded(&path, MAX_POLICY_BYTES))
             .await
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
@@ -150,11 +150,12 @@ impl Policy {
     }
 }
 
-async fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+/// Read at most `limit + 1` bytes, so callers can reject an oversized owner file.
+pub(crate) async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     tokio::fs::File::open(path)
         .await?
-        .take(MAX_POLICY_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut body)
         .await?;
     Ok(body)

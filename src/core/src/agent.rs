@@ -118,12 +118,17 @@ impl Agent<'_> {
                 .await
                 .map_err(tools::ToolError::Execution)?;
         }
+        let command_tools = match user_directory {
+            Some(directory) => crate::command_tools::CommandTools::load(directory).await,
+            None => Default::default(),
+        };
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
             crate::instructions::Instructions::discover(&workspace, user_directory.as_deref())
         })
         .await?;
+        guidance.warnings.extend(command_tools.error.clone());
         self.report_instructions(request_id, &guidance);
         if !compact
             && source.last().is_some_and(|message| {
@@ -160,6 +165,7 @@ impl Agent<'_> {
             _ => None,
         };
         let mut definitions = tools::definitions(self.web_enabled, true);
+        definitions.extend(command_tools.definitions());
         if memory.is_some() {
             definitions.extend(crate::memory::definitions());
         }
@@ -311,6 +317,7 @@ impl Agent<'_> {
                     let definitions = &definitions;
                     let deferred = &deferred;
                     let guidance = &guidance;
+                    let command_tools = &command_tools;
                     async move {
                         let ui_id = format!("{iteration}_{index}_{}", call.id);
                         (self.emit)(AgentEvent::ToolCall {
@@ -352,6 +359,16 @@ impl Agent<'_> {
                             )
                             .await
                             .map_err(tools::ToolError::Execution)
+                        } else if let Some(tool) = command_tools.get(&call.function.name) {
+                            tool.run(
+                                &self.workspace.path,
+                                &call.function.arguments,
+                                request_id,
+                                &self.approvals,
+                                self.emit.as_ref(),
+                                std::time::Duration::from_secs(budget.command_timeout_seconds),
+                            )
+                            .await
                         } else {
                             tools::execute(
                                 &self.workspace,

@@ -31,6 +31,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Projects cannot add rules, chained shell commands never match an allow rule, invalid files fall
   back to asking, and every decision is recorded in a redacted local audit log.
 
+- Run owner-defined command tools from `~/.blackwall/tools.json` in Agent mode, such as another
+  assistant's command line, without a shell and behind Exec approval and owner rules.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
