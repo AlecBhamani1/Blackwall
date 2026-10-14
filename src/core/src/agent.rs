@@ -1554,6 +1554,8 @@ mod recall_tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
         }
+        // Windows cannot delete the project directory while its capability handle is open.
+        drop(project);
         drop(db);
         std::fs::remove_dir_all(directory).unwrap();
     }
