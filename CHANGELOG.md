@@ -44,6 +44,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Run CLI tasks headlessly with `bw run --json`, printing agent events as JSON lines and denying
   any action that owner rules leave to an approval prompt.
 
+- Add, list, enable, disable, and remove MCP servers with `bw mcp`, without editing `mcp.json` by
+  hand.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.

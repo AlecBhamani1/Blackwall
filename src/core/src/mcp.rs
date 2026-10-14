@@ -4,7 +4,7 @@ use crate::{
     protocol::{AgentEvent, ApprovalKind},
     tools::ToolError,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::{
@@ -22,26 +22,84 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-#[derive(Debug, Deserialize)]
+/// One server entry in `mcp.json`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ServerConfig {
-    name: String,
-    command: Vec<String>,
+pub struct ServerConfig {
+    pub name: String,
+    pub command: Vec<String>,
     #[serde(default = "enabled")]
-    enabled: bool,
-    allow_tools: Option<Vec<String>>,
-    #[serde(default)]
-    deny_tools: Vec<String>,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_tools: Vec<String>,
 }
 
 fn enabled() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct McpFile {
     servers: Vec<ServerConfig>,
+}
+
+fn parse(body: &[u8]) -> Result<Vec<ServerConfig>, &'static str> {
+    if body.len() > MAX_FILE_BYTES {
+        return Err("The MCP file is too large.");
+    }
+    serde_json::from_slice::<McpFile>(body)
+        .map_err(|_| "The MCP file is not valid.")
+        .and_then(|file| validate(file.servers))
+}
+
+/// Read the owner's servers for editing. A missing file has no servers.
+pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> {
+    use std::io::Read;
+    let mut body = vec![];
+    match std::fs::File::open(directory.join(MCP_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(_) => return Err("The MCP file could not be read."),
+        Ok(file) => file
+            .take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| "The MCP file could not be read.")?,
+    };
+    parse(&body)
+}
+
+/// Validate and replace the owner's servers, so a failed write leaves the old file in place.
+pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
+    use std::io::Write;
+    let failed = "The MCP file could not be saved.";
+    let mut body = serde_json::to_vec_pretty(&McpFile {
+        servers: validate(servers)?,
+    })
+    .map_err(|_| failed)?;
+    body.push(b'\n');
+    if body.len() > MAX_FILE_BYTES {
+        return Err("The MCP file is too large.");
+    }
+    let path = directory.join(MCP_FILE);
+    // Like the data folder and database, the file must not be a link that a save would replace.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("The MCP file must not be a symbolic link.");
+    }
+    let temporary = directory.join(format!(".mcp-{:016x}", rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let result = options
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&temporary, &path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|_| failed)
 }
 
 struct Tool {
@@ -76,10 +134,7 @@ impl McpServers {
         {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return started,
             Err(_) => Err("The MCP file could not be read."),
-            Ok(body) if body.len() > MAX_FILE_BYTES => Err("The MCP file is too large."),
-            Ok(body) => serde_json::from_slice::<McpFile>(&body)
-                .map_err(|_| "The MCP file is not valid.")
-                .and_then(|file| validate(file.servers)),
+            Ok(body) => parse(&body),
         };
         let configs = match configs {
             Ok(configs) => configs,
