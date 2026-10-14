@@ -470,12 +470,14 @@ pub(crate) type ServerStreams = (
     tokio::process::ChildStdout,
     tokio::process::ChildStderr,
 );
-/// Start a resolved program without a shell, in `directory`, without Blackwall's secrets.
+/// Start a resolved program without a shell, in `directory`, without Blackwall's secrets but with
+/// the server's own `environment`.
 #[cfg(any(unix, windows))]
 pub(crate) fn spawn_server(
     directory: &Path,
     program: &Path,
     args: &[String],
+    environment: &[(String, String)],
 ) -> Result<ServerStreams, ToolError> {
     let start = || ToolError::Execution("The program could not start.".into());
     let mut process = tokio::process::Command::new(program);
@@ -489,6 +491,7 @@ pub(crate) fn spawn_server(
     for key in SECRET_ENV {
         process.env_remove(key);
     }
+    process.envs(environment.iter().map(|(name, value)| (name, value)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

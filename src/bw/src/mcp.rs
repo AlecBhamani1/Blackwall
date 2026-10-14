@@ -1,9 +1,21 @@
 //! Owner commands for MCP servers. They edit `mcp.json` and never start a server.
-use blackwall_core::mcp::{read_config, write_config, ServerConfig};
-use std::path::Path;
+use blackwall_core::{
+    mcp::{read_config, valid_secret_name, write_config, ServerConfig, SECRET_SERVICE},
+    secrets,
+};
+use std::{
+    io::{IsTerminal, Read},
+    path::Path,
+};
 
-const USAGE: &str =
-    "Use bw mcp list|add <name> <command> [arguments]|enable <name>|disable <name>|remove <name>.";
+const USAGE: &str = "Use bw mcp list|add <name> <command> [arguments]|enable <name>|disable <name>|remove <name>|secret <name> <NAME> [--delete].";
+
+fn store_error(error: secrets::SecretError) -> String {
+    error.explain(format!(
+        "The credential store could not be updated. {}, then try again.",
+        secrets::RECOVER
+    ))
+}
 
 pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
     let mut servers = read_config(directory)?;
@@ -31,6 +43,9 @@ pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
                 if !server.deny_tools.is_empty() {
                     println!("Denied tools: {}", list(&server.deny_tools));
                 }
+                if !server.secrets.is_empty() {
+                    println!("Secrets: {}", list(&server.secrets));
+                }
             }
             return Ok(());
         }
@@ -44,6 +59,7 @@ pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
                 enabled: true,
                 allow_tools: None,
                 deny_tools: vec![],
+                secrets: vec![],
             });
             write_config(directory, servers)?;
             println!("MCP server {name} added. It starts with the next Agent run.");
@@ -55,9 +71,51 @@ pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
             println!("MCP server {name} {command}d.");
         }
         "remove" if args.len() == 2 => {
-            servers.remove(position.ok_or_else(missing)?);
+            let index = position.ok_or_else(missing)?;
+            // Secrets go first, so a failure leaves the entry in place to retry.
+            for key in &servers[index].secrets {
+                secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
+            }
+            servers.remove(index);
             write_config(directory, servers)?;
             println!("MCP server {name} removed.");
+        }
+        "secret" if args.len() == 3 || (args.len() == 4 && args[3] == "--delete") => {
+            let index = position.ok_or_else(missing)?;
+            let key = args[2].clone();
+            let account = format!("{name}/{key}");
+            if args.len() == 4 {
+                secrets::delete(SECRET_SERVICE, &account).map_err(store_error)?;
+                servers[index].secrets.retain(|existing| *existing != key);
+                write_config(directory, servers)?;
+                println!("Removed {key} from MCP server {name}.");
+                return Ok(());
+            }
+            if !valid_secret_name(&key) {
+                return Err("Use an environment variable name, such as JIRA_API_TOKEN.".into());
+            }
+            if std::io::stdin().is_terminal() {
+                return Err(
+                    "Pipe the value into this command, for example from the clipboard, so it is never shown."
+                        .into(),
+                );
+            }
+            let mut value = String::new();
+            std::io::stdin()
+                .take(16 * 1024 + 1)
+                .read_to_string(&mut value)
+                .map_err(|_| "The value could not be read.")?;
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.is_empty() || value.len() > 16 * 1024 {
+                return Err("Provide a value of up to 16 KiB.".into());
+            }
+            // The value is saved first, so the file never names a secret that failed to save.
+            secrets::set(SECRET_SERVICE, &account, value).map_err(store_error)?;
+            if !servers[index].secrets.contains(&key) {
+                servers[index].secrets.push(key.clone());
+                write_config(directory, servers)?;
+            }
+            println!("Saved {key} for MCP server {name} in {}.", secrets::STORE);
         }
         _ => return Err(USAGE.into()),
     }

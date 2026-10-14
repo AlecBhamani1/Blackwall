@@ -217,15 +217,20 @@ rules match the namespaced name, so `{"decision":"allow","kind":"exec","command"
 allows that tool; server descriptions and hints never grant permission. Calls use the command time
 limit, and a server that times out is not used again in that run. Text results are returned to the
 model; other content is noted but omitted. Servers inherit your environment without the
-credentials Blackwall itself uses, and `mcp.json` cannot store secrets yet. If the file is invalid
-or a server does not start, the run continues without those tools and shows a warning.
+credentials Blackwall itself uses. A server that needs an access token lists its environment
+variable name under `secrets`; the value lives only in the platform credential store and is given to
+that server's process when it starts. If the file is invalid, a secret is missing, or a server does
+not start, the run continues without those tools and shows a warning.
 
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
 an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
 `bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
 they are saved, apply from the next Agent run, and an invalid or linked file is reported rather than
 replaced.
-Tool lists are edited in the file.
+Tool lists are edited in the file. `bw mcp secret <name> <NAME>` reads a value from standard input,
+for example `pbpaste | bw mcp secret jira JIRA_API_TOKEN` on macOS, saves it in the credential store,
+and adds the name to the server; it refuses to read from a terminal, where the value would be shown.
+Add `--delete` to remove one, and `bw mcp remove` deletes a server's saved secrets.
 
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
@@ -338,7 +343,8 @@ database; `BLACKWALL_DATA_DIR` selects a different data folder, including its me
 
 For an authenticated service, set `BLACKWALL_MODEL_API_KEY` and the matching
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`). Environment keys are sent only to that origin, even
-after `/endpoint` changes. The CLI does not store keys or use desktop credential-store entries.
+after `/endpoint` changes. The CLI does not store model keys or use desktop credential-store entries;
+MCP server secrets are the exception, shared through the credential store with desktop.
 Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol preview without a model call.
 
 `bw run --json "prompt"` and `bw resume SESSION_ID --json "prompt"` run without prompting, for scripts

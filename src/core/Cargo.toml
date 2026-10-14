@@ -29,9 +29,20 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"], optional = true }
 process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop", "creation-flags"] }
 windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
+
+[features]
+# The platform credential store, for clients that keep user secrets. The relay leaves it off.
+credential-store = ["dep:security-framework", "dep:keyring"]
 
 [dev-dependencies]
 tower.workspace = true
