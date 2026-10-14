@@ -1,10 +1,24 @@
 <script lang="ts">
-  import type { PendingApproval } from '../types';
+  import type { ApprovalDecision, PendingApproval } from '../types';
   export let approval: PendingApproval;
-  export let onResolve: (decision: 'allow' | 'always_allow' | 'deny') => Promise<void>;
+  export let onResolve: (decision: ApprovalDecision) => Promise<void>;
   let busy = false;
   let error = '';
-  async function decide(decision: 'allow' | 'always_allow' | 'deny') {
+  // MCP approvals can be saved as an owner rule for one tool or the whole server.
+  let scope: 'tool' | 'server' = 'tool';
+  let place: 'project' | 'everywhere' = 'project';
+  // A new approval starts from the narrowest choice, even when the card is reused.
+  let shown = '';
+  $: if (approval.approvalId !== shown) {
+    shown = approval.approvalId;
+    scope = 'tool';
+    place = 'project';
+  }
+  $: toolName = approval.tool?.tool.slice(approval.tool.server.length + 2) ?? '';
+  $: saved = (
+    place === 'project' ? `allow_${scope}_in_project` : `allow_${scope}`
+  ) as ApprovalDecision;
+  async function decide(decision: ApprovalDecision) {
     if (busy) return;
     busy = true;
     error = '';
@@ -25,7 +39,9 @@
         ? 'Review this file change'
         : approval.kind === 'network'
           ? 'Allow this web request?'
-          : 'Allow this command?'}</strong
+          : approval.tool
+            ? 'Allow this tool?'
+            : 'Allow this command?'}</strong
     ><small>Waiting for you</small>
   </div>
   <!-- Scrollable action details need a keyboard focus target. -->
@@ -41,6 +57,24 @@
       >{busy ? 'Sending…' : 'Allow once'}</button
     >
   </div>
+  {#if approval.tool}
+    <div class="always">
+      <label
+        >Always allow <select bind:value={scope} disabled={busy} aria-label="What to allow"
+          ><option value="tool">{toolName}</option><option value="server"
+            >every {approval.tool.server} tool</option
+          ></select
+        ></label
+      ><label
+        ><select bind:value={place} disabled={busy} aria-label="Where to allow it"
+          ><option value="project">in this project</option><option value="everywhere"
+            >in every project</option
+          ></select
+        ></label
+      ><button class="remember" disabled={busy} onclick={() => decide(saved)}>Always allow</button>
+    </div>
+    <small class="note">Saved as an owner rule. Remove it in MCP servers.</small>
+  {/if}
   {#if error}<p role="alert">{error}</p>{/if}
 </section>
 
@@ -117,6 +151,32 @@
     background: var(--bg-elevated);
     border: 1px solid var(--border-strong);
   }
+  .always {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 11.5px;
+  }
+  .always label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  select {
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-strong);
+    background: var(--bg-base);
+    font: inherit;
+  }
+  .note {
+    display: block;
+    margin-top: 6px;
+  }
   p {
     color: var(--err);
     font-size: 12px;
@@ -129,6 +189,11 @@
     }
     .actions > span {
       display: none;
+    }
+    .always,
+    .always label {
+      display: grid;
+      grid-template-columns: 1fr;
     }
     button {
       min-height: 38px;

@@ -22,6 +22,30 @@ describe('action approval', () => {
     expect(onResolve).toHaveBeenCalledExactlyOnceWith('allow');
     expect(screen.getByRole('button', { name: 'Deny' })).toBeDisabled();
   });
+  it('offers to always allow an MCP tool or its whole server', async () => {
+    const user = userEvent.setup();
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const tool = {
+      requestId: 'run',
+      approvalId: 'tool',
+      kind: 'exec',
+      detail: 'MCP server: context7\nTool: query-docs',
+      tool: { server: 'context7', tool: 'context7__query-docs' },
+    };
+    const { rerender } = render(ApprovalCard, { props: { approval: tool, onResolve } });
+    expect(screen.getByText('Allow this tool?')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Always allow' }));
+    expect(onResolve).toHaveBeenLastCalledWith('allow_tool_in_project');
+    await user.selectOptions(screen.getByLabelText('What to allow'), 'every context7 tool');
+    await user.selectOptions(screen.getByLabelText('Where to allow it'), 'in every project');
+    await user.click(screen.getByRole('button', { name: 'Always allow' }));
+    expect(onResolve).toHaveBeenLastCalledWith('allow_server');
+    await rerender({ approval: { ...tool, approvalId: 'next' }, onResolve });
+    await user.click(screen.getByRole('button', { name: 'Always allow' }));
+    expect(onResolve).toHaveBeenLastCalledWith('allow_tool_in_project');
+    await rerender({ approval, onResolve });
+    expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
+  });
   it('offers recovery after a decision cannot be delivered', async () => {
     const user = userEvent.setup();
     const onResolve = vi.fn().mockRejectedValue(new Error('expired'));

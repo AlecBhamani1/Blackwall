@@ -299,6 +299,23 @@ pub enum ApprovalDecision {
     AlwaysAllow,
     /// Refuse this operation.
     Deny,
+    /// Permit this MCP tool from now on in this project, saving an owner rule.
+    AllowToolInProject,
+    /// Permit this MCP tool from now on in every project, saving an owner rule.
+    AllowTool,
+    /// Permit every tool from this MCP server from now on in this project, saving an owner rule.
+    AllowServerInProject,
+    /// Permit every tool from this MCP server from now on in every project, saving an owner rule.
+    AllowServer,
+}
+
+/// The MCP tool an approval is for, so the owner can allow it from now on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalTool {
+    /// Server name from the owner's MCP file.
+    pub server: String,
+    /// Namespaced `server__tool` name.
+    pub tool: String,
 }
 
 /// Request to resolve an outstanding approval event.
@@ -400,6 +417,9 @@ pub enum AgentEvent {
         kind: ApprovalKind,
         /// Exact command, file change, host, or delegated capability.
         detail: String,
+        /// The MCP tool, for approvals that can be saved as an owner rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<ApprovalTool>,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -655,6 +675,17 @@ mod tests {
                 approval_id: "a1".to_owned(),
                 kind: ApprovalKind::Exec,
                 detail: "cargo test".to_owned(),
+                tool: None,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "a2".to_owned(),
+                kind: ApprovalKind::Exec,
+                detail: "MCP server: docs".to_owned(),
+                tool: Some(ApprovalTool {
+                    server: "docs".to_owned(),
+                    tool: "docs__search".to_owned(),
+                }),
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),

@@ -83,6 +83,39 @@ describe('native chat failure boundary', () => {
     });
   });
 
+  it('keeps the MCP tool an approval can be saved for and drops malformed ones', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    const approval = { type: 'approval_request', requestId: 'tools', kind: 'exec', detail: 'd' };
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          ...approval,
+          approvalId: 'a1',
+          tool: { server: 'context7', tool: 'context7__query-docs' },
+        },
+      });
+      listener({
+        payload: { ...approval, approvalId: 'a2', tool: { server: 'docs', tool: 'other__x' } },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'tools' } });
+      return { requestId: 'tools' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'tools', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith({
+      ...approval,
+      approvalId: 'a1',
+      tool: { server: 'context7', tool: 'context7__query-docs' },
+    });
+    expect(onEvent).toHaveBeenCalledWith({ ...approval, approvalId: 'a2' });
+  });
+
   it('reports local storage failure without blaming the model or exposing native details', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

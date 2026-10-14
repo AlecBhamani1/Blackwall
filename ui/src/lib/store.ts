@@ -21,6 +21,7 @@ import type {
   PendingAttachment,
   RunState,
   PendingApproval,
+  ApprovalDecision,
   SessionSummary,
   ConversationMode,
   ContextState,
@@ -228,7 +229,7 @@ export function createChatController(
       notice.set('The project folder could not be opened. Try choosing it again.');
     }
   }
-  async function resolveApproval(decision: 'allow' | 'always_allow' | 'deny') {
+  async function resolveApproval(decision: ApprovalDecision) {
     const pending = get(approval);
     if (!pending) return;
     await agentClient.resolve(pending, decision);

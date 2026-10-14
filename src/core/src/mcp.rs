@@ -1,7 +1,7 @@
 //! Owner-configured local MCP servers whose tools join Agent runs behind Blackwall approvals.
 use crate::{
     approvals::Approvals,
-    protocol::{AgentEvent, ApprovalKind},
+    protocol::{AgentEvent, ApprovalTool},
     tools::ToolError,
 };
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,6 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
-    use std::io::Write;
     let failed = "The MCP file could not be saved.";
     let mut body = serde_json::to_vec_pretty(&McpFile {
         servers: validate(servers)?,
@@ -93,19 +92,7 @@ pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), 
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("The MCP file must not be a symbolic link.");
     }
-    let temporary = directory.join(format!(".mcp-{:016x}", rand::random::<u64>()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let result = options
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
-        .and_then(|()| std::fs::rename(&temporary, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|_| failed)
+    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)
 }
 
 /// Owner edits shared by the CLI and desktop. Each one validates before anything is saved.
@@ -169,7 +156,7 @@ pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), St
     })
 }
 
-/// Secrets are deleted first, so a failure leaves the entry in place to retry.
+/// Secrets and owner rules are deleted first, so a failure leaves the entry in place to retry.
 pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
     let name = &saved_name(name);
     edit(directory, name, |servers, index| {
@@ -177,6 +164,7 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
             crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}"))
                 .map_err(store_error)?;
         }
+        crate::policy::remove_server_rules(directory, name)?;
         servers.remove(index);
         Ok(())
     })
@@ -414,8 +402,12 @@ impl McpServers {
             "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
             server.name, tool.name
         );
+        let approval = ApprovalTool {
+            server: server.name.clone(),
+            tool: tool.exposed.clone(),
+        };
         if !approvals
-            .request(request_id, ApprovalKind::Exec, &tool.exposed, detail, emit)
+            .request_tool(request_id, approval, detail, emit)
             .await
             .map_err(ToolError::Execution)?
         {
@@ -694,6 +686,14 @@ pub fn valid_secret_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A policy `tool` value: a server name, or `server__tool` for one of its tools.
+pub(crate) fn valid_tool_rule(rule: &str) -> bool {
+    match rule.split_once("__") {
+        Some((server, _)) => valid_server_name(server) && valid_tool_name(rule),
+        None => valid_server_name(rule),
+    }
 }
 
 fn valid_server_name(name: &str) -> bool {

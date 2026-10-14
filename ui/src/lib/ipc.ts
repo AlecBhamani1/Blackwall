@@ -12,6 +12,7 @@ import { normalizeEndpoint } from './setup';
 import { nativeModelError } from './modelError';
 import type {
   AgentEvent,
+  ApprovalTool,
   AttachmentPayload,
   ChatRequest,
   ModelInfo,
@@ -537,8 +538,18 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       approvalId: event.approvalId,
       detail: event.detail,
       kind: event.kind,
+      ...approvalTool(event.tool),
     };
   return null;
+}
+
+/** The MCP tool an approval can be saved for, when the event names one. */
+function approvalTool(value: unknown): { tool?: ApprovalTool } {
+  if (!value || typeof value !== 'object') return {};
+  const { server, tool } = value as Record<string, unknown>;
+  return typeof server === 'string' && typeof tool === 'string' && tool.startsWith(`${server}__`)
+    ? { tool: { server, tool } }
+    : {};
 }
 
 async function streamTauriChat(

@@ -156,6 +156,11 @@ is the authority for file tools; a folder must be selected again after reopening
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
+MCP tool approvals also offer **Always allow**, for that tool or every tool from its server, in this
+project or every project. It saves an owner rule in `policy.json`, applies it to the rest of the
+run, and allows the call; if the rule cannot be saved, the call does not run and says why. The
+server's page in **MCP servers** lists these rules and removes them; a removal applies from the next
+run. Removing a server also removes its rules, so a later server with the same name starts asking.
 
 To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
 (`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
@@ -170,7 +175,10 @@ To decide routine actions in advance, add rules to `policy.json` in the Blackwal
 ```
 
 `command` matches the leading words of a shell command, `path` matches a workspace-relative path and
-everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. Ask and deny
+everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. For MCP calls,
+an `exec` rule can use `tool` instead: a server name such as `context7` matches all of that server's
+tools, and `server__tool` matches one. `tool` rules never match shell commands. Any rule can add
+`project` with an absolute folder path, and then applies only to runs in that project. Ask and deny
 path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
 and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
 prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask

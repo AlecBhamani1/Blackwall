@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { PendingApproval, SessionSummary } from './types';
+import type { ApprovalDecision, PendingApproval, SessionSummary } from './types';
 export interface FileEntry {
   name: string;
   path: string;
@@ -39,7 +39,7 @@ export const agentClient = {
   },
   async resolve(
     approval: PendingApproval,
-    decision: 'allow' | 'always_allow' | 'deny',
+    decision: ApprovalDecision,
   ): Promise<void> {
     await invoke('resolve_approval', {
       request: { requestId: approval.requestId, approvalId: approval.approvalId, decision },

@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type McpServer } from '../persistence';
+  import { persistence, type McpServer, type McpToolRule } from '../persistence';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
   let servers: McpServer[] = [];
+  let rules: McpToolRule[] = [];
+  let rulesError = '';
   let selected: McpServer | null = null;
   let adding = false;
   let name = '';
@@ -23,6 +25,33 @@
   async function load() {
     servers = await persistence.mcpServers();
     if (selected) open(servers.find((server) => server.name === selected?.name) ?? null);
+    // Rules live in policy.json, so a problem there does not hide the servers.
+    try {
+      rules = await persistence.mcpToolRules();
+      rulesError = '';
+    } catch (cause) {
+      rules = [];
+      rulesError =
+        typeof cause === 'string' ? cause : 'Saved rules could not be read from policy.json.';
+    }
+  }
+  // Saved Windows paths keep their verbatim prefix for matching; it is hidden when shown.
+  function folder(path: string) {
+    return path.replace(/^\\\\\?\\/, '');
+  }
+  // Rules are passed in, so the markup updates when they reload.
+  function serverRules(rules: McpToolRule[], server: string) {
+    return rules.filter((rule) => rule.tool === server || rule.tool.startsWith(`${server}__`));
+  }
+  function summary(rules: McpToolRule[], server: McpServer) {
+    const allowed = serverRules(rules, server.name).length;
+    const secrets = server.secrets?.length ?? 0;
+    return [
+      allowed ? `${allowed} allowed without asking` : 'Asks before every call',
+      secrets ? `${secrets} secret${secrets === 1 ? '' : 's'}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
   }
   async function run(action: () => Promise<void>, failure: string) {
     busy = true;
@@ -138,6 +167,28 @@
         >
       </div>
       <code>{JSON.stringify(server.command)}</code>
+      <h3>Allowed without asking</h3>
+      {#each serverRules(rules, server.name) as rule (`${rule.tool} ${rule.project}`)}<article>
+          <span class="rule"
+            ><strong class:tool={rule.tool !== server.name}
+              >{rule.tool === server.name
+                ? 'Every tool'
+                : rule.tool.slice(server.name.length + 2)}</strong
+            >
+            <small>{rule.project ? `In ${folder(rule.project)}` : 'In every project'}</small></span
+          ><button
+            class="delete"
+            aria-label={`Stop allowing ${rule.tool}${rule.project ? ` in ${rule.project}` : ''}`}
+            disabled={busy}
+            onclick={() =>
+              run(
+                () => persistence.removeMcpToolRule(rule),
+                'This rule could not be removed.',
+              )}>Remove</button
+          >
+        </article>{:else}<p class="empty">
+          {rulesError || 'Every call asks for approval. Choose Always allow on an approval to skip it.'}
+        </p>{/each}
       <h3>Secrets</h3>
       {#each server.secrets ?? [] as secret (secret)}<article>
           <span class="secret">{secret}</span><button
@@ -208,7 +259,13 @@
       {#each servers as server (server.name)}<article>
           <button class="server" disabled={busy} onclick={() => open(server)}
             ><strong>{server.name}</strong>
-            <p class="code">{server.command.join(' ')}</p></button
+            <p class="code">{server.command.join(' ')}</p>
+            <small>{summary(rules, server)}</small></button
+          ><button
+            class="secondary manage"
+            disabled={busy}
+            aria-label={`Manage ${server.name}`}
+            onclick={() => open(server)}>Manage <Icon name="chevron-right" size={13} /></button
           ><button
             class:enabled={server.enabled}
             class="toggle"
@@ -341,6 +398,17 @@
     font-size: 13px;
     font-weight: 570;
   }
+  .server small {
+    display: block;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    margin-top: 6px;
+  }
+  .manage {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
   .server p {
     color: var(--text-muted);
     font-size: 12px;
@@ -352,6 +420,23 @@
   }
   .secret {
     flex: 1;
+  }
+  .rule {
+    flex: 1;
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .rule strong {
+    font-size: 12px;
+  }
+  .rule .tool {
+    font-family: var(--font-code);
+  }
+  .rule small {
+    color: var(--text-muted);
+    font-size: 11px;
   }
   .code,
   code,
