@@ -220,6 +220,13 @@ model; other content is noted but omitted. Servers inherit your environment with
 credentials Blackwall itself uses, and `mcp.json` cannot store secrets yet. If the file is invalid
 or a server does not start, the run continues without those tools and shows a warning.
 
+The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
+an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
+`bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
+they are saved, apply from the next Agent run, and an invalid or linked file is reported rather than
+replaced.
+Tool lists are edited in the file.
+
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
 configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children

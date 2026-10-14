@@ -1,4 +1,5 @@
 mod input;
+mod mcp;
 mod memory;
 mod session;
 mod settings;
@@ -52,6 +53,7 @@ USAGE:
                              Continue a saved Agent conversation
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
+  bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw request <prompt>        Print a request preview without a model call
 
 Install: cargo install --locked --path src/bw
@@ -97,7 +99,8 @@ async fn run() -> Result<(), String> {
             println!("bw {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory" => {}
+        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
+        | "mcp" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -110,6 +113,9 @@ async fn run() -> Result<(), String> {
         return memory::run(&directory, &arguments);
     }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
+    if command == "mcp" {
+        return mcp::run(&directory, &arguments);
+    }
     if command == "sessions" {
         require_no_arguments(&arguments)?;
         return list_sessions(&store);
