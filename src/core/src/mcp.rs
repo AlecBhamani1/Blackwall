@@ -108,6 +108,94 @@ pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), 
     result.map_err(|_| failed)
 }
 
+/// Owner edits shared by the CLI and desktop. Each one validates before anything is saved.
+fn edit(
+    directory: &Path,
+    name: &str,
+    change: impl FnOnce(&mut Vec<ServerConfig>, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut servers = read_config(directory)?;
+    let index = servers
+        .iter()
+        .position(|server| server.name == name)
+        .ok_or_else(|| format!("No MCP server is named {name:?}."))?;
+    change(&mut servers, index)?;
+    Ok(write_config(directory, servers)?)
+}
+
+fn store_error(error: crate::secrets::SecretError) -> String {
+    error.explain(format!(
+        "The credential store could not be updated. {}, then try again.",
+        crate::secrets::RECOVER
+    ))
+}
+
+pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<(), String> {
+    let mut servers = read_config(directory)?;
+    if servers.iter().any(|server| server.name == name) {
+        return Err(format!("An MCP server named {name:?} already exists."));
+    }
+    servers.push(ServerConfig {
+        name: name.into(),
+        command,
+        enabled: true,
+        allow_tools: None,
+        deny_tools: vec![],
+        secrets: vec![],
+    });
+    Ok(write_config(directory, servers)?)
+}
+
+pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), String> {
+    edit(directory, name, |servers, index| {
+        servers[index].enabled = enabled;
+        Ok(())
+    })
+}
+
+/// Secrets are deleted first, so a failure leaves the entry in place to retry.
+pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
+    edit(directory, name, |servers, index| {
+        for key in &servers[index].secrets {
+            crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}"))
+                .map_err(store_error)?;
+        }
+        servers.remove(index);
+        Ok(())
+    })
+}
+
+/// The value is saved first, so the file never names a secret that failed to save. Blocking.
+pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Result<(), String> {
+    if !valid_secret_name(key) {
+        return Err("Use an environment variable name, such as JIRA_API_TOKEN.".into());
+    }
+    if value.is_empty() || value.len() > 16 * 1024 {
+        return Err("Provide a value of up to 16 KiB.".into());
+    }
+    edit(directory, name, |servers, index| {
+        crate::secrets::set(SECRET_SERVICE, &format!("{name}/{key}"), value)
+            .map_err(store_error)?;
+        if !servers[index]
+            .secrets
+            .iter()
+            .any(|existing| existing == key)
+        {
+            servers[index].secrets.push(key.into());
+        }
+        Ok(())
+    })
+}
+
+/// Blocking: the credential store may ask the owner for access.
+pub fn delete_secret(directory: &Path, name: &str, key: &str) -> Result<(), String> {
+    edit(directory, name, |servers, index| {
+        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
+        servers[index].secrets.retain(|existing| existing != key);
+        Ok(())
+    })
+}
+
 struct Tool {
     exposed: String,
     name: String,

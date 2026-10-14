@@ -266,6 +266,74 @@ pub async fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
     with_skills(&app, move |store| store.remove(&name)).await
 }
 
+/// MCP edits share the CLI's validation; secret values go only to the credential store.
+/// Like saved model keys, the lock is checked first and not held, so a credential store prompt
+/// cannot stall the rest of the app.
+async fn with_mcp<T: Send + 'static>(
+    app: &AppHandle,
+    operation: impl FnOnce(&std::path::Path) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    crate::auth::require_unlocked(app).await?;
+    let directory = crate::identity::data_directory(app)?;
+    tokio::task::spawn_blocking(move || operation(&directory))
+        .await
+        .map_err(|_| "The MCP task could not finish.")?
+}
+#[tauri::command]
+pub async fn list_mcp_servers(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_mcp(&app, |directory| {
+        Ok(serde_json::json!(blackwall_core::mcp::read_config(
+            directory
+        )?))
+    })
+    .await
+}
+#[tauri::command]
+pub async fn add_mcp_server(app: AppHandle, name: String, command: String) -> Result<(), String> {
+    let command = command.split_whitespace().map(str::to_owned).collect();
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::add_server(directory, &name, command)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn set_mcp_server_enabled(
+    app: AppHandle,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::set_enabled(directory, &name, enabled)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn remove_mcp_server(app: AppHandle, name: String) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::remove_server(directory, &name)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn save_mcp_secret(
+    app: AppHandle,
+    name: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::save_secret(directory, &name, &key, &value)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn delete_mcp_secret(app: AppHandle, name: String, key: String) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::delete_secret(directory, &name, &key)
+    })
+    .await
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod pairing_commit_tests {

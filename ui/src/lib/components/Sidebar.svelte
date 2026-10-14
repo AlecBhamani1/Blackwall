@@ -12,6 +12,7 @@
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
+  import McpDialog from './McpDialog.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
@@ -47,6 +48,7 @@
   let settingsOpen = false;
   let memoryOpen = false;
   let skillsOpen = false;
+  let mcpOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -101,6 +103,9 @@
   >
   <button class="memory-button" onclick={() => (skillsOpen = true)}
     >Skills <span>Reusable workflows</span></button
+  >
+  <button class="memory-button" onclick={() => (mcpOpen = true)}
+    >MCP servers <span>Tools from local servers</span></button
   >
   <section class="history">
     <div class="section-label">Recent</div>
@@ -158,6 +163,7 @@
 </aside>
 
 {#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
+{#if mcpOpen}<McpDialog onClose={() => (mcpOpen = false)} />{/if}
 {#if memoryOpen}<MemoryDialog
     {onPreferences}
     {contextPreferences}

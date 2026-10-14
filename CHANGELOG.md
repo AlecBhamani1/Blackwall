@@ -50,6 +50,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Keep MCP server access tokens in the platform credential store. `bw mcp secret` saves one from
   standard input, `mcp.json` holds only its name, and the server receives it when it starts.
 
+- Manage MCP servers and their secrets from **MCP servers** in the desktop sidebar, sharing the
+  CLI's validation and credential store.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
