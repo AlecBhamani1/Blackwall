@@ -30,6 +30,10 @@ describe('MCP server management', () => {
     await user.click(await screen.findByRole('button', { name: 'Disable jira' }));
     expect(toggle).toHaveBeenCalledWith('jira', false);
     await user.click(screen.getByRole('button', { name: 'Add server' }));
+    for (const field of ['Name', 'Command']) {
+      expect(screen.getByLabelText(field)).toHaveAttribute('autocorrect', 'off');
+      expect(screen.getByLabelText(field)).toHaveAttribute('autocapitalize', 'none');
+    }
     await user.type(screen.getByLabelText('Name'), 'files');
     await user.type(screen.getByLabelText('Command'), 'npx -y server-filesystem /tmp');
     await user.click(screen.getByRole('button', { name: 'Add server' }));

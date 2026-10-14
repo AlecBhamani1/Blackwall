@@ -130,7 +130,21 @@ fn store_error(error: crate::secrets::SecretError) -> String {
     ))
 }
 
-pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<(), String> {
+/// Names are lowercased and spaces or underscores become hyphens, so `My Jira` is saved and
+/// found as `my-jira`.
+fn saved_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c == '_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Add a server under its saved name, which is returned.
+pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
+    let name = saved_name(name);
+    let name = name.as_str();
     let mut servers = read_config(directory)?;
     if servers.iter().any(|server| server.name == name) {
         return Err(format!("An MCP server named {name:?} already exists."));
@@ -143,10 +157,12 @@ pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<
         deny_tools: vec![],
         secrets: vec![],
     });
-    Ok(write_config(directory, servers)?)
+    write_config(directory, servers)?;
+    Ok(name.into())
 }
 
 pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         servers[index].enabled = enabled;
         Ok(())
@@ -155,6 +171,7 @@ pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), St
 
 /// Secrets are deleted first, so a failure leaves the entry in place to retry.
 pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         for key in &servers[index].secrets {
             crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}"))
@@ -167,6 +184,7 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
 
 /// The value is saved first, so the file never names a secret that failed to save. Blocking.
 pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     if !valid_secret_name(key) {
         return Err("Use an environment variable name, such as JIRA_API_TOKEN.".into());
     }
@@ -189,6 +207,7 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
 
 /// Blocking: the credential store may ask the owner for access.
 pub fn delete_secret(directory: &Path, name: &str, key: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
         servers[index].secrets.retain(|existing| existing != key);
@@ -697,15 +716,26 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
         return Err("The MCP file has too many servers.");
     }
     for (index, server) in servers.iter().enumerate() {
-        if !valid_server_name(&server.name)
-            || servers[..index]
-                .iter()
-                .any(|other| other.name == server.name)
-            || server.command.is_empty()
-            || server.command.len() > 64
-            || !crate::command_tools::valid_program(&server.command[0])
+        if !valid_server_name(&server.name) {
+            return Err(
+                "MCP server names use lowercase letters, numbers, and hyphens, up to 32 characters.",
+            );
+        }
+        if servers[..index]
+            .iter()
+            .any(|other| other.name == server.name)
         {
-            return Err("An MCP server has an invalid name or command.");
+            return Err("Two MCP servers have the same name.");
+        }
+        if server.command.is_empty() || server.command.len() > 64 {
+            return Err("Give each MCP server a command with at most 63 arguments.");
+        }
+        if !crate::command_tools::valid_program(&server.command[0]) {
+            return Err(if cfg!(windows) {
+                "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
+            } else {
+                "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
+            });
         }
         if server.secrets.len() > 16
             || server.secrets.iter().enumerate().any(|(index, name)| {

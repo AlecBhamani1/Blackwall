@@ -13,6 +13,14 @@
     web_search: 'Search the web',
     spawn_agent: 'Delegate task',
   };
+  // Startup warnings, such as an MCP server that did not start, are shown without expanding.
+  function warnings(tool: ToolEntry): string[] {
+    if (tool.name !== 'project_instructions') return [];
+    return (tool.output ?? '')
+      .split('\n')
+      .filter((line) => line.startsWith('Warning: '))
+      .map((line) => line.slice('Warning: '.length));
+  }
   function detail(tool: ToolEntry): string {
     try {
       const args = JSON.parse(tool.arguments);
@@ -43,6 +51,9 @@
       >
       <pre>{tool.output ?? tool.arguments}</pre>
     </details>
+    {#each warnings(tool) as warning}
+      <p class="warning">{warning}</p>
+    {/each}
   {/each}
 </div>
 
@@ -94,6 +105,13 @@
   small {
     font-size: 10px;
     color: var(--text-muted);
+  }
+  .warning {
+    margin: 0;
+    padding: 0 12px;
+    font-size: 11.5px;
+    color: var(--err);
+    overflow-wrap: anywhere;
   }
   pre {
     max-height: 300px;

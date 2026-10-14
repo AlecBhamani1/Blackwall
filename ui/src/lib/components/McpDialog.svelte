@@ -92,14 +92,23 @@
       <form onsubmit={add}>
         <label for="mcp-name">Name</label><input
           id="mcp-name"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           bind:value={name}
-          pattern="[a-z0-9-]+"
           maxlength="32"
           required
           disabled={busy}
           placeholder="jira"
-        /><label for="mcp-command">Command</label><input
+        />
+        <p class="field-hint">
+          Saved in lowercase with hyphens for spaces and underscores, so My Jira becomes my-jira.
+        </p>
+        <label for="mcp-command">Command</label><input
           id="mcp-command"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           class="code"
           bind:value={commandLine}
           required
@@ -147,6 +156,9 @@
       <form onsubmit={saveSecret}>
         <label for="mcp-secret-name">Environment variable</label><input
           id="mcp-secret-name"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           class="code"
           bind:value={secretName}
           pattern="[A-Z_][A-Z0-9_]*"
@@ -375,6 +387,11 @@
     border-radius: var(--radius-sm);
     padding: 11px 12px;
     font-size: 12px;
+  }
+  .field-hint {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    margin: 6px 0 0;
   }
   .empty {
     color: var(--text-muted);

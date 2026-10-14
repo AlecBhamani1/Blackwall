@@ -209,7 +209,8 @@ folder:
 Each enabled server starts when an Agent run starts, in the data folder, without a shell, and stops
 when the run ends; pass a project path as an argument when a server needs one. Programs follow the
 same rules as command tools, so on Windows a server needs an `.exe` launcher such as `node` rather
-than `npx`. Server names use lowercase letters, digits, and `-`. Its tools are offered
+than `npx`. Server names use lowercase letters, digits, and `-`; names added with `bw mcp add` or
+the desktop are lowercased, with spaces and underscores as hyphens. Its tools are offered
 as `server__tool`, such as `files__read_text_file`; `allowTools` limits a server to the listed
 tools, `denyTools` hides tools, and `"enabled":false` keeps a server from starting. Tools whose
 names are invalid or already used are skipped with a warning. Every call needs Exec approval, and
