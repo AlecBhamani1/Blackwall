@@ -60,6 +60,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Update the TLS dependency to include upstream security fixes.
+
 - Use portable paths in instruction source lists and directory scopes on Windows.
 
 - Size requests to the context window Ollama loaded the selected model with, reserving a quarter
