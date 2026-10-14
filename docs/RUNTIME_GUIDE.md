@@ -312,8 +312,16 @@ Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are repor
 Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
 model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
 usable.
-They cannot grant tool permissions. Skills are currently managed by the user; agent-generated skill
-creation and automatic learning are not implemented.
+They cannot grant tool permissions.
+
+Type `/learn` in an Agent conversation to have the model propose a skill from the workflow that
+worked, leaving out failed attempts and secrets. The model can only propose: `skill_propose` stores
+the proposal with its source session and message under `skills/.proposals`, and nothing is loaded
+until the owner approves it. `bw skills` lists pending proposals with a diff against the current
+skill, `bw skills approve <id>` saves one and keeps the proposal in `skills/.proposals/approved` as
+a record of its source, and `bw skills reject <id>` discards it, even one that can no longer be
+read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
+kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
 
