@@ -26,6 +26,14 @@ export interface Skill {
   body: string;
   enabled: boolean;
 }
+export interface McpServer {
+  name: string;
+  command: string[];
+  enabled: boolean;
+  allowTools?: string[];
+  denyTools?: string[];
+  secrets?: string[];
+}
 export interface MemoryEntry {
   id: string;
   content: string;
@@ -58,6 +66,15 @@ export const persistence = {
   skills: () => command<{ skills: Skill[]; warnings: string[] }>('list_skills'),
   saveSkill: (skill: Skill) => command<void>('save_skill', { skill }),
   removeSkill: (name: string) => command<void>('delete_skill', { name }),
+  mcpServers: () => command<McpServer[]>('list_mcp_servers'),
+  addMcpServer: (name: string, commandLine: string) =>
+    command<void>('add_mcp_server', { name, command: commandLine }),
+  setMcpServerEnabled: (name: string, enabled: boolean) =>
+    command<void>('set_mcp_server_enabled', { name, enabled }),
+  removeMcpServer: (name: string) => command<void>('remove_mcp_server', { name }),
+  saveMcpSecret: (name: string, key: string, value: string) =>
+    command<void>('save_mcp_secret', { name, key, value }),
+  removeMcpSecret: (name: string, key: string) => command<void>('delete_mcp_secret', { name, key }),
   memories: (query = '') => command<MemoryEntry[]>('list_memories', { query }),
   memoryProposals: () => command<MemoryProposal[]>('list_memory_proposals'),
   approveMemory: (id: string, content: string | null = null) =>

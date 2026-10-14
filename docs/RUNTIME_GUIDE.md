@@ -222,6 +222,10 @@ variable name under `secrets`; the value lives only in the platform credential s
 that server's process when it starts. If the file is invalid, a secret is missing, or a server does
 not start, the run continues without those tools and shows a warning.
 
+In the desktop app, **MCP servers** in the sidebar lists the servers with enable and disable
+toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
+password field. It uses the same validation and credential store as the CLI.
+
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
 an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
 `bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
