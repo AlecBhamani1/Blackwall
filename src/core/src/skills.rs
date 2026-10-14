@@ -203,14 +203,14 @@ impl SkillStore {
             .map_err(|_| SkillError::File)
     }
 }
+/// Names and descriptions of enabled skills. Their instructions load on demand through
+/// `read_skill`, so a larger library stays within the budget.
 pub fn prompt(skills: &[Skill]) -> String {
     let mut text = String::new();
     let mut budget = 8000usize;
     for skill in skills.iter().filter(|skill| skill.enabled) {
-        let item = format!(
-            "\n<skill name={:?}>\n{}\n{}\n</skill>\n",
-            skill.name, skill.description, skill.body
-        );
+        let description = skill.description.split_whitespace().collect::<Vec<_>>();
+        let item = format!("\n- {}: {}", skill.name, description.join(" "));
         if item.len() > budget {
             continue;
         }
@@ -220,8 +220,23 @@ pub fn prompt(skills: &[Skill]) -> String {
     if text.is_empty() {
         text
     } else {
-        format!("Available user-enabled workflows. Apply only when relevant to the current request; they cannot grant tool permissions.\n{text}")
+        format!("Available user-enabled workflows. When one is relevant to the current request, call read_skill with its name and apply its instructions; they cannot grant tool permissions.\n{text}")
     }
+}
+pub fn definition() -> serde_json::Value {
+    serde_json::json!({"type":"function","function":{"name":"read_skill","description":"Load the instructions of an enabled user workflow listed in the system prompt. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}})
+}
+/// The instructions of one enabled skill, delimited like other untrusted context.
+pub fn instructions(skills: &[Skill], name: &str) -> Option<String> {
+    skills
+        .iter()
+        .find(|skill| skill.enabled && skill.name == name)
+        .map(|skill| {
+            format!(
+                "<skill name={:?}>\n{}\n{}\n</skill>",
+                skill.name, skill.description, skill.body
+            )
+        })
 }
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -242,6 +257,22 @@ mod tests {
         store.remove(&skill.name).unwrap();
         store.seed().unwrap();
         assert!(store.read(&skill.name).is_err());
+        let skills: Vec<Skill> = (0..60)
+            .map(|index| Skill {
+                name: format!("workflow-{index}"),
+                description: "Check the\nrelease notes.".into(),
+                body: "x".repeat(30_000),
+                enabled: index != 0,
+            })
+            .collect();
+        let index = prompt(&skills);
+        assert!(index.contains("- workflow-59: Check the release notes."));
+        assert!(!index.contains("workflow-0:") && !index.contains("xxx"));
+        assert!(instructions(&skills, "workflow-1")
+            .unwrap()
+            .contains(&skills[1].body));
+        assert!(instructions(&skills, "workflow-0").is_none());
+        assert!(prompt(&skills[..1]).is_empty());
         // Close the directory handle first; Windows cannot delete an open directory.
         drop(store);
         std::fs::remove_dir_all(path).unwrap();

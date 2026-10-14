@@ -37,6 +37,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Connect local MCP servers listed in `~/.blackwall/mcp.json` to Agent runs. Their tools are named
   by server, can be limited per server, and every call needs Exec approval or an owner rule.
 
+- Load enabled skills on demand in Agent runs. The prompt lists each skill's name and description
+  within the shared budget, and the model reads a skill's instructions with `read_skill`, so far
+  larger libraries fit.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.

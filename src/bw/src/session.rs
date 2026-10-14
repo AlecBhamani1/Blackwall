@@ -166,6 +166,12 @@ impl Conversation {
         {
             definitions.extend(blackwall_core::memory::definitions());
         }
+        let skills = SkillStore::open(&directory.join("skills"))
+            .and_then(|skills| skills.list())
+            .map_err(|error| error.to_string())?;
+        if skills.0.iter().any(|skill| skill.enabled) {
+            definitions.push(blackwall_core::skills::definition());
+        }
         let report = settings
             .budget
             .report(&messages, &definitions, state.server_usage);
