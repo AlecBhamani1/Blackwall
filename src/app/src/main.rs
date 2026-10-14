@@ -10,10 +10,10 @@ mod keychain;
 #[cfg(target_os = "macos")]
 mod lifecycle;
 mod pairing;
-mod secrets;
 mod setup;
 mod updates;
 
+use blackwall_core::secrets;
 use commands::AppState;
 use thiserror::Error;
 

@@ -13,6 +13,8 @@ use tokio::{
 };
 
 pub const MCP_FILE: &str = "mcp.json";
+/// Credential store service for server secrets; each account is `server/NAME`.
+pub const SECRET_SERVICE: &str = "com.blackwall.mcp";
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_SERVERS: usize = 16;
 const MAX_TOOLS: usize = 128;
@@ -20,6 +22,7 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SECRET_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// One server entry in `mcp.json`.
@@ -34,6 +37,9 @@ pub struct ServerConfig {
     pub allow_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_tools: Vec<String>,
+    /// Names of environment variables the server receives from the platform credential store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
 }
 
 fn enabled() -> bool {
@@ -151,7 +157,29 @@ impl McpServers {
             .map(str::to_owned)
             .collect();
         for config in configs.into_iter().filter(|config| config.enabled) {
-            match tokio::time::timeout(STARTUP_TIMEOUT, launch(&config, directory)).await {
+            // A credential store prompt gets its own, longer wait than the server's startup.
+            let environment =
+                match tokio::time::timeout(SECRET_TIMEOUT, read_secrets(&config)).await {
+                    Ok(Ok(environment)) => environment,
+                    Ok(Err(error)) => {
+                        started
+                            .warnings
+                            .push(format!("MCP server {} did not start: {error}", config.name));
+                        continue;
+                    }
+                    Err(_) => {
+                        started.warnings.push(format!(
+                            "MCP server {} is waiting for {}. {}, then try again.",
+                            config.name,
+                            crate::secrets::STORE,
+                            crate::secrets::RECOVER
+                        ));
+                        continue;
+                    }
+                };
+            match tokio::time::timeout(STARTUP_TIMEOUT, launch(&config, directory, environment))
+                .await
+            {
                 Ok(Ok(connection)) => {
                     started.add(config, connection, &mut names).await;
                 }
@@ -296,7 +324,7 @@ impl McpServers {
         )
         .await;
         let result = match result {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(|error| connection.redact(error))?,
             Err(_) => {
                 // A late reply would arrive out of order, so the server is stopped and not reused.
                 connection.broken = true;
@@ -318,6 +346,7 @@ impl McpServers {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let text = redact(text, &connection.secrets);
         if text.len() > MAX_OUTPUT_BYTES {
             return Err(ToolError::Execution(
                 "The MCP tool result exceeded 64 KiB.".into(),
@@ -336,11 +365,20 @@ struct Connection {
     writer: Box<dyn AsyncWrite + Send + Unpin>,
     next_id: u64,
     broken: bool,
+    /// Values given to the server, removed from anything it sends back.
+    secrets: Vec<String>,
     #[cfg(any(unix, windows))]
     process: Option<crate::tools::ServerProcess>,
 }
 
 impl Connection {
+    fn redact(&self, error: ToolError) -> ToolError {
+        match error {
+            ToolError::Execution(text) => ToolError::Execution(redact(text, &self.secrets)),
+            other => other,
+        }
+    }
+
     async fn initialize(&mut self) -> Result<(), ToolError> {
         let result = self
             .request(
@@ -468,7 +506,37 @@ async fn read_message(
 }
 
 /// Servers start in the data folder so a project cannot shadow what a package runner loads.
-async fn launch(config: &ServerConfig, directory: &Path) -> Result<Connection, ToolError> {
+/// Read a server's secrets from the credential store, which may first ask the owner for access.
+async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, ToolError> {
+    let mut environment = vec![];
+    for name in &config.secrets {
+        let account = format!("{}/{name}", config.name);
+        let value =
+            tokio::task::spawn_blocking(move || crate::secrets::get(SECRET_SERVICE, &account))
+                .await
+                .map_err(|_| ToolError::Execution("The credential store did not respond.".into()))?
+                .map_err(|error| {
+                    ToolError::Execution(error.explain(format!(
+                        "{name} could not be read from {}.",
+                        crate::secrets::STORE
+                    )))
+                })?
+                .ok_or_else(|| {
+                    ToolError::Execution(format!(
+                        "{name} is not saved. Add it with bw mcp secret {} {name}.",
+                        config.name
+                    ))
+                })?;
+        environment.push((name.clone(), value));
+    }
+    Ok(environment)
+}
+
+async fn launch(
+    config: &ServerConfig,
+    directory: &Path,
+    environment: Vec<(String, String)>,
+) -> Result<Connection, ToolError> {
     #[cfg(any(unix, windows))]
     {
         let program =
@@ -479,7 +547,7 @@ async fn launch(config: &ServerConfig, directory: &Path) -> Result<Connection, T
                 ))
             })?;
         let (process, stdin, stdout, stderr) =
-            crate::tools::spawn_server(directory, &program, &config.command[1..])?;
+            crate::tools::spawn_server(directory, &program, &config.command[1..], &environment)?;
         // Server logs are not shown; draining them keeps a chatty server from blocking.
         tokio::spawn(async move {
             let mut stderr = stderr;
@@ -490,18 +558,35 @@ async fn launch(config: &ServerConfig, directory: &Path) -> Result<Connection, T
             writer: Box::new(stdin),
             next_id: 0,
             broken: false,
+            secrets: environment.into_iter().map(|(_, value)| value).collect(),
             process: Some(process),
         };
-        connection.initialize().await?;
+        let initialized = connection.initialize().await;
+        initialized.map_err(|error| connection.redact(error))?;
         Ok(connection)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (config, directory);
+        let _ = (config, directory, environment);
         Err(ToolError::Execution(
             "MCP servers are not supported on this platform.".into(),
         ))
     }
+}
+
+fn redact(text: String, secrets: &[String]) -> String {
+    secrets.iter().fold(text, |text, secret| {
+        text.replace(secret.as_str(), "[redacted]")
+    })
+}
+
+/// Secret names are environment variable names: uppercase letters, digits, and `_`.
+pub fn valid_secret_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn valid_server_name(name: &str) -> bool {
@@ -533,6 +618,13 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
             || !crate::command_tools::valid_program(&server.command[0])
         {
             return Err("An MCP server has an invalid name or command.");
+        }
+        if server.secrets.len() > 16
+            || server.secrets.iter().enumerate().any(|(index, name)| {
+                !valid_secret_name(name) || server.secrets[..index].contains(name)
+            })
+        {
+            return Err("An MCP server has an invalid secret name.");
         }
     }
     Ok(servers)
@@ -603,6 +695,7 @@ mod tests {
             writer: Box::new(client_write),
             next_id: 0,
             broken: false,
+            secrets: vec![],
             #[cfg(any(unix, windows))]
             process: None,
         }
@@ -617,6 +710,7 @@ mod tests {
             enabled: true,
             allow_tools: None,
             deny_tools: vec!["delete_issue".into()],
+            secrets: vec![],
         };
         let mut names: Vec<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
         let mut servers = McpServers::default();
@@ -656,6 +750,41 @@ mod tests {
         assert!(servers.warnings.iter().any(|w| w.contains("bad name!")));
         assert!(servers.warnings.iter().any(|w| w.contains("tool fail ")));
         assert!(servers.handles("jira__search") && !servers.handles("search"));
+    }
+
+    #[tokio::test]
+    async fn secret_values_are_removed_from_server_output() {
+        let mut connection = fake_server(Arc::default());
+        connection.initialize().await.unwrap();
+        connection.secrets = vec!["boom".into(), "found".into()];
+        let config = ServerConfig {
+            name: "jira".into(),
+            command: vec!["jira-mcp".into()],
+            enabled: true,
+            allow_tools: Some(vec!["search".into(), "fail".into()]),
+            deny_tools: vec![],
+            secrets: vec!["JIRA_API_TOKEN".into()],
+        };
+        let mut servers = McpServers::default();
+        servers.add(config, connection, &mut vec![]).await;
+        let approvals = Approvals::default();
+        let allow = decide(&approvals, ApprovalDecision::Allow);
+        let timeout = Duration::from_secs(5);
+        let found = servers
+            .call(
+                "jira__search",
+                r#"{"q":"x"}"#,
+                "run",
+                &approvals,
+                &allow,
+                timeout,
+            )
+            .await;
+        assert_eq!(found.unwrap(), r#"[redacted] {"q":"x"}"#);
+        assert!(matches!(
+            servers.call("jira__fail", "{}", "run", &approvals, &allow, timeout).await,
+            Err(ToolError::Execution(message)) if message == "[redacted]"
+        ));
     }
 
     #[tokio::test]
@@ -729,6 +858,28 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn secret_names_must_be_unique_environment_names() {
+        let server = |secrets: &[&str]| ServerConfig {
+            name: "jira".into(),
+            command: vec!["jira-mcp".into()],
+            enabled: true,
+            allow_tools: None,
+            deny_tools: vec![],
+            secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        assert!(validate(vec![server(&["JIRA_API_TOKEN", "JIRA_2"])]).is_ok());
+        for invalid in [
+            &["lower"][..],
+            &["2FA"],
+            &["A-B"],
+            &[""],
+            &["TOKEN", "TOKEN"],
+        ] {
+            assert!(validate(vec![server(invalid)]).is_err(), "{invalid:?}");
+        }
+    }
+
     #[tokio::test]
     async fn invalid_files_warn_and_disabled_servers_never_launch() {
         let directory =
@@ -775,6 +926,7 @@ mod tests {
             writer: Box::new(tokio::io::sink()),
             next_id: 0,
             broken: false,
+            secrets: vec![],
             #[cfg(any(unix, windows))]
             process: None,
         };
