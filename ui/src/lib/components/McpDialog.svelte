@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { MCP_SUGGESTIONS, type McpSuggestion } from '../mcpSuggestions';
   import { persistence, type McpServer, type McpToolRule } from '../persistence';
+  import { detectPlatform } from '../platform';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
@@ -11,6 +13,10 @@
   let adding = false;
   let name = '';
   let commandLine = '';
+  let commandInput: HTMLInputElement;
+  let suggestion: McpSuggestion | null = null;
+  // Suggestions start with npx, a batch file on Windows, which servers cannot run there.
+  const windows = detectPlatform() === 'windows';
   let secretName = '';
   let secretValue = '';
   let busy = false;
@@ -71,8 +77,38 @@
     busy = false;
     return true;
   }
+  async function suggest(item: McpSuggestion) {
+    suggestion = item;
+    name = item.name;
+    commandLine = item.command.join(' ') + (item.needs ? ' ' : '');
+    error = '';
+    if (!item.needs) return;
+    await tick();
+    commandInput.focus();
+    commandInput.setSelectionRange(commandLine.length, commandLine.length);
+  }
+  function cancelAdd() {
+    adding = false;
+    suggestion = null;
+    name = '';
+    commandLine = '';
+    error = '';
+  }
+  // A command retyped by the owner is no longer the suggestion, so its hint and check stop.
+  function commandEdited(event: Event) {
+    const value = (event.currentTarget as HTMLInputElement).value.trim();
+    if (suggestion && !value.startsWith(suggestion.command.join(' '))) suggestion = null;
+  }
   async function add(event: SubmitEvent) {
     event.preventDefault();
+    const words = commandLine.trim().split(/\s+/);
+    if (suggestion?.needs && words.length <= suggestion.command.length) {
+      error =
+        suggestion.needs === 'folder'
+          ? 'Add the folder this server may use at the end of the command.'
+          : 'Add the web address of the server at the end of the command.';
+      return;
+    }
     if (
       await run(
         () => persistence.addMcpServer(name, commandLine),
@@ -80,6 +116,7 @@
       )
     ) {
       adding = false;
+      suggestion = null;
       name = '';
       commandLine = '';
     }
@@ -119,6 +156,31 @@
     {#if !desktop}<p>MCP servers are available in the installed Blackwall desktop app.</p>
     {:else if adding}
       <form onsubmit={add}>
+        <h3 class="first">Suggested</h3>
+        {#if windows}<p class="hint">
+            Suggested servers start with <code>npx</code>, which Blackwall cannot run on Windows yet.
+            Add a server whose program is an <code>.exe</code> instead.
+          </p>
+        {:else}<div class="suggestions">
+            {#each MCP_SUGGESTIONS as item (item.name)}{@const added = servers.some(
+                (server) => server.name === item.name,
+              )}<button
+                type="button"
+                class="suggestion"
+                class:chosen={suggestion?.name === item.name}
+                disabled={busy || added}
+                aria-pressed={suggestion?.name === item.name}
+                onclick={() => suggest(item)}
+                ><strong>{item.name}</strong><small
+                  >{added ? 'Already added' : item.description}</small
+                ></button
+              >{/each}
+          </div>
+          <p class="hint">
+            Pick one to fill in the form, then review it and choose Add server. The first agent run
+            after adding one downloads that exact version from npm, so it needs a network connection.
+          </p>
+        {/if}
         <label for="mcp-name">Name</label><input
           id="mcp-name"
           autocapitalize="none"
@@ -139,18 +201,25 @@
           autocorrect="off"
           spellcheck="false"
           class="code"
+          bind:this={commandInput}
           bind:value={commandLine}
+          oninput={commandEdited}
           required
           disabled={busy}
           placeholder="npx -y @modelcontextprotocol/server-filesystem /path/to/folder"
         />
+        {#if suggestion?.needs}<p class="field-hint">
+            {suggestion.needs === 'folder'
+              ? 'Add the folder this server may use at the end, such as /Users/me/projects.'
+              : 'Add the web address of the server at the end, such as https://mcp.example.com/mcp.'}
+          </p>{/if}
         <p class="hint">
           Words are separated by spaces; use <code>bw mcp add</code> or edit mcp.json for an argument
           that contains a space. Servers start without a shell in the Blackwall data folder, so pass a
           project path as an argument when a server needs one.
         </p>
         <div class="actions">
-          <button type="button" class="secondary" disabled={busy} onclick={() => (adding = false)}
+          <button type="button" class="secondary" disabled={busy} onclick={cancelAdd}
             >Cancel</button
           ><span></span><button class="primary" disabled={busy}
             >{busy ? 'Saving…' : 'Add server'}</button
@@ -322,6 +391,9 @@
     font-size: 13px;
     font-weight: 570;
   }
+  h3.first {
+    margin-top: 0;
+  }
   header p,
   .hint {
     font-size: 12px;
@@ -403,6 +475,35 @@
     color: var(--text-muted);
     font-size: 11.5px;
     margin-top: 6px;
+  }
+  .suggestions {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 8px;
+  }
+  .suggestion {
+    display: grid;
+    gap: 4px;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+  .suggestion strong {
+    font-family: var(--font-code);
+    font-size: 12px;
+  }
+  .suggestion small {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .suggestion.chosen {
+    border-color: var(--accent);
+  }
+  .suggestion:disabled {
+    opacity: 0.55;
   }
   .manage {
     display: flex;

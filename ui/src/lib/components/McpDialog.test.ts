@@ -111,4 +111,73 @@ describe('MCP server management', () => {
     await user.click(await screen.findByText('jira'));
     expect(screen.getByText('The policy file is not valid.')).toBeInTheDocument();
   });
+  it('fills the form from a suggestion and marks servers already added', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      { name: 'git', command: ['git-mcp'], enabled: true },
+    ]);
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    expect(screen.getByRole('button', { name: /^git/ })).toBeDisabled();
+    expect(screen.getByText('Already added')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^context7/ }));
+    expect(screen.getByLabelText('Name')).toHaveValue('context7');
+    expect(screen.getByLabelText('Command')).toHaveValue('npx -y @upstash/context7-mcp@4.4.1');
+    expect(add).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).toHaveBeenCalledWith('context7', 'npx -y @upstash/context7-mcp@4.4.1');
+  });
+  it.each([
+    ['filesystem', 'Add the folder', '/tmp/notes', '@modelcontextprotocol/server-filesystem@1.0.0'],
+    ['remote', 'Add the web address', 'https://mcp.example.com/mcp', 'mcp-remote@0.14.3'],
+  ])('asks for what %s needs before adding it', async (name, message, value, pkg) => {
+    const user = userEvent.setup();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.click(screen.getByRole('button', { name: new RegExp(`^${name}`) }));
+    expect(screen.getByLabelText('Command')).toHaveFocus();
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(message);
+    expect(add).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText('Command'), value);
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).toHaveBeenCalledWith(name, `npx -y ${pkg} ${value}`);
+  });
+  it('does not offer suggestions that cannot run on Windows', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Windows NT 10.0)');
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    expect(screen.queryByRole('button', { name: /^context7/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/cannot run on Windows yet/)).toBeInTheDocument();
+  });
+  it('forgets a suggestion when the form is cancelled or the command is retyped', async () => {
+    const user = userEvent.setup();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.click(screen.getByRole('button', { name: /^filesystem/ }));
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(screen.getByLabelText('Name')).toHaveValue('');
+    expect(screen.getByLabelText('Command')).toHaveValue('');
+    await user.click(screen.getByRole('button', { name: /^filesystem/ }));
+    const command = screen.getByLabelText('Command');
+    await user.clear(command);
+    await user.type(command, 'npx @modelcontextprotocol/server-filesystem@1.0.0');
+    expect(screen.getByRole('button', { name: /^filesystem/ })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    );
+    expect(screen.queryByText(/Add the folder this server may use/)).not.toBeInTheDocument();
+    await user.clear(command);
+    await user.type(command, 'my-server --stdio');
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).toHaveBeenCalledWith('filesystem', 'my-server --stdio');
+  });
 });
