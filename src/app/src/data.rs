@@ -327,6 +327,25 @@ pub async fn save_mcp_secret(
     .await
 }
 #[tauri::command]
+pub async fn list_mcp_tool_rules(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::policy::ToolRule>, String> {
+    with_mcp(&app, |directory| {
+        blackwall_core::policy::tool_rules(directory)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn remove_mcp_tool_rule(
+    app: AppHandle,
+    rule: blackwall_core::policy::ToolRule,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::policy::remove_tool_rule(directory, &rule)
+    })
+    .await
+}
+#[tauri::command]
 pub async fn delete_mcp_secret(app: AppHandle, name: String, key: String) -> Result<(), String> {
     with_mcp(&app, move |directory| {
         blackwall_core::mcp::delete_secret(directory, &name, &key)

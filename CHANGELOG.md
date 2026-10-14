@@ -53,6 +53,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Manage MCP servers and their secrets from **MCP servers** in the desktop sidebar, sharing the
   CLI's validation and credential store.
 
+- Always allow an MCP tool, or every tool from its server, from its approval card, in one project
+  or every project. The choice is saved as an owner rule with new `tool` and `project` fields, and
+  **MCP servers** lists and removes these rules.
+
 ### Fixed
 
 - Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands

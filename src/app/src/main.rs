@@ -71,6 +71,8 @@ fn run() -> Result<(), StartupError> {
             data::remove_mcp_server,
             data::save_mcp_secret,
             data::delete_mcp_secret,
+            data::list_mcp_tool_rules,
+            data::remove_mcp_tool_rule,
             data::list_sessions,
             data::load_session,
             data::save_session,

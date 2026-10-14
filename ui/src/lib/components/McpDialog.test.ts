@@ -21,6 +21,7 @@ describe('MCP server management', () => {
         secrets: ['JIRA_API_TOKEN'],
       },
     ]);
+    vi.spyOn(persistence, 'mcpToolRules').mockResolvedValue([]);
   });
   it('adds a server from a command line and toggles one', async () => {
     const user = userEvent.setup();
@@ -81,5 +82,33 @@ describe('MCP server management', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Keychain is locked.');
     expect(screen.getByLabelText('Value')).toHaveValue('');
     expect(screen.getByLabelText('Environment variable')).toHaveValue('JIRA_API_TOKEN');
+  });
+  it('lists and removes the rules that allow a server without asking', async () => {
+    const user = userEvent.setup();
+    const rule = { tool: 'jira__search', project: '/work/app' };
+    vi.spyOn(persistence, 'mcpToolRules').mockResolvedValue([
+      { tool: 'jira', project: null },
+      rule,
+      { tool: 'docs', project: null },
+    ]);
+    const remove = vi.spyOn(persistence, 'removeMcpToolRule').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    expect(await screen.findByText('2 allowed without asking · 1 secret')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Manage jira' }));
+    expect(screen.getByText('Every tool')).toBeInTheDocument();
+    expect(screen.getByText('In every project')).toBeInTheDocument();
+    expect(screen.getByText('In /work/app')).toBeInTheDocument();
+    expect(screen.queryByText('docs')).not.toBeInTheDocument();
+    vi.spyOn(persistence, 'mcpToolRules').mockResolvedValue([{ tool: 'jira', project: null }]);
+    await user.click(screen.getByRole('button', { name: 'Stop allowing jira__search in /work/app' }));
+    expect(remove).toHaveBeenCalledWith(rule);
+    await vi.waitFor(() => expect(screen.queryByText('In /work/app')).not.toBeInTheDocument());
+  });
+  it('still lists servers when the rules file cannot be read', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpToolRules').mockRejectedValue('The policy file is not valid.');
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByText('jira'));
+    expect(screen.getByText('The policy file is not valid.')).toBeInTheDocument();
   });
 });
