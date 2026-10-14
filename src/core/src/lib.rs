@@ -22,6 +22,7 @@ pub mod agent;
 pub mod approvals;
 pub mod command_tools;
 pub mod instructions;
+pub mod mcp;
 pub mod model;
 pub mod policy;
 pub mod tools;

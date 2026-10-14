@@ -444,6 +444,86 @@ pub(crate) async fn program_with_timeout(
         run_with_timeout(directory, process, timeout).await
     }
 }
+/// Blackwall's model and relay secrets, which child programs never inherit.
+#[cfg(any(unix, windows))]
+const SECRET_ENV: [&str; 4] = [
+    "BLACKWALL_MODEL_API_KEY",
+    "BLACKWALL_RELAY_TOKEN",
+    "TAURI_SIGNING_PRIVATE_KEY",
+    "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+];
+/// A long-running program with piped standard streams, such as an MCP server. Dropping it stops
+/// the program and its descendants, like a finished or cancelled shell command.
+#[cfg(any(unix, windows))]
+pub(crate) struct ServerProcess {
+    #[cfg(unix)]
+    _child: tokio::process::Child,
+    #[cfg(unix)]
+    _group: ProcessGroup,
+    #[cfg(windows)]
+    _child: Box<dyn process_wrap::tokio::ChildWrapper>,
+}
+#[cfg(any(unix, windows))]
+pub(crate) type ServerStreams = (
+    ServerProcess,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+    tokio::process::ChildStderr,
+);
+/// Start a resolved program without a shell, in `directory`, without Blackwall's secrets.
+#[cfg(any(unix, windows))]
+pub(crate) fn spawn_server(
+    directory: &Path,
+    program: &Path,
+    args: &[String],
+) -> Result<ServerStreams, ToolError> {
+    let start = || ToolError::Execution("The program could not start.".into());
+    let mut process = tokio::process::Command::new(program);
+    process
+        .args(args)
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for key in SECRET_ENV {
+        process.env_remove(key);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
+        let mut child = process.spawn().map_err(|_| start())?;
+        let group = ProcessGroup(child.id().ok_or_else(start)?);
+        let stdin = child.stdin.take().ok_or_else(start)?;
+        let stdout = child.stdout.take().ok_or_else(start)?;
+        let stderr = child.stderr.take().ok_or_else(start)?;
+        Ok((
+            ServerProcess {
+                _child: child,
+                _group: group,
+            },
+            stdin,
+            stdout,
+            stderr,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        let mut process = CommandWrap::from(process);
+        process
+            .wrap(CreationFlags(CREATE_NO_WINDOW))
+            .wrap(KillOnDrop)
+            .wrap(JobObject);
+        let mut child = process.spawn().map_err(|_| start())?;
+        let stdin = child.stdin().take().ok_or_else(start)?;
+        let stdout = child.stdout().take().ok_or_else(start)?;
+        let stderr = child.stderr().take().ok_or_else(start)?;
+        Ok((ServerProcess { _child: child }, stdin, stdout, stderr))
+    }
+}
 /// Bounded, time-limited capture with the same descendant cleanup for every process.
 #[cfg(any(unix, windows))]
 async fn run_with_timeout(
@@ -457,13 +537,7 @@ async fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Do not inherit the model or relay secrets from Blackwall's environment.
-    for key in [
-        "BLACKWALL_MODEL_API_KEY",
-        "BLACKWALL_RELAY_TOKEN",
-        "TAURI_SIGNING_PRIVATE_KEY",
-        "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
-    ] {
+    for key in SECRET_ENV {
         process.env_remove(key);
     }
     #[cfg(unix)]
