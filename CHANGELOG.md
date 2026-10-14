@@ -41,6 +41,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   within the shared budget, and the model reads a skill's instructions with `read_skill`, so far
   larger libraries fit.
 
+- Run CLI tasks headlessly with `bw run --json`, printing agent events as JSON lines and denying
+  any action that owner rules leave to an approval prompt.
+
 ### Fixed
 
 - Use portable paths in instruction source lists and directory scopes on Windows.

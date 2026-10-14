@@ -334,6 +334,14 @@ For an authenticated service, set `BLACKWALL_MODEL_API_KEY` and the matching
 after `/endpoint` changes. The CLI does not store keys or use desktop credential-store entries.
 Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol preview without a model call.
 
+`bw run --json "prompt"` and `bw resume SESSION_ID --json "prompt"` run without prompting, for scripts
+and CI. Each agent event except context snapshots is printed to standard output as one JSON object
+per line, ending with a `result` line that has the session ID, `status`, the answer, and any error.
+Standard input is not read: actions that owner rules allow run, and anything that would show an
+approval prompt is denied.
+The command exits with a nonzero status when the run fails; errors before the run starts, such as
+invalid settings, are reported only on standard error.
+
 The CLI shares core tools, approval rules, enabled memory, skills, and native sessions with desktop.
 Type `yes` to authorize the displayed action once; other input or EOF denies it. Web tools are off
 initially and every enabled web request still needs approval. Ctrl+C stops the active turn and
