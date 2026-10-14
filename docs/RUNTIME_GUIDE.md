@@ -273,7 +273,9 @@ and report concrete findings with file paths.
 
 Names use lowercase letters, numbers, and hyphens, up to 64 characters. A file must be valid UTF-8
 Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are reported and skipped.
-Enabled skills enter agent context when they fit the shared 8,000-byte budget.
+Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
+model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
+usable.
 They cannot grant tool permissions. Skills are currently managed by the user; agent-generated skill
 creation and automatic learning are not implemented.
 

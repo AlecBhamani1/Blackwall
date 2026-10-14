@@ -16,7 +16,7 @@ const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_TOOLS: usize = 20;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_VALUE_BYTES: usize = 8000;
-const BUILT_IN: [&str; 10] = [
+const BUILT_IN: [&str; 11] = [
     "read_file",
     "list_files",
     "search_files",
@@ -27,6 +27,7 @@ const BUILT_IN: [&str; 10] = [
     "spawn_agent",
     "memory_list",
     "memory_propose",
+    "read_skill",
 ];
 
 #[derive(Debug, Deserialize)]

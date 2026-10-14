@@ -123,6 +123,18 @@ impl Agent<'_> {
             None => Default::default(),
         };
         let mcp_directory = user_directory.map(std::path::Path::to_path_buf);
+        let skills = match user_directory {
+            Some(directory) => {
+                let directory = directory.join("skills");
+                instruction_task(move || {
+                    crate::skills::SkillStore::open(&directory).and_then(|store| store.list())
+                })
+                .await?
+                .map_err(|_| AgentError::Instructions)?
+                .0
+            }
+            None => vec![],
+        };
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
@@ -169,6 +181,9 @@ impl Agent<'_> {
         definitions.extend(command_tools.definitions());
         if memory.is_some() {
             definitions.extend(crate::memory::definitions());
+        }
+        if skills.iter().any(|skill| skill.enabled) {
+            definitions.push(crate::skills::definition());
         }
 
         let mut has_guidance = !guidance.prompt().is_empty();
@@ -329,6 +344,7 @@ impl Agent<'_> {
                     let guidance = &guidance;
                     let command_tools = &command_tools;
                     let mcp = &mcp;
+                    let skills = &skills;
                     async move {
                         let ui_id = format!("{iteration}_{index}_{}", call.id);
                         (self.emit)(AgentEvent::ToolCall {
@@ -356,6 +372,18 @@ impl Agent<'_> {
                                     .map_err(tools::ToolError::Execution),
                                 None => Err(tools::ToolError::Denied),
                             }
+                        } else if call.function.name == "read_skill" {
+                            serde_json::from_str::<Value>(&call.function.arguments)
+                                .ok()
+                                .and_then(|args| args["name"].as_str().map(str::to_owned))
+                                .ok_or(tools::ToolError::Arguments)
+                                .and_then(|name| {
+                                    crate::skills::instructions(skills, &name).ok_or_else(|| {
+                                        tools::ToolError::Execution(
+                                            "No enabled workflow has that name.".into(),
+                                        )
+                                    })
+                                })
                         } else if call.function.name == "spawn_agent" {
                             let args: Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
@@ -1126,6 +1154,89 @@ mod tests {
             "Guided investigation completed."
         );
         assert!(events.lock().unwrap().iter().any(|event| matches!(event, AgentEvent::InstructionsLoaded { agent_id: Some(_), sources, .. } if sources.contains(&"nested/AGENTS.md".to_owned()))));
+        drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    struct SkillModel {
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for SkillModel {
+        fn generate<'a>(
+            &'a self,
+            messages: &'a [Value],
+            definitions: &'a [Value],
+            _delta: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    assert!(definitions
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "read_skill"));
+                    let call = |id: &str, name: &str| ToolCall {
+                        id: id.into(),
+                        function: ToolFunction {
+                            name: "read_skill".into(),
+                            arguments: format!("{{\"name\":{name:?}}}"),
+                        },
+                    };
+                    return Ok(ModelTurn {
+                        calls: vec![call("enabled", "release"), call("disabled", "draft")],
+                        ..Default::default()
+                    });
+                }
+                let output = |id: &str| {
+                    messages
+                        .iter()
+                        .find(|message| message["tool_call_id"] == id)
+                        .unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                };
+                assert!(output("enabled").contains("Run the release checklist."));
+                assert!(output("disabled").contains("No enabled workflow"));
+                Ok(ModelTurn {
+                    content: "Loaded.".into(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn enabled_skills_load_on_demand_and_disabled_skills_stay_hidden() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-skill-tool-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        let store = crate::skills::SkillStore::open(&directory.join("user/skills")).unwrap();
+        for (name, enabled) in [("release", true), ("draft", false)] {
+            store
+                .save(&crate::skills::Skill {
+                    name: name.into(),
+                    description: "Ship a release.".into(),
+                    body: "Run the release checklist.".into(),
+                    enabled,
+                })
+                .unwrap();
+        }
+        drop(store);
+        let agent = Agent {
+            backend: &SkillModel {
+                step: Mutex::new(0),
+            },
+            workspace: Workspace::open(&directory.join("project")).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(|_| {}),
+        };
+        assert_eq!(
+            agent
+                .run_with_user_instructions("skills", vec![], Some(&directory.join("user")))
+                .await
+                .unwrap(),
+            "Loaded."
+        );
         drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }

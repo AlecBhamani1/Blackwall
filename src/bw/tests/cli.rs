@@ -921,6 +921,7 @@ fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
     assert!(output.contains("Checkpoints: 1"));
     let mut definitions = blackwall_core::tools::definitions(false, true);
     definitions.extend(blackwall_core::memory::definitions());
+    definitions.push(blackwall_core::skills::definition());
     assert!(output.contains(&format!(
         "tools: {}",
         blackwall_core::context::estimate(&definitions)

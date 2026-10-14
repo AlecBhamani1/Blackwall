@@ -154,8 +154,8 @@
           >
         </article>{/each}
       <p class="hint">
-        Blackwall includes enabled skills when they fit its context budget. Keep instructions
-        focused and use a model that supports tools.
+        Agent runs list enabled skills by name and description and load one when it is relevant.
+        Keep descriptions specific and use a model that supports tools.
       </p>
     {/if}
     {#each warnings as warning}<p class="warning">{warning}</p>{/each}
