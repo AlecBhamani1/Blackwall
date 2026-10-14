@@ -47,8 +47,9 @@ USAGE:
   bw config [show]           Show effective settings
   bw config set <name> <value>
   bw commands                List interactive slash commands
-  bw run <prompt>            Run one task
-  bw resume <id> [prompt]    Continue a saved Agent conversation
+  bw run [--json] <prompt>   Run one task; --json prints JSON lines and denies prompts
+  bw resume <id> [--json] [prompt]
+                             Continue a saved Agent conversation
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw request <prompt>        Print a request preview without a model call
@@ -133,10 +134,9 @@ async fn run() -> Result<(), String> {
         );
         return Ok(());
     }
-    let mut input = Input::stdin();
     if command == "setup" {
         require_no_arguments(&arguments)?;
-        return setup(&store, &mut settings, &mut input).await;
+        return setup(&store, &mut settings, &mut Input::stdin()).await;
     }
     let workspace =
         Workspace::open(&env::current_dir().map_err(|_| "The current folder is unavailable.")?)
@@ -159,9 +159,15 @@ async fn run() -> Result<(), String> {
         } else {
             &arguments[..]
         };
+        let (json, prompt_arguments) = match prompt_arguments.split_first() {
+            Some((flag, rest)) if flag == "--json" => (true, rest),
+            _ => (false, prompt_arguments),
+        };
         let prompt = required_prompt(prompt_arguments)?;
+        // A headless run never reads standard input, so it cannot take a script's later input.
+        let mut input = (!json).then(Input::stdin);
         return conversation
-            .turn(&store, &directory, &settings, &prompt, &mut input)
+            .turn(&store, &directory, &settings, &prompt, input.as_mut())
             .await;
     }
     if command == "chat" {
@@ -172,7 +178,7 @@ async fn run() -> Result<(), String> {
         &directory,
         &mut settings,
         &mut conversation,
-        &mut input,
+        &mut Input::stdin(),
     )
     .await
 }
@@ -326,7 +332,7 @@ async fn chat(
                 match name {
                     "init" if value.is_empty() => {
                         conversation
-                            .turn(store, directory, settings, "/init", input)
+                            .turn(store, directory, settings, "/init", Some(input))
                             .await
                     }
                     "compact" if value.is_empty() => {
@@ -346,7 +352,7 @@ async fn chat(
                     line
                 };
                 conversation
-                    .turn(store, directory, settings, prompt, input)
+                    .turn(store, directory, settings, prompt, Some(input))
                     .await
             };
         if let Err(error) = result {

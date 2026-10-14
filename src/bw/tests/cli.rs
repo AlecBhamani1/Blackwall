@@ -491,6 +491,36 @@ fn a_write_requires_explicit_yes_and_is_denied_when_stdin_ends() {
 }
 
 #[test]
+fn json_runs_print_events_and_deny_prompts_even_when_stdin_says_yes() {
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    let protected = fixture.project.join("protected.txt");
+    fs::write(&protected, "original\n").unwrap();
+    let model = ModelServer::start(vec![proposed_write(), answer("approval handled")]);
+    fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
+    let output = fixture.success(&["run", "--json", "change protected.txt"], "yes\n");
+    let events: Vec<serde_json::Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "approval_request"));
+    assert!(events.iter().any(|event| event["type"] == "tool_result"
+        && event["output"].as_str().unwrap().contains("denied")));
+    let result = events.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["status"], "complete");
+    assert!(result["answer"]
+        .as_str()
+        .unwrap()
+        .contains("Fixture approval handled"));
+    assert!(result["sessionId"].as_str().is_some());
+    assert_eq!(fs::read_to_string(&protected).unwrap(), "original\n");
+    model.finish();
+}
+
+#[test]
 fn resuming_from_another_directory_reads_files_from_the_saved_project() {
     let fixture = Fixture::new();
     fixture.configure_model();

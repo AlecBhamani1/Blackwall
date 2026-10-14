@@ -211,7 +211,7 @@ impl Conversation {
                 instructions,
                 compact: true,
             },
-            input,
+            Some(input),
             memory.as_ref(),
             directory,
         )
@@ -234,8 +234,10 @@ impl Conversation {
         directory: &Path,
         settings: &Settings,
         prompt: &str,
-        input: &mut Input,
+        input: Option<&mut Input>,
     ) -> Result<(), String> {
+        // Without input, the run is headless: JSON lines, and prompts are denied.
+        let json = input.is_none();
         self.flush(store)?;
         let budget = served_budget(&settings.endpoint, &settings.model, settings.budget).await;
         let backend = HttpModel::new(
@@ -292,7 +294,7 @@ impl Conversation {
         let content = if answer.is_empty() {
             result.as_ref().err().cloned().unwrap_or_default()
         } else {
-            answer
+            answer.clone()
         };
         self.session["messages"].as_array_mut().ok_or("The conversation is invalid.")?.push(
             json!({"id":format!("assistant_{timestamp}_{}",SEQUENCE.fetch_add(1,Ordering::Relaxed)),"role":"assistant","content":content,"attachments":[],"status":status,"createdAt":timestamp})
@@ -300,7 +302,12 @@ impl Conversation {
         self.session["updatedAt"] = json!(now()?);
         self.dirty = true;
         self.flush(store)?;
-        eprintln!("Saved conversation {}", self.id());
+        if json {
+            let result = json!({"type":"result","sessionId":self.id(),"status":status,"answer":answer,"error":result.as_ref().err()});
+            println!("{result}");
+        } else {
+            eprintln!("Saved conversation {}", self.id());
+        }
         result
     }
 }
@@ -366,10 +373,11 @@ async fn execute(
     workspace: Workspace,
     web_enabled: bool,
     run: ContextRun,
-    input: &mut Input,
+    mut input: Option<&mut Input>,
     memory: Option<&MemoryTools>,
     directory: &Path,
 ) -> (String, Option<ContextState>, Result<(), String>) {
+    let json = input.is_none();
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
     let emit = Arc::new(move |event| {
@@ -392,7 +400,12 @@ async fn execute(
         tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => break Err("Task stopped. You can continue this conversation.".into()),
-            line = input.read(), if pending.is_some() => {
+            line = async {
+                match input.as_deref_mut() {
+                    Some(input) => input.read().await,
+                    None => Ok(None),
+                }
+            }, if pending.is_some() => {
                 match line {
                     Ok(line) => {
                         if let Some(mut request) = pending.take() {
@@ -403,7 +416,13 @@ async fn execute(
                     Err(error) => break Err(error),
                 }
             }
-            event = incoming.recv() => if let Some(event) = event { render_event(event, &mut answer, &mut pending, &mut snapshot); },
+            event = incoming.recv() => if let Some(event) = event {
+                render_event(event, &mut answer, &mut pending, &mut snapshot, json);
+                // Nobody can answer a prompt in a headless run, so it is denied at once.
+                if let Some(request) = pending.take_if(|_| json) {
+                    if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
+                }
+            },
             result = &mut work => match result {
                 Ok(complete) => break Ok(complete),
                 Err(error) => break Err(error.to_string()),
@@ -413,13 +432,15 @@ async fn execute(
     // A ready model future can enqueue events and complete in one poll. Render those
     // events before returning so fast completions retain text and instruction provenance.
     while let Ok(event) = incoming.try_recv() {
-        render_event(event, &mut answer, &mut pending, &mut snapshot);
+        render_event(event, &mut answer, &mut pending, &mut snapshot, json);
     }
     let _ = io::stdout().flush();
     let result = result.map(|complete| {
         answer = complete;
     });
-    println!();
+    if !json {
+        println!();
+    }
     (answer, snapshot, result)
 }
 
@@ -428,7 +449,32 @@ fn render_event(
     answer: &mut String,
     pending: &mut Option<ResolveApprovalRequest>,
     snapshot: &mut Option<ContextState>,
+    json: bool,
 ) {
+    if json {
+        // Context snapshots are internal state; every other event is one JSON line.
+        if let AgentEvent::ContextUpdated { state, .. } = event {
+            *snapshot = Some(state);
+            return;
+        }
+        println!("{}", serde_json::to_string(&event).unwrap_or_default());
+        match event {
+            AgentEvent::AssistantDelta { delta, .. } => answer.push_str(&delta),
+            AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } => {
+                *pending = Some(ResolveApprovalRequest {
+                    request_id,
+                    approval_id,
+                    decision: ApprovalDecision::Deny,
+                })
+            }
+            _ => {}
+        }
+        return;
+    }
     match event {
         AgentEvent::ContextUpdated { state, .. } => *snapshot = Some(state),
         AgentEvent::AssistantDelta { delta, .. } => {
