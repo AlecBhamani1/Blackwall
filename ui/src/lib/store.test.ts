@@ -404,7 +404,7 @@ describe('chat controller', () => {
     expect(tools).toHaveLength(2);
     expect(tools?.[1]).toMatchObject({ id: 'instructions_child', status: 'complete' });
     expect(tools?.[1].output).toContain('nested/AGENTS.md');
-    expect(tools?.[0]).toMatchObject({ name: 'project_instructions', status: 'complete' });
+    expect(tools?.[0]).toMatchObject({ name: 'project_instructions', status: 'error' });
     expect(tools?.[0].output).toContain('AGENTS.md, src/AGENTS.override.md');
     expect(tools?.[0].output).toContain('Warning: Skipped oversized guidance.');
     controller.destroy();

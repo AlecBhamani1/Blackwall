@@ -1,14 +1,22 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { persistence, type McpServer } from '../persistence';
+  import { onMount, tick } from 'svelte';
+  import { MCP_SUGGESTIONS, type McpSuggestion } from '../mcpSuggestions';
+  import { persistence, type McpServer, type McpToolRule } from '../persistence';
+  import { detectPlatform } from '../platform';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
   let servers: McpServer[] = [];
+  let rules: McpToolRule[] = [];
+  let rulesError = '';
   let selected: McpServer | null = null;
   let adding = false;
   let name = '';
   let commandLine = '';
+  let commandInput: HTMLInputElement;
+  let suggestion: McpSuggestion | null = null;
+  // Suggestions start with npx, a batch file on Windows, which servers cannot run there.
+  const windows = detectPlatform() === 'windows';
   let secretName = '';
   let secretValue = '';
   let busy = false;
@@ -23,6 +31,33 @@
   async function load() {
     servers = await persistence.mcpServers();
     if (selected) open(servers.find((server) => server.name === selected?.name) ?? null);
+    // Rules live in policy.json, so a problem there does not hide the servers.
+    try {
+      rules = await persistence.mcpToolRules();
+      rulesError = '';
+    } catch (cause) {
+      rules = [];
+      rulesError =
+        typeof cause === 'string' ? cause : 'Saved rules could not be read from policy.json.';
+    }
+  }
+  // Saved Windows paths keep their verbatim prefix for matching; it is hidden when shown.
+  function folder(path: string) {
+    return path.replace(/^\\\\\?\\/, '');
+  }
+  // Rules are passed in, so the markup updates when they reload.
+  function serverRules(rules: McpToolRule[], server: string) {
+    return rules.filter((rule) => rule.tool === server || rule.tool.startsWith(`${server}__`));
+  }
+  function summary(rules: McpToolRule[], server: McpServer) {
+    const allowed = serverRules(rules, server.name).length;
+    const secrets = server.secrets?.length ?? 0;
+    return [
+      allowed ? `${allowed} allowed without asking` : 'Asks before every call',
+      secrets ? `${secrets} secret${secrets === 1 ? '' : 's'}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
   }
   async function run(action: () => Promise<void>, failure: string) {
     busy = true;
@@ -42,8 +77,38 @@
     busy = false;
     return true;
   }
+  async function suggest(item: McpSuggestion) {
+    suggestion = item;
+    name = item.name;
+    commandLine = item.command.join(' ') + (item.needs ? ' ' : '');
+    error = '';
+    if (!item.needs) return;
+    await tick();
+    commandInput.focus();
+    commandInput.setSelectionRange(commandLine.length, commandLine.length);
+  }
+  function cancelAdd() {
+    adding = false;
+    suggestion = null;
+    name = '';
+    commandLine = '';
+    error = '';
+  }
+  // A command retyped by the owner is no longer the suggestion, so its hint and check stop.
+  function commandEdited(event: Event) {
+    const value = (event.currentTarget as HTMLInputElement).value.trim();
+    if (suggestion && !value.startsWith(suggestion.command.join(' '))) suggestion = null;
+  }
   async function add(event: SubmitEvent) {
     event.preventDefault();
+    const words = commandLine.trim().split(/\s+/);
+    if (suggestion?.needs && words.length <= suggestion.command.length) {
+      error =
+        suggestion.needs === 'folder'
+          ? 'Add the folder this server may use at the end of the command.'
+          : 'Add the web address of the server at the end of the command.';
+      return;
+    }
     if (
       await run(
         () => persistence.addMcpServer(name, commandLine),
@@ -51,6 +116,7 @@
       )
     ) {
       adding = false;
+      suggestion = null;
       name = '';
       commandLine = '';
     }
@@ -90,29 +156,70 @@
     {#if !desktop}<p>MCP servers are available in the installed Blackwall desktop app.</p>
     {:else if adding}
       <form onsubmit={add}>
+        <h3 class="first">Suggested</h3>
+        {#if windows}<p class="hint">
+            Suggested servers start with <code>npx</code>, which Blackwall cannot run on Windows yet.
+            Add a server whose program is an <code>.exe</code> instead.
+          </p>
+        {:else}<div class="suggestions">
+            {#each MCP_SUGGESTIONS as item (item.name)}{@const added = servers.some(
+                (server) => server.name === item.name,
+              )}<button
+                type="button"
+                class="suggestion"
+                class:chosen={suggestion?.name === item.name}
+                disabled={busy || added}
+                aria-pressed={suggestion?.name === item.name}
+                onclick={() => suggest(item)}
+                ><strong>{item.name}</strong><small
+                  >{added ? 'Already added' : item.description}</small
+                ></button
+              >{/each}
+          </div>
+          <p class="hint">
+            Pick one to fill in the form, then review it and choose Add server. The first agent run
+            after adding one downloads that exact version from npm, so it needs a network connection.
+          </p>
+        {/if}
         <label for="mcp-name">Name</label><input
           id="mcp-name"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           bind:value={name}
-          pattern="[a-z0-9-]+"
           maxlength="32"
           required
           disabled={busy}
           placeholder="jira"
-        /><label for="mcp-command">Command</label><input
+        />
+        <p class="field-hint">
+          Saved in lowercase with hyphens for spaces and underscores, so My Jira becomes my-jira.
+        </p>
+        <label for="mcp-command">Command</label><input
           id="mcp-command"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           class="code"
+          bind:this={commandInput}
           bind:value={commandLine}
+          oninput={commandEdited}
           required
           disabled={busy}
           placeholder="npx -y @modelcontextprotocol/server-filesystem /path/to/folder"
         />
+        {#if suggestion?.needs}<p class="field-hint">
+            {suggestion.needs === 'folder'
+              ? 'Add the folder this server may use at the end, such as /Users/me/projects.'
+              : 'Add the web address of the server at the end, such as https://mcp.example.com/mcp.'}
+          </p>{/if}
         <p class="hint">
           Words are separated by spaces; use <code>bw mcp add</code> or edit mcp.json for an argument
           that contains a space. Servers start without a shell in the Blackwall data folder, so pass a
           project path as an argument when a server needs one.
         </p>
         <div class="actions">
-          <button type="button" class="secondary" disabled={busy} onclick={() => (adding = false)}
+          <button type="button" class="secondary" disabled={busy} onclick={cancelAdd}
             >Cancel</button
           ><span></span><button class="primary" disabled={busy}
             >{busy ? 'Saving…' : 'Add server'}</button
@@ -129,6 +236,28 @@
         >
       </div>
       <code>{JSON.stringify(server.command)}</code>
+      <h3>Allowed without asking</h3>
+      {#each serverRules(rules, server.name) as rule (`${rule.tool} ${rule.project}`)}<article>
+          <span class="rule"
+            ><strong class:tool={rule.tool !== server.name}
+              >{rule.tool === server.name
+                ? 'Every tool'
+                : rule.tool.slice(server.name.length + 2)}</strong
+            >
+            <small>{rule.project ? `In ${folder(rule.project)}` : 'In every project'}</small></span
+          ><button
+            class="delete"
+            aria-label={`Stop allowing ${rule.tool}${rule.project ? ` in ${rule.project}` : ''}`}
+            disabled={busy}
+            onclick={() =>
+              run(
+                () => persistence.removeMcpToolRule(rule),
+                'This rule could not be removed.',
+              )}>Remove</button
+          >
+        </article>{:else}<p class="empty">
+          {rulesError || 'Every call asks for approval. Choose Always allow on an approval to skip it.'}
+        </p>{/each}
       <h3>Secrets</h3>
       {#each server.secrets ?? [] as secret (secret)}<article>
           <span class="secret">{secret}</span><button
@@ -147,6 +276,9 @@
       <form onsubmit={saveSecret}>
         <label for="mcp-secret-name">Environment variable</label><input
           id="mcp-secret-name"
+          autocapitalize="none"
+          autocorrect="off"
+          spellcheck="false"
           class="code"
           bind:value={secretName}
           pattern="[A-Z_][A-Z0-9_]*"
@@ -196,7 +328,13 @@
       {#each servers as server (server.name)}<article>
           <button class="server" disabled={busy} onclick={() => open(server)}
             ><strong>{server.name}</strong>
-            <p class="code">{server.command.join(' ')}</p></button
+            <p class="code">{server.command.join(' ')}</p>
+            <small>{summary(rules, server)}</small></button
+          ><button
+            class="secondary manage"
+            disabled={busy}
+            aria-label={`Manage ${server.name}`}
+            onclick={() => open(server)}>Manage <Icon name="chevron-right" size={13} /></button
           ><button
             class:enabled={server.enabled}
             class="toggle"
@@ -252,6 +390,9 @@
     margin: 22px 0 6px;
     font-size: 13px;
     font-weight: 570;
+  }
+  h3.first {
+    margin-top: 0;
   }
   header p,
   .hint {
@@ -329,6 +470,46 @@
     font-size: 13px;
     font-weight: 570;
   }
+  .server small {
+    display: block;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    margin-top: 6px;
+  }
+  .suggestions {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 8px;
+  }
+  .suggestion {
+    display: grid;
+    gap: 4px;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+  .suggestion strong {
+    font-family: var(--font-code);
+    font-size: 12px;
+  }
+  .suggestion small {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .suggestion.chosen {
+    border-color: var(--accent);
+  }
+  .suggestion:disabled {
+    opacity: 0.55;
+  }
+  .manage {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
   .server p {
     color: var(--text-muted);
     font-size: 12px;
@@ -340,6 +521,23 @@
   }
   .secret {
     flex: 1;
+  }
+  .rule {
+    flex: 1;
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .rule strong {
+    font-size: 12px;
+  }
+  .rule .tool {
+    font-family: var(--font-code);
+  }
+  .rule small {
+    color: var(--text-muted);
+    font-size: 11px;
   }
   .code,
   code,
@@ -375,6 +573,11 @@
     border-radius: var(--radius-sm);
     padding: 11px 12px;
     font-size: 12px;
+  }
+  .field-hint {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    margin: 6px 0 0;
   }
   .empty {
     color: var(--text-muted);

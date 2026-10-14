@@ -27,6 +27,7 @@ import type {
   PendingAttachment,
   RunState,
   PendingApproval,
+  ApprovalDecision,
   SessionSummary,
   ConversationMode,
   ContextState,
@@ -237,7 +238,7 @@ export function createChatController(
       notice.set('The project folder could not be opened. Try choosing it again.');
     }
   }
-  async function resolveApproval(decision: 'allow' | 'always_allow' | 'deny') {
+  async function resolveApproval(decision: ApprovalDecision) {
     const pending = get(approval);
     if (!pending) return;
     await agentClient.resolve(pending, decision);
@@ -782,9 +783,12 @@ export function createChatController(
                               }),
                               output: [
                                 `Loaded instructions: ${event.sources.join(', ') || 'None'}`,
-                                ...event.warnings.map((warning) => `Warning: ${warning}`),
+                                ...event.warnings.map(
+                                  (warning) => `Warning: ${warning.replace(/\s*\n\s*/g, ' ')}`,
+                                ),
                               ].join('\n'),
-                              status: 'complete',
+                              // Warnings, such as an MCP server that did not start, stay visible.
+                              status: event.warnings.length ? 'error' : 'complete',
                             },
                           ],
                         }

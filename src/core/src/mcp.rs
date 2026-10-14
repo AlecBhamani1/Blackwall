@@ -1,7 +1,7 @@
 //! Owner-configured local MCP servers whose tools join Agent runs behind Blackwall approvals.
 use crate::{
     approvals::Approvals,
-    protocol::{AgentEvent, ApprovalKind},
+    protocol::{AgentEvent, ApprovalTool},
     tools::ToolError,
 };
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,6 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
-    use std::io::Write;
     let failed = "The MCP file could not be saved.";
     let mut body = serde_json::to_vec_pretty(&McpFile {
         servers: validate(servers)?,
@@ -93,19 +92,7 @@ pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), 
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("The MCP file must not be a symbolic link.");
     }
-    let temporary = directory.join(format!(".mcp-{:016x}", rand::random::<u64>()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let result = options
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
-        .and_then(|()| std::fs::rename(&temporary, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|_| failed)
+    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)
 }
 
 /// Owner edits shared by the CLI and desktop. Each one validates before anything is saved.
@@ -130,7 +117,21 @@ fn store_error(error: crate::secrets::SecretError) -> String {
     ))
 }
 
-pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<(), String> {
+/// Names are lowercased and spaces or underscores become hyphens, so `My Jira` is saved and
+/// found as `my-jira`.
+fn saved_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c == '_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Add a server under its saved name, which is returned.
+pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
+    let name = saved_name(name);
+    let name = name.as_str();
     let mut servers = read_config(directory)?;
     if servers.iter().any(|server| server.name == name) {
         return Err(format!("An MCP server named {name:?} already exists."));
@@ -143,23 +144,27 @@ pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<
         deny_tools: vec![],
         secrets: vec![],
     });
-    Ok(write_config(directory, servers)?)
+    write_config(directory, servers)?;
+    Ok(name.into())
 }
 
 pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         servers[index].enabled = enabled;
         Ok(())
     })
 }
 
-/// Secrets are deleted first, so a failure leaves the entry in place to retry.
+/// Secrets and owner rules are deleted first, so a failure leaves the entry in place to retry.
 pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         for key in &servers[index].secrets {
             crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}"))
                 .map_err(store_error)?;
         }
+        crate::policy::remove_server_rules(directory, name)?;
         servers.remove(index);
         Ok(())
     })
@@ -167,6 +172,7 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
 
 /// The value is saved first, so the file never names a secret that failed to save. Blocking.
 pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     if !valid_secret_name(key) {
         return Err("Use an environment variable name, such as JIRA_API_TOKEN.".into());
     }
@@ -189,6 +195,7 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
 
 /// Blocking: the credential store may ask the owner for access.
 pub fn delete_secret(directory: &Path, name: &str, key: &str) -> Result<(), String> {
+    let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
         servers[index].secrets.retain(|existing| existing != key);
@@ -395,8 +402,12 @@ impl McpServers {
             "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
             server.name, tool.name
         );
+        let approval = ApprovalTool {
+            server: server.name.clone(),
+            tool: tool.exposed.clone(),
+        };
         if !approvals
-            .request(request_id, ApprovalKind::Exec, &tool.exposed, detail, emit)
+            .request_tool(request_id, approval, detail, emit)
             .await
             .map_err(ToolError::Execution)?
         {
@@ -677,6 +688,14 @@ pub fn valid_secret_name(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// A policy `tool` value: a server name, or `server__tool` for one of its tools.
+pub(crate) fn valid_tool_rule(rule: &str) -> bool {
+    match rule.split_once("__") {
+        Some((server, _)) => valid_server_name(server) && valid_tool_name(rule),
+        None => valid_server_name(rule),
+    }
+}
+
 fn valid_server_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name
@@ -697,15 +716,26 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
         return Err("The MCP file has too many servers.");
     }
     for (index, server) in servers.iter().enumerate() {
-        if !valid_server_name(&server.name)
-            || servers[..index]
-                .iter()
-                .any(|other| other.name == server.name)
-            || server.command.is_empty()
-            || server.command.len() > 64
-            || !crate::command_tools::valid_program(&server.command[0])
+        if !valid_server_name(&server.name) {
+            return Err(
+                "MCP server names use lowercase letters, numbers, and hyphens, up to 32 characters.",
+            );
+        }
+        if servers[..index]
+            .iter()
+            .any(|other| other.name == server.name)
         {
-            return Err("An MCP server has an invalid name or command.");
+            return Err("Two MCP servers have the same name.");
+        }
+        if server.command.is_empty() || server.command.len() > 64 {
+            return Err("Give each MCP server a command with at most 63 arguments.");
+        }
+        if !crate::command_tools::valid_program(&server.command[0]) {
+            return Err(if cfg!(windows) {
+                "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
+            } else {
+                "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
+            });
         }
         if server.secrets.len() > 16
             || server.secrets.iter().enumerate().any(|(index, name)| {

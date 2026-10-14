@@ -28,6 +28,8 @@ fn run() -> Result<(), StartupError> {
     let mut context = tauri::generate_context!();
     identity::initialize(&context.config().identifier).map_err(StartupError::Identity)?;
     identity::configure_acceptance_webviews(context.config_mut());
+    #[cfg(target_os = "macos")]
+    lifecycle::adopt_login_path();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -69,6 +71,8 @@ fn run() -> Result<(), StartupError> {
             data::remove_mcp_server,
             data::save_mcp_secret,
             data::delete_mcp_secret,
+            data::list_mcp_tool_rules,
+            data::remove_mcp_tool_rule,
             data::list_sessions,
             data::search_sessions,
             data::load_session,

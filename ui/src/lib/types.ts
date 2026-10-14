@@ -134,6 +134,7 @@ export type AgentEvent =
       approvalId: string;
       kind: string;
       detail: string;
+      tool?: ApprovalTool;
     };
 
 export interface ChildEntry {
@@ -148,11 +149,27 @@ export interface ToolEntry {
   output?: string;
   status: 'running' | 'complete' | 'error' | 'stopped';
 }
+/** The MCP tool an approval is for; `tool` is the namespaced `server__tool` name. */
+export interface ApprovalTool {
+  server: string;
+  tool: string;
+}
+
+export type ApprovalDecision =
+  | 'allow'
+  | 'always_allow'
+  | 'deny'
+  | 'allow_tool_in_project'
+  | 'allow_tool'
+  | 'allow_server_in_project'
+  | 'allow_server';
+
 export interface PendingApproval {
   requestId: string;
   approvalId: string;
   kind: string;
   detail: string;
+  tool?: ApprovalTool;
 }
 
 export interface StreamCallbacks {

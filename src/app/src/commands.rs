@@ -524,6 +524,8 @@ pub(crate) async fn stream_chat(
                 message,
                 retryable: false,
             })?;
+        #[cfg(target_os = "macos")]
+        crate::lifecycle::login_path_settled().await;
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,

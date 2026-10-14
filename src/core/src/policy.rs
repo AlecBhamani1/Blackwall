@@ -23,20 +23,37 @@ pub enum Decision {
     Deny,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Rule {
     decision: Decision,
     kind: ApprovalKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
+    /// An MCP server name, matching all of its tools, or one `server__tool` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    /// Limits the rule to runs in this project folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
     rules: Vec<Rule>,
+}
+
+/// A saved rule that allows an MCP server or tool, as listed for the owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolRule {
+    pub tool: String,
+    pub project: Option<String>,
 }
 
 /// Rules loaded for one run. A missing file has no rules; an invalid file has no rules and an
@@ -48,6 +65,8 @@ pub struct Policy {
     audit: PathBuf,
     /// The data folder relative to the workspace, when the workspace contains it.
     protected: Option<PathBuf>,
+    directory: PathBuf,
+    workspace: PathBuf,
 }
 
 impl Policy {
@@ -72,20 +91,43 @@ impl Policy {
                 .map_err(|_| "The policy file is not valid.")
                 .and_then(|file| validate(file.rules)),
         };
-        match parsed {
-            Ok(rules) => Self {
-                rules,
-                error: None,
-                audit,
-                protected,
-            },
-            Err(error) => Self {
-                rules: vec![],
-                error: Some(format!("{error} Every action will ask for approval.")),
-                audit,
-                protected,
-            },
+        let (rules, error) = match parsed {
+            Ok(rules) => (rules, None),
+            Err(error) => (
+                vec![],
+                Some(format!("{error} Every action will ask for approval.")),
+            ),
+        };
+        // Project rules apply only in their own folder. The workspace path is already canonical.
+        let mut kept = Vec::with_capacity(rules.len());
+        for rule in rules {
+            if let Some(project) = &rule.project {
+                let folder =
+                    tokio::time::timeout(IO_TIMEOUT, tokio::fs::canonicalize(project)).await;
+                if folder.ok().and_then(Result::ok).as_deref() != Some(workspace) {
+                    continue;
+                }
+            }
+            kept.push(rule);
         }
+        Self {
+            rules: kept,
+            error,
+            audit,
+            protected,
+            directory: directory.into(),
+            workspace: workspace.into(),
+        }
+    }
+
+    /// Reload the owner's rules for the same data folder and workspace.
+    pub async fn reload(&self) -> Self {
+        Self::load(&self.directory, &self.workspace).await
+    }
+
+    /// The owner's data folder and the run's workspace, for saving a rule from an approval.
+    pub fn scope(&self) -> (&Path, &Path) {
+        (&self.directory, &self.workspace)
     }
 
     /// Deny outranks ask, and ask outranks allow. Unmatched actions ask, and so do writes to the
@@ -109,27 +151,60 @@ impl Policy {
         }
     }
 
+    /// MCP calls match `tool` rules by server or exact name, and `command` rules by the namespaced
+    /// name. `tool` rules never match shell commands, which `decide` handles.
+    pub fn decide_tool(&self, exposed: &str) -> Decision {
+        let server = exposed
+            .split_once("__")
+            .map_or(exposed, |(server, _)| server);
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.kind == ApprovalKind::Exec
+                    && match rule.tool.as_deref() {
+                        Some(tool) => tool == exposed || tool == server,
+                        None => matches(rule, exposed),
+                    }
+            })
+            .map(|rule| rule.decision)
+            .max()
+            .unwrap_or(Decision::Ask)
+    }
+
     /// Append a bounded, redacted record. Audit failures never change the decision.
+    /// `saved` is the rule the owner saved from this approval, if any.
     pub async fn record(
         &self,
         kind: ApprovalKind,
         subject: &str,
         decision: Decision,
         allowed: bool,
+        saved: Option<&ToolRule>,
     ) {
-        let _ =
-            tokio::time::timeout(IO_TIMEOUT, self.append(kind, subject, decision, allowed)).await;
+        let _ = tokio::time::timeout(
+            IO_TIMEOUT,
+            self.append(kind, subject, decision, allowed, saved),
+        )
+        .await;
     }
 
-    async fn append(&self, kind: ApprovalKind, subject: &str, decision: Decision, allowed: bool) {
+    async fn append(
+        &self,
+        kind: ApprovalKind,
+        subject: &str,
+        decision: Decision,
+        allowed: bool,
+        saved: Option<&ToolRule>,
+    ) {
         let path = &self.audit;
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let line = format!(
-            "{}\n",
-            json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed})
-        );
+        let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed});
+        if let Some(rule) = saved {
+            entry["saved"] = json!(rule);
+        }
+        let line = format!("{entry}\n");
         if tokio::fs::metadata(path)
             .await
             .is_ok_and(|meta| meta.len() > MAX_AUDIT_BYTES)
@@ -167,20 +242,162 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
     }
     for rule in &rules {
         let field = match rule.kind {
-            ApprovalKind::Exec => rule.command.as_deref().filter(|c| !c.trim().is_empty()),
+            ApprovalKind::Exec => rule
+                .command
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .or(rule
+                    .tool
+                    .as_deref()
+                    .filter(|t| crate::mcp::valid_tool_rule(t))),
             ApprovalKind::File => rule.path.as_deref().filter(|p| normalize(p).is_some()),
             ApprovalKind::Network => rule.host.as_deref().filter(|h| !h.trim().is_empty()),
             ApprovalKind::Subagent => None,
         };
-        let fields = [&rule.command, &rule.path, &rule.host]
+        let fields = [&rule.command, &rule.path, &rule.host, &rule.tool]
             .iter()
             .filter(|f| f.is_some())
             .count();
-        if field.is_none() || fields != 1 {
+        if field.is_none()
+            || fields != 1
+            || rule
+                .project
+                .as_deref()
+                .is_some_and(|project| !Path::new(project).is_absolute())
+        {
             return Err("A policy rule has missing or mismatched fields.");
         }
     }
     Ok(rules)
+}
+
+/// Save an allow rule for an MCP server or tool, optionally limited to one project, keeping the
+/// owner's other rules. An unreadable or invalid file is left unchanged. Blocking.
+pub fn allow_tool(directory: &Path, tool: &str, project: Option<&Path>) -> Result<(), String> {
+    let rule = Rule {
+        decision: Decision::Allow,
+        kind: ApprovalKind::Exec,
+        command: None,
+        path: None,
+        host: None,
+        tool: Some(tool.into()),
+        project: project.map(|project| project.to_string_lossy().into_owned()),
+    };
+    edit_rules(directory, |rules| {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    })
+}
+
+/// The owner's saved allow rules for MCP servers and tools. Blocking.
+pub fn tool_rules(directory: &Path) -> Result<Vec<ToolRule>, String> {
+    Ok(read_rules(directory)?
+        .into_iter()
+        .filter(|rule| rule.decision == Decision::Allow)
+        .filter_map(|rule| {
+            Some(ToolRule {
+                tool: rule.tool?,
+                project: rule.project,
+            })
+        })
+        .collect())
+}
+
+/// Remove every saved `tool` rule for a server and its tools, so a later server with the same
+/// name does not inherit them. Blocking.
+pub fn remove_server_rules(directory: &Path, server: &str) -> Result<(), String> {
+    let prefix = format!("{server}__");
+    edit_rules(directory, |rules| {
+        rules.retain(|rule| {
+            rule.tool
+                .as_deref()
+                .is_none_or(|tool| tool != server && !tool.starts_with(&prefix))
+        });
+    })
+}
+
+/// Remove saved allow rules for exactly this MCP server or tool and project. Blocking.
+pub fn remove_tool_rule(directory: &Path, rule: &ToolRule) -> Result<(), String> {
+    edit_rules(directory, |rules| {
+        rules.retain(|saved| {
+            saved.decision != Decision::Allow
+                || saved.tool.as_deref() != Some(rule.tool.as_str())
+                || saved.project != rule.project
+        });
+    })
+}
+
+fn read_rules(directory: &Path) -> Result<Vec<Rule>, String> {
+    use std::io::Read;
+    let unusable = "The policy file could not be read or is not valid, so it was left unchanged. Fix or remove policy.json in the Blackwall data folder, then try again.";
+    let mut body = vec![];
+    match std::fs::File::open(directory.join(POLICY_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(_) => return Err(unusable.into()),
+        Ok(file) => file
+            .take(MAX_POLICY_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| unusable)?,
+    };
+    if body.len() > MAX_POLICY_BYTES {
+        return Err(unusable.into());
+    }
+    serde_json::from_slice::<RuleFile>(&body)
+        .ok()
+        .and_then(|file| validate(file.rules).ok())
+        .ok_or_else(|| unusable.into())
+}
+
+/// Serializes rule edits in this process, so two saves cannot both read the old file.
+static EDITS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn edit_rules(directory: &Path, change: impl FnOnce(&mut Vec<Rule>)) -> Result<(), String> {
+    let _edit = EDITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rules = read_rules(directory)?;
+    let before = rules.len();
+    change(&mut rules);
+    if rules.len() == before && !directory.join(POLICY_FILE).exists() {
+        // Nothing to save, so a missing file stays missing.
+        return Ok(());
+    }
+    let rules = validate(rules)?;
+    let mut body = serde_json::to_vec_pretty(&RuleFile { rules })
+        .map_err(|_| "The policy file could not be saved.")?;
+    body.push(b'\n');
+    if body.len() > MAX_POLICY_BYTES {
+        return Err("The policy file is too large.".into());
+    }
+    let path = directory.join(POLICY_FILE);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("The policy file must not be a symbolic link.".into());
+    }
+    replace_owner_file(directory, &path, &body)
+        .map_err(|_| "The policy file could not be saved.".into())
+}
+
+/// Write a private temporary file and rename it over `path`, so a failed write leaves the old file.
+pub(crate) fn replace_owner_file(
+    directory: &Path,
+    path: &Path,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let temporary = directory.join(format!(".save-{:016x}", rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let result = options
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(body).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn matches(rule: &Rule, subject: &str) -> bool {
@@ -288,6 +505,8 @@ mod tests {
             error: None,
             audit: std::env::temp_dir().join(AUDIT_FILE),
             protected: Some(PathBuf::from(".blackwall")),
+            directory: std::env::temp_dir(),
+            workspace: PathBuf::from("/workspace"),
         }
     }
 
@@ -427,6 +646,138 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn tool_rules_match_only_mcp_calls_and_their_project() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-tools-{}", rand::random::<u64>()));
+        let project = directory.join("project");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        let project = tokio::fs::canonicalize(&project).await.unwrap();
+        tokio::fs::write(
+            directory.join(POLICY_FILE),
+            serde_json::json!({"rules":[
+                {"decision":"allow","kind":"exec","tool":"docs"},
+                {"decision":"deny","kind":"exec","tool":"docs__delete"},
+                {"decision":"allow","kind":"exec","tool":"files__read","project":project},
+                {"decision":"allow","kind":"exec","command":"jira__search"}
+            ]})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let here = Policy::load(&directory, &project).await;
+        assert!(here.error.is_none());
+        assert_eq!(here.decide_tool("docs__search"), Decision::Allow);
+        assert_eq!(here.decide_tool("docs__delete"), Decision::Deny);
+        assert_eq!(here.decide_tool("files__read"), Decision::Allow);
+        assert_eq!(here.decide_tool("files__write"), Decision::Ask);
+        assert_eq!(here.decide_tool("jira__search"), Decision::Allow);
+        // A shell command spelled like a server or tool never matches a tool rule.
+        assert_eq!(here.decide(ApprovalKind::Exec, "docs"), Decision::Ask);
+        assert_eq!(
+            here.decide(ApprovalKind::Exec, "files__read"),
+            Decision::Ask
+        );
+        let elsewhere = Policy::load(&directory, Path::new("/workspace")).await;
+        assert_eq!(elsewhere.decide_tool("files__read"), Decision::Ask);
+        assert_eq!(elsewhere.decide_tool("docs__search"), Decision::Allow);
+        for body in [
+            r#"{"rules":[{"decision":"allow","kind":"exec","tool":"Bad Name"}]}"#,
+            r#"{"rules":[{"decision":"allow","kind":"file","tool":"docs"}]}"#,
+            r#"{"rules":[{"decision":"allow","kind":"exec","tool":"docs","command":"ls"}]}"#,
+            r#"{"rules":[{"decision":"allow","kind":"exec","tool":"docs","project":"relative"}]}"#,
+        ] {
+            tokio::fs::write(directory.join(POLICY_FILE), body)
+                .await
+                .unwrap();
+            assert!(
+                Policy::load(&directory, &project).await.error.is_some(),
+                "{body}"
+            );
+        }
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[test]
+    fn saving_tool_rules_keeps_other_rules_and_refuses_invalid_files() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-save-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(POLICY_FILE);
+        std::fs::write(
+            &path,
+            r#"{"rules":[{"decision":"deny","kind":"file","path":".git"}]}"#,
+        )
+        .unwrap();
+        allow_tool(&directory, "docs", None).unwrap();
+        allow_tool(&directory, "docs", None).unwrap();
+        let app = directory.join("app");
+        let app_path = app.to_string_lossy().into_owned();
+        allow_tool(&directory, "files__read", Some(&app)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({"rules":[
+                {"decision":"deny","kind":"file","path":".git"},
+                {"decision":"allow","kind":"exec","tool":"docs"},
+                {"decision":"allow","kind":"exec","tool":"files__read","project":app_path}
+            ]})
+        );
+        let read = ToolRule {
+            tool: "files__read".into(),
+            project: Some(app_path.clone()),
+        };
+        assert_eq!(
+            tool_rules(&directory).unwrap(),
+            vec![
+                ToolRule {
+                    tool: "docs".into(),
+                    project: None
+                },
+                read.clone()
+            ]
+        );
+        remove_tool_rule(&directory, &read).unwrap();
+        assert_eq!(tool_rules(&directory).unwrap().len(), 1);
+        allow_tool(&directory, "docs__fetch", None).unwrap();
+        allow_tool(&directory, "docs-extra", None).unwrap();
+        remove_server_rules(&directory, "docs").unwrap();
+        assert_eq!(
+            tool_rules(&directory).unwrap(),
+            vec![ToolRule {
+                tool: "docs-extra".into(),
+                project: None
+            }]
+        );
+        let empty = directory.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        remove_server_rules(&empty, "docs").unwrap();
+        assert!(!empty.join(POLICY_FILE).exists());
+        std::fs::write(&path, "not json").unwrap();
+        let error = allow_tool(&directory, "docs", None).unwrap_err();
+        assert!(error.contains("left unchanged"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_saves_keep_every_rule() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-race-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let directory = &directory;
+                scope.spawn(move || {
+                    allow_tool(directory, &format!("server-{index}"), None).unwrap()
+                });
+            }
+        });
+        assert_eq!(tool_rules(&directory).unwrap().len(), 8);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     async fn record_secret(policy: &Policy) {
         policy
             .record(
@@ -435,6 +786,7 @@ mod tests {
                  https://me:hunter2@host API_TOKEN=hunter2",
                 Decision::Ask,
                 false,
+                None,
             )
             .await;
     }

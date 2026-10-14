@@ -57,6 +57,10 @@ export interface McpServer {
   denyTools?: string[];
   secrets?: string[];
 }
+export interface McpToolRule {
+  tool: string;
+  project: string | null;
+}
 export interface MemoryEntry {
   id: string;
   content: string;
@@ -99,6 +103,8 @@ export const persistence = {
   saveMcpSecret: (name: string, key: string, value: string) =>
     command<void>('save_mcp_secret', { name, key, value }),
   removeMcpSecret: (name: string, key: string) => command<void>('delete_mcp_secret', { name, key }),
+  mcpToolRules: () => command<McpToolRule[]>('list_mcp_tool_rules'),
+  removeMcpToolRule: (rule: McpToolRule) => command<void>('remove_mcp_tool_rule', { rule }),
   memories: (query = '') => command<MemoryEntry[]>('list_memories', { query }),
   memoryProposals: () => command<MemoryProposal[]>('list_memory_proposals'),
   approveMemory: (id: string, content: string | null = null) =>

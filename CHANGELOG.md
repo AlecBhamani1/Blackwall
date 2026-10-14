@@ -58,9 +58,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Manage MCP servers and their secrets from **MCP servers** in the desktop sidebar, sharing the
   CLI's validation and credential store.
 
+- Always allow an MCP tool, or every tool from its server, from its approval card, in one project
+  or every project. The choice is saved as an owner rule with new `tool` and `project` fields, and
+  **MCP servers** lists and removes these rules.
+
+- Suggest common MCP servers in the desktop **Add server** form. Picking one fills in its name and
+  a pinned `npx` command; the list ships with the app and is not offered on Windows.
+
 ### Fixed
 
 - Update the TLS dependency to include upstream security fixes.
+
+- Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
+  when the macOS app is opened from the Dock, using the login shell's `PATH`.
+
+- Save MCP server names such as `Context7` or `My Jira` in lowercase with hyphens instead of
+  rejecting them, say which part of an MCP server is invalid, and show startup warnings, such as a
+  server that did not start, without expanding the project instructions entry.
 
 - Use portable paths in instruction source lists and directory scopes on Windows.
 

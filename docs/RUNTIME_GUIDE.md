@@ -156,6 +156,11 @@ is the authority for file tools; a folder must be selected again after reopening
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
+MCP tool approvals also offer **Always allow**, for that tool or every tool from its server, in this
+project or every project. It saves an owner rule in `policy.json`, applies it to the rest of the
+run, and allows the call; if the rule cannot be saved, the call does not run and says why. The
+server's page in **MCP servers** lists these rules and removes them; a removal applies from the next
+run. Removing a server also removes its rules, so a later server with the same name starts asking.
 
 To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
 (`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
@@ -170,7 +175,10 @@ To decide routine actions in advance, add rules to `policy.json` in the Blackwal
 ```
 
 `command` matches the leading words of a shell command, `path` matches a workspace-relative path and
-everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. Ask and deny
+everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. For MCP calls,
+an `exec` rule can use `tool` instead: a server name such as `context7` matches all of that server's
+tools, and `server__tool` matches one. `tool` rules never match shell commands. Any rule can add
+`project` with an absolute folder path, and then applies only to runs in that project. Ask and deny
 path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
 and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
 prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
@@ -209,7 +217,8 @@ folder:
 Each enabled server starts when an Agent run starts, in the data folder, without a shell, and stops
 when the run ends; pass a project path as an argument when a server needs one. Programs follow the
 same rules as command tools, so on Windows a server needs an `.exe` launcher such as `node` rather
-than `npx`. Server names use lowercase letters, digits, and `-`. Its tools are offered
+than `npx`. Server names use lowercase letters, digits, and `-`; names added with `bw mcp add` or
+the desktop are lowercased, with spaces and underscores as hyphens. Its tools are offered
 as `server__tool`, such as `files__read_text_file`; `allowTools` limits a server to the listed
 tools, `denyTools` hides tools, and `"enabled":false` keeps a server from starting. Tools whose
 names are invalid or already used are skipped with a warning. Every call needs Exec approval, and
@@ -224,7 +233,13 @@ not start, the run continues without those tools and shows a warning.
 
 In the desktop app, **MCP servers** in the sidebar lists the servers with enable and disable
 toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
-password field. It uses the same validation and credential store as the CLI.
+password field. It uses the same validation and credential store as the CLI. **Add server** offers
+suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
+thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
+form with a pinned package version; filesystem and remote ask for a folder or address at the end of
+the command. The list ships with the app and is never downloaded, but `npx -y` downloads the pinned
+package from npm the first time the server starts, without asking again. Suggestions start with
+`npx`, so they are not offered on Windows.
 
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
 an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
@@ -235,6 +250,11 @@ Tool lists are edited in the file. `bw mcp secret <name> <NAME>` reads a value f
 for example `pbpaste | bw mcp secret jira JIRA_API_TOKEN` on macOS, saves it in the credential store,
 and adds the name to the server; it refuses to read from a terminal, where the value would be shown.
 Add `--delete` to remove one, and `bw mcp remove` deletes a server's saved secrets.
+
+On macOS, the desktop app finds programs for command tools, MCP servers, and shell commands with
+your login shell's `PATH`, so tools installed with Homebrew or npm work when Blackwall is opened from
+the Dock. It asks the shell once at startup and keeps the system default if that takes more than
+five seconds.
 
 Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
 `/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the

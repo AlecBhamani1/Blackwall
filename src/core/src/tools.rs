@@ -444,6 +444,19 @@ pub(crate) async fn program_with_timeout(
         run_with_timeout(directory, process, timeout).await
     }
 }
+static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+/// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
+/// start with only the system directories, so tools installed with Homebrew or npm are missing.
+pub fn set_search_path(path: std::ffi::OsString) {
+    let _ = SEARCH_PATH.set(path);
+}
+/// The `PATH` used to find programs: the login-shell one when the desktop app set it.
+pub(crate) fn search_path() -> Option<std::ffi::OsString> {
+    SEARCH_PATH
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))
+}
 /// Blackwall's model and relay secrets, which child programs never inherit.
 #[cfg(any(unix, windows))]
 const SECRET_ENV: [&str; 4] = [
@@ -490,6 +503,9 @@ pub(crate) fn spawn_server(
         .kill_on_drop(true);
     for key in SECRET_ENV {
         process.env_remove(key);
+    }
+    if let Some(path) = SEARCH_PATH.get() {
+        process.env("PATH", path);
     }
     process.envs(environment.iter().map(|(name, value)| (name, value)));
     #[cfg(unix)]
@@ -542,6 +558,9 @@ async fn run_with_timeout(
         .kill_on_drop(true);
     for key in SECRET_ENV {
         process.env_remove(key);
+    }
+    if let Some(path) = SEARCH_PATH.get() {
+        process.env("PATH", path);
     }
     #[cfg(unix)]
     let mut child = process
