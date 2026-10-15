@@ -53,6 +53,18 @@ pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {
     with_store(&app, |store| store.list_sessions()).await
 }
 #[tauri::command]
+pub async fn search_sessions(
+    app: AppHandle,
+    query: blackwall_core::storage::RecallQuery,
+) -> Result<blackwall_core::storage::RecallResults, String> {
+    let results = with_store(&app, move |store| {
+        store.search_messages(blackwall_core::memory::MemoryClient::Desktop, &query)
+    })
+    .await?;
+    crate::auth::require_unlocked(&app).await?;
+    Ok(results)
+}
+#[tauri::command]
 pub async fn load_session(app: AppHandle, id: String) -> Result<Option<Value>, String> {
     with_store(&app, move |store| store.load_session(&id)).await
 }
@@ -103,6 +115,28 @@ pub async fn reject_memory_proposal(app: AppHandle, id: String) -> Result<(), St
     with_store(&app, move |store| store.reject_memory(&id)).await
 }
 
+/// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
+pub(crate) async fn trace_options(
+    directory: std::path::PathBuf,
+) -> blackwall_core::trace::TraceOptions {
+    let saved = tokio::task::spawn_blocking(move || {
+        LocalStore::open(&directory)
+            .ok()?
+            .setting("preferences")
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    blackwall_core::trace::TraceOptions {
+        enabled: saved["tracesEnabled"].as_bool().unwrap_or(true),
+        content: saved["traceContent"].as_bool().unwrap_or(false),
+    }
+}
+
 #[tauri::command]
 pub async fn load_preferences(app: AppHandle) -> Result<Value, String> {
     with_store(&app, |store| {
@@ -131,6 +165,9 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "maxIterations"
                 | "commandTimeoutSeconds"
                 | "memoryEnabled"
+                | "recallEnabled"
+                | "tracesEnabled"
+                | "traceContent"
                 | "workspace"
                 | "connections"
         )
@@ -186,6 +223,18 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|value| !value.is_boolean())
     {
         return Err("Invalid memory setting.".into());
+    }
+    if object
+        .get("recallEnabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid recall setting.".into());
+    }
+    if ["tracesEnabled", "traceContent"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_boolean()))
+    {
+        return Err("Invalid trace setting.".into());
     }
     for key in ["model", "connectionName", "relayUrl", "workspace"] {
         if object.get(key).is_some_and(|value| !value.is_string()) {
@@ -264,6 +313,56 @@ pub async fn save_skill(
 #[tauri::command]
 pub async fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
     with_skills(&app, move |store| store.remove(&name)).await
+}
+#[tauri::command]
+pub async fn list_skill_proposals(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_skills(&app, |store| {
+        let (proposals, warnings) = store.proposals()?;
+        Ok(serde_json::json!({"proposals":proposals,"warnings":warnings}))
+    })
+    .await
+}
+/// Approve a proposal, with the owner's edited description and instructions when given.
+#[tauri::command]
+pub async fn approve_skill_proposal(
+    app: AppHandle,
+    id: String,
+    description: String,
+    body: String,
+) -> Result<(), String> {
+    with_skills(&app, move |store| {
+        store
+            .approve_edited(&id, Some((description, body)))
+            .map(|_| ())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn reject_skill_proposal(app: AppHandle, id: String) -> Result<(), String> {
+    with_skills(&app, move |store| store.reject(&id)).await
+}
+
+/// The 50 newest agent-run traces. Each file is parsed, so the list stays short.
+#[tauri::command]
+pub async fn list_traces(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::trace::TraceSummary>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::list(&directory, 50))
+        .await
+        .map_err(|_| "Traces could not be read.".into())
+}
+#[tauri::command]
+pub async fn read_trace(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<blackwall_core::trace::SpanView>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::read(&directory, &id))
+        .await
+        .map_err(|_| "This trace could not be read.")?
 }
 
 /// MCP edits share the CLI's validation; secret values go only to the credential store.

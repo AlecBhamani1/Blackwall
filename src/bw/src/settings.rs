@@ -11,7 +11,28 @@ pub struct Settings {
     pub model: String,
     pub web_enabled: bool,
     pub memory_enabled: bool,
+    pub recall_enabled: bool,
     pub budget: blackwall_core::context::ContextBudget,
+    /// Local run traces; on by default, with prompts and outputs off by default.
+    pub trace: blackwall_core::trace::TraceOptions,
+}
+
+/// Traces are on unless the owner turned them off.
+fn trace_options(
+    object: &serde_json::Map<String, Value>,
+    invalid: &str,
+) -> Result<blackwall_core::trace::TraceOptions, String> {
+    let flag = |key: &str, default: bool| {
+        object
+            .get(key)
+            .map(|value| value.as_bool().ok_or_else(|| invalid.to_owned()))
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    Ok(blackwall_core::trace::TraceOptions {
+        enabled: flag("tracesEnabled", true)?,
+        content: flag("traceContent", false)?,
+    })
 }
 
 impl Settings {
@@ -37,7 +58,10 @@ impl Settings {
             "model": validated.model,
             "webEnabled": validated.web_enabled,
             "memoryEnabled": validated.memory_enabled,
+            "recallEnabled": validated.recall_enabled,
             "contextBudget": validated.budget,
+            "tracesEnabled": validated.trace.enabled,
+            "traceContent": validated.trace.content,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -60,6 +84,9 @@ impl Settings {
             "model" => updated.model = value.into(),
             "web" => updated.web_enabled = on_or_off(value)?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
+            "recall" => updated.recall_enabled = on_or_off(value)?,
+            "traces" => updated.trace.enabled = on_or_off(value)?,
+            "trace-content" => updated.trace.content = on_or_off(value)?,
             "context" => {
                 updated.budget.context_window = value
                     .parse()
@@ -86,7 +113,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, web, memory, context, output, compact, iterations, or timeout."
+                "Choose a setting: model, endpoint, web, memory, recall, traces, trace-content, context, output, compact, iterations, or timeout."
                     .into(),
             ),
         }
@@ -103,9 +130,12 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
+            if self.recall_enabled { "on" } else { "off" },
+            if self.trace.enabled { "on" } else { "off" },
+            if self.trace.content { "on" } else { "off" },
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
             self.budget.max_iterations, self.budget.command_timeout_seconds,
@@ -156,6 +186,12 @@ fn load_with_environment(
         model,
         web_enabled: false,
         memory_enabled,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or("Invalid recall setting."))
+            .transpose()?
+            .unwrap_or(false),
+        trace: trace_options(object, "Invalid trace setting.")?,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -210,7 +246,14 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "endpoint" | "model" | "webEnabled" | "memoryEnabled" | "contextBudget"
+            "endpoint"
+                | "model"
+                | "webEnabled"
+                | "memoryEnabled"
+                | "recallEnabled"
+                | "contextBudget"
+                | "tracesEnabled"
+                | "traceContent"
         )
     }) {
         return Err(invalid.into());
@@ -235,10 +278,16 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .get("webEnabled")
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
         memory_enabled: object
             .get("memoryEnabled")
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
+        trace: trace_options(object, invalid)?,
     };
     settings
         .validate()
@@ -330,7 +379,12 @@ mod tests {
                 model: DEFAULT_MODEL.into(),
                 web_enabled: false,
                 memory_enabled: false,
+                recall_enabled: false,
                 budget: Default::default(),
+                trace: blackwall_core::trace::TraceOptions {
+                    enabled: true,
+                    content: false,
+                },
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -409,11 +463,15 @@ mod tests {
             .unwrap();
         settings.set(&store, "model", " trimmed-model ").unwrap();
         settings.set(&store, "web", "ON").unwrap();
+        settings.set(&store, "recall", "on").unwrap();
+        assert!(settings.recall_enabled);
         settings.set(&store, "context", "8192").unwrap();
         settings.set(&store, "output", "1024").unwrap();
         settings.set(&store, "compact", "on").unwrap();
         settings.set(&store, "iterations", "40").unwrap();
         settings.set(&store, "timeout", "600").unwrap();
+        settings.set(&store, "traces", "off").unwrap();
+        settings.set(&store, "trace-content", "on").unwrap();
         assert_eq!(settings.endpoint, "https://models.example/v1");
         assert_eq!(settings.model, "trimmed-model");
         drop(store);
@@ -421,7 +479,14 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 5);
+        assert_eq!(saved.as_object().unwrap().len(), 8);
+        assert_eq!(
+            (
+                saved["tracesEnabled"].clone(),
+                saved["traceContent"].clone()
+            ),
+            (json!(false), json!(true))
+        );
         assert_eq!(
             saved["contextBudget"],
             json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
@@ -531,7 +596,9 @@ mod tests {
             model: "\u{1b}[31msecret".into(),
             web_enabled: true,
             memory_enabled: false,
+            recall_enabled: false,
             budget: Default::default(),
+            trace: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());

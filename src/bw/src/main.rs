@@ -1,8 +1,12 @@
 mod input;
 mod mcp;
 mod memory;
+mod recall;
+mod review;
 mod session;
 mod settings;
+mod skills;
+mod traces;
 
 use blackwall_core::{
     storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
@@ -22,7 +26,11 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /memory on|off            Include/exclude your saved memories
   /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
+  /review [target]          Inspect Git changes; --uncommitted, --commit <ref>, or --base <ref>
   /init                     Review a proposed AGENTS.md (preserves existing guidance)
+  /recall <words> [filters]  Search saved messages; same filters as bw sessions search
+  /settings recall on|off   Enable or disable the agent recall tool (default off)
+  /learn                    Propose a reusable skill from this conversation for review
   /context                  Show estimated budget and last server token usage
   /compact                  Summarize older context; retain the original transcript
   /settings context <n>     Configure model context limit in tokens
@@ -47,13 +55,18 @@ USAGE:
   bw setup                   Configure endpoint, model, web, and memory
   bw config [show]           Show effective settings
   bw config set <name> <value>
+  bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
   bw run [--json] <prompt>   Run one task; --json prints JSON lines and denies prompts
   bw resume <id> [--json] [prompt]
                              Continue a saved Agent conversation
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
+  bw skills <action>         Review learned skill proposals (bw skills for pending)
+  bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
+  bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
+                             Review Git changes without agent tools
   bw request <prompt>        Print a request preview without a model call
 
 Install: cargo install --locked --path src/bw
@@ -100,7 +113,7 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
-        | "mcp" => {}
+        | "mcp" | "review" | "skills" | "traces" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -112,11 +125,20 @@ async fn run() -> Result<(), String> {
     if command == "memory" {
         return memory::run(&directory, &arguments);
     }
+    if command == "skills" {
+        return skills::run(&directory, &arguments);
+    }
+    if command == "traces" {
+        return traces::run(&directory, &arguments);
+    }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "mcp" {
         return mcp::run(&directory, &arguments);
     }
     if command == "sessions" {
+        if arguments.first().map(String::as_str) == Some("search") {
+            return recall::search(&store, &arguments[1..]);
+        }
         require_no_arguments(&arguments)?;
         return list_sessions(&store);
     }
@@ -148,6 +170,9 @@ async fn run() -> Result<(), String> {
         Workspace::open(&env::current_dir().map_err(|_| "The current folder is unavailable.")?)
             .map_err(|error| error.to_string())?
             .path;
+    if command == "review" {
+        return review::run(&workspace, &settings, &arguments).await;
+    }
     let mut conversation = if command == "resume" {
         Conversation::load(
             &store,
@@ -219,7 +244,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|web|memory|context|output|compact|iterations|timeout> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|web|memory|recall|context|output|compact|iterations|timeout> <value>.".into(),
             )
         }
     }
@@ -336,9 +361,17 @@ async fn chat(
                     }
                 }
                 match name {
-                    "init" if value.is_empty() => {
+                    "review" => {
+                        let arguments = value
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        review::run(&conversation.workspace, settings, &arguments).await
+                    }
+                    "init" | "learn" if value.is_empty() => {
+                        let command = format!("/{name}");
                         conversation
-                            .turn(store, directory, settings, "/init", Some(input))
+                            .turn(store, directory, settings, &command, Some(input))
                             .await
                     }
                     "compact" if value.is_empty() => {
@@ -384,7 +417,7 @@ fn slash(
         ),
         "settings" => {
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
-                "Use /settings <model|endpoint|web|memory|context|output|compact|iterations|timeout> <value>.",
+                "Use /settings <model|endpoint|web|memory|recall|context|output|compact|iterations|timeout> <value>.",
             )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());
@@ -418,6 +451,10 @@ fn slash(
                 .path;
             *conversation = Conversation::new(workspace)?;
             println!("Project: {}", conversation.workspace.display());
+        }
+        "recall" => {
+            let search_store = LocalStore::open(directory).map_err(|e| e.to_string())?;
+            recall::search(&search_store, &recall::line(value)?)?;
         }
         "sessions" if value.is_empty() => list_sessions(store)?,
         "resume" if !value.is_empty() => {

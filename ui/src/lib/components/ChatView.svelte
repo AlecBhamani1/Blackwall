@@ -7,6 +7,7 @@
 
   export let messages: ChatMessage[] = [];
   export let connectionState: ConnectionState = 'checking';
+  export let focusedMessageId: string | undefined = undefined;
   export let showHarnessDemo = false;
 
   let scroller: HTMLDivElement;
@@ -23,6 +24,13 @@
     scroller.scrollTop = scroller.scrollHeight;
   }
 
+  async function focusMessage(id: string) {
+    followsTail = false;
+    await tick();
+    document.getElementById(`message-${id}`)?.scrollIntoView({ block: 'center' });
+  }
+  $: if (focusedMessageId) void focusMessage(focusedMessageId);
+  else followsTail = true;
   $: if (messages) void followMessages();
   onMount(() => void followMessages());
 </script>

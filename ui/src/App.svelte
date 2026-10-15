@@ -10,6 +10,7 @@
   import ChatView from './lib/components/ChatView.svelte';
   import Composer from './lib/components/Composer.svelte';
   import ChatDropZone from './lib/components/ChatDropZone.svelte';
+  import RecallPanel from './lib/components/RecallPanel.svelte';
   import WorkspaceFiles from './lib/components/WorkspaceFiles.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
@@ -39,6 +40,8 @@
     workspace,
     approval,
     preferences,
+    recallText,
+    focusedMessageId,
   } = controller;
   const {
     channel: updateChannel,
@@ -258,6 +261,7 @@
               class="export"
               onclick={controller.exportConversation}>Export chat</button
             >{/if}
+          <button class="export" onclick={() => controller.showRecall()}>Search history</button>
         </div>
       {/if}
       {#if $persistenceError}<div class="storage-error" role="alert">
@@ -267,6 +271,16 @@
             >Export chat</button
           >
         </div>{/if}
+      {#if $recallText !== null}
+        <RecallPanel
+          initialQuery={$recallText}
+          search={controller.searchRecall}
+          enabled={$preferences.recallEnabled ?? false}
+          onEnabled={(recallEnabled) => controller.savePreferences({ recallEnabled })}
+          onOpen={controller.openRecallResult}
+          onClose={controller.closeRecall}
+        />
+      {/if}
       <section class="conversation-pane" aria-label="Blackwall chat">
         {#if setupOpen}
           <ConnectionSetup
@@ -288,7 +302,12 @@
               busy={$runState !== 'idle'}
               onFiles={(files) => composer?.addFiles(files)}
             >
-              <ChatView messages={$messages} connectionState={$connectionState} {showHarnessDemo} />
+              <ChatView
+                focusedMessageId={$focusedMessageId}
+                messages={$messages}
+                connectionState={$connectionState}
+                {showHarnessDemo}
+              />
               {#if $approval}<ApprovalCard
                   approval={$approval}
                   onResolve={controller.resolveApproval}

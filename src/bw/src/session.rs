@@ -166,6 +166,13 @@ impl Conversation {
         {
             definitions.extend(blackwall_core::memory::definitions());
         }
+        if self.memory_tools(directory).is_some()
+            && store
+                .recall_enabled(MemoryClient::Cli)
+                .map_err(|e| e.to_string())?
+        {
+            definitions.push(blackwall_core::memory::recall_definition());
+        }
         let skills = SkillStore::open(&directory.join("skills"))
             .and_then(|skills| skills.list())
             .map_err(|error| error.to_string())?;
@@ -210,6 +217,7 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: true,
+                trace: settings.trace,
             },
             Some(input),
             memory.as_ref(),
@@ -281,6 +289,7 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: false,
+                trace: settings.trace,
             },
             input,
             memory.as_ref(),
@@ -344,7 +353,7 @@ fn context(
     Ok(messages)
 }
 
-fn environment_key(endpoint: &str) -> Option<String> {
+pub(crate) fn environment_key(endpoint: &str) -> Option<String> {
     let configured = env::var("BLACKWALL_MODEL_ENDPOINT")
         .ok()
         .filter(|value| !value.trim().is_empty())

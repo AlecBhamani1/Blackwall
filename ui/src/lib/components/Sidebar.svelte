@@ -13,6 +13,7 @@
   import LogoMark from './LogoMark.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
   import McpDialog from './McpDialog.svelte';
+  import RunsDialog from './RunsDialog.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
@@ -49,6 +50,7 @@
   let memoryOpen = false;
   let skillsOpen = false;
   let mcpOpen = false;
+  let runsOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -107,6 +109,9 @@
   <button class="memory-button" onclick={() => (mcpOpen = true)}
     >MCP servers <span>Tools from local servers</span></button
   >
+  <button class="memory-button" onclick={() => (runsOpen = true)}
+    >Runs <span>Traces of agent runs</span></button
+  >
   <section class="history">
     <div class="section-label">Recent</div>
     {#if sessions.length === 0}
@@ -164,6 +169,7 @@
 
 {#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
 {#if mcpOpen}<McpDialog onClose={() => (mcpOpen = false)} />{/if}
+{#if runsOpen}<RunsDialog onClose={() => (runsOpen = false)} />{/if}
 {#if memoryOpen}<MemoryDialog
     {onPreferences}
     {contextPreferences}
