@@ -22,6 +22,17 @@ pub enum ModelError {
     )]
     Limit,
 }
+impl ModelError {
+    /// A stable name for traces.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Http(_) => "http",
+            Self::Invalid => "invalid_response",
+            Self::Limit => "limit",
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ToolFunction {
     pub name: String,
@@ -46,6 +57,10 @@ pub struct ModelTurn {
 pub trait ModelBackend: Send + Sync {
     fn context_budget(&self) -> crate::context::ContextBudget {
         Default::default()
+    }
+    /// The requested model's name, recorded in traces.
+    fn model_name(&self) -> Option<&str> {
+        None
     }
     fn generate<'a>(
         &'a self,
@@ -98,6 +113,9 @@ impl HttpModel {
 impl ModelBackend for HttpModel {
     fn context_budget(&self) -> crate::context::ContextBudget {
         self.budget
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
     }
     fn generate<'a>(
         &'a self,

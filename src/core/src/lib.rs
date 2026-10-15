@@ -9,6 +9,7 @@ pub mod context;
 pub mod jobs;
 pub mod memory;
 pub mod protocol;
+pub mod review;
 pub mod share;
 pub mod storage;
 
@@ -27,6 +28,7 @@ pub mod model;
 pub mod policy;
 pub mod secrets;
 pub mod tools;
+pub mod trace;
 
 pub mod web;
 

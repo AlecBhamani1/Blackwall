@@ -47,7 +47,7 @@ a SmartScreen or Gatekeeper warning.
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
-  demand
+  demand and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
@@ -90,13 +90,22 @@ choices. Type `/commands` during chat to see the available controls. Change sett
 Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
 reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
+`/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
+proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+`bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
+one as a tree; the desktop **Runs** panel shows the same traces. See
+[Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
 an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resume` for scripts and
 CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied. See
 the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
+
+Use `bw review` or `/review` in CLI or desktop Agent chat to inspect Git changes without agent tools. Choose `--uncommitted`,
+`--commit <ref>`, or `--base <ref>`; add `--json` for structured findings and separate hypotheses.
+See [Git review](docs/GIT_REVIEW.md) for target semantics, evidence limits, and isolation.
 
 Saved message search works offline with `bw sessions search "search words"`, `/recall search words`
 in the CLI, or **Search history** and `/recall` in desktop. Results include bounded excerpts and

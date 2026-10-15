@@ -217,6 +217,7 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: true,
+                trace: settings.trace,
             },
             Some(input),
             memory.as_ref(),
@@ -288,6 +289,7 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: false,
+                trace: settings.trace,
             },
             input,
             memory.as_ref(),
@@ -351,7 +353,7 @@ fn context(
     Ok(messages)
 }
 
-fn environment_key(endpoint: &str) -> Option<String> {
+pub(crate) fn environment_key(endpoint: &str) -> Option<String> {
     let configured = env::var("BLACKWALL_MODEL_ENDPOINT")
         .ok()
         .filter(|value| !value.trim().is_empty())

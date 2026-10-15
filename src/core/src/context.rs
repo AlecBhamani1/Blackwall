@@ -444,6 +444,8 @@ pub struct ContextRun {
     pub budget: ContextBudget,
     pub instructions: Vec<Value>,
     pub compact: bool,
+    /// Owner trace settings; recorded only when the adapter also supplies the data folder.
+    pub trace: crate::trace::TraceOptions,
 }
 
 /// Shared tool-free chat/compaction path. Only newly generated calls could ever be actions,
@@ -460,6 +462,7 @@ pub async fn chat(
         budget,
         instructions,
         compact,
+        trace: _,
     } = run;
     use crate::protocol::AgentEvent;
     state.validate()?;
@@ -747,6 +750,7 @@ mod tests {
             },
             instructions: vec![],
             compact: false,
+            trace: Default::default(),
         };
         assert_eq!(
             chat(&Automatic, "auto", run, &|event| events
