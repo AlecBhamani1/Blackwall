@@ -264,3 +264,96 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
     .unwrap();
     assert_eq!(settings["model"], "after-stop");
 }
+
+#[test]
+fn interrupting_git_review_cancels_the_request_without_changes() {
+    let fixture = Fixture::new();
+    let project = fixture.0.join("project");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "user.name", "Fixture"],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    fs::write(project.join("file"), "original\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "fixture"]] {
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    fs::write(project.join("file"), "changed\n").unwrap();
+    let index = fs::read(project.join(".git/index")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (observed, requests) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + WAIT_LIMIT;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("Fixture accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
+        let request = read_request(&mut stream);
+        assert!(request.get("tools").is_none());
+        observed.send(()).unwrap();
+        let mut buffer = [0u8; 1];
+        match stream.read(&mut buffer) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("Cancelled review did not close the connection: {result:?}"),
+        }
+    });
+    let mut child = RunningCli(
+        Command::new(env!("CARGO_BIN_EXE_bw"))
+            .arg("review")
+            .current_dir(&project)
+            .env("BLACKWALL_DATA_DIR", fixture.0.join("data"))
+            .env("BLACKWALL_MODEL_ENDPOINT", endpoint)
+            .env("BLACKWALL_MODEL", "fixture")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    requests.recv_timeout(WAIT_LIMIT).unwrap();
+    assert!(Command::new("kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(!child.wait().success());
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("Review cancelled"));
+    server.join().unwrap();
+    assert_eq!(index, fs::read(project.join(".git/index")).unwrap());
+    assert_eq!(
+        fs::read_to_string(project.join("file")).unwrap(),
+        "changed\n"
+    );
+}

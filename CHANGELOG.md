@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Inspect Git changes with `bw review` and CLI/desktop Agent `/review`, using exclusive working-tree, commit,
+  or base-branch targets. Return prioritized findings separately from unverified hypotheses,
+  with bounded untracked text and JSON output. Review runs without model tools or write access.
+
 - Search saved desktop and CLI message text locally with `bw sessions search`, `/recall`, and desktop
   Search history. Filter by project and updated date, open referenced messages without changing
   their saved mode, and optionally enable a bounded, project-scoped agent recall tool. Existing
