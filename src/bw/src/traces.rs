@@ -57,15 +57,27 @@ fn seconds(ms: u64) -> String {
     format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
 }
 
-/// One line per span, children indented under their parent in start order.
+/// One line per span, children indented under their parent in start order. Spans whose parent
+/// is missing are listed at the top level, and each ID's children are listed once.
 fn tree(spans: &[SpanView]) -> String {
-    fn walk(spans: &[SpanView], parent: Option<&str>, depth: usize, out: &mut String) {
-        let mut children: Vec<_> = spans
-            .iter()
-            .filter(|span| span.parent.as_deref() == parent)
+    fn walk(
+        spans: &[SpanView],
+        parent: Option<&str>,
+        depth: usize,
+        placed: &mut [bool],
+        expanded: &mut std::collections::HashSet<String>,
+        out: &mut String,
+    ) {
+        let mut children: Vec<_> = (0..spans.len())
+            .filter(|&index| !placed[index] && spans[index].parent.as_deref() == parent)
             .collect();
-        children.sort_by_key(|span| span.start_ms);
-        for span in children {
+        children.sort_by_key(|&index| spans[index].start_ms);
+        for index in children {
+            if placed[index] {
+                continue;
+            }
+            placed[index] = true;
+            let span = &spans[index];
             let mut details = vec![seconds(span.duration_ms)];
             let number = |key: &str| span.attributes.get(key).and_then(|v| v.as_u64());
             if let (Some(input), Some(output)) = (
@@ -99,10 +111,74 @@ fn tree(spans: &[SpanView]) -> String {
                     ));
                 }
             }
-            walk(spans, Some(&span.id), depth + 1, out);
+            if expanded.insert(span.id.clone()) {
+                walk(spans, Some(&span.id), depth + 1, placed, expanded, out);
+            }
         }
     }
     let mut out = String::new();
-    walk(spans, None, 0, &mut out);
+    let mut placed = vec![false; spans.len()];
+    let mut expanded = std::collections::HashSet::new();
+    walk(spans, None, 0, &mut placed, &mut expanded, &mut out);
+    let mut orphans: Vec<_> = (0..spans.len()).filter(|&index| !placed[index]).collect();
+    orphans.sort_by_key(|&index| spans[index].start_ms);
+    for index in orphans {
+        if !placed[index] {
+            walk(
+                spans,
+                spans[index].parent.as_deref(),
+                0,
+                &mut placed,
+                &mut expanded,
+                &mut out,
+            );
+        }
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(id: &str, parent: Option<&str>, start_ms: u64) -> SpanView {
+        SpanView {
+            id: id.into(),
+            parent: parent.map(Into::into),
+            name: format!("span {id}"),
+            start_ms,
+            duration_ms: 0,
+            error: None,
+            attributes: Default::default(),
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn tree_keeps_orphans_and_stops_on_cycles() {
+        let lines: Vec<String> = tree(&[
+            span("root", None, 0),
+            span("b", Some("root"), 2),
+            span("a", Some("root"), 1),
+            span("orphan", Some("missing"), 3),
+            span("x", Some("y"), 4),
+            span("y", Some("x"), 5),
+            span("root", Some("root"), 6),
+        ])
+        .lines()
+        .map(|line| line.split("  0.0s").next().unwrap().to_owned())
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                "span root",
+                "  span a",
+                "  span b",
+                "  span root",
+                "span orphan",
+                "span x",
+                "  span y",
+            ]
+        );
+    }
 }
