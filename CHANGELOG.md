@@ -13,6 +13,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or base-branch targets. Return prioritized findings separately from unverified hypotheses,
   with bounded untracked text and JSON output. Review runs without model tools or write access.
 
+- Review agent runs in the desktop **Runs** panel: recent runs with their model and tool calls,
+  tokens, and failures, each run as a tree of steps with any captured content, and settings to turn
+  traces and content capture on or off.
+
+- Record a local OpenTelemetry trace of each CLI and desktop Agent run, with model and tool spans,
+  token counts, errors, and approval requests. `bw traces` lists recent runs and `bw traces show`
+  prints one as a tree. Traces are on by default and keep the newest 200; prompt, answer, and tool
+  text is recorded only with `bw config set trace-content on`, redacted and size-limited.
+
 - Search saved desktop and CLI message text locally with `bw sessions search`, `/recall`, and desktop
   Search history. Filter by project and updated date, open referenced messages without changing
   their saved mode, and optionally enable a bounded, project-scoped agent recall tool. Existing
@@ -50,6 +59,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   within the shared budget, and the model reads a skill's instructions with `read_skill`, so far
   larger libraries fit.
 
+- Propose skills from successful work with `/learn`. Proposals keep their source, never load until
+  approved with `bw skills` or in the desktop, and cannot overwrite a skill the owner changed after
+  the proposal.
+
+- Review proposed skills in the desktop **Skills** dialog: see the source and the saved skill, edit
+  the proposed description and instructions, then approve or reject.
+
 - Run CLI tasks headlessly with `bw run --json`, printing agent events as JSON lines and denying
   any action that owner rules leave to an approval prompt.
 
@@ -70,6 +86,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a pinned `npx` command; the list ships with the app and is not offered on Windows.
 
 ### Fixed
+
+- Flush each policy audit record before the decision returns. Tokio finishes file writes in the
+  background, so a record could be missing when the log was read right after a decision.
 
 - Update the TLS dependency to include upstream security fixes.
 

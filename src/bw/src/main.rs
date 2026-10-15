@@ -5,6 +5,8 @@ mod recall;
 mod review;
 mod session;
 mod settings;
+mod skills;
+mod traces;
 
 use blackwall_core::{
     storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
@@ -28,6 +30,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /init                     Review a proposed AGENTS.md (preserves existing guidance)
   /recall <words> [filters]  Search saved messages; same filters as bw sessions search
   /settings recall on|off   Enable or disable the agent recall tool (default off)
+  /learn                    Propose a reusable skill from this conversation for review
   /context                  Show estimated budget and last server token usage
   /compact                  Summarize older context; retain the original transcript
   /settings context <n>     Configure model context limit in tokens
@@ -59,6 +62,8 @@ USAGE:
                              Continue a saved Agent conversation
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
+  bw skills <action>         Review learned skill proposals (bw skills for pending)
+  bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
                              Review Git changes without agent tools
@@ -108,7 +113,7 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
-        | "mcp" | "review" => {}
+        | "mcp" | "review" | "skills" | "traces" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -119,6 +124,12 @@ async fn run() -> Result<(), String> {
     };
     if command == "memory" {
         return memory::run(&directory, &arguments);
+    }
+    if command == "skills" {
+        return skills::run(&directory, &arguments);
+    }
+    if command == "traces" {
+        return traces::run(&directory, &arguments);
     }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "mcp" {
@@ -357,9 +368,10 @@ async fn chat(
                             .collect::<Vec<_>>();
                         review::run(&conversation.workspace, settings, &arguments).await
                     }
-                    "init" if value.is_empty() => {
+                    "init" | "learn" if value.is_empty() => {
+                        let command = format!("/{name}");
                         conversation
-                            .turn(store, directory, settings, "/init", Some(input))
+                            .turn(store, directory, settings, &command, Some(input))
                             .await
                     }
                     "compact" if value.is_empty() => {

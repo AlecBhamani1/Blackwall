@@ -312,10 +312,49 @@ Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are repor
 Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
 model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
 usable.
-They cannot grant tool permissions. Skills are currently managed by the user; agent-generated skill
-creation and automatic learning are not implemented.
+They cannot grant tool permissions.
+
+Type `/learn` in an Agent conversation to have the model propose a skill from the workflow that
+worked, leaving out failed attempts and secrets. The model can only propose: `skill_propose` stores
+the proposal with its source session and message under `skills/.proposals`, and nothing is loaded
+until the owner approves it. `bw skills` lists pending proposals with a diff against the current
+skill, `bw skills approve <id>` saves one and keeps the proposal in `skills/.proposals/approved` as
+a record of its source, and `bw skills reject <id>` discards it, even one that can no longer be
+read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
+kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
+
+In the desktop app, **Skills** lists pending proposals under **Pending review**. Each one shows its
+source session and message, the saved skill it would replace, and the proposed description and
+instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
+validation as a saved skill; **Reject** discards the proposal.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
+
+## Agent traces
+
+Each CLI and desktop Agent run records a local trace in `~/.blackwall/traces` (or the
+`BLACKWALL_DATA_DIR` data folder). A trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with
+a span for the run, each model call, and each tool call, using the OpenTelemetry generative AI names
+(`invoke_agent`, `chat`, `execute_tool`). Spans keep timings, the model, token counts the server
+reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the newest 200
+traces and never sends them anywhere.
+
+`bw traces` lists recent runs with their duration, model and tool calls, tokens, and any failure.
+`bw traces show <id>` prints one run as a tree. Turn traces off with `bw config set traces off`.
+
+By default a trace holds no prompt, answer, tool argument, or tool output text. `bw config set
+trace-content on` also records tool arguments, tool results, and model answers, each redacted like
+audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. A value
+redacted anywhere in a run is removed wherever else it appears in that trace, such as when the model
+repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
+output is also content, so without it the trace only says the tool reported an error. If a trace
+with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
+turn it on only while investigating a run.
+
+In the desktop app, **Runs** lists the 50 newest runs and opens one as a tree of model and tool steps,
+with failures, approval requests, and any captured content. **Record agent runs** and **Include
+content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
+Subagent runs and compaction requests are not traced yet.
 
 ## App lock
 

@@ -47,6 +47,20 @@ pub enum ToolError {
     #[error("{0}")]
     Execution(String),
 }
+impl ToolError {
+    /// A stable name for traces, without any tool output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::File => "file",
+            Self::Limit => "limit",
+            Self::Arguments => "arguments",
+            Self::Denied => "denied",
+            Self::Changed => "changed",
+            Self::Execution(_) => "execution",
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Workspace {
     pub(crate) directory: Arc<Dir>,

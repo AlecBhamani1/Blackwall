@@ -47,7 +47,7 @@ a SmartScreen or Gatekeeper warning.
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
-  demand
+  demand and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
@@ -90,7 +90,12 @@ choices. Type `/commands` during chat to see the available controls. Change sett
 Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
 reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
+`/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
+proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+`bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
+one as a tree; the desktop **Runs** panel shows the same traces. See
+[Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
