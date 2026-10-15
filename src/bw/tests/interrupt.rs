@@ -9,10 +9,15 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 const PARTIAL_ANSWER: &str = "Fixture partial answer before approval.";
@@ -25,9 +30,14 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        Self::at(timestamp)
+    }
+
+    fn at(timestamp: u128) -> Self {
         let root = env::temp_dir().join(format!(
-            "blackwall-cli-interrupt-{}-{timestamp}",
+            "blackwall-cli-interrupt-{}-{timestamp}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(root.join("project")).unwrap();
         Self(root)
@@ -38,6 +48,15 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn fixtures_with_the_same_clock_tick_do_not_share_directories() {
+    let first = Fixture::at(0);
+    let second = Fixture::at(0);
+    assert_ne!(first.0, second.0);
+    drop(first);
+    assert!(second.0.join("project").is_dir());
 }
 
 /// Kill a stalled CLI even if a bounded assertion fails while stdin is still open.
