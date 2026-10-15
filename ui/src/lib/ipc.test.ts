@@ -37,6 +37,8 @@ describe('native chat failure boundary', () => {
           enabled: true,
           workspace: '/projects/current',
           webEnabled: false,
+          executionProfile: 'read-only',
+          commandNetwork: false,
           sessionId: 'session-test',
           sourceMessageId: 'message-test',
         },

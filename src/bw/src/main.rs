@@ -37,6 +37,8 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings output <n>      Reserve generated output tokens
   /settings compact on|off  Automatically compact near the context limit
   /settings iterations <n>  Limit model/tool iterations per Agent run
+  /settings profile <read-only|workspace-write|unsandboxed>  Set command access (default read-only)
+  /settings command-network on|off  Command network access (default off; unsandboxed always on)
   /settings timeout <n>     Limit each shell command in seconds
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
@@ -244,7 +246,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|web|memory|recall|context|output|compact|iterations|timeout> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.".into(),
             )
         }
     }
@@ -332,9 +334,15 @@ async fn chat(
     input: &mut Input,
 ) -> Result<(), String> {
     println!(
-        "Blackwall — {}\nProject: {}\nType /commands for settings and controls.",
+        "Blackwall — {}\nProject: {}\nCommands: {}\nType /commands for settings and controls.",
         settings.model,
-        conversation.workspace.display()
+        conversation.workspace.display(),
+        blackwall_core::sandbox::ExecutionPolicy {
+            profile: settings.execution_profile,
+            network: settings.command_network,
+            data_directory: None
+        }
+        .description()
     );
     loop {
         input.prompt("you> ")?;
@@ -417,7 +425,7 @@ fn slash(
         ),
         "settings" => {
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
-                "Use /settings <model|endpoint|web|memory|recall|context|output|compact|iterations|timeout> <value>.",
+                "Use /settings <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.",
             )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());
