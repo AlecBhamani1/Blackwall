@@ -103,6 +103,10 @@ an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resu
 CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied. See
 the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
 
+Use `bw review` or `/review` in CLI or desktop Agent chat to inspect Git changes without agent tools. Choose `--uncommitted`,
+`--commit <ref>`, or `--base <ref>`; add `--json` for structured findings and separate hypotheses.
+See [Git review](docs/GIT_REVIEW.md) for target semantics, evidence limits, and isolation.
+
 Saved message search works offline with `bw sessions search "search words"`, `/recall search words`
 in the CLI, or **Search history** and `/recall` in desktop. Results include bounded excerpts and
 session/message references; project and updated-date filters help narrow the history. Agent recall

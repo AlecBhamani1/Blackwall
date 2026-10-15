@@ -204,6 +204,12 @@ impl From<blackwall_core::agent::AgentError> for CommandError {
         match error {
             AgentError::Budget(error) => error.into(),
             AgentError::Model(error) => error.into(),
+            AgentError::Review(blackwall_core::review::ReviewError::Model(error)) => error.into(),
+            AgentError::Review(error) => Self {
+                code: "review_error",
+                message: error.to_string(),
+                retryable: false,
+            },
             AgentError::Iterations => Self {
                 code: "agent_iteration_limit",
                 message: error.to_string(),

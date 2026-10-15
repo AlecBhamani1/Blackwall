@@ -2,6 +2,7 @@ mod input;
 mod mcp;
 mod memory;
 mod recall;
+mod review;
 mod session;
 mod settings;
 mod skills;
@@ -25,6 +26,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /memory on|off            Include/exclude your saved memories
   /memory <action>          list, pending, approve, reject, edit, forget
   /workspace <path>         Start a new conversation in a project
+  /review [target]          Inspect Git changes; --uncommitted, --commit <ref>, or --base <ref>
   /init                     Review a proposed AGENTS.md (preserves existing guidance)
   /recall <words> [filters]  Search saved messages; same filters as bw sessions search
   /settings recall on|off   Enable or disable the agent recall tool (default off)
@@ -63,6 +65,8 @@ USAGE:
   bw skills <action>         Review learned skill proposals (bw skills for pending)
   bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
+  bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
+                             Review Git changes without agent tools
   bw request <prompt>        Print a request preview without a model call
 
 Install: cargo install --locked --path src/bw
@@ -109,7 +113,7 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
-        | "mcp" | "skills" | "traces" => {}
+        | "mcp" | "review" | "skills" | "traces" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -166,6 +170,9 @@ async fn run() -> Result<(), String> {
         Workspace::open(&env::current_dir().map_err(|_| "The current folder is unavailable.")?)
             .map_err(|error| error.to_string())?
             .path;
+    if command == "review" {
+        return review::run(&workspace, &settings, &arguments).await;
+    }
     let mut conversation = if command == "resume" {
         Conversation::load(
             &store,
@@ -354,6 +361,13 @@ async fn chat(
                     }
                 }
                 match name {
+                    "review" => {
+                        let arguments = value
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        review::run(&conversation.workspace, settings, &arguments).await
+                    }
                     "init" | "learn" if value.is_empty() => {
                         let command = format!("/{name}");
                         conversation

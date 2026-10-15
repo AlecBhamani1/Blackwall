@@ -16,6 +16,8 @@ pub enum AgentError {
     Budget(#[from] crate::context::ContextError),
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error(transparent)]
+    Review(#[from] crate::review::ReviewError),
     #[error("The agent reached its iteration limit. Review its progress before continuing.")]
     Iterations,
     #[error("The conversation is too large for this agent run. Start a new conversation with a shorter task.")]
@@ -145,6 +147,45 @@ impl Agent<'_> {
             approvals: self.approvals.clone(),
             request_id: request_id.into(),
         };
+        // Dispatch before loading policy, project instructions, skills, command tools, or MCP.
+        if !compact {
+            if let Some(text) = source.last().filter(|m| m["role"] == "user").and_then(|m| {
+                m["content"]
+                    .as_str()
+                    .or_else(|| m["content"].as_array()?.first()?["text"].as_str())
+            }) {
+                let mut arguments = text.split_whitespace();
+                if arguments.next() == Some("/review") {
+                    let target = crate::review::ReviewTarget::parse(
+                        &arguments.map(str::to_owned).collect::<Vec<_>>(),
+                    )?;
+                    let snapshot =
+                        crate::review::ReviewSnapshot::collect(&self.workspace.path, &target)
+                            .await?;
+                    let result = snapshot.review(self.backend).await?;
+                    let answer = snapshot.render(&result);
+                    (self.emit)(AgentEvent::AssistantDelta {
+                        request_id: request_id.into(),
+                        delta: answer.clone(),
+                    });
+                    state
+                        .transcript
+                        .push(json!({"role":"assistant","content":answer}));
+                    state.complete_source(&source, &answer);
+                    (self.emit)(AgentEvent::ContextUpdated {
+                        request_id: request_id.into(),
+                        state: state.clone(),
+                    });
+                    (self.emit)(AgentEvent::TurnComplete {
+                        request_id: request_id.into(),
+                        message: ChatMessage::new(MessageRole::Assistant, &answer),
+                        finish_reason: Some("stop".into()),
+                        usage: None,
+                    });
+                    return Ok(answer);
+                }
+            }
+        }
         if let Some(directory) = user_directory {
             self.approvals
                 .load_policy(request_id, directory, &self.workspace.path)

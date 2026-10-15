@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Inspect Git changes with `bw review` and CLI/desktop Agent `/review`, using exclusive working-tree, commit,
+  or base-branch targets. Return prioritized findings separately from unverified hypotheses,
+  with bounded untracked text and JSON output. Review runs without model tools or write access.
+
 - Review agent runs in the desktop **Runs** panel: recent runs with their model and tool calls,
   tokens, and failures, each run as a tree of steps with any captured content, and settings to turn
   traces and content capture on or off.

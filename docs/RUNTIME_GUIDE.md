@@ -393,6 +393,7 @@ Setup does not test connectivity or launch/download a model. `npm run cli -- set
 | `/model <id>`, `/endpoint <url>` | Change the model or service for the next turn |
 | `/web on\|off`, `/memory on\|off` | Enable or disable web tools or saved memory injection |
 | `/workspace <path>` | Start a new conversation in another project; relative paths use the current project |
+| `/review [target]` | Read-only Git review; `--uncommitted`, `--commit <ref>`, or `--base <ref>` ([limits and behavior](GIT_REVIEW.md)) |
 | `/new` | Start a new conversation in the current project |
 | `/sessions`, `/resume <id>` | List conversations or restore an Agent conversation and its project |
 | `/quit`, `/exit` | Exit; EOF also exits |
