@@ -310,7 +310,7 @@ impl LocalStore {
     }
 }
 
-fn validate_id(id: &str) -> Result<(), StorageError> {
+pub(crate) fn validate_id(id: &str) -> Result<(), StorageError> {
     if id.is_empty()
         || id.len() > 128
         || !id

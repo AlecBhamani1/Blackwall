@@ -135,6 +135,10 @@ impl Agent<'_> {
             }
             None => vec![],
         };
+        // Proposals need the owner's skill folder and the message they came from.
+        let proposals = user_directory
+            .zip(memory)
+            .map(|(directory, tools)| (directory.join("skills"), tools.source.clone()));
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
@@ -173,6 +177,16 @@ impl Agent<'_> {
             return Ok(answer);
         }
         instructions.insert(0, default_instructions(&self.workspace));
+        if !compact
+            && source.last().is_some_and(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.trim() == "/learn")
+            })
+        {
+            instructions.push(json!({"role":"system","content":crate::skills::LEARN}));
+        }
 
         let mut definitions = tools::definitions(self.web_enabled, true);
         definitions.extend(command_tools.definitions());
@@ -186,6 +200,9 @@ impl Agent<'_> {
         }
         if skills.iter().any(|skill| skill.enabled) {
             definitions.push(crate::skills::definition());
+        }
+        if proposals.is_some() {
+            definitions.push(crate::skills::propose_definition());
         }
 
         let mut has_guidance = !guidance.prompt().is_empty();
@@ -347,6 +364,7 @@ impl Agent<'_> {
                     let command_tools = &command_tools;
                     let mcp = &mcp;
                     let skills = &skills;
+                    let proposals = &proposals;
                     async move {
                         let ui_id = format!("{iteration}_{index}_{}", call.id);
                         (self.emit)(AgentEvent::ToolCall {
@@ -386,6 +404,17 @@ impl Agent<'_> {
                                         )
                                     })
                                 })
+                        } else if call.function.name == "skill_propose" {
+                            match proposals {
+                                Some((directory, source)) => crate::skills::propose_call(
+                                    directory.clone(),
+                                    source.clone(),
+                                    &call.function.arguments,
+                                )
+                                .await
+                                .map_err(tools::ToolError::Execution),
+                                None => Err(tools::ToolError::Denied),
+                            }
                         } else if call.function.name == "spawn_agent" {
                             let args: Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
@@ -1240,6 +1269,101 @@ mod tests {
             "Loaded."
         );
         drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    struct LearnModel {
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for LearnModel {
+        fn generate<'a>(
+            &'a self,
+            messages: &'a [Value],
+            definitions: &'a [Value],
+            _delta: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    assert!(messages
+                        .iter()
+                        .any(|message| message["content"] == crate::skills::LEARN));
+                    assert!(definitions
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "skill_propose"));
+                    return Ok(ModelTurn {
+                        calls: vec![ToolCall {
+                            id: "learn".into(),
+                            function: ToolFunction {
+                                name: "skill_propose".into(),
+                                arguments: json!({"name":"release","description":"Ship a release.","body":"Run the release checklist."}).to_string(),
+                            },
+                        }],
+                        ..Default::default()
+                    });
+                }
+                assert!(messages.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pending_review"));
+                Ok(ModelTurn {
+                    content: "Proposed.".into(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn learn_proposes_a_skill_for_review_without_saving_it() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-learn-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        std::fs::create_dir_all(directory.join("user")).unwrap();
+        let agent = Agent {
+            backend: &LearnModel {
+                step: Mutex::new(0),
+            },
+            workspace: Workspace::open(&directory.join("project")).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(|_| {}),
+        };
+        let memory = crate::memory::MemoryTools {
+            directory: directory.join("user"),
+            client: crate::memory::MemoryClient::Cli,
+            workspace: None,
+            source: crate::storage::MemorySource {
+                session_id: "session".into(),
+                message_id: "message".into(),
+            },
+        };
+        let source = vec![json!({"role":"user","content":"/learn"})];
+        let run = crate::context::ContextRun {
+            state: crate::context::ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: Default::default(),
+            instructions: vec![],
+            compact: false,
+        };
+        assert_eq!(
+            agent
+                .run_context_with_guidance(
+                    "learn",
+                    run,
+                    Some(&memory),
+                    Some(&directory.join("user"))
+                )
+                .await
+                .unwrap(),
+            "Proposed."
+        );
+        let store = crate::skills::SkillStore::open(&directory.join("user/skills")).unwrap();
+        let (proposals, warnings) = store.proposals().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].source.message_id, "message");
+        assert!(store.read("release").is_err());
+        drop((agent, store));
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]

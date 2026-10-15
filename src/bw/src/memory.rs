@@ -3,7 +3,7 @@ use blackwall_core::storage::LocalStore;
 use std::path::Path;
 
 const USAGE: &str = "Use bw memory list|pending|approve <id> [edited text]|reject <id>|edit <id> <text>|forget <id>.";
-fn visible(text: &str) -> String {
+pub(crate) fn visible(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
