@@ -53,6 +53,18 @@ pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {
     with_store(&app, |store| store.list_sessions()).await
 }
 #[tauri::command]
+pub async fn search_sessions(
+    app: AppHandle,
+    query: blackwall_core::storage::RecallQuery,
+) -> Result<blackwall_core::storage::RecallResults, String> {
+    let results = with_store(&app, move |store| {
+        store.search_messages(blackwall_core::memory::MemoryClient::Desktop, &query)
+    })
+    .await?;
+    crate::auth::require_unlocked(&app).await?;
+    Ok(results)
+}
+#[tauri::command]
 pub async fn load_session(app: AppHandle, id: String) -> Result<Option<Value>, String> {
     with_store(&app, move |store| store.load_session(&id)).await
 }
@@ -131,6 +143,7 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "maxIterations"
                 | "commandTimeoutSeconds"
                 | "memoryEnabled"
+                | "recallEnabled"
                 | "workspace"
                 | "connections"
         )
@@ -186,6 +199,12 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|value| !value.is_boolean())
     {
         return Err("Invalid memory setting.".into());
+    }
+    if object
+        .get("recallEnabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid recall setting.".into());
     }
     for key in ["model", "connectionName", "relayUrl", "workspace"] {
         if object.get(key).is_some_and(|value| !value.is_string()) {

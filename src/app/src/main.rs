@@ -74,6 +74,7 @@ fn run() -> Result<(), StartupError> {
             data::list_mcp_tool_rules,
             data::remove_mcp_tool_rule,
             data::list_sessions,
+            data::search_sessions,
             data::load_session,
             data::save_session,
             data::delete_session,

@@ -18,7 +18,30 @@ export interface Preferences {
   maxIterations?: number;
   commandTimeoutSeconds?: number;
   memoryEnabled?: boolean;
+  recallEnabled?: boolean;
   workspace?: string;
+}
+export interface RecallQuery {
+  query: string;
+  project?: string;
+  after?: number;
+  before?: number;
+  limit?: number;
+}
+export interface RecallHit {
+  sessionId: string;
+  messageId: string;
+  messageIndex: number;
+  title: string;
+  mode: string;
+  project: string | null;
+  updatedAt: number;
+  role: string;
+  excerpt: string;
+}
+export interface RecallResults {
+  results: RecallHit[];
+  remainingSessions: number;
 }
 export interface Skill {
   name: string;
@@ -61,6 +84,7 @@ async function command<T>(name: string, args?: Record<string, unknown>): Promise
 export const persistence = {
   available: isDesktop,
   list: () => command<SessionSummary[]>('list_sessions'),
+  search: (query: RecallQuery) => command<RecallResults>('search_sessions', { query }),
   load: (id: string) => command<SessionSummary | null>('load_session', { id }),
   save: (session: SessionSummary) => command<void>('save_session', { session }),
   remove: (id: string) => command<void>('delete_session', { id }),

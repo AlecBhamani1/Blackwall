@@ -166,6 +166,13 @@ impl Conversation {
         {
             definitions.extend(blackwall_core::memory::definitions());
         }
+        if self.memory_tools(directory).is_some()
+            && store
+                .recall_enabled(MemoryClient::Cli)
+                .map_err(|e| e.to_string())?
+        {
+            definitions.push(blackwall_core::memory::recall_definition());
+        }
         let skills = SkillStore::open(&directory.join("skills"))
             .and_then(|skills| skills.list())
             .map_err(|error| error.to_string())?;

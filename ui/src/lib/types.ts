@@ -29,6 +29,8 @@ export interface ChatMessage {
   error?: string;
   tools?: ToolEntry[];
   children?: ChildEntry[];
+  /** Restored tool activity is inert history, never live approval state. */
+  historical?: boolean;
 }
 
 export interface ModelInfo {

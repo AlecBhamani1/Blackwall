@@ -997,3 +997,36 @@ fn reviewed_memory_stays_current_when_resuming_and_compacting_context() {
         .iter()
         .any(|tool| tool["function"]["name"] == "memory_propose"));
 }
+
+#[test]
+fn saved_message_search_is_offline_filtered_and_does_not_convert_chat_sessions() {
+    let fixture = Fixture::new();
+    let store = blackwall_core::storage::LocalStore::open(&fixture.root.join("data")).unwrap();
+    let session = json!({"id":"desktop_chat","title":"Saved Chat","mode":"chat","updatedAt":200,"messages":[{"id":"m","role":"assistant","content":"remembered needle","attachments":[]}]});
+    store.save_session(&session).unwrap();
+    let output = fixture.run(
+        &[
+            "sessions", "search", "needle", "--after", "200", "--before", "200",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("desktop_chat / m"));
+    assert!(text.contains("remembered needle"));
+    assert!(text.contains("Open this Chat conversation in desktop history"));
+    let output = fixture.run(&["sessions", "search", "needle", "--after", "201"], "");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No matching"));
+    let output = fixture.run(&["resume", "desktop_chat", "continue"], "");
+    assert!(!output.status.success());
+    assert_eq!(store.load_session("desktop_chat").unwrap(), Some(session));
+    store.delete_session("desktop_chat").unwrap();
+    let output = fixture.run(&["sessions", "search", "needle"], "");
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("remembered needle"));
+}

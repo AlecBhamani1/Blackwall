@@ -173,14 +173,16 @@ impl Agent<'_> {
             return Ok(answer);
         }
         instructions.insert(0, default_instructions(&self.workspace));
-        let memory = match memory {
-            Some(memory) if memory.available().await.unwrap_or(false) => Some(memory),
-            _ => None,
-        };
+
         let mut definitions = tools::definitions(self.web_enabled, true);
         definitions.extend(command_tools.definitions());
-        if memory.is_some() {
-            definitions.extend(crate::memory::definitions());
+        if let Some(memory) = memory {
+            if memory.available().await.unwrap_or(false) {
+                definitions.extend(crate::memory::definitions());
+            }
+            if memory.recall_available().await.unwrap_or(false) {
+                definitions.push(crate::memory::recall_definition());
+            }
         }
         if skills.iter().any(|skill| skill.enabled) {
             definitions.push(crate::skills::definition());
@@ -363,7 +365,7 @@ impl Agent<'_> {
                             Err(tools::ToolError::Execution("New directory instructions were loaded. Review them before proposing this edit again.".into()))
                         } else if matches!(
                             call.function.name.as_str(),
-                            "memory_list" | "memory_propose"
+                            "memory_list" | "memory_propose" | "session_recall"
                         ) {
                             match memory {
                                 Some(memory) => memory
@@ -1425,6 +1427,136 @@ mod context_tests {
         assert!(ContextState::restore(&source, Some(saved)).is_ok());
         assert!(!directory.join("not-created.txt").exists());
         drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod recall_tests {
+    use super::*;
+    use crate::{
+        context::{ContextRun, ContextState},
+        memory::{MemoryClient, MemoryTools},
+        model::{ModelTurn, ToolCall, ToolFunction},
+        storage::{LocalStore, MemorySource},
+    };
+    use futures_util::future::BoxFuture;
+    use std::sync::Mutex;
+    struct RecallModel {
+        allowed: bool,
+        step: Mutex<u32>,
+    }
+    impl ModelBackend for RecallModel {
+        fn generate<'a>(
+            &'a self,
+            messages: &'a [Value],
+            definitions: &'a [Value],
+            _delta: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                assert_eq!(
+                    definitions
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "session_recall"),
+                    self.allowed
+                );
+                assert!(!definitions
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "memory_list"));
+                if *step == 1 {
+                    return Ok(ModelTurn {
+                        calls: vec![ToolCall {
+                            id: "recall".into(),
+                            function: ToolFunction {
+                                name: "session_recall".into(),
+                                arguments: r#"{"query":"needle"}"#.into(),
+                            },
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let text = messages.last().unwrap()["content"].as_str().unwrap();
+                if self.allowed {
+                    assert!(text.contains("private needle"));
+                    assert!(text.contains("sessionId"));
+                } else {
+                    assert!(text.contains("denied"));
+                    assert!(!text.contains("private needle"));
+                }
+                Ok(ModelTurn {
+                    content: "Recalled safely.".into(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn runtime_offers_recall_only_to_opted_in_owners_and_rejects_guessed_guest_calls() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-agent-recall-{}", rand::random::<u64>()));
+        let db = LocalStore::open(&directory).unwrap();
+        let project = Workspace::open(&directory).unwrap();
+        let path = project.path.to_string_lossy().into_owned();
+        db.save_session(&json!({"id":"saved","title":"History","workspace":path,"mode":"agent","updatedAt":100,"messages":[{"id":"m","role":"user","content":"private needle","attachments":[]}]})).unwrap();
+        for (enabled, client, allowed) in [
+            (true, MemoryClient::Desktop, true),
+            (false, MemoryClient::Desktop, false),
+            (true, MemoryClient::Guest, false),
+        ] {
+            db.save_setting(
+                "preferences",
+                &json!({"recallEnabled":enabled,"memoryEnabled":false}).to_string(),
+            )
+            .unwrap();
+            let memory = MemoryTools {
+                directory: directory.clone(),
+                client,
+                workspace: Some(path.clone()),
+                source: MemorySource {
+                    session_id: "saved".into(),
+                    message_id: "m".into(),
+                },
+            };
+            let backend = RecallModel {
+                allowed,
+                step: Mutex::new(0),
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = events.clone();
+            let agent = Agent {
+                backend: &backend,
+                workspace: project.clone(),
+                web_enabled: false,
+                approvals: Approvals::default(),
+                emit: Arc::new(move |event| captured.lock().unwrap().push(event)),
+            };
+            let source = vec![json!({"role":"user","content":"Recall previous work"})];
+            agent
+                .run_context_with_memory(
+                    "test-recall",
+                    ContextRun {
+                        state: ContextState::restore(&source, None).unwrap(),
+                        source,
+                        budget: Default::default(),
+                        instructions: vec![],
+                        compact: false,
+                    },
+                    Some(&memory),
+                )
+                .await
+                .unwrap();
+            assert!(!events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
+        }
+        // Windows cannot delete the project directory while its capability handle is open.
+        drop(project);
+        drop(db);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

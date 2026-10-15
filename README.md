@@ -98,6 +98,12 @@ an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resu
 CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied. See
 the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
 
+Saved message search works offline with `bw sessions search "search words"`, `/recall search words`
+in the CLI, or **Search history** and `/recall` in desktop. Results include bounded excerpts and
+session/message references; project and updated-date filters help narrow the history. Agent recall
+is off by default; enable it with `bw config set recall on` or the desktop search panel.
+See [Conversation recall](docs/CONVERSATION_RECALL.md) for limits, migration, and privacy.
+
 ## Project working agreements
 
 CLI and desktop Agent tasks discover `AGENTS.md` guidance, with `AGENTS.override.md` taking

@@ -11,6 +11,7 @@ pub struct Settings {
     pub model: String,
     pub web_enabled: bool,
     pub memory_enabled: bool,
+    pub recall_enabled: bool,
     pub budget: blackwall_core::context::ContextBudget,
 }
 
@@ -37,6 +38,7 @@ impl Settings {
             "model": validated.model,
             "webEnabled": validated.web_enabled,
             "memoryEnabled": validated.memory_enabled,
+            "recallEnabled": validated.recall_enabled,
             "contextBudget": validated.budget,
         });
         store
@@ -60,6 +62,7 @@ impl Settings {
             "model" => updated.model = value.into(),
             "web" => updated.web_enabled = on_or_off(value)?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
+            "recall" => updated.recall_enabled = on_or_off(value)?,
             "context" => {
                 updated.budget.context_window = value
                     .parse()
@@ -86,7 +89,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, web, memory, context, output, compact, iterations, or timeout."
+                "Choose a setting: model, endpoint, web, memory, recall, context, output, compact, iterations, or timeout."
                     .into(),
             ),
         }
@@ -103,9 +106,10 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
+            if self.recall_enabled { "on" } else { "off" },
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
             self.budget.max_iterations, self.budget.command_timeout_seconds,
@@ -156,6 +160,11 @@ fn load_with_environment(
         model,
         web_enabled: false,
         memory_enabled,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or("Invalid recall setting."))
+            .transpose()?
+            .unwrap_or(false),
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -210,7 +219,12 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "endpoint" | "model" | "webEnabled" | "memoryEnabled" | "contextBudget"
+            "endpoint"
+                | "model"
+                | "webEnabled"
+                | "memoryEnabled"
+                | "recallEnabled"
+                | "contextBudget"
         )
     }) {
         return Err(invalid.into());
@@ -235,6 +249,11 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .get("webEnabled")
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
         memory_enabled: object
             .get("memoryEnabled")
             .and_then(Value::as_bool)
@@ -330,6 +349,7 @@ mod tests {
                 model: DEFAULT_MODEL.into(),
                 web_enabled: false,
                 memory_enabled: false,
+                recall_enabled: false,
                 budget: Default::default(),
             }
         );
@@ -409,6 +429,8 @@ mod tests {
             .unwrap();
         settings.set(&store, "model", " trimmed-model ").unwrap();
         settings.set(&store, "web", "ON").unwrap();
+        settings.set(&store, "recall", "on").unwrap();
+        assert!(settings.recall_enabled);
         settings.set(&store, "context", "8192").unwrap();
         settings.set(&store, "output", "1024").unwrap();
         settings.set(&store, "compact", "on").unwrap();
@@ -421,7 +443,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 5);
+        assert_eq!(saved.as_object().unwrap().len(), 6);
         assert_eq!(
             saved["contextBudget"],
             json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
@@ -531,6 +553,7 @@ mod tests {
             model: "\u{1b}[31msecret".into(),
             web_enabled: true,
             memory_enabled: false,
+            recall_enabled: false,
             budget: Default::default(),
         };
         let before = settings.clone();

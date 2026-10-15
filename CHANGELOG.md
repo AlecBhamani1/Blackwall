@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Search saved desktop and CLI message text locally with `bw sessions search`, `/recall`, and desktop
+  Search history. Filter by project and updated date, open referenced messages without changing
+  their saved mode, and optionally enable a bounded, project-scoped agent recall tool. Existing
+  histories migrate in small batches; edits and deletions remove their old search excerpts.
+
 - Load scoped `AGENTS.md` and `AGENTS.override.md` guidance in CLI and desktop Agent tasks,
   with bounded discovery, visible source lists and warnings, and a reviewed `/init` proposal
   that preserves existing project instructions.
@@ -61,6 +66,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a pinned `npx` command; the list ships with the app and is not offered on Windows.
 
 ### Fixed
+
+- Update the TLS dependency to include upstream security fixes.
 
 - Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
   when the macOS app is opened from the Dock, using the login shell's `PATH`.
