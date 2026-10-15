@@ -65,6 +65,7 @@ USAGE:
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw skills <action>         Review learned skill proposals (bw skills for pending)
+  bw skills import [<path>]  Import SKILL.md skills from other harnesses (list without a path)
   bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]

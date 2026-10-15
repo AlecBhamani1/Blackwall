@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Import skills written for Claude Code, Codex, and other agents in the `SKILL.md` format, from the
+  desktop Skills panel or `bw skills import`. Skills found in their usual folders are listed, and
+  each import shows what is left out, such as bundled files and permission settings.
+
 - Choose read-only (default), workspace-write, or explicitly unsandboxed command execution in
   desktop Agent mode and CLI settings. macOS Seatbelt enforces filesystem restrictions and
   default-off network access for shells, command tools, and descendants; protects application data,

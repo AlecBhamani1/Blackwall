@@ -50,6 +50,8 @@ pub enum SkillError {
     Pending,
     #[error("This proposal could not be read. Reject it by its ID.")]
     Invalid,
+    #[error("A skill with this name already exists. Choose to replace it, or rename one of them.")]
+    Exists,
 }
 /// A learned skill waiting for owner review. `before` is the skill it would replace, so approval
 /// can refuse a proposal made against an older version.
@@ -129,6 +131,19 @@ pub fn parse(text: &str) -> Result<Skill, SkillError> {
         enabled: frontmatter.enabled,
     })
 }
+/// The saved file for a skill, after the same checks as reading one back.
+pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
+    validate_name(&skill.name)?;
+    let document = format!(
+        "---\nname: {}\ndescription: {}\nenabled: {}\n---\n\n{}\n",
+        skill.name,
+        serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
+        skill.enabled,
+        skill.body
+    );
+    parse(&document)?;
+    Ok(document)
+}
 pub struct SkillStore {
     directory: Dir,
 }
@@ -203,16 +218,29 @@ impl SkillStore {
         }
         Ok(skill)
     }
-    pub fn save(&self, skill: &Skill) -> Result<(), SkillError> {
-        validate_name(&skill.name)?;
-        let document = format!(
-            "---\nname: {}\ndescription: {}\nenabled: {}\n---\n\n{}\n",
-            skill.name,
-            serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
-            skill.enabled,
-            skill.body
-        );
-        parse(&document)?;
+    /// Whether a file for this skill name exists, even one that cannot be read as a skill.
+    pub fn contains(&self, name: &str) -> bool {
+        validate_name(name).is_ok()
+            && self
+                .directory
+                .symlink_metadata(format!("{name}.md"))
+                .is_ok()
+    }
+    /// Save a new skill, refusing to replace any existing file with that name, even one written
+    /// at the same moment.
+    pub fn create(&self, skill: &Skill) -> Result<(), SkillError> {
+        let document = validate(skill)?;
+        let temporary = self.write_temporary(&document)?;
+        let linked =
+            self.directory
+                .hard_link(&temporary, &self.directory, format!("{}.md", skill.name));
+        let _ = self.directory.remove_file(&temporary);
+        linked.map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => SkillError::Exists,
+            _ => SkillError::File,
+        })
+    }
+    fn write_temporary(&self, document: &str) -> Result<String, SkillError> {
         let temporary = format!(".skill-{:016x}", rand::random::<u64>());
         let result = (|| {
             let mut file = self
@@ -221,11 +249,20 @@ impl SkillStore {
                 .map_err(|_| SkillError::File)?;
             file.write_all(document.as_bytes())
                 .map_err(|_| SkillError::File)?;
-            file.sync_all().map_err(|_| SkillError::File)?;
-            self.directory
-                .rename(&temporary, &self.directory, format!("{}.md", skill.name))
-                .map_err(|_| SkillError::File)
+            file.sync_all().map_err(|_| SkillError::File)
         })();
+        if result.is_err() {
+            let _ = self.directory.remove_file(&temporary);
+        }
+        result.map(|()| temporary)
+    }
+    pub fn save(&self, skill: &Skill) -> Result<(), SkillError> {
+        let document = validate(skill)?;
+        let temporary = self.write_temporary(&document)?;
+        let result = self
+            .directory
+            .rename(&temporary, &self.directory, format!("{}.md", skill.name))
+            .map_err(|_| SkillError::File);
         if result.is_err() {
             let _ = self.directory.remove_file(temporary);
         }

@@ -78,6 +78,14 @@ export interface TraceSpan {
   attributes: Record<string, unknown>;
   events: string[];
 }
+export interface SkillImportCandidate {
+  origin: string;
+  source: string;
+  skill: Skill | null;
+  error: string | null;
+  notes: string[];
+  exists: boolean;
+}
 export interface McpServer {
   name: string;
   command: string[];
@@ -128,6 +136,11 @@ export const persistence = {
   approveSkillProposal: (id: string, description: string, body: string) =>
     command<void>('approve_skill_proposal', { id, description, body }),
   rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),
+  findSkillImports: () => command<SkillImportCandidate[]>('find_skill_imports'),
+  chooseSkillImport: (folder: boolean) =>
+    command<SkillImportCandidate[] | null>('choose_skill_import', { folder }),
+  importSkill: (source: string, replace: boolean) =>
+    command<Skill>('import_skill', { source, replace }),
   traces: () => command<TraceSummary[]>('list_traces'),
   trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),

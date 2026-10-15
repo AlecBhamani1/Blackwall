@@ -363,6 +363,19 @@ source session and message, the saved skill it would replace, and the proposed d
 instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
 validation as a saved skill; **Reject** discards the proposal.
 
+To reuse skills written for other agents, choose **Import skills** in the Skills panel or run
+`bw skills import`. Blackwall reads the `SKILL.md` format used by Claude Code, Codex, and most
+published skills: a folder with a `SKILL.md` whose frontmatter has a name and description. The
+panel lists skills found in `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`, and
+**Choose folder…** or **Choose file…** adds others, such as a downloaded skill. `bw skills import`
+lists the same folders; `bw skills import <path>` imports a `SKILL.md`, a skill folder, or a folder
+of them, and `--replace` overwrites saved skills with the same name. The panel previews each skill
+before importing it. Names are converted to lowercase with hyphens, descriptions over 500 bytes are shortened,
+and skills over 32 KiB are refused. Only the instructions are imported: bundled scripts and
+reference files are not copied, and settings such as `allowed-tools` are ignored, because skills
+never grant permissions. The preview lists what was left out. A saved skill is replaced only when
+you choose to.
+
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
 
 ## Agent traces

@@ -34,6 +34,7 @@ pub mod web;
 
 pub mod subagents;
 
+pub mod skill_import;
 pub mod skills;
 
 pub mod auth;

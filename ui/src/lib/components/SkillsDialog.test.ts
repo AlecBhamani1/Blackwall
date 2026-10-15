@@ -127,4 +127,28 @@ describe('skill proposal review', () => {
     await user.click(screen.getByRole('button', { name: 'Approve todo-audit' }));
     await vi.waitFor(() => expect(screen.queryByText(/Pending review/)).not.toBeInTheDocument());
   });
+  it('opens the importer and reports what was imported', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'findSkillImports').mockResolvedValue([
+      {
+        origin: 'Codex',
+        source: '/s/SKILL.md',
+        skill: { name: 'imported', description: 'd', body: 'b', enabled: true },
+        error: null,
+        notes: [],
+        exists: false,
+      },
+    ]);
+    vi.spyOn(persistence, 'importSkill').mockResolvedValue({
+      name: 'imported',
+      description: 'd',
+      body: 'b',
+      enabled: true,
+    });
+    render(SkillsDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Import skills' }));
+    await user.click(await screen.findByRole('button', { name: 'Import 1 skill' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Imported 1 skill.');
+    expect(screen.getByText('Pending review · 2')).toBeInTheDocument();
+  });
 });
