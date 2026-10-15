@@ -115,6 +115,28 @@ pub async fn reject_memory_proposal(app: AppHandle, id: String) -> Result<(), St
     with_store(&app, move |store| store.reject_memory(&id)).await
 }
 
+/// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
+pub(crate) async fn trace_options(
+    directory: std::path::PathBuf,
+) -> blackwall_core::trace::TraceOptions {
+    let saved = tokio::task::spawn_blocking(move || {
+        LocalStore::open(&directory)
+            .ok()?
+            .setting("preferences")
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    blackwall_core::trace::TraceOptions {
+        enabled: saved["tracesEnabled"].as_bool().unwrap_or(true),
+        content: saved["traceContent"].as_bool().unwrap_or(false),
+    }
+}
+
 #[tauri::command]
 pub async fn load_preferences(app: AppHandle) -> Result<Value, String> {
     with_store(&app, |store| {
@@ -144,6 +166,8 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "commandTimeoutSeconds"
                 | "memoryEnabled"
                 | "recallEnabled"
+                | "tracesEnabled"
+                | "traceContent"
                 | "workspace"
                 | "connections"
         )
@@ -205,6 +229,12 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|value| !value.is_boolean())
     {
         return Err("Invalid recall setting.".into());
+    }
+    if ["tracesEnabled", "traceContent"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_boolean()))
+    {
+        return Err("Invalid trace setting.".into());
     }
     for key in ["model", "connectionName", "relayUrl", "workspace"] {
         if object.get(key).is_some_and(|value| !value.is_string()) {

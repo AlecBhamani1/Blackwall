@@ -467,6 +467,11 @@ fn normalize(path: &str) -> Option<PathBuf> {
     Some(normal)
 }
 
+/// Redact credentials line by line, keeping line breaks.
+pub(crate) fn redact_text(text: &str) -> String {
+    text.lines().map(redact).collect::<Vec<_>>().join("\n")
+}
+
 fn redact(subject: &str) -> String {
     let mut hide_next = false;
     subject

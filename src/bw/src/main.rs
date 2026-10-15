@@ -5,6 +5,7 @@ mod recall;
 mod session;
 mod settings;
 mod skills;
+mod traces;
 
 use blackwall_core::{
     storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
@@ -60,6 +61,7 @@ USAGE:
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw skills <action>         Review learned skill proposals (bw skills for pending)
+  bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw request <prompt>        Print a request preview without a model call
 
@@ -107,7 +109,7 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
-        | "mcp" | "skills" => {}
+        | "mcp" | "skills" | "traces" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -121,6 +123,9 @@ async fn run() -> Result<(), String> {
     }
     if command == "skills" {
         return skills::run(&directory, &arguments);
+    }
+    if command == "traces" {
+        return traces::run(&directory, &arguments);
     }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "mcp" {
