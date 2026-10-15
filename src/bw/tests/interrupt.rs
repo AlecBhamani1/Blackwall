@@ -106,6 +106,28 @@ fn read_request(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+fn isolate_model_environment(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with("BLACKWALL_MODEL"))
+        {
+            command.env_remove(key);
+        }
+    }
+    for key in [
+        "OLLAMA_HOST",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(key);
+    }
+}
+
 #[test]
 fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
     let fixture = Fixture::new();
@@ -168,25 +190,7 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, _) in env::vars_os() {
-        if key
-            .to_str()
-            .is_some_and(|key| key.starts_with("BLACKWALL_MODEL"))
-        {
-            command.env_remove(key);
-        }
-    }
-    for key in [
-        "OLLAMA_HOST",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
-        command.env_remove(key);
-    }
+    isolate_model_environment(&mut command);
     command
         .env("BLACKWALL_DATA_DIR", &data)
         .env("BLACKWALL_MODEL_ENDPOINT", &endpoint)
@@ -300,33 +304,10 @@ fn interrupting_git_review_cancels_the_request_without_changes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-    let (observed, requests) = mpsc::channel();
-    let server = thread::spawn(move || {
-        let deadline = Instant::now() + WAIT_LIMIT;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline);
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("Fixture accept failed: {error}"),
-            }
-        };
-        stream.set_nonblocking(false).unwrap();
-        stream.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
-        let request = read_request(&mut stream);
-        assert!(request.get("tools").is_none());
-        observed.send(()).unwrap();
-        let mut buffer = [0u8; 1];
-        match stream.read(&mut buffer) {
-            Ok(0) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-            result => panic!("Cancelled review did not close the connection: {result:?}"),
-        }
-    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bw"));
+    isolate_model_environment(&mut command);
     let mut child = RunningCli(
-        Command::new(env!("CARGO_BIN_EXE_bw"))
+        command
             .arg("review")
             .current_dir(&project)
             .env("BLACKWALL_DATA_DIR", fixture.0.join("data"))
@@ -339,7 +320,46 @@ fn interrupting_git_review_cancels_the_request_without_changes() {
             .spawn()
             .unwrap(),
     );
-    requests.recv_timeout(WAIT_LIMIT).unwrap();
+    // Git collection and a cold CLI startup may take longer on hosted runners. Wait on
+    // the real request, while also detecting a CLI that exits before contacting the model.
+    let request_limit = Duration::from_secs(30);
+    let deadline = Instant::now() + request_limit;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("Fixture accept failed: {error}"),
+        }
+        let status = child.0.try_wait().unwrap();
+        if status.is_some() || Instant::now() >= deadline {
+            if status.is_none() {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+            }
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("Review did not contact the model (status: {status:?}):\n{stdout}\n{stderr}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(request_limit)).unwrap();
+    let request = read_request(&mut stream);
+    assert!(request.get("tools").is_none());
     assert!(Command::new("kill")
         .args(["-INT", &child.0.id().to_string()])
         .status()
@@ -355,7 +375,12 @@ fn interrupting_git_review_cancels_the_request_without_changes() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(stderr.contains("Review cancelled"));
-    server.join().unwrap();
+    let mut buffer = [0u8; 1];
+    match stream.read(&mut buffer) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("Cancelled review did not close the connection: {result:?}"),
+    }
     assert_eq!(index, fs::read(project.join(".git/index")).unwrap());
     assert_eq!(
         fs::read_to_string(project.join("file")).unwrap(),

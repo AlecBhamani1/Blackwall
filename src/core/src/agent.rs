@@ -975,7 +975,7 @@ mod tests {
             backend: &TracedModel {
                 step: Mutex::new(1),
             },
-            workspace: workspace.clone(),
+            workspace,
             web_enabled: false,
             approvals: Approvals::default(),
             emit: Arc::new(|_| {}),
