@@ -953,6 +953,7 @@ mod tests {
             crate::trace::list(&directory.join("user"), 10).len(),
             before
         );
+        drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]
