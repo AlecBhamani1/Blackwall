@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Review agent runs in the desktop **Runs** panel: recent runs with their model and tool calls,
+  tokens, and failures, each run as a tree of steps with any captured content, and settings to turn
+  traces and content capture on or off.
+
 - Record a local OpenTelemetry trace of each CLI and desktop Agent run, with model and tool spans,
   token counts, errors, and approval requests. `bw traces` lists recent runs and `bw traces show`
   prints one as a tree. Traces are on by default and keep the newest 200; prompt, answer, and tool

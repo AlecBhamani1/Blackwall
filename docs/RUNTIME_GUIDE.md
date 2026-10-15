@@ -349,8 +349,12 @@ redacted anywhere in a run is removed wherever else it appears in that trace, su
 repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
 output is also content, so without it the trace only says the tool reported an error. If a trace
 with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
-turn it on only while investigating a run. The desktop app reads the same `tracesEnabled` and
-`traceContent` preferences. Subagent runs and compaction requests are not traced yet.
+turn it on only while investigating a run.
+
+In the desktop app, **Runs** lists the 50 newest runs and opens one as a tree of model and tool steps,
+with failures, approval requests, and any captured content. **Record agent runs** and **Include
+content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
+Subagent runs and compaction requests are not traced yet.
 
 ## App lock
 
