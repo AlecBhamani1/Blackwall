@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Record a local OpenTelemetry trace of each CLI and desktop Agent run, with model and tool spans,
+  token counts, errors, and approval requests. `bw traces` lists recent runs and `bw traces show`
+  prints one as a tree. Traces are on by default and keep the newest 200; prompt, answer, and tool
+  text is recorded only with `bw config set trace-content on`, redacted and size-limited.
+
 - Search saved desktop and CLI message text locally with `bw sessions search`, `/recall`, and desktop
   Search history. Filter by project and updated date, open referenced messages without changing
   their saved mode, and optionally enable a bounded, project-scoped agent recall tool. Existing

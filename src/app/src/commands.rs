@@ -526,6 +526,7 @@ pub(crate) async fn stream_chat(
             })?;
         #[cfg(target_os = "macos")]
         crate::lifecycle::login_path_settled().await;
+        let trace = crate::data::trace_options(instruction_directory.clone()).await;
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,
@@ -538,7 +539,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run_context_with_guidance(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact },memory.as_ref(),Some(&instruction_directory))=>result.map(|_|()).map_err(CommandError::from),
+            result=runner.run_context_with_guidance(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact, trace },memory.as_ref(),Some(&instruction_directory))=>result.map(|_|()).map_err(CommandError::from),
         }
     } else {
         inject_memory(&app, &mut request, None).await?;
@@ -733,6 +734,7 @@ async fn stream_chat_events(
             budget: request.context_budget,
             instructions,
             compact: request.compact,
+            trace: Default::default(),
         },
         &|event| {
             let _ = emit_event(app, &event);

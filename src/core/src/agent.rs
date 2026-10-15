@@ -69,6 +69,7 @@ impl Agent<'_> {
                 budget: self.backend.context_budget(),
                 instructions,
                 compact: false,
+                trace: Default::default(),
             },
             None,
             user_directory,
@@ -100,12 +101,44 @@ impl Agent<'_> {
         memory: Option<&crate::memory::MemoryTools>,
         user_directory: Option<&std::path::Path>,
     ) -> Result<String, AgentError> {
+        // The guard writes the trace when the run ends, fails, or is cancelled.
+        let mut tracing = user_directory
+            .and_then(|directory| crate::trace::Trace::start(directory, request_id, run.trace))
+            .map(|trace| crate::trace::TraceGuard {
+                trace,
+                outcome: None,
+            });
+        if let (Some(guard), Some(model)) = (&tracing, self.backend.model_name()) {
+            let root = guard.trace.root();
+            guard
+                .trace
+                .set(&root, vec![("gen_ai.request.model".into(), json!(model))]);
+        }
+        let trace = tracing.as_ref().map(|guard| &guard.trace);
+        let result = self
+            .run_traced(request_id, run, memory, user_directory, trace)
+            .await;
+        if let Some(guard) = &mut tracing {
+            guard.outcome = Some(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
+        result
+    }
+
+    async fn run_traced(
+        &self,
+        request_id: &str,
+        run: crate::context::ContextRun,
+        memory: Option<&crate::memory::MemoryTools>,
+        user_directory: Option<&std::path::Path>,
+        trace: Option<&crate::trace::Trace>,
+    ) -> Result<String, AgentError> {
         let crate::context::ContextRun {
             source,
             mut state,
             budget,
             mut instructions,
             compact,
+            trace: _,
         } = run;
         state.validate()?;
         let _guard = RunGuard {
@@ -273,6 +306,18 @@ impl Agent<'_> {
                 });
                 answer.push_str("\n\n");
             }
+            let model = self.backend.model_name().unwrap_or("model");
+            let model_span = trace.map(|trace| {
+                trace.begin(
+                    &trace.root(),
+                    &format!("chat {model}"),
+                    3,
+                    vec![
+                        ("gen_ai.operation.name".into(), json!("chat")),
+                        ("gen_ai.request.model".into(), json!(model)),
+                    ],
+                )
+            });
             let turn = self
                 .backend
                 .generate(&messages, &definitions, &mut |delta| {
@@ -281,7 +326,44 @@ impl Agent<'_> {
                         delta,
                     });
                 })
-                .await?;
+                .await;
+            if let (Some(trace), Some(span)) = (trace, &model_span) {
+                match &turn {
+                    Ok(turn) => {
+                        let mut attributes = vec![(
+                            "gen_ai.response.finish_reasons".into(),
+                            json!([if turn.calls.is_empty() {
+                                "stop"
+                            } else {
+                                "tool_calls"
+                            }]),
+                        )];
+                        if let Some(usage) = turn.usage {
+                            attributes.push((
+                                "gen_ai.usage.input_tokens".into(),
+                                json!(usage.prompt_tokens),
+                            ));
+                            attributes.push((
+                                "gen_ai.usage.output_tokens".into(),
+                                json!(usage.completion_tokens),
+                            ));
+                        }
+                        if trace.content && !turn.content.is_empty() {
+                            attributes.push((
+                                "gen_ai.output.messages".into(),
+                                json!(json!([{"role":"assistant","parts":[{"type":"text","content":trace.clip(&turn.content)}]}]).to_string()),
+                            ));
+                        }
+                        trace.set(span, attributes);
+                        trace.end(span, None);
+                    }
+                    Err(error) => {
+                        trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
+                        trace.end(span, Some(&error.to_string()));
+                    }
+                }
+            }
+            let turn = turn?;
             answer.push_str(&turn.content);
             state.server_usage = turn.usage;
             if let Some(count) = turn.usage {
@@ -366,6 +448,49 @@ impl Agent<'_> {
                     let skills = &skills;
                     let proposals = &proposals;
                     async move {
+                        let tool_span = trace.map(|trace| {
+                            let mut attributes = vec![
+                                ("gen_ai.operation.name".into(), json!("execute_tool")),
+                                ("gen_ai.tool.name".into(), json!(call.function.name)),
+                                ("gen_ai.tool.call.id".into(), json!(call.id)),
+                                (
+                                    "gen_ai.tool.type".into(),
+                                    json!(if mcp.handles(&call.function.name) {
+                                        "extension"
+                                    } else {
+                                        "function"
+                                    }),
+                                ),
+                            ];
+                            if trace.content {
+                                attributes.push((
+                                    "gen_ai.tool.call.arguments".into(),
+                                    json!(trace.clip(&call.function.arguments)),
+                                ));
+                            }
+                            trace.begin(
+                                &trace.root(),
+                                &format!("execute_tool {}", call.function.name),
+                                1,
+                                attributes,
+                            )
+                        });
+                        // Approval prompts raised by this call are recorded on its span.
+                        let emit = |event: AgentEvent| {
+                            if let (
+                                Some(trace),
+                                Some(span),
+                                AgentEvent::ApprovalRequest { kind, .. },
+                            ) = (trace, &tool_span, &event)
+                            {
+                                trace.event(
+                                    span,
+                                    "approval_requested",
+                                    vec![("blackwall.approval.kind".into(), json!(kind))],
+                                );
+                            }
+                            (self.emit)(event)
+                        };
                         let ui_id = format!("{iteration}_{index}_{}", call.id);
                         (self.emit)(AgentEvent::ToolCall {
                             request_id: request_id.into(),
@@ -435,7 +560,7 @@ impl Agent<'_> {
                                 &call.function.arguments,
                                 request_id,
                                 &self.approvals,
-                                self.emit.as_ref(),
+                                &emit,
                                 std::time::Duration::from_secs(budget.command_timeout_seconds),
                             )
                             .await
@@ -445,7 +570,7 @@ impl Agent<'_> {
                                 &call.function.arguments,
                                 request_id,
                                 &self.approvals,
-                                self.emit.as_ref(),
+                                &emit,
                                 std::time::Duration::from_secs(budget.command_timeout_seconds),
                             )
                             .await
@@ -455,13 +580,40 @@ impl Agent<'_> {
                                 &call,
                                 request_id,
                                 &self.approvals,
-                                self.emit.as_ref(),
+                                &emit,
                                 std::time::Duration::from_secs(budget.command_timeout_seconds),
                             )
                             .await
                         };
                         let success = result.is_ok();
+                        if let (Some(trace), Some(span), Err(error)) =
+                            (trace, &tool_span, &result)
+                        {
+                            trace.set(
+                                span,
+                                vec![("error.type".into(), json!(error.kind()))],
+                            );
+                        }
+                        // Command and extension failures carry their output, which is content.
+                        let quiet_error = matches!(&result, Err(tools::ToolError::Execution(_)));
                         let output = result.unwrap_or_else(|error| error.to_string());
+                        if let (Some(trace), Some(span)) = (trace, &tool_span) {
+                            if trace.content {
+                                trace.set(
+                                    span,
+                                    vec![(
+                                        "gen_ai.tool.call.result".into(),
+                                        json!(trace.clip(&output)),
+                                    )],
+                                );
+                            }
+                            let error = if quiet_error && !trace.content {
+                                "The tool reported an error."
+                            } else {
+                                output.as_str()
+                            };
+                            trace.end(span, (!success).then_some(error));
+                        }
                         (self.emit)(AgentEvent::ToolResult {
                             request_id: request_id.into(),
                             tool_call_id: ui_id,
@@ -606,6 +758,204 @@ mod tests {
             })
         }
     }
+    struct TracedModel {
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for TracedModel {
+        fn model_name(&self) -> Option<&str> {
+            Some("fixture-model")
+        }
+        fn generate<'a>(
+            &'a self,
+            _: &'a [Value],
+            _: &'a [Value],
+            _: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                let call = |id: &str, name: &str, arguments: &str| ToolCall {
+                    id: id.into(),
+                    function: ToolFunction {
+                        name: name.into(),
+                        arguments: arguments.into(),
+                    },
+                };
+                Ok(if *step == 1 {
+                    ModelTurn {
+                        content: String::new(),
+                        calls: vec![
+                            call("read", "read_file", r#"{"path":"notes.txt"}"#),
+                            call("write", "write_file", r#"{"path":"out.txt","content":"x"}"#),
+                            call(
+                                "shell",
+                                "shell",
+                                r#"{"command":"echo leaked-output; exit 3"}"#,
+                            ),
+                        ],
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 100,
+                            completion_tokens: 10,
+                            total_tokens: 110,
+                        }),
+                    }
+                } else {
+                    ModelTurn {
+                        content: "Done.".into(),
+                        calls: vec![],
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 120,
+                            completion_tokens: 5,
+                            total_tokens: 125,
+                        }),
+                    }
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn traces_record_model_and_tool_spans_and_content_only_when_asked() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-trace-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        std::fs::create_dir_all(directory.join("user")).unwrap();
+        std::fs::write(
+            directory.join("project/notes.txt"),
+            "API_TOKEN=hunter2\nplain",
+        )
+        .unwrap();
+        for content in [false, true] {
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let agent = Agent {
+                backend: &TracedModel {
+                    step: Mutex::new(0),
+                },
+                workspace: Workspace::open(&directory.join("project")).unwrap(),
+                web_enabled: false,
+                approvals,
+                emit: Arc::new(move |event| {
+                    if let AgentEvent::ApprovalRequest {
+                        request_id,
+                        approval_id,
+                        kind,
+                        ..
+                    } = event
+                    {
+                        decisions
+                            .resolve(ResolveApprovalRequest {
+                                request_id,
+                                approval_id,
+                                decision: if kind == crate::protocol::ApprovalKind::Exec {
+                                    ApprovalDecision::Allow
+                                } else {
+                                    ApprovalDecision::Deny
+                                },
+                            })
+                            .unwrap();
+                    }
+                }),
+            };
+            let source = vec![json!({"role":"user","content":"Read the notes."})];
+            let run = crate::context::ContextRun {
+                state: crate::context::ContextState::restore(&source, None).unwrap(),
+                source,
+                budget: Default::default(),
+                instructions: vec![],
+                compact: false,
+                trace: crate::trace::TraceOptions {
+                    enabled: true,
+                    content,
+                },
+            };
+            let request = format!("traced-{content}");
+            agent
+                .run_context_with_guidance(&request, run, None, Some(&directory.join("user")))
+                .await
+                .unwrap();
+            let summary = crate::trace::list(&directory.join("user"), 10)
+                .into_iter()
+                .find(|summary| summary.id.ends_with(&request))
+                .unwrap();
+            assert_eq!((summary.model_calls, summary.tool_calls), (2, 3));
+            assert_eq!((summary.input_tokens, summary.output_tokens), (220, 15));
+            assert_eq!(summary.model.as_deref(), Some("fixture-model"));
+            assert!(summary.error.is_none());
+            let spans = crate::trace::read(&directory.join("user"), &summary.id).unwrap();
+            let write = spans
+                .iter()
+                .find(|span| span.name == "execute_tool write_file")
+                .unwrap();
+            assert!(write.error.is_some());
+            assert_eq!(write.events, ["approval_requested"]);
+            assert_eq!(write.attributes["error.type"], "denied");
+            let shell = spans
+                .iter()
+                .find(|span| span.name == "execute_tool shell")
+                .unwrap();
+            assert_eq!(shell.attributes["error.type"], "execution");
+            assert_eq!(
+                shell.error.as_ref().unwrap().contains("leaked-output"),
+                content
+            );
+            let chat = spans
+                .iter()
+                .find(|span| span.name == "chat fixture-model")
+                .unwrap();
+            assert_eq!(
+                chat.attributes["gen_ai.response.finish_reasons"],
+                json!(["tool_calls"])
+            );
+            let read = spans
+                .iter()
+                .find(|span| span.name == "execute_tool read_file")
+                .unwrap();
+            assert!(read.error.is_none());
+            let result = read.attributes.get("gen_ai.tool.call.result");
+            if content {
+                let result = result.unwrap().as_str().unwrap();
+                assert!(result.contains("API_TOKEN=[redacted]") && !result.contains("hunter2"));
+                assert!(spans
+                    .iter()
+                    .any(|span| span.attributes.contains_key("gen_ai.output.messages")));
+            } else {
+                assert!(result.is_none());
+                assert!(!spans
+                    .iter()
+                    .any(|span| span.attributes.contains_key("gen_ai.tool.call.arguments")));
+            }
+        }
+        // Traces off writes nothing.
+        let before = crate::trace::list(&directory.join("user"), 10).len();
+        let source = vec![json!({"role":"user","content":"Again."})];
+        let agent = Agent {
+            backend: &TracedModel {
+                step: Mutex::new(1),
+            },
+            workspace: Workspace::open(&directory.join("project")).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(|_| {}),
+        };
+        let run = crate::context::ContextRun {
+            state: crate::context::ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: Default::default(),
+            instructions: vec![],
+            compact: false,
+            trace: Default::default(),
+        };
+        agent
+            .run_context_with_guidance("untraced", run, None, Some(&directory.join("user")))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::trace::list(&directory.join("user"), 10).len(),
+            before
+        );
+        drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[tokio::test]
     async fn denied_write_returns_to_model_without_changing_files() {
         let directory =
@@ -744,6 +1094,7 @@ mod tests {
             },
             instructions: vec![],
             compact: false,
+            trace: Default::default(),
         };
         assert!(matches!(
             agent.run_context("limited", run).await,
@@ -1344,6 +1695,7 @@ mod tests {
             budget: Default::default(),
             instructions: vec![],
             compact: false,
+            trace: Default::default(),
         };
         assert_eq!(
             agent
@@ -1450,6 +1802,7 @@ mod tests {
                     budget,
                     instructions: vec![],
                     compact: false,
+                    trace: Default::default(),
                 },
             )
             .await;
@@ -1529,6 +1882,7 @@ mod context_tests {
                     budget: Default::default(),
                     instructions: vec![],
                     compact: false,
+                    trace: Default::default(),
                 },
             )
             .await
@@ -1667,6 +2021,7 @@ mod recall_tests {
                         budget: Default::default(),
                         instructions: vec![],
                         compact: false,
+                        trace: Default::default(),
                     },
                     Some(&memory),
                 )

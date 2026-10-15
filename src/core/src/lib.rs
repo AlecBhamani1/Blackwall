@@ -27,6 +27,7 @@ pub mod model;
 pub mod policy;
 pub mod secrets;
 pub mod tools;
+pub mod trace;
 
 pub mod web;
 

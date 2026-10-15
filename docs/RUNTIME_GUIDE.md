@@ -330,6 +330,28 @@ validation as a saved skill; **Reject** discards the proposal.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
 
+## Agent traces
+
+Each CLI and desktop Agent run records a local trace in `~/.blackwall/traces` (or the
+`BLACKWALL_DATA_DIR` data folder). A trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with
+a span for the run, each model call, and each tool call, using the OpenTelemetry generative AI names
+(`invoke_agent`, `chat`, `execute_tool`). Spans keep timings, the model, token counts the server
+reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the newest 200
+traces and never sends them anywhere.
+
+`bw traces` lists recent runs with their duration, model and tool calls, tokens, and any failure.
+`bw traces show <id>` prints one run as a tree. Turn traces off with `bw config set traces off`.
+
+By default a trace holds no prompt, answer, tool argument, or tool output text. `bw config set
+trace-content on` also records tool arguments, tool results, and model answers, each redacted like
+audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. A value
+redacted anywhere in a run is removed wherever else it appears in that trace, such as when the model
+repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
+output is also content, so without it the trace only says the tool reported an error. If a trace
+with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
+turn it on only while investigating a run. The desktop app reads the same `tracesEnabled` and
+`traceContent` preferences. Subagent runs and compaction requests are not traced yet.
+
 ## App lock
 
 Enable **App lock** in Settings with a passphrase of at least 10 characters. Blackwall stores a salted

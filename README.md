@@ -93,6 +93,8 @@ Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their
 `/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
 proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+`bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
+one as a tree. See [Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
