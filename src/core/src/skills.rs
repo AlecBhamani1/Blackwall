@@ -7,7 +7,7 @@ use std::{
 };
 use thiserror::Error;
 const MAX_SKILL: usize = 32 * 1024;
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
     pub name: String,
@@ -40,6 +40,58 @@ pub enum SkillError {
         "The skill folder or file could not be accessed. Existing files have been left in place."
     )]
     File,
+    #[error("This proposal is no longer pending. Refresh the review queue.")]
+    Missing,
+    #[error(
+        "This skill changed after the proposal was made. Reject it and review a fresh proposal."
+    )]
+    Stale,
+    #[error("Too many skill proposals are pending. Review or reject some first.")]
+    Pending,
+    #[error("This proposal could not be read. Reject it by its ID.")]
+    Invalid,
+}
+/// A learned skill waiting for owner review. `before` is the skill it would replace, so approval
+/// can refuse a proposal made against an older version.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillProposal {
+    pub id: String,
+    pub skill: Skill,
+    pub before: Option<Skill>,
+    pub source: crate::storage::MemorySource,
+}
+impl SkillProposal {
+    /// A unified diff from the current skill, or from nothing for a new skill.
+    pub fn diff(&self) -> String {
+        let document = |skill: &Skill| {
+            format!(
+                "description: {}\n\n{}\n",
+                skill
+                    .description
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                skill.body
+            )
+        };
+        let before = self.before.as_ref().map(document).unwrap_or_default();
+        let after = document(&self.skill);
+        similar::TextDiff::from_lines(&before, &after)
+            .unified_diff()
+            .header("current", "proposed")
+            .to_string()
+    }
+}
+const PROPOSALS: &str = ".proposals";
+const MAX_PROPOSALS: usize = 20;
+/// A proposal holds up to two skills; JSON escaping can grow each body several times.
+const MAX_PROPOSAL: usize = 256 * 1024;
+fn valid_proposal_id(id: &str) -> Result<(), SkillError> {
+    match id.strip_prefix("skill_") {
+        Some(hex) if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(()),
+        _ => Err(SkillError::Missing),
+    }
 }
 fn validate_name(name: &str) -> Result<(), SkillError> {
     if name.is_empty()
@@ -178,6 +230,146 @@ impl SkillStore {
         }
         result
     }
+    fn proposal_directory(&self) -> Result<Dir, SkillError> {
+        if self
+            .directory
+            .symlink_metadata(PROPOSALS)
+            .is_ok_and(|metadata| metadata.is_symlink())
+        {
+            return Err(SkillError::File);
+        }
+        self.directory
+            .create_dir_all(PROPOSALS)
+            .and_then(|()| self.directory.open_dir(PROPOSALS))
+            .map_err(|_| SkillError::File)
+    }
+    /// Pending proposals, newest last. Unreadable entries become warnings so they never block the
+    /// queue; each can still be rejected by its ID.
+    pub fn proposals(&self) -> Result<(Vec<SkillProposal>, Vec<String>), SkillError> {
+        let directory = self.proposal_directory()?;
+        let mut proposals = vec![];
+        let mut warnings = vec![];
+        for entry in directory.entries().map_err(|_| SkillError::File)?.take(200) {
+            let entry = entry.map_err(|_| SkillError::File)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            match self.proposal(&directory, id) {
+                Ok(proposal) => proposals.push(proposal),
+                Err(error) => warnings.push(format!("{name}: {error}")),
+            }
+        }
+        proposals.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok((proposals, warnings))
+    }
+    fn proposal(&self, directory: &Dir, id: &str) -> Result<SkillProposal, SkillError> {
+        valid_proposal_id(id)?;
+        let filename = format!("{id}.json");
+        if !directory
+            .symlink_metadata(&filename)
+            .map_err(|_| SkillError::Missing)?
+            .is_file()
+        {
+            return Err(SkillError::File);
+        }
+        let mut bytes = vec![];
+        directory
+            .open(&filename)
+            .map_err(|_| SkillError::Missing)?
+            .take(MAX_PROPOSAL as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SkillError::File)?;
+        let proposal: SkillProposal = (bytes.len() <= MAX_PROPOSAL)
+            .then(|| serde_json::from_slice(&bytes).ok())
+            .flatten()
+            .ok_or(SkillError::Invalid)?;
+        if proposal.id != id {
+            return Err(SkillError::Invalid);
+        }
+        Ok(proposal)
+    }
+    /// The current skill, or `None` only when no file exists; other failures block a change.
+    fn current(&self, name: &str) -> Result<Option<Skill>, SkillError> {
+        validate_name(name)?;
+        match self.directory.symlink_metadata(format!("{name}.md")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => self.read(name).map(Some),
+        }
+    }
+    /// Record a proposal without changing any skill. Its contents pass the same validation as a save.
+    pub fn propose(
+        &self,
+        skill: Skill,
+        source: crate::storage::MemorySource,
+    ) -> Result<SkillProposal, SkillError> {
+        validate_name(&skill.name)?;
+        parse(&format!(
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            skill.name,
+            serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
+            skill.body
+        ))?;
+        crate::storage::validate_id(&source.session_id)
+            .and_then(|()| crate::storage::validate_id(&source.message_id))
+            .map_err(|_| SkillError::Invalid)?;
+        let (pending, warnings) = self.proposals()?;
+        if pending.len() + warnings.len() >= MAX_PROPOSALS {
+            return Err(SkillError::Pending);
+        }
+        let before = self.current(&skill.name)?;
+        let proposal = SkillProposal {
+            id: format!("skill_{:016x}", rand::random::<u64>()),
+            skill: Skill {
+                enabled: before.as_ref().is_none_or(|current| current.enabled),
+                ..skill
+            },
+            before,
+            source,
+        };
+        let body = serde_json::to_vec(&proposal).map_err(|_| SkillError::Format)?;
+        if body.len() > MAX_PROPOSAL {
+            return Err(SkillError::Limit);
+        }
+        let directory = self.proposal_directory()?;
+        let temporary = format!(".skill-{:016x}", rand::random::<u64>());
+        let result = directory
+            .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
+            .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_all()))
+            .and_then(|()| {
+                directory.rename(&temporary, &directory, format!("{}.json", proposal.id))
+            });
+        if result.is_err() {
+            let _ = directory.remove_file(&temporary);
+        }
+        result.map_err(|_| SkillError::File)?;
+        Ok(proposal)
+    }
+    /// Save a proposal unless the skill changed since it was made. The proposal moves to
+    /// `.proposals/approved`, keeping the skill's source after approval.
+    pub fn approve(&self, id: &str) -> Result<Skill, SkillError> {
+        let directory = self.proposal_directory()?;
+        let proposal = self.proposal(&directory, id)?;
+        if self.current(&proposal.skill.name)? != proposal.before {
+            return Err(SkillError::Stale);
+        }
+        self.save(&proposal.skill)?;
+        directory
+            .create_dir_all("approved")
+            .and_then(|()| directory.open_dir("approved"))
+            .and_then(|approved| {
+                directory.rename(format!("{id}.json"), &approved, format!("{id}.json"))
+            })
+            .map_err(|_| SkillError::File)?;
+        Ok(proposal.skill)
+    }
+    /// Discard a proposal by ID, even one that can no longer be read.
+    pub fn reject(&self, id: &str) -> Result<(), SkillError> {
+        valid_proposal_id(id)?;
+        self.proposal_directory()?
+            .remove_file(format!("{id}.json"))
+            .map_err(|_| SkillError::Missing)
+    }
     pub fn remove(&self, name: &str) -> Result<(), SkillError> {
         validate_name(name)?;
         self.directory
@@ -226,6 +418,39 @@ pub fn prompt(skills: &[Skill]) -> String {
 pub fn definition() -> serde_json::Value {
     serde_json::json!({"type":"function","function":{"name":"read_skill","description":"Load the instructions of an enabled user workflow listed in the system prompt. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}})
 }
+/// Sent with `/learn`; the model may only propose, and the owner reviews every proposal.
+pub const LEARN: &str = "The user typed /learn. Review this conversation for a workflow that succeeded and would help future tasks, then call skill_propose once with a short lowercase name, a description of when to use it, and step-by-step instructions. Keep only the steps that worked; leave out failed attempts, secrets, credentials, personal data, and one-off details. To refine an existing workflow, reuse its name. If nothing is worth keeping, or skill_propose is unavailable, say so instead.";
+pub fn propose_definition() -> serde_json::Value {
+    serde_json::json!({"type":"function","function":{"name":"skill_propose","description":"Propose a reusable workflow for owner review. Nothing is saved or loaded until the owner approves it. Reusing an existing name proposes a revision. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"Lowercase letters, numbers, and hyphens"},"description":{"type":"string","description":"When the workflow applies"},"body":{"type":"string","description":"Step-by-step instructions"}},"required":["name","description","body"],"additionalProperties":false}}})
+}
+/// Record a `skill_propose` call for review. File work runs off the async runtime.
+pub async fn propose_call(
+    directory: std::path::PathBuf,
+    source: crate::storage::MemorySource,
+    arguments: &str,
+) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        name: String,
+        description: String,
+        body: String,
+    }
+    let input: Input = serde_json::from_str(arguments)
+        .map_err(|_| "Provide a name, description, and body.".to_owned())?;
+    let skill = Skill {
+        name: input.name,
+        description: input.description,
+        body: input.body,
+        enabled: true,
+    };
+    let proposal =
+        tokio::task::spawn_blocking(move || SkillStore::open(&directory)?.propose(skill, source))
+            .await
+            .map_err(|_| "Skills could not be accessed.".to_owned())?
+            .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"pendingProposalId":proposal.id,"status":"pending_review","message":"No workflow changed. The owner must review this with bw skills pending."}).to_string())
+}
 /// The instructions of one enabled skill, delimited like other untrusted context.
 pub fn instructions(skills: &[Skill], name: &str) -> Option<String> {
     skills
@@ -273,6 +498,66 @@ mod tests {
             .contains(&skills[1].body));
         assert!(instructions(&skills, "workflow-0").is_none());
         assert!(prompt(&skills[..1]).is_empty());
+        let source = crate::storage::MemorySource {
+            session_id: "session".into(),
+            message_id: "message".into(),
+        };
+        let learned = Skill {
+            name: "release".into(),
+            description: "Ship a release.".into(),
+            body: "Run the checklist.".into(),
+            enabled: true,
+        };
+        let proposal = store.propose(learned.clone(), source.clone()).unwrap();
+        assert!(proposal.before.is_none() && proposal.diff().contains("+Run the checklist."));
+        assert_eq!(store.approve(&proposal.id).unwrap(), learned);
+        assert!(matches!(
+            store.approve(&proposal.id),
+            Err(SkillError::Missing)
+        ));
+        let revision = Skill {
+            body: "Run the full checklist.".into(),
+            ..learned.clone()
+        };
+        let stale = store.propose(revision.clone(), source.clone()).unwrap();
+        let rejected = store.propose(revision, source.clone()).unwrap();
+        // An owner edit after the proposal makes it stale instead of overwriting the edit.
+        store
+            .save(&Skill {
+                body: "Owner edit.".into(),
+                ..learned.clone()
+            })
+            .unwrap();
+        assert!(matches!(store.approve(&stale.id), Err(SkillError::Stale)));
+        assert_eq!(store.read("release").unwrap().body, "Owner edit.");
+        store.reject(&rejected.id).unwrap();
+        assert!(store
+            .propose(
+                Skill {
+                    name: "Bad Name".into(),
+                    ..learned.clone()
+                },
+                source.clone()
+            )
+            .is_err());
+        // Approval keeps the proposal, and its source, as a record.
+        assert!(path
+            .join(".proposals/approved")
+            .join(format!("{}.json", proposal.id))
+            .exists());
+        // An unreadable proposal is reported without blocking the queue, and can be rejected.
+        std::fs::write(path.join(".proposals/skill_00000000000000ff.json"), "{").unwrap();
+        assert_eq!(store.proposals().unwrap().1.len(), 1);
+        store.reject("skill_00000000000000ff").unwrap();
+        assert!(store.proposals().unwrap().1.is_empty());
+        for _ in store.proposals().unwrap().0.len()..MAX_PROPOSALS {
+            store.propose(learned.clone(), source.clone()).unwrap();
+        }
+        assert!(matches!(
+            store.propose(learned, source),
+            Err(SkillError::Pending)
+        ));
+        assert!(store.list().unwrap().1.is_empty());
         // Close the directory handle first; Windows cannot delete an open directory.
         drop(store);
         std::fs::remove_dir_all(path).unwrap();

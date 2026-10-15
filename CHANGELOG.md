@@ -46,6 +46,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   within the shared budget, and the model reads a skill's instructions with `read_skill`, so far
   larger libraries fit.
 
+- Propose skills from successful work with `/learn`. Proposals keep their source, never load until
+  approved with `bw skills`, and cannot overwrite a skill the owner changed after the proposal.
+
 - Run CLI tasks headlessly with `bw run --json`, printing agent events as JSON lines and denying
   any action that owner rules leave to an approval prompt.
 
