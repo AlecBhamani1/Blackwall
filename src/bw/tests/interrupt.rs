@@ -267,6 +267,21 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
 
 #[test]
 fn interrupting_git_review_cancels_the_request_without_changes() {
+    fn git(project: &std::path::Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        for (key, _) in env::vars_os() {
+            if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
+                command.env_remove(key);
+            }
+        }
+        assert!(command
+            .current_dir(project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
     let fixture = Fixture::new();
     let project = fixture.0.join("project");
     for args in [
@@ -274,21 +289,11 @@ fn interrupting_git_review_cancels_the_request_without_changes() {
         vec!["config", "user.email", "fixture@example.invalid"],
         vec!["config", "user.name", "Fixture"],
     ] {
-        assert!(Command::new("git")
-            .current_dir(&project)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
+        git(&project, &args);
     }
     fs::write(project.join("file"), "original\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "fixture"]] {
-        assert!(Command::new("git")
-            .current_dir(&project)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
+        git(&project, &args);
     }
     fs::write(project.join("file"), "changed\n").unwrap();
     let index = fs::read(project.join(".git/index")).unwrap();

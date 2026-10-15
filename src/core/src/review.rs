@@ -403,11 +403,14 @@ mod tests {
             repo
         }
         fn git(&self, args: &[&str]) -> String {
-            let output = std::process::Command::new("git")
-                .current_dir(&self.0)
-                .args(args)
-                .output()
-                .unwrap();
+            let mut command = std::process::Command::new("git");
+            // Hooks export Git paths for the real checkout; fixture Git must ignore them.
+            for (key, _) in std::env::vars_os() {
+                if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
+                    command.env_remove(key);
+                }
+            }
+            let output = command.current_dir(&self.0).args(args).output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",

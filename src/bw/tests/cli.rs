@@ -1031,27 +1031,32 @@ fn saved_message_search_is_offline_filtered_and_does_not_convert_chat_sessions()
     assert!(!String::from_utf8_lossy(&output.stdout).contains("remembered needle"));
 }
 
+fn review_git(project: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    for (key, _) in env::vars_os() {
+        if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    assert!(command
+        .current_dir(project)
+        .args(args)
+        .status()
+        .unwrap()
+        .success());
+}
+
 fn review_repository(fixture: &Fixture) {
     for args in [
         vec!["init", "-q"],
         vec!["config", "user.email", "fixture@example.invalid"],
         vec!["config", "user.name", "Fixture"],
     ] {
-        assert!(Command::new("git")
-            .current_dir(&fixture.project)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
+        review_git(&fixture.project, &args);
     }
     fs::write(fixture.project.join("file.txt"), "original\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "fixture"]] {
-        assert!(Command::new("git")
-            .current_dir(&fixture.project)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
+        review_git(&fixture.project, &args);
     }
 }
 
