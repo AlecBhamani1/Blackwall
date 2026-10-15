@@ -323,6 +323,11 @@ a record of its source, and `bw skills reject <id>` discards it, even one that c
 read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
 kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
 
+In the desktop app, **Skills** lists pending proposals under **Pending review**. Each one shows its
+source session and message, the saved skill it would replace, and the proposed description and
+instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
+validation as a saved skill; **Reject** discards the proposal.
+
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
 
 ## App lock

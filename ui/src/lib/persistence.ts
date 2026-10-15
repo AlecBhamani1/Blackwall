@@ -49,6 +49,12 @@ export interface Skill {
   body: string;
   enabled: boolean;
 }
+export interface SkillProposal {
+  id: string;
+  skill: Skill;
+  before: Skill | null;
+  source: { sessionId: string; messageId: string };
+}
 export interface McpServer {
   name: string;
   command: string[];
@@ -94,6 +100,11 @@ export const persistence = {
   skills: () => command<{ skills: Skill[]; warnings: string[] }>('list_skills'),
   saveSkill: (skill: Skill) => command<void>('save_skill', { skill }),
   removeSkill: (name: string) => command<void>('delete_skill', { name }),
+  skillProposals: () =>
+    command<{ proposals: SkillProposal[]; warnings: string[] }>('list_skill_proposals'),
+  approveSkillProposal: (id: string, description: string, body: string) =>
+    command<void>('approve_skill_proposal', { id, description, body }),
+  rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),

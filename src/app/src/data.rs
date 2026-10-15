@@ -284,6 +284,33 @@ pub async fn save_skill(
 pub async fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
     with_skills(&app, move |store| store.remove(&name)).await
 }
+#[tauri::command]
+pub async fn list_skill_proposals(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_skills(&app, |store| {
+        let (proposals, warnings) = store.proposals()?;
+        Ok(serde_json::json!({"proposals":proposals,"warnings":warnings}))
+    })
+    .await
+}
+/// Approve a proposal, with the owner's edited description and instructions when given.
+#[tauri::command]
+pub async fn approve_skill_proposal(
+    app: AppHandle,
+    id: String,
+    description: String,
+    body: String,
+) -> Result<(), String> {
+    with_skills(&app, move |store| {
+        store
+            .approve_edited(&id, Some((description, body)))
+            .map(|_| ())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn reject_skill_proposal(app: AppHandle, id: String) -> Result<(), String> {
+    with_skills(&app, move |store| store.reject(&id)).await
+}
 
 /// MCP edits share the CLI's validation; secret values go only to the credential store.
 /// Like saved model keys, the lock is checked first and not held, so a credential store prompt

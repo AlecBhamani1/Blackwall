@@ -84,6 +84,7 @@ impl SkillProposal {
     }
 }
 const PROPOSALS: &str = ".proposals";
+static APPROVALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const MAX_PROPOSALS: usize = 20;
 /// A proposal holds up to two skills; JSON escaping can grow each body several times.
 const MAX_PROPOSAL: usize = 256 * 1024;
@@ -348,20 +349,45 @@ impl SkillStore {
     /// Save a proposal unless the skill changed since it was made. The proposal moves to
     /// `.proposals/approved`, keeping the skill's source after approval.
     pub fn approve(&self, id: &str) -> Result<Skill, SkillError> {
+        self.approve_edited(id, None)
+    }
+    /// Approve with the owner's edited description and instructions in place of the proposed ones.
+    /// The skill keeps the proposed name, and the edits pass the same validation as a save.
+    pub fn approve_edited(
+        &self,
+        id: &str,
+        edited: Option<(String, String)>,
+    ) -> Result<Skill, SkillError> {
+        // Approvals in this process run one at a time, so two cannot both pass the stale check.
+        let _approving = APPROVALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = self.proposal_directory()?;
         let proposal = self.proposal(&directory, id)?;
         if self.current(&proposal.skill.name)? != proposal.before {
             return Err(SkillError::Stale);
         }
-        self.save(&proposal.skill)?;
-        directory
+        let skill = match edited {
+            Some((description, body)) => Skill {
+                description,
+                body,
+                ..proposal.skill
+            },
+            None => proposal.skill,
+        };
+        self.save(&skill)?;
+        // The skill is saved; if its record cannot be kept, the proposal is still removed so it
+        // does not stay pending and later look stale.
+        let archived = directory
             .create_dir_all("approved")
             .and_then(|()| directory.open_dir("approved"))
             .and_then(|approved| {
                 directory.rename(format!("{id}.json"), &approved, format!("{id}.json"))
-            })
-            .map_err(|_| SkillError::File)?;
-        Ok(proposal.skill)
+            });
+        if archived.is_err() {
+            let _ = directory.remove_file(format!("{id}.json"));
+        }
+        Ok(skill)
     }
     /// Discard a proposal by ID, even one that can no longer be read.
     pub fn reject(&self, id: &str) -> Result<(), SkillError> {
@@ -449,7 +475,7 @@ pub async fn propose_call(
             .await
             .map_err(|_| "Skills could not be accessed.".to_owned())?
             .map_err(|error| error.to_string())?;
-    Ok(serde_json::json!({"pendingProposalId":proposal.id,"status":"pending_review","message":"No workflow changed. The owner must review this with bw skills pending."}).to_string())
+    Ok(serde_json::json!({"pendingProposalId":proposal.id,"status":"pending_review","message":"No workflow changed. The owner must review this with bw skills pending or in the desktop Skills dialog."}).to_string())
 }
 /// The instructions of one enabled skill, delimited like other untrusted context.
 pub fn instructions(skills: &[Skill], name: &str) -> Option<String> {
@@ -530,6 +556,67 @@ mod tests {
             .unwrap();
         assert!(matches!(store.approve(&stale.id), Err(SkillError::Stale)));
         assert_eq!(store.read("release").unwrap().body, "Owner edit.");
+        // The owner's edits replace the proposed text; the name stays and edits are validated.
+        let edited = store
+            .propose(
+                Skill {
+                    body: "Run the checklist twice.".into(),
+                    ..learned.clone()
+                },
+                source.clone(),
+            )
+            .unwrap();
+        assert!(store
+            .approve_edited(&edited.id, Some(("Ship it.".into(), "   ".into())))
+            .is_err());
+        let saved = store
+            .approve_edited(
+                &edited.id,
+                Some((
+                    "Ship a release safely.".into(),
+                    "Run the checklist once.".into(),
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                saved.name.as_str(),
+                saved.description.as_str(),
+                saved.body.as_str()
+            ),
+            (
+                "release",
+                "Ship a release safely.",
+                "Run the checklist once."
+            )
+        );
+        assert_eq!(
+            store.read("release").unwrap().body,
+            "Run the checklist once."
+        );
+        // A proposal for a disabled skill keeps it disabled when approved with edits.
+        store
+            .save(&Skill {
+                enabled: false,
+                ..store.read("release").unwrap()
+            })
+            .unwrap();
+        let disabled = store
+            .propose(
+                Skill {
+                    body: "Run the checklist and tag.".into(),
+                    ..learned.clone()
+                },
+                source.clone(),
+            )
+            .unwrap();
+        let saved = store
+            .approve_edited(
+                &disabled.id,
+                Some(("Ship a release.".into(), "Tag it.".into())),
+            )
+            .unwrap();
+        assert!(!saved.enabled && !store.read("release").unwrap().enabled);
         store.reject(&rejected.id).unwrap();
         assert!(store
             .propose(
