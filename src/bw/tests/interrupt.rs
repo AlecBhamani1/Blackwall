@@ -9,10 +9,15 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 const PARTIAL_ANSWER: &str = "Fixture partial answer before approval.";
@@ -25,9 +30,14 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        Self::at(timestamp)
+    }
+
+    fn at(timestamp: u128) -> Self {
         let root = env::temp_dir().join(format!(
-            "blackwall-cli-interrupt-{}-{timestamp}",
+            "blackwall-cli-interrupt-{}-{timestamp}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(root.join("project")).unwrap();
         Self(root)
@@ -38,6 +48,15 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn fixtures_with_the_same_clock_tick_do_not_share_directories() {
+    let first = Fixture::at(0);
+    let second = Fixture::at(0);
+    assert_ne!(first.0, second.0);
+    drop(first);
+    assert!(second.0.join("project").is_dir());
 }
 
 /// Kill a stalled CLI even if a bounded assertion fails while stdin is still open.
@@ -106,6 +125,28 @@ fn read_request(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+fn isolate_model_environment(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with("BLACKWALL_MODEL"))
+        {
+            command.env_remove(key);
+        }
+    }
+    for key in [
+        "OLLAMA_HOST",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(key);
+    }
+}
+
 #[test]
 fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
     let fixture = Fixture::new();
@@ -168,25 +209,7 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, _) in env::vars_os() {
-        if key
-            .to_str()
-            .is_some_and(|key| key.starts_with("BLACKWALL_MODEL"))
-        {
-            command.env_remove(key);
-        }
-    }
-    for key in [
-        "OLLAMA_HOST",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
-        command.env_remove(key);
-    }
+    isolate_model_environment(&mut command);
     command
         .env("BLACKWALL_DATA_DIR", &data)
         .env("BLACKWALL_MODEL_ENDPOINT", &endpoint)
@@ -263,4 +286,123 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
     )
     .unwrap();
     assert_eq!(settings["model"], "after-stop");
+}
+
+#[test]
+fn interrupting_git_review_cancels_the_request_without_changes() {
+    fn git(project: &std::path::Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        for (key, _) in env::vars_os() {
+            if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
+                command.env_remove(key);
+            }
+        }
+        assert!(command
+            .current_dir(project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    let fixture = Fixture::new();
+    let project = fixture.0.join("project");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "user.name", "Fixture"],
+    ] {
+        git(&project, &args);
+    }
+    fs::write(project.join("file"), "original\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "fixture"]] {
+        git(&project, &args);
+    }
+    fs::write(project.join("file"), "changed\n").unwrap();
+    let index = fs::read(project.join(".git/index")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bw"));
+    isolate_model_environment(&mut command);
+    let mut child = RunningCli(
+        command
+            .arg("review")
+            .current_dir(&project)
+            .env("BLACKWALL_DATA_DIR", fixture.0.join("data"))
+            .env("BLACKWALL_MODEL_ENDPOINT", endpoint)
+            .env("BLACKWALL_MODEL", "fixture")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // Git collection and a cold CLI startup may take longer on hosted runners. Wait on
+    // the real request, while also detecting a CLI that exits before contacting the model.
+    let request_limit = Duration::from_secs(30);
+    let deadline = Instant::now() + request_limit;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("Fixture accept failed: {error}"),
+        }
+        let status = child.0.try_wait().unwrap();
+        if status.is_some() || Instant::now() >= deadline {
+            if status.is_none() {
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+            }
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            child
+                .0
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut stdout)
+                .unwrap();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("Review did not contact the model (status: {status:?}):\n{stdout}\n{stderr}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream.set_read_timeout(Some(request_limit)).unwrap();
+    let request = read_request(&mut stream);
+    assert!(request.get("tools").is_none());
+    assert!(Command::new("kill")
+        .args(["-INT", &child.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(!child.wait().success());
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("Review cancelled"));
+    let mut buffer = [0u8; 1];
+    match stream.read(&mut buffer) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("Cancelled review did not close the connection: {result:?}"),
+    }
+    assert_eq!(index, fs::read(project.join(".git/index")).unwrap());
+    assert_eq!(
+        fs::read_to_string(project.join("file")).unwrap(),
+        "changed\n"
+    );
 }

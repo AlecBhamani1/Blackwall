@@ -47,10 +47,25 @@ pub enum ToolError {
     #[error("{0}")]
     Execution(String),
 }
+impl ToolError {
+    /// A stable name for traces, without any tool output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::File => "file",
+            Self::Limit => "limit",
+            Self::Arguments => "arguments",
+            Self::Denied => "denied",
+            Self::Changed => "changed",
+            Self::Execution(_) => "execution",
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Workspace {
     pub(crate) directory: Arc<Dir>,
     pub path: PathBuf,
+    pub execution: crate::sandbox::ExecutionPolicy,
 }
 impl Workspace {
     pub fn open(path: &Path) -> Result<Self, ToolError> {
@@ -60,6 +75,7 @@ impl Workspace {
         Ok(Self {
             directory: Arc::new(directory),
             path,
+            execution: Default::default(),
         })
     }
     pub(crate) fn checked(path: &str) -> Result<&Path, ToolError> {
@@ -243,11 +259,7 @@ impl Workspace {
     }
 }
 
-const SHELL_DESCRIPTION: &str = if cfg!(windows) {
-    "Propose a Windows PowerShell command in the project directory. Always requires user approval. Commands are not sandboxed."
-} else {
-    "Propose a shell command in the project directory. Always requires user approval. Commands are not sandboxed."
-};
+const SHELL_DESCRIPTION: &str = "Propose a shell command in the project directory. Requires approval and runs under the owner's execution profile. Approval does not bypass filesystem or network restrictions.";
 fn file_definitions() -> Vec<Value> {
     [("read_file","Read a UTF-8 text file inside the selected project.",json!({"path":{"type":"string"}}),vec!["path"]),
      ("list_files","List up to 500 entries in a project directory. Use '.' for the project root.",json!({"path":{"type":"string"}}),vec!["path"]),
@@ -324,7 +336,11 @@ pub async fn execute(
             if command.trim().is_empty() || command.len() > 8000 {
                 return Err(ToolError::Arguments);
             }
-            let detail=format!("Project: {}\nCommand: {command}\n\nThis command runs with your account permissions. It can access files outside the project and use the network.",workspace.path.display());
+            let detail = format!(
+                "Project: {}\nCommand: {command}\n\n{}",
+                workspace.path.display(),
+                workspace.execution.description()
+            );
             if !approvals
                 .request(request_id, ApprovalKind::Exec, command, detail, emit)
                 .await
@@ -332,7 +348,12 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            shell_with_timeout(&workspace.path, command, command_timeout).await
+            run_with_timeout(
+                &workspace.path,
+                crate::sandbox::wrap(workspace, shell_command(command))?,
+                command_timeout,
+            )
+            .await
         }
         "web_fetch" => {
             crate::web::fetch(
@@ -374,10 +395,8 @@ impl Drop for ProcessGroup {
 }
 #[cfg(unix)]
 fn shell_command(command: &str) -> tokio::process::Command {
-    use std::os::unix::process::CommandExt;
     let mut process = tokio::process::Command::new("/bin/sh");
     process.arg("-c").arg(command);
-    process.as_std_mut().process_group(0);
     process
 }
 #[cfg(windows)]
@@ -403,6 +422,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
 async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
     shell_with_timeout(directory, command, Duration::from_secs(120)).await
 }
+#[cfg(test)]
 async fn shell_with_timeout(
     directory: &Path,
     command: &str,
@@ -420,14 +440,14 @@ async fn shell_with_timeout(
 }
 /// Run a resolved program with separate arguments, never parsed by a shell.
 pub(crate) async fn program_with_timeout(
-    directory: &Path,
+    workspace: &Workspace,
     program: &Path,
     args: &[String],
     timeout: Duration,
 ) -> Result<String, ToolError> {
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (directory, program, args, timeout);
+        let _ = (workspace, program, args, timeout);
         Err(ToolError::Execution(
             "Owner tools are not supported on this platform.".into(),
         ))
@@ -436,12 +456,12 @@ pub(crate) async fn program_with_timeout(
     {
         let mut process = tokio::process::Command::new(program);
         process.args(args);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            process.as_std_mut().process_group(0);
-        }
-        run_with_timeout(directory, process, timeout).await
+        run_with_timeout(
+            &workspace.path,
+            crate::sandbox::wrap(workspace, process)?,
+            timeout,
+        )
+        .await
     }
 }
 static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
@@ -545,7 +565,7 @@ pub(crate) fn spawn_server(
 }
 /// Bounded, time-limited capture with the same descendant cleanup for every process.
 #[cfg(any(unix, windows))]
-async fn run_with_timeout(
+pub(crate) async fn run_with_timeout(
     directory: &Path,
     mut process: tokio::process::Command,
     timeout: Duration,
@@ -561,6 +581,11 @@ async fn run_with_timeout(
     }
     if let Some(path) = SEARCH_PATH.get() {
         process.env("PATH", path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
     }
     #[cfg(unix)]
     let mut child = process

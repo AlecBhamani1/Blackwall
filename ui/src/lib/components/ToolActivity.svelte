@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ToolEntry } from '../types';
   import Icon from './Icon.svelte';
+  export let historical = false;
   export let tools: ToolEntry[] = [];
   const labels: Record<string, string> = {
     project_instructions: 'Project instructions',
@@ -31,7 +32,7 @@
   }
 </script>
 
-<div class="tool-activity" aria-label="Agent actions">
+<div class="tool-activity" aria-label={historical ? 'Historical agent actions' : 'Agent actions'}>
   {#each tools as tool (tool.id)}
     <details class:failed={tool.status === 'error'}>
       <summary
@@ -47,7 +48,7 @@
               size={12}
             />{/if}</span
         ><strong>{labels[tool.name] ?? tool.name}</strong><span class="detail">{detail(tool)}</span
-        ><small>{tool.status}</small></summary
+        ><small>{historical ? 'History · ' : ''}{tool.status}</small></summary
       >
       <pre>{tool.output ?? tool.arguments}</pre>
     </details>

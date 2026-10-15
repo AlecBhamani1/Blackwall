@@ -18,13 +18,65 @@ export interface Preferences {
   maxIterations?: number;
   commandTimeoutSeconds?: number;
   memoryEnabled?: boolean;
+  recallEnabled?: boolean;
+  tracesEnabled?: boolean;
+  traceContent?: boolean;
   workspace?: string;
+}
+export interface RecallQuery {
+  query: string;
+  project?: string;
+  after?: number;
+  before?: number;
+  limit?: number;
+}
+export interface RecallHit {
+  sessionId: string;
+  messageId: string;
+  messageIndex: number;
+  title: string;
+  mode: string;
+  project: string | null;
+  updatedAt: number;
+  role: string;
+  excerpt: string;
+}
+export interface RecallResults {
+  results: RecallHit[];
+  remainingSessions: number;
 }
 export interface Skill {
   name: string;
   description: string;
   body: string;
   enabled: boolean;
+}
+export interface SkillProposal {
+  id: string;
+  skill: Skill;
+  before: Skill | null;
+  source: { sessionId: string; messageId: string };
+}
+export interface TraceSummary {
+  id: string;
+  startedMs: number;
+  durationMs: number;
+  error: string | null;
+  modelCalls: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  model: string | null;
+}
+export interface TraceSpan {
+  id: string;
+  parent: string | null;
+  name: string;
+  startMs: number;
+  durationMs: number;
+  error: string | null;
+  attributes: Record<string, unknown>;
+  events: string[];
 }
 export interface McpServer {
   name: string;
@@ -61,6 +113,7 @@ async function command<T>(name: string, args?: Record<string, unknown>): Promise
 export const persistence = {
   available: isDesktop,
   list: () => command<SessionSummary[]>('list_sessions'),
+  search: (query: RecallQuery) => command<RecallResults>('search_sessions', { query }),
   load: (id: string) => command<SessionSummary | null>('load_session', { id }),
   save: (session: SessionSummary) => command<void>('save_session', { session }),
   remove: (id: string) => command<void>('delete_session', { id }),
@@ -70,6 +123,13 @@ export const persistence = {
   skills: () => command<{ skills: Skill[]; warnings: string[] }>('list_skills'),
   saveSkill: (skill: Skill) => command<void>('save_skill', { skill }),
   removeSkill: (name: string) => command<void>('delete_skill', { name }),
+  skillProposals: () =>
+    command<{ proposals: SkillProposal[]; warnings: string[] }>('list_skill_proposals'),
+  approveSkillProposal: (id: string, description: string, body: string) =>
+    command<void>('approve_skill_proposal', { id, description, body }),
+  rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),
+  traces: () => command<TraceSummary[]>('list_traces'),
+  trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),

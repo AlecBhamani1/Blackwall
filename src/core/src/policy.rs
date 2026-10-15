@@ -220,7 +220,11 @@ impl Policy {
             .open(path)
             .await
         {
-            let _ = file.write_all(line.as_bytes()).await;
+            // Tokio finishes file writes in the background; flush so the record is on disk
+            // before the decision returns.
+            if file.write_all(line.as_bytes()).await.is_ok() {
+                let _ = file.flush().await;
+            }
         }
     }
 }
@@ -461,6 +465,11 @@ fn normalize(path: &str) -> Option<PathBuf> {
         }
     }
     Some(normal)
+}
+
+/// Redact credentials line by line, keeping line breaks.
+pub(crate) fn redact_text(text: &str) -> String {
+    text.lines().map(redact).collect::<Vec<_>>().join("\n")
 }
 
 fn redact(subject: &str) -> String {

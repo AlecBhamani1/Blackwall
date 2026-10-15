@@ -23,7 +23,9 @@ pub struct LocalStore {
     connection: Connection,
 }
 mod memory;
+mod recall;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
+pub use recall::{RecallHit, RecallQuery, RecallResults};
 
 impl LocalStore {
     pub(crate) fn connection(&self) -> &Connection {
@@ -75,7 +77,7 @@ impl LocalStore {
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(StorageError::Invalid(
                 "This data was created by a newer Blackwall version. Update the app to open it.",
             ));
@@ -101,8 +103,11 @@ impl LocalStore {
                 PRAGMA user_version=3;",
             )?;
         }
+        recall::schema(&connection)?;
         connection.execute_batch("COMMIT;")?;
-        Ok(Self { connection })
+        let store = Self { connection };
+        store.migrate_message_index()?;
+        Ok(store)
     }
     pub fn paired_devices(&self) -> Result<Vec<crate::pairing::PairedDevice>, StorageError> {
         let mut query = self
@@ -212,7 +217,10 @@ impl LocalStore {
         if !exists && count >= MAX_SESSIONS {
             return Err(StorageError::Invalid("Your history has reached 500 conversations. Export or delete an older conversation before starting another."));
         }
-        self.connection.execute("INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at=excluded.updated_at,body=excluded.body", params![id, title, updated, body])?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute("INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at=excluded.updated_at,body=excluded.body", params![id, title, updated, body])?;
+        recall::index(&transaction, session)?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn delete_session(&self, id: &str) -> Result<(), StorageError> {
@@ -247,6 +255,7 @@ impl LocalStore {
             [],
         )?;
         transaction.commit()?;
+        self.migrate_message_index()?;
         Ok(())
     }
     pub fn setting(&self, key: &str) -> Result<Option<String>, StorageError> {
@@ -301,7 +310,7 @@ impl LocalStore {
     }
 }
 
-fn validate_id(id: &str) -> Result<(), StorageError> {
+pub(crate) fn validate_id(id: &str) -> Result<(), StorageError> {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -429,10 +438,10 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         upgraded
             .connection
-            .pragma_update(None, "user_version", 4)
+            .pragma_update(None, "user_version", 5)
             .unwrap();
         assert!(LocalStore::initialize(upgraded.connection).is_err());
     }

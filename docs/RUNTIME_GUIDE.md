@@ -256,11 +256,44 @@ your login shell's `PATH`, so tools installed with Homebrew or npm work when Bla
 the Dock. It asks the shell once at startup and keeps the system default if that takes more than
 five seconds.
 
-Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
-`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
-configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children
-whose parent shell has already exited. Review the command itself when
-deciding; the selected project folder does not constrain what an approved shell command can access.
+Shell commands and owner-defined command tools use an owner-selected execution profile. In desktop
+Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
+CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
+`bw config set command-network on|off`; `/settings` offers the same controls. The default is
+read-only with command network disabled. Desktop selections reset when switching conversations;
+CLI selections persist. Old saved settings acquire the safe defaults.
+
+On macOS, Seatbelt applies before the shell/program starts and is inherited by descendants:
+
+| Profile | Filesystem access | Command network |
+| --- | --- | --- |
+| Read-only | Read project and system runtime files; no project writes | Disabled unless explicitly enabled |
+| Workspace-write | Also write inside the selected project, excluding protected paths | Disabled unless explicitly enabled |
+| Unsandboxed | Full account permissions | Always enabled |
+
+Sandboxed commands cannot read or write Blackwall's data directory, credential directories such as
+`.ssh`, `.aws`, `.gnupg`, `.config`, or the owner's `Library`. Project metadata and agent configuration
+folders (`.git`, `.hg`, `.svn`, `.agents`, `.codex`, `.claude`) are protected at every depth;
+`AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` remain readable but cannot be changed by commands.
+System runtime reads include `/System`, `/usr`, `/bin`, `/sbin`, and `/opt/homebrew`; arbitrary
+external source trees, home-installed runtimes and shared temporary folders are not granted. Put
+build output and scratch files inside the project when using workspace-write.
+
+Approval still applies to commands, including exact command text and working folder. Approval or
+an allow rule never widens the profile. A denied action must be reported to the owner; change the
+profile explicitly before proposing it again. A missing/broken macOS backend fails closed with no
+unsandboxed retry. Linux and Windows currently fail closed for restricted profiles; full account
+execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
+Windows uses Windows PowerShell.
+
+Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
+and timeouts terminate the process group or Windows Job Object. Restricted macOS commands cannot
+create a new process group/session to escape cleanup: direct `setpgid`/`setsid` calls and
+`posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
+`posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
+command tools; separately configured MCP servers retain their own account permissions and approvals.
+File tools remain workspace jailed, with reviewed edits; **Web access** controls the separate web
+tools and does not enable command network. Model connections remain available with command network off.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
 the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency
@@ -312,10 +345,49 @@ Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are repor
 Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
 model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
 usable.
-They cannot grant tool permissions. Skills are currently managed by the user; agent-generated skill
-creation and automatic learning are not implemented.
+They cannot grant tool permissions.
+
+Type `/learn` in an Agent conversation to have the model propose a skill from the workflow that
+worked, leaving out failed attempts and secrets. The model can only propose: `skill_propose` stores
+the proposal with its source session and message under `skills/.proposals`, and nothing is loaded
+until the owner approves it. `bw skills` lists pending proposals with a diff against the current
+skill, `bw skills approve <id>` saves one and keeps the proposal in `skills/.proposals/approved` as
+a record of its source, and `bw skills reject <id>` discards it, even one that can no longer be
+read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
+kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
+
+In the desktop app, **Skills** lists pending proposals under **Pending review**. Each one shows its
+source session and message, the saved skill it would replace, and the proposed description and
+instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
+validation as a saved skill; **Reject** discards the proposal.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
+
+## Agent traces
+
+Each CLI and desktop Agent run records a local trace in `~/.blackwall/traces` (or the
+`BLACKWALL_DATA_DIR` data folder). A trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with
+a span for the run, each model call, and each tool call, using the OpenTelemetry generative AI names
+(`invoke_agent`, `chat`, `execute_tool`). Spans keep timings, the model, token counts the server
+reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the newest 200
+traces and never sends them anywhere.
+
+`bw traces` lists recent runs with their duration, model and tool calls, tokens, and any failure.
+`bw traces show <id>` prints one run as a tree. Turn traces off with `bw config set traces off`.
+
+By default a trace holds no prompt, answer, tool argument, or tool output text. `bw config set
+trace-content on` also records tool arguments, tool results, and model answers, each redacted like
+audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. A value
+redacted anywhere in a run is removed wherever else it appears in that trace, such as when the model
+repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
+output is also content, so without it the trace only says the tool reported an error. If a trace
+with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
+turn it on only while investigating a run.
+
+In the desktop app, **Runs** lists the 50 newest runs and opens one as a tree of model and tool steps,
+with failures, approval requests, and any captured content. **Record agent runs** and **Include
+content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
+Subagent runs and compaction requests are not traced yet.
 
 ## App lock
 
@@ -354,6 +426,7 @@ Setup does not test connectivity or launch/download a model. `npm run cli -- set
 | `/model <id>`, `/endpoint <url>` | Change the model or service for the next turn |
 | `/web on\|off`, `/memory on\|off` | Enable or disable web tools or saved memory injection |
 | `/workspace <path>` | Start a new conversation in another project; relative paths use the current project |
+| `/review [target]` | Read-only Git review; `--uncommitted`, `--commit <ref>`, or `--base <ref>` ([limits and behavior](GIT_REVIEW.md)) |
 | `/new` | Start a new conversation in the current project |
 | `/sessions`, `/resume <id>` | List conversations or restore an Agent conversation and its project |
 | `/quit`, `/exit` | Exit; EOF also exits |

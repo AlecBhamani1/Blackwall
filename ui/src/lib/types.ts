@@ -29,6 +29,8 @@ export interface ChatMessage {
   error?: string;
   tools?: ToolEntry[];
   children?: ChildEntry[];
+  /** Restored tool activity is inert history, never live approval state. */
+  historical?: boolean;
 }
 
 export interface ModelInfo {
@@ -102,6 +104,8 @@ export interface ChatRequest {
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;
+  executionProfile?: 'read-only' | 'workspace-write' | 'unsandboxed';
+  commandNetwork?: boolean;
   endpoint?: string;
   model?: string;
   messages: ModelMessage[];

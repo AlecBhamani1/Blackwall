@@ -17,7 +17,11 @@
   }
 </script>
 
-<article class:user={message.role === 'user'} class:assistant={message.role === 'assistant'}>
+<article
+  id={`message-${message.id}`}
+  class:user={message.role === 'user'}
+  class:assistant={message.role === 'assistant'}
+>
   {#if message.role === 'assistant'}
     <div class="assistant-avatar"><LogoMark size={24} /></div>
   {/if}
@@ -37,7 +41,10 @@
             <p>{child.summary}</p>
           </details>{/each}
       </div>{/if}
-    {#if message.tools?.length}<ToolActivity tools={message.tools} />{/if}
+    {#if message.tools?.length}<ToolActivity
+        tools={message.tools}
+        historical={message.historical ?? false}
+      />{/if}
 
     {#if message.status === 'streaming'}
       <span class="streaming-cursor" aria-label="Blackwall is responding"></span>
