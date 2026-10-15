@@ -70,6 +70,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Flush each policy audit record before the decision returns. Tokio finishes file writes in the
+  background, so a record could be missing when the log was read right after a decision.
+
 - Update the TLS dependency to include upstream security fixes.
 
 - Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
