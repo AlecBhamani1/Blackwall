@@ -85,3 +85,35 @@ it('keeps mode and project locked, separates histories, and resets and restores 
   expect(screen.queryByRole('button', { name: /Project task/ })).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'demo' })).not.toBeInTheDocument();
 });
+
+it('sends the selected command boundary and resets full access on a new session', async () => {
+  const user = userEvent.setup();
+  render(App);
+  const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('Conversation mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  const network = screen.getByRole('checkbox', { name: 'Command network' });
+  expect(profile).toHaveValue('read-only');
+  expect(network).not.toBeChecked();
+  await user.selectOptions(profile, 'workspace-write');
+  await user.click(network);
+  await user.click(screen.getByRole('button', { name: 'Choose project folder' }));
+  await user.type(input, 'Check project{Enter}');
+  await waitFor(() =>
+    expect(vi.mocked(localModelClient.streamChat).mock.calls.at(-1)?.[0]).toMatchObject({
+      executionProfile: 'workspace-write',
+      commandNetwork: true,
+    }),
+  );
+  await waitFor(() => expect(profile).toBeEnabled());
+  await user.selectOptions(profile, 'unsandboxed');
+  expect(screen.getByText(/Unsandboxed commands have full account/)).toBeInTheDocument();
+  expect(network).toBeDisabled();
+  expect(network).toBeChecked();
+  await user.click(screen.getByRole('button', { name: /New chat/ }));
+  expect(profile).toHaveValue('read-only');
+  expect(network).not.toBeChecked();
+});

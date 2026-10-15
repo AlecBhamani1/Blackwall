@@ -10,6 +10,8 @@ pub struct Settings {
     pub endpoint: String,
     pub model: String,
     pub web_enabled: bool,
+    pub execution_profile: blackwall_core::sandbox::ExecutionProfile,
+    pub command_network: bool,
     pub memory_enabled: bool,
     pub recall_enabled: bool,
     pub budget: blackwall_core::context::ContextBudget,
@@ -57,6 +59,8 @@ impl Settings {
             "endpoint": validated.endpoint,
             "model": validated.model,
             "webEnabled": validated.web_enabled,
+            "executionProfile": validated.execution_profile,
+            "commandNetwork": validated.command_network,
             "memoryEnabled": validated.memory_enabled,
             "recallEnabled": validated.recall_enabled,
             "contextBudget": validated.budget,
@@ -83,6 +87,8 @@ impl Settings {
             "endpoint" => updated.endpoint = value.into(),
             "model" => updated.model = value.into(),
             "web" => updated.web_enabled = on_or_off(value)?,
+            "profile" => updated.execution_profile = value.parse()?,
+            "command-network" => updated.command_network = on_or_off(value)?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
             "recall" => updated.recall_enabled = on_or_off(value)?,
             "traces" => updated.trace.enabled = on_or_off(value)?,
@@ -113,7 +119,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, web, memory, recall, traces, trace-content, context, output, compact, iterations, or timeout."
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, context, output, compact, iterations, or timeout."
                     .into(),
             ),
         }
@@ -130,7 +136,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -139,6 +145,8 @@ impl Settings {
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
             self.budget.max_iterations, self.budget.command_timeout_seconds,
+            self.execution_profile.name(),
+            if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
         )
     }
 }
@@ -185,6 +193,8 @@ fn load_with_environment(
         endpoint,
         model,
         web_enabled: false,
+        execution_profile: Default::default(),
+        command_network: false,
         memory_enabled,
         recall_enabled: object
             .get("recallEnabled")
@@ -249,6 +259,8 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             "endpoint"
                 | "model"
                 | "webEnabled"
+                | "executionProfile"
+                | "commandNetwork"
                 | "memoryEnabled"
                 | "recallEnabled"
                 | "contextBudget"
@@ -259,6 +271,16 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
         return Err(invalid.into());
     }
     let mut settings = Settings {
+        execution_profile: object
+            .get("executionProfile")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
+        command_network: object
+            .get("commandNetwork")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
         budget: object
             .get("contextBudget")
             .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
@@ -378,6 +400,8 @@ mod tests {
                 endpoint: DEFAULT_ENDPOINT.into(),
                 model: DEFAULT_MODEL.into(),
                 web_enabled: false,
+                execution_profile: Default::default(),
+                command_network: false,
                 memory_enabled: false,
                 recall_enabled: false,
                 budget: Default::default(),
@@ -479,7 +503,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 8);
+        assert_eq!(saved.as_object().unwrap().len(), 10);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -533,6 +557,35 @@ mod tests {
             .set(&store, "timeout", "9")
             .unwrap_err()
             .contains("between 10 and 3,600 seconds"));
+    }
+
+    #[test]
+    fn execution_settings_require_explicit_values_and_persist() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        assert_eq!(settings.execution_profile.name(), "read-only");
+        assert!(!settings.command_network);
+        settings.set(&store, "profile", "workspace-write").unwrap();
+        settings.set(&store, "command-network", "on").unwrap();
+        let loaded = defaults(&store);
+        assert_eq!(loaded.execution_profile.name(), "workspace-write");
+        assert!(loaded.command_network);
+        let before = settings.clone();
+        assert!(settings.set(&store, "profile", "invalid").is_err());
+        assert_eq!(settings, before);
+        settings.set(&store, "profile", "unsandboxed").unwrap();
+        assert!(settings.describe().contains("on (unsandboxed)"));
+        let old = r#"{"endpoint":"http://localhost:11434/v1","model":"fixture","webEnabled":false,"memoryEnabled":false}"#;
+        assert_eq!(
+            saved_settings(old).unwrap().execution_profile.name(),
+            "read-only"
+        );
+        assert!(saved_settings(&old.replace(
+            "\"webEnabled\"",
+            "\"executionProfile\":\"invalid\",\"webEnabled\""
+        ))
+        .is_err());
     }
 
     #[test]
@@ -595,6 +648,8 @@ mod tests {
             endpoint: "models.example".into(),
             model: "\u{1b}[31msecret".into(),
             web_enabled: true,
+            execution_profile: Default::default(),
+            command_network: false,
             memory_enabled: false,
             recall_enabled: false,
             budget: Default::default(),

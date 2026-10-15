@@ -197,6 +197,8 @@ export function createChatController(
   const runState = writable<RunState>('idle');
   const agentMode = writable(false);
   const webEnabled = writable(false);
+  const executionProfile = writable<'read-only' | 'workspace-write' | 'unsandboxed'>('read-only');
+  const commandNetwork = writable(false);
   const workspace = writable('');
   const sessionLocked = derived(messages, ($messages) => $messages.length > 0);
   const visibleSessions = derived([sessions, agentMode], ([$sessions, $agentMode]) =>
@@ -208,6 +210,8 @@ export function createChatController(
     agentMode.set(mode === 'agent');
     workspace.set('');
     webEnabled.set(false);
+    executionProfile.set('read-only');
+    commandNetwork.set(false);
   }
   function sessionContext(): { mode: ConversationMode; workspace?: string } {
     return {
@@ -432,6 +436,8 @@ export function createChatController(
           agentMode: get(agentMode),
           workspace: get(workspace) || undefined,
           webEnabled: get(webEnabled),
+          executionProfile: get(executionProfile),
+          commandNetwork: get(commandNetwork),
           endpoint: get(endpoint) || undefined,
           model: get(selectedModel),
           messages: asModelMessages(get(messages)),
@@ -756,6 +762,8 @@ export function createChatController(
             agentMode: get(agentMode),
             workspace: get(agentMode) ? get(workspace) : undefined,
             webEnabled: get(webEnabled),
+            executionProfile: get(executionProfile),
+            commandNetwork: get(commandNetwork),
             endpoint: get(endpoint) || undefined,
             model: get(selectedModel),
             messages: asModelMessages(nextMessages.filter((message) => message.id !== assistantId)),
@@ -993,6 +1001,8 @@ export function createChatController(
     workspace.set('');
     agentMode.set(mode === 'agent');
     webEnabled.set(false);
+    executionProfile.set('read-only');
+    commandNetwork.set(false);
     activeSessionId.set(createId('session'));
     notice.set('');
     runState.set('idle');
@@ -1071,6 +1081,8 @@ export function createChatController(
     workspace.set(restoredWorkspace);
     agentMode.set(session.mode === 'agent');
     webEnabled.set(false);
+    executionProfile.set('read-only');
+    commandNetwork.set(false);
     activeSessionId.set(session.id);
     notice.set('');
     runState.set('idle');
@@ -1087,6 +1099,8 @@ export function createChatController(
       contextReport.set(undefined);
       workspace.set('');
       webEnabled.set(false);
+      executionProfile.set('read-only');
+      commandNetwork.set(false);
       activeSessionId.set(createId('session'));
       notice.set('');
     }
@@ -1129,6 +1143,8 @@ export function createChatController(
     workspace.set('');
     agentMode.set(false);
     webEnabled.set(false);
+    executionProfile.set('read-only');
+    commandNetwork.set(false);
     activeSessionId.set(createId('session'));
     models.set([]);
     connectionState.set('checking');
@@ -1151,6 +1167,8 @@ export function createChatController(
     runState,
     agentMode: readonly(agentMode),
     webEnabled,
+    executionProfile,
+    commandNetwork,
     workspace: readonly(workspace),
     sessionLocked,
     visibleSessions,

@@ -104,6 +104,8 @@ export interface ChatRequest {
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;
+  executionProfile?: 'read-only' | 'workspace-write' | 'unsandboxed';
+  commandNetwork?: boolean;
   endpoint?: string;
   model?: string;
   messages: ModelMessage[];
