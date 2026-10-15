@@ -68,6 +68,8 @@ fn run() -> Result<(), StartupError> {
             data::list_skill_proposals,
             data::approve_skill_proposal,
             data::reject_skill_proposal,
+            data::list_traces,
+            data::read_trace,
             data::list_mcp_servers,
             data::add_mcp_server,
             data::set_mcp_server_enabled,

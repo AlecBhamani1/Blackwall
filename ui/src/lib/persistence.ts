@@ -19,6 +19,8 @@ export interface Preferences {
   commandTimeoutSeconds?: number;
   memoryEnabled?: boolean;
   recallEnabled?: boolean;
+  tracesEnabled?: boolean;
+  traceContent?: boolean;
   workspace?: string;
 }
 export interface RecallQuery {
@@ -54,6 +56,27 @@ export interface SkillProposal {
   skill: Skill;
   before: Skill | null;
   source: { sessionId: string; messageId: string };
+}
+export interface TraceSummary {
+  id: string;
+  startedMs: number;
+  durationMs: number;
+  error: string | null;
+  modelCalls: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  model: string | null;
+}
+export interface TraceSpan {
+  id: string;
+  parent: string | null;
+  name: string;
+  startMs: number;
+  durationMs: number;
+  error: string | null;
+  attributes: Record<string, unknown>;
+  events: string[];
 }
 export interface McpServer {
   name: string;
@@ -105,6 +128,8 @@ export const persistence = {
   approveSkillProposal: (id: string, description: string, body: string) =>
     command<void>('approve_skill_proposal', { id, description, body }),
   rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),
+  traces: () => command<TraceSummary[]>('list_traces'),
+  trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),

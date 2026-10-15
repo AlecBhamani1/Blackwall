@@ -342,6 +342,29 @@ pub async fn reject_skill_proposal(app: AppHandle, id: String) -> Result<(), Str
     with_skills(&app, move |store| store.reject(&id)).await
 }
 
+/// The 50 newest agent-run traces. Each file is parsed, so the list stays short.
+#[tauri::command]
+pub async fn list_traces(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::trace::TraceSummary>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::list(&directory, 50))
+        .await
+        .map_err(|_| "Traces could not be read.".into())
+}
+#[tauri::command]
+pub async fn read_trace(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<blackwall_core::trace::SpanView>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::read(&directory, &id))
+        .await
+        .map_err(|_| "This trace could not be read.")?
+}
+
 /// MCP edits share the CLI's validation; secret values go only to the credential store.
 /// Like saved model keys, the lock is checked first and not held, so a credential store prompt
 /// cannot stall the rest of the app.
