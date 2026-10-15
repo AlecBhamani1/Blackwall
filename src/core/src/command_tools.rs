@@ -108,7 +108,7 @@ impl CommandTool {
     /// Rules match the configured command template, so `claude -p` can allow every prompt.
     pub async fn run(
         &self,
-        workspace: &Path,
+        workspace: &crate::tools::Workspace,
         arguments: &str,
         request_id: &str,
         approvals: &Approvals,
@@ -136,11 +136,12 @@ impl CommandTool {
         })?;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let detail = format!(
-            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}\n\nThis program runs with your account permissions. It can access files outside the project and use the network.",
-            workspace.display(),
+            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}\n\n{}",
+            workspace.path.display(),
             self.name,
             program.display(),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
+            workspace.execution.description(),
         );
         if !approvals
             .request(
@@ -312,6 +313,8 @@ mod tests {
         )
         .await;
         let tool = tools.get("echo_back").unwrap();
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         let approvals = Approvals::default();
         let decisions = approvals.clone();
         let details = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
@@ -336,7 +339,7 @@ mod tests {
         };
         let output = tool
             .run(
-                &directory,
+                &workspace,
                 r#"{"text":"hi; touch injected"}"#,
                 "run",
                 &approvals,
@@ -350,7 +353,7 @@ mod tests {
         assert!(details.lock().unwrap()[0].contains(r#"Arguments: ["hi; touch injected"]"#));
         assert!(matches!(
             tool.run(
-                &directory,
+                &workspace,
                 r#"{"text":"--version"}"#,
                 "run",
                 &approvals,

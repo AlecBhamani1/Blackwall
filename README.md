@@ -42,6 +42,7 @@ a SmartScreen or Gatekeeper warning.
 - Native SQLite history with attachment contents, migration, and ordered save retries
 - Optional desktop passphrase lock that stops active work and guest sharing
 - Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
+- Owner-selected command profiles with macOS filesystem isolation and default-off command network
 - Owner allow, ask, and deny rules for agent actions, with a redacted local audit log
 - Owner-defined command tools and local MCP servers behind the same approvals, with MCP secrets
   kept in the platform credential store

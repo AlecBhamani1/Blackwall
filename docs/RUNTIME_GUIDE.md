@@ -256,11 +256,44 @@ your login shell's `PATH`, so tools installed with Homebrew or npm work when Bla
 the Dock. It asks the shell once at startup and keeps the system default if that takes more than
 five seconds.
 
-Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
-`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they stop at the
-configured command time limit (two minutes by default), and cancellation terminates their process group or Windows Job Object, including children
-whose parent shell has already exited. Review the command itself when
-deciding; the selected project folder does not constrain what an approved shell command can access.
+Shell commands and owner-defined command tools use an owner-selected execution profile. In desktop
+Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
+CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
+`bw config set command-network on|off`; `/settings` offers the same controls. The default is
+read-only with command network disabled. Desktop selections reset when switching conversations;
+CLI selections persist. Old saved settings acquire the safe defaults.
+
+On macOS, Seatbelt applies before the shell/program starts and is inherited by descendants:
+
+| Profile | Filesystem access | Command network |
+| --- | --- | --- |
+| Read-only | Read project and system runtime files; no project writes | Disabled unless explicitly enabled |
+| Workspace-write | Also write inside the selected project, excluding protected paths | Disabled unless explicitly enabled |
+| Unsandboxed | Full account permissions | Always enabled |
+
+Sandboxed commands cannot read or write Blackwall's data directory, credential directories such as
+`.ssh`, `.aws`, `.gnupg`, `.config`, or the owner's `Library`. Project metadata and agent configuration
+folders (`.git`, `.hg`, `.svn`, `.agents`, `.codex`, `.claude`) are protected at every depth;
+`AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` remain readable but cannot be changed by commands.
+System runtime reads include `/System`, `/usr`, `/bin`, `/sbin`, and `/opt/homebrew`; arbitrary
+external source trees, home-installed runtimes and shared temporary folders are not granted. Put
+build output and scratch files inside the project when using workspace-write.
+
+Approval still applies to commands, including exact command text and working folder. Approval or
+an allow rule never widens the profile. A denied action must be reported to the owner; change the
+profile explicitly before proposing it again. A missing/broken macOS backend fails closed with no
+unsandboxed retry. Linux and Windows currently fail closed for restricted profiles; full account
+execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
+Windows uses Windows PowerShell.
+
+Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
+and timeouts terminate the process group or Windows Job Object. Restricted macOS commands cannot
+create a new process group/session to escape cleanup: direct `setpgid`/`setsid` calls and
+`posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
+`posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
+command tools; separately configured MCP servers retain their own account permissions and approvals.
+File tools remain workspace jailed, with reviewed edits; **Web access** controls the separate web
+tools and does not enable command network. Model connections remain available with command network off.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
 the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency

@@ -37,6 +37,8 @@
     persistenceError,
     agentMode,
     webEnabled,
+    executionProfile,
+    commandNetwork,
     workspace,
     approval,
     preferences,
@@ -246,7 +248,25 @@
               >{$workspace
                 ? $workspace.split('/').filter(Boolean).at(-1)
                 : 'Choose project folder'}</button
-            >{/if}<span></span>{#if $agentMode}<label class="web-toggle"
+            >{/if}<span></span>{#if $agentMode}<label class="web-toggle">
+              Commands
+              <select
+                aria-label="Command execution profile"
+                bind:value={$executionProfile}
+                disabled={$runState !== 'idle'}
+              >
+                <option value="read-only">Read-only</option>
+                <option value="workspace-write">Workspace-write</option>
+                <option value="unsandboxed">Unsandboxed (full access)</option>
+              </select>
+            </label><label class="web-toggle">
+              <input
+                type="checkbox"
+                checked={$commandNetwork || $executionProfile === 'unsandboxed'}
+                onchange={(event) => commandNetwork.set(event.currentTarget.checked)}
+                disabled={$runState !== 'idle' || $executionProfile === 'unsandboxed'}
+              />Command network
+            </label><label class="web-toggle"
               ><input
                 type="checkbox"
                 bind:checked={$webEnabled}
@@ -262,6 +282,12 @@
               onclick={controller.exportConversation}>Export chat</button
             >{/if}
           <button class="export" onclick={() => controller.showRecall()}>Search history</button>
+        </div>
+      {/if}
+      {#if $agentMode && $executionProfile === 'unsandboxed'}
+        <div class="storage-error" role="status">
+          Unsandboxed commands have full account filesystem and network access. Each command still
+          requires approval.
         </div>
       {/if}
       {#if $persistenceError}<div class="storage-error" role="alert">
@@ -389,11 +415,21 @@
     font-size: 11px;
     white-space: nowrap;
   }
+  .web-toggle select {
+    max-width: 190px;
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font: inherit;
+  }
   .web-toggle input {
     accent-color: var(--accent);
   }
   .project-bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     min-height: 45px;

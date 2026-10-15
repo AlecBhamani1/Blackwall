@@ -150,7 +150,7 @@ impl Conversation {
         let state = ContextState::restore(&source, self.saved_context()?.as_ref())
             .map_err(|e| e.to_string())?;
         let mut messages = instructions;
-        let workspace = Workspace::open(&self.workspace).map_err(|e| e.to_string())?;
+        let workspace = execution_workspace(&self.workspace, directory, settings)?;
         let guidance =
             blackwall_core::instructions::Instructions::discover(&workspace, Some(directory));
         if !guidance.prompt().is_empty() {
@@ -209,7 +209,7 @@ impl Conversation {
         let memory = self.memory_tools(directory);
         let (_, snapshot, result) = execute(
             &backend,
-            Workspace::open(&self.workspace).map_err(|e| e.to_string())?,
+            execution_workspace(&self.workspace, directory, settings)?,
             settings.web_enabled,
             ContextRun {
                 source,
@@ -255,7 +255,7 @@ impl Conversation {
         )
         .and_then(|backend| backend.with_budget(budget))
         .map_err(|error| error.to_string())?;
-        let workspace = Workspace::open(&self.workspace).map_err(|error| error.to_string())?;
+        let workspace = execution_workspace(&self.workspace, directory, settings)?;
         let timestamp = now()?;
         let mut candidate = self.session.clone();
         let history = candidate["messages"]
@@ -538,6 +538,20 @@ fn render_event(
         }
         _ => {}
     }
+}
+
+fn execution_workspace(
+    path: &Path,
+    directory: &Path,
+    settings: &Settings,
+) -> Result<Workspace, String> {
+    let mut workspace = Workspace::open(path).map_err(|error| error.to_string())?;
+    workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
+        profile: settings.execution_profile,
+        network: settings.command_network,
+        data_directory: Some(directory.into()),
+    };
+    Ok(workspace)
 }
 
 #[cfg(test)]

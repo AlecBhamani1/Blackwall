@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Choose read-only (default), workspace-write, or explicitly unsandboxed command execution in
+  desktop Agent mode and CLI settings. macOS Seatbelt enforces filesystem restrictions and
+  default-off network access for shells, command tools, and descendants; protects application data,
+  credentials and project metadata; and fails closed if unavailable. Restricted execution on other
+  platforms fails closed until a backend is supported. Existing CLI settings migrate to read-only.
+
 - Inspect Git changes with `bw review` and CLI/desktop Agent `/review`, using exclusive working-tree, commit,
   or base-branch targets. Return prioritized findings separately from unverified hypotheses,
   with bounded untracked text and JSON output. Review runs without model tools or write access.

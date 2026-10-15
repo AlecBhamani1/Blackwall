@@ -409,6 +409,10 @@ pub(crate) struct AgentOptions {
     workspace: Option<String>,
     #[serde(default)]
     web_enabled: bool,
+    #[serde(default)]
+    execution_profile: blackwall_core::sandbox::ExecutionProfile,
+    #[serde(default)]
+    command_network: bool,
     session_id: Option<String>,
     source_message_id: Option<String>,
 }
@@ -469,7 +473,7 @@ pub(crate) async fn stream_chat(
     };
     let options = options.unwrap_or_default();
     let stream_result = if options.enabled {
-        let workspace = options
+        let mut workspace = options
             .workspace
             .as_deref()
             .ok_or(CommandError {
@@ -533,6 +537,11 @@ pub(crate) async fn stream_chat(
         #[cfg(target_os = "macos")]
         crate::lifecycle::login_path_settled().await;
         let trace = crate::data::trace_options(instruction_directory.clone()).await;
+        workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
+            profile: options.execution_profile,
+            network: options.command_network,
+            data_directory: Some(instruction_directory.clone()),
+        };
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,

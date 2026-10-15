@@ -586,6 +586,8 @@ async function streamTauriChat(
         enabled: request.agentMode ?? false,
         workspace: request.workspace ?? null,
         webEnabled: request.webEnabled ?? false,
+        executionProfile: request.executionProfile ?? 'read-only',
+        commandNetwork: request.commandNetwork ?? false,
         sessionId: request.sessionId ?? null,
         sourceMessageId: request.sourceMessageId ?? null,
       },
