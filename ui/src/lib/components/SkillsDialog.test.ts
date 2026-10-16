@@ -137,8 +137,12 @@ describe('skill proposal review', () => {
         error: null,
         notes: [],
         exists: false,
+        files: [],
+        license: null,
+        findings: [],
       },
     ]);
+    vi.spyOn(persistence, 'suggestedSkills').mockResolvedValue([]);
     vi.spyOn(persistence, 'importSkill').mockResolvedValue({
       name: 'imported',
       description: 'd',

@@ -66,6 +66,7 @@ USAGE:
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw skills <action>         Review learned skill proposals (bw skills for pending)
   bw skills import [<path>]  Import SKILL.md skills from other harnesses (list without a path)
+  bw skills suggested        List suggested skills; bw skills get <name> downloads, scans, and imports one
   bw traces [show <id>]      List recent agent-run traces or show one as a tree
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
@@ -129,7 +130,7 @@ async fn run() -> Result<(), String> {
         return memory::run(&directory, &arguments);
     }
     if command == "skills" {
-        return skills::run(&directory, &arguments);
+        return skills::run(&directory, &arguments).await;
     }
     if command == "traces" {
         return traces::run(&directory, &arguments);

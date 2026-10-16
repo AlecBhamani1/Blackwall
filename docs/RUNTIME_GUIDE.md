@@ -363,18 +363,35 @@ source session and message, the saved skill it would replace, and the proposed d
 instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
 validation as a saved skill; **Reject** discards the proposal.
 
-To reuse skills written for other agents, choose **Import skills** in the Skills panel or run
-`bw skills import`. Blackwall reads the `SKILL.md` format used by Claude Code, Codex, and most
-published skills: a folder with a `SKILL.md` whose frontmatter has a name and description. The
-panel lists skills found in `~/.claude/skills`, `~/.codex/skills`, and `~/.agents/skills`, and
-**Choose folder…** or **Choose file…** adds others, such as a downloaded skill. `bw skills import`
-lists the same folders; `bw skills import <path>` imports a `SKILL.md`, a skill folder, or a folder
-of them, and `--replace` overwrites saved skills with the same name. The panel previews each skill
-before importing it. Names are converted to lowercase with hyphens, descriptions over 500 bytes are shortened,
-and skills over 32 KiB are refused. Only the instructions are imported: bundled scripts and
-reference files are not copied, and settings such as `allowed-tools` are ignored, because skills
-never grant permissions. The preview lists what was left out. A saved skill is replaced only when
-you choose to.
+To reuse skills written for other agents, choose **Import skills** in the Skills panel or use
+`bw skills`. Blackwall reads the `SKILL.md` format used by Claude Code, Codex, and most published
+skills: a folder with a `SKILL.md` whose frontmatter has a name and description, and optional
+bundled files such as scripts and references. The whole folder is imported, up to 200 files and
+5 MB; links and hidden files are left out. The panel lists skills found in `~/.claude/skills`,
+`~/.codex/skills`, and `~/.agents/skills`, and **Choose folder…** or **Choose file…** adds others.
+`bw skills import` lists the same folders, and `bw skills import <path>` imports a `SKILL.md`, a
+skill folder, or a folder of them.
+
+**Suggested** lists skills from the official Anthropic and OpenAI skill repositories and Matt
+Pocock's engineering skills, each pinned to a reviewed commit. **Get** (or `bw skills get <name>`;
+`bw skills suggested` lists them) downloads that version from GitHub for review; Blackwall goes
+online only when you ask.
+
+Before anything is saved, each skill is scanned locally for patterns that often hide prompt
+injection or send data away: invisible characters and hidden comments, instructions to ignore you
+or hide actions, uploads to remote addresses and paste or webhook services, scripts that read secret
+files such as `~/.ssh` or `.env`, long encoded blocks, code that decodes and runs itself, and downloads
+piped into a shell. Findings show the file, line, and text. A clean scan reads "Scanned: no issues
+found", which means none of these patterns matched, not that a skill is safe. A skill with findings
+is imported only if you choose **Allow anyway** (`--allow-anyway` in the CLI); **Block** drops it.
+The files are read and scanned again at import, so a change after the preview is caught.
+
+The preview also shows the license, the bundled files, and what conversion changed. Names are
+converted to lowercase with hyphens, descriptions over 500 bytes are shortened, and settings such
+as `allowed-tools` are ignored, because skills never grant permissions. A saved skill is replaced
+only when you choose to (`--replace` in the CLI). The agent reads a skill's bundled text files
+through `read_skill`, and runs its scripts with the shell tool by their full path, so each command
+still needs your approval.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
 
