@@ -134,7 +134,7 @@ impl ModelBackend for HttpModel {
             self.budget
                 .check(messages, tools)
                 .map_err(|_| ModelError::Limit)?;
-            let mut payload = json!({"model":self.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"max_tokens":self.max_tokens.unwrap_or(self.budget.output_tokens)});
+            let mut payload = json!({"model":self.model,"messages":one_system_message(messages),"stream":true,"stream_options":{"include_usage":true},"max_tokens":self.max_tokens.unwrap_or(self.budget.output_tokens)});
             if let Some(temperature) = self.temperature {
                 payload["temperature"] = json!(temperature);
             }
@@ -306,6 +306,25 @@ impl StreamDecoder {
     }
 }
 
+/// Send every text system message as one, first. Chat templates such as Qwen's reject a system
+/// message anywhere but first, so Blackwall's separate instruction blocks go out as one.
+fn one_system_message(messages: &[Value]) -> Vec<Value> {
+    let (system, rest): (Vec<_>, Vec<_>) = messages
+        .iter()
+        .partition(|m| m["role"] == "system" && m["content"].is_string());
+    if system.is_empty() {
+        return messages.to_vec();
+    }
+    let content = system
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    std::iter::once(json!({"role":"system","content":content}))
+        .chain(rest.into_iter().cloned())
+        .collect()
+}
+
 pub fn messages(request: &ChatRequest) -> Vec<Value> {
     let last_user = request
         .messages
@@ -376,6 +395,26 @@ mod tests {
         let turn = decoder.finish(&mut |_| {}).unwrap();
         assert_eq!(text, "Hi 🦀");
         assert_eq!(turn.calls[0].function.arguments, "{\"path\":\"a\"}");
+    }
+    #[test]
+    fn system_messages_are_sent_as_one_first() {
+        let messages = [
+            json!({"role":"system","content":"Base"}),
+            json!({"role":"system","content":"Guidance"}),
+            json!({"role":"user","content":"Hi"}),
+            json!({"role":"system","content":"Later"}),
+        ];
+        let sent = one_system_message(&messages);
+        assert_eq!(
+            sent,
+            [
+                json!({"role":"system","content":"Base\n\nGuidance\n\nLater"}),
+                messages[2].clone()
+            ]
+        );
+        let single = [messages[0].clone(), messages[2].clone()];
+        assert_eq!(one_system_message(&single), single);
+        assert!(one_system_message(&[]).is_empty());
     }
     #[test]
     fn truncated_stream_is_an_error() {

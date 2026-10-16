@@ -298,6 +298,8 @@ tools and does not enable command network. Model connections remain available wi
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
 the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency
 of three. The selected model must support OpenAI-compatible tool calls for Agent mode to work well.
+Blackwall's instructions and any project guidance reach the model as one system message at the start,
+because some chat templates, such as Qwen's on vLLM, reject any other system message.
 
 Tool entries are collapsed by default and can be expanded to inspect results. Restored transcripts
 show past actions without executing them again. A fresh model turn currently receives the prior prose

@@ -93,6 +93,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Send Blackwall's instructions as one system message, first. Chat templates such as Qwen's reject
+  any other system message, so Agent runs failed with HTTP 400 on vLLM servers.
+
 - Flush each policy audit record before the decision returns. Tokio finishes file writes in the
   background, so a record could be missing when the log was read right after a decision.
 
