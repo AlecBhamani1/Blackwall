@@ -272,6 +272,7 @@ mod tests {
         import(&store, &[path, "--replace".into()]).unwrap();
         assert_eq!(store.read("review").unwrap().body, "Read it twice.");
         assert!(import(&store, &["a".into(), "b".into()]).is_err());
+        drop(store); // Windows cannot remove a folder the store still holds open.
         std::fs::remove_dir_all(root).unwrap();
     }
 }
