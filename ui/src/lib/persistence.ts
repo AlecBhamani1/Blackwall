@@ -50,6 +50,8 @@ export interface Skill {
   description: string;
   body: string;
   enabled: boolean;
+  /** Runs only when the user types /name; the model never picks it on its own. */
+  userOnly?: boolean;
 }
 export interface SkillProposal {
   id: string;

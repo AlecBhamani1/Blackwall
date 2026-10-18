@@ -155,4 +155,13 @@ describe('skill proposal review', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Imported 1 skill.');
     expect(screen.getByText('Pending review · 2')).toBeInTheDocument();
   });
+  it('marks a skill to run only when typed', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'saveSkill').mockResolvedValue();
+    render(SkillsDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: /^release/ }));
+    await user.click(screen.getByRole('checkbox', { name: 'Run only when I type /release' }));
+    await user.click(screen.getByRole('button', { name: 'Save skill' }));
+    expect(save).toHaveBeenCalledWith({ ...release, userOnly: true });
+  });
 });

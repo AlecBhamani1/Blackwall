@@ -14,6 +14,10 @@ pub struct Skill {
     pub description: String,
     pub body: String,
     pub enabled: bool,
+    /// Runs only when the user types `/name`; hidden from the model's list and `read_skill`.
+    /// Saved as `disable-model-invocation: true`, the key other harnesses use.
+    #[serde(default)]
+    pub user_only: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +26,8 @@ struct Frontmatter {
     description: String,
     #[serde(default = "enabled")]
     enabled: bool,
+    #[serde(default, rename = "disable-model-invocation")]
+    user_only: bool,
 }
 fn enabled() -> bool {
     true
@@ -56,7 +62,32 @@ pub enum SkillError {
     Folder,
     #[error("The safety scan found something in this skill. Review the findings, then allow or block it.")]
     Flagged,
+    #[error("This name is a built-in command, so typing it could not run the skill. Give the skill another name.")]
+    Reserved,
 }
+/// Built-in commands of the CLI and desktop app. A skill cannot take one of these names, because
+/// typing `/name` must run exactly one thing.
+pub const COMMANDS: &[&str] = &[
+    "commands",
+    "compact",
+    "context",
+    "endpoint",
+    "exit",
+    "help",
+    "init",
+    "learn",
+    "memory",
+    "model",
+    "new",
+    "quit",
+    "recall",
+    "resume",
+    "review",
+    "sessions",
+    "settings",
+    "web",
+    "workspace",
+];
 /// A learned skill waiting for owner review. `before` is the skill it would replace, so approval
 /// can refuse a proposal made against an older version.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -148,16 +179,25 @@ pub fn parse(text: &str) -> Result<Skill, SkillError> {
         description: frontmatter.description,
         body: body.trim().into(),
         enabled: frontmatter.enabled,
+        user_only: frontmatter.user_only,
     })
 }
 /// The saved file for a skill, after the same checks as reading one back.
 pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
     validate_name(&skill.name)?;
+    if COMMANDS.contains(&skill.name.as_str()) {
+        return Err(SkillError::Reserved);
+    }
     let document = format!(
-        "---\nname: {}\ndescription: {}\nenabled: {}\n---\n\n{}\n",
+        "---\nname: {}\ndescription: {}\nenabled: {}\n{}---\n\n{}\n",
         skill.name,
         serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
         skill.enabled,
+        if skill.user_only {
+            "disable-model-invocation: true\n"
+        } else {
+            ""
+        },
         skill.body
     );
     parse(&document)?;
@@ -581,7 +621,12 @@ impl SkillStore {
         if self.current(&proposal.skill.name)? != proposal.before {
             return Err(SkillError::Stale);
         }
-        let skill = match edited {
+        // A refined skill keeps running only when typed, if it did before.
+        let keep = proposal
+            .before
+            .as_ref()
+            .is_some_and(|before| before.user_only);
+        let mut skill = match edited {
             Some((description, body)) => Skill {
                 description,
                 body,
@@ -589,6 +634,7 @@ impl SkillStore {
             },
             None => proposal.skill,
         };
+        skill.user_only |= keep;
         self.save(&skill)?;
         // The skill is saved; if its record cannot be kept, the proposal is still removed so it
         // does not stay pending and later look stale.
@@ -753,7 +799,7 @@ impl SkillStore {
         for (name,description,body) in [
             ("repo-orientation","Understand a project before making changes.","Read the project README and contribution guidance. List the main source directories. Identify the entry points, build commands, and tests. Summarize the architecture with file paths. Ask about unclear goals before proposing changes."),
             ("bugfix-triage","Investigate and fix a reported bug with focused validation.","Reproduce the reported behavior where practical. Trace it to the relevant code and identify the cause. Propose a focused change; request approval before writes or commands. Run the smallest meaningful regression check, then relevant project checks. Report the fix, evidence, and remaining uncertainty.")]{
-            if !self.directory.try_exists(format!("{name}.md")).map_err(|_|SkillError::File)?{self.save(&Skill{name:name.into(),description:description.into(),body:body.into(),enabled:true})?;}
+            if !self.directory.try_exists(format!("{name}.md")).map_err(|_|SkillError::File)?{self.save(&Skill{name:name.into(),description:description.into(),body:body.into(),enabled:true,user_only:false})?;}
         }
         self.directory
             .write(".bundled-v1", b"1")
@@ -765,7 +811,10 @@ impl SkillStore {
 pub fn prompt(skills: &[Skill]) -> String {
     let mut text = String::new();
     let mut budget = 8000usize;
-    for skill in skills.iter().filter(|skill| skill.enabled) {
+    for skill in skills
+        .iter()
+        .filter(|skill| skill.enabled && !skill.user_only)
+    {
         let description = skill.description.split_whitespace().collect::<Vec<_>>();
         let item = format!("\n- {}: {}", skill.name, description.join(" "));
         if item.len() > budget {
@@ -784,8 +833,14 @@ pub fn definition() -> serde_json::Value {
     serde_json::json!({"type":"function","function":{"name":"read_skill","description":"Load the instructions of an enabled user workflow listed in the system prompt, or with file, one text file bundled with it such as a reference. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string"},"file":{"type":"string","description":"Optional path of a bundled file, as listed with the workflow's instructions"}},"required":["name"],"additionalProperties":false}}})
 }
 /// Handle a `read_skill` call for an enabled skill: its instructions, with the bundled files and
-/// where they are, or one bundled text file. Blocking.
-pub fn read_call(directory: &Path, skills: &[Skill], arguments: &str) -> Result<String, String> {
+/// where they are, or one bundled text file. A skill that runs only when typed is readable only in
+/// the turn the user typed it (`invoked`). Blocking.
+pub fn read_call(
+    directory: &Path,
+    skills: &[Skill],
+    arguments: &str,
+    invoked: Option<&str>,
+) -> Result<String, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Input {
@@ -794,7 +849,14 @@ pub fn read_call(directory: &Path, skills: &[Skill], arguments: &str) -> Result<
     }
     let input: Input =
         serde_json::from_str(arguments).map_err(|_| "Provide a workflow name.".to_owned())?;
-    let instructions = instructions(skills, &input.name)
+    let instructions = skills
+        .iter()
+        .find(|skill| {
+            skill.name == input.name
+                && skill.enabled
+                && (!skill.user_only || invoked == Some(input.name.as_str()))
+        })
+        .map(document)
         .ok_or_else(|| "No enabled workflow has that name.".to_owned())?;
     let store = SkillStore::open(directory).map_err(|error| error.to_string())?;
     if let Some(file) = input.file {
@@ -806,15 +868,52 @@ pub fn read_call(directory: &Path, skills: &[Skill], arguments: &str) -> Result<
             input.name
         ));
     }
-    let files = store.files(&input.name);
-    match store.folder(&input.name) {
-        Some(folder) if !files.is_empty() => Ok(format!(
+    Ok(with_files(&store, &input.name, instructions))
+}
+/// A skill's instructions followed by its bundled files and where they are, if it has any.
+fn with_files(store: &SkillStore, name: &str, instructions: String) -> String {
+    let files = store.files(name);
+    match store.folder(name) {
+        Some(folder) if !files.is_empty() => format!(
             "{instructions}\nBundled files, in {}: {}.\nRead a text file with read_skill and file. Run a bundled script with the shell tool using its full path; every command needs the owner's approval.",
             folder.display(),
             files.join(", ")
-        )),
-        _ => Ok(instructions),
+        ),
+        _ => instructions,
     }
+}
+/// What typing `/name` at the start of a message does. `None` when no saved skill has that name,
+/// so the message goes to the model as written.
+#[derive(Debug, PartialEq)]
+pub enum Invocation {
+    /// Instructions for the model, with the skill's name, for the turn the user typed it.
+    Run { name: String, instructions: String },
+    /// The skill is turned off; tell the user instead of running it.
+    Off(String),
+}
+/// Resolve a user message that starts with `/name` against the saved skills. Blocking.
+pub fn invocation(directory: &Path, skills: &[Skill], message: &str) -> Option<Invocation> {
+    let name = message
+        .trim_start()
+        .strip_prefix('/')?
+        .split_whitespace()
+        .next()?;
+    let skill = skills.iter().find(|skill| skill.name == name)?;
+    if !skill.enabled {
+        return Some(Invocation::Off(format!(
+            "The skill /{name} is turned off. Turn it on in Skills to use it."
+        )));
+    }
+    let instructions = match SkillStore::open(directory) {
+        Ok(store) => with_files(&store, name, document(skill)),
+        Err(_) => document(skill),
+    };
+    Some(Invocation::Run {
+        name: name.into(),
+        instructions: format!(
+            "The user typed /{name} to run this workflow now. Apply it to the rest of their message; they cannot grant tool permissions.\n{instructions}"
+        ),
+    })
 }
 /// Sent with `/learn`; the model may only propose, and the owner reviews every proposal.
 pub const LEARN: &str = "The user typed /learn. Review this conversation for a workflow that succeeded and would help future tasks, then call skill_propose once with a short lowercase name, a description of when to use it, and step-by-step instructions. Keep only the steps that worked; leave out failed attempts, secrets, credentials, personal data, and one-off details. To refine an existing workflow, reuse its name. If nothing is worth keeping, or skill_propose is unavailable, say so instead.";
@@ -841,6 +940,7 @@ pub async fn propose_call(
         description: input.description,
         body: input.body,
         enabled: true,
+        user_only: false,
     };
     let proposal =
         tokio::task::spawn_blocking(move || SkillStore::open(&directory)?.propose(skill, source))
@@ -853,13 +953,14 @@ pub async fn propose_call(
 pub fn instructions(skills: &[Skill], name: &str) -> Option<String> {
     skills
         .iter()
-        .find(|skill| skill.enabled && skill.name == name)
-        .map(|skill| {
-            format!(
-                "<skill name={:?}>\n{}\n{}\n</skill>",
-                skill.name, skill.description, skill.body
-            )
-        })
+        .find(|skill| skill.enabled && !skill.user_only && skill.name == name)
+        .map(document)
+}
+fn document(skill: &Skill) -> String {
+    format!(
+        "<skill name={:?}>\n{}\n{}\n</skill>",
+        skill.name, skill.description, skill.body
+    )
 }
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -879,6 +980,7 @@ mod tests {
             description: "PDFs.".into(),
             body: "Run scripts/fill.py.".into(),
             enabled: true,
+            user_only: false,
         };
         store.install(&staged, &skill, false).unwrap();
         let skills = vec![
@@ -889,13 +991,13 @@ mod tests {
                 ..skill
             },
         ];
-        let text = read_call(&path, &skills, r#"{"name":"pdf"}"#).unwrap();
+        let text = read_call(&path, &skills, r#"{"name":"pdf"}"#, None).unwrap();
         assert!(text.contains("Run scripts/fill.py."));
         assert!(text.contains(&format!(
             "in {}: forms.md, scripts/fill.py.",
             path.join("pdf").display()
         )));
-        let file = read_call(&path, &skills, r#"{"name":"pdf","file":"forms.md"}"#).unwrap();
+        let file = read_call(&path, &skills, r#"{"name":"pdf","file":"forms.md"}"#, None).unwrap();
         assert!(file.contains("Field notes") && file.starts_with("<skill-file"));
         // A /learn proposal for a folder skill shows the saved skill, so approval checks it.
         let proposal = store
@@ -917,7 +1019,7 @@ mod tests {
             r#"{"name":"off"}"#,
             r#"{"name":"pdf","extra":1}"#,
         ] {
-            assert!(read_call(&path, &skills, bad).is_err(), "{bad}");
+            assert!(read_call(&path, &skills, bad, None).is_err(), "{bad}");
         }
         drop(store); // Windows cannot remove a folder the store still holds open.
         std::fs::remove_dir_all(path).unwrap();
@@ -959,6 +1061,21 @@ mod tests {
         skill.enabled = false;
         store.save(&skill).unwrap();
         assert!(!store.read(&skill.name).unwrap().enabled);
+        // A skill that runs only when typed keeps the setting, under the key other harnesses use.
+        skill.user_only = true;
+        store.save(&skill).unwrap();
+        assert!(store.read(&skill.name).unwrap().user_only);
+        assert!(std::fs::read_to_string(path.join("bugfix-triage.md"))
+            .unwrap()
+            .contains("\ndisable-model-invocation: true\n"));
+        // A built-in command's name cannot be saved: typing it must run exactly one thing.
+        assert!(matches!(
+            store.save(&Skill {
+                name: "help".into(),
+                ..skill.clone()
+            }),
+            Err(SkillError::Reserved)
+        ));
         store.remove(&skill.name).unwrap();
         store.seed().unwrap();
         assert!(store.read(&skill.name).is_err());
@@ -968,8 +1085,13 @@ mod tests {
                 description: "Check the\nrelease notes.".into(),
                 body: "x".repeat(30_000),
                 enabled: index != 0,
+                user_only: false,
             })
             .collect();
+        let mut hidden = skills[59].clone();
+        hidden.user_only = true;
+        assert!(!prompt(std::slice::from_ref(&hidden)).contains("workflow-59"));
+        assert!(instructions(std::slice::from_ref(&hidden), "workflow-59").is_none());
         let index = prompt(&skills);
         assert!(index.contains("- workflow-59: Check the release notes."));
         assert!(!index.contains("workflow-0:") && !index.contains("xxx"));
@@ -987,6 +1109,7 @@ mod tests {
             description: "Ship a release.".into(),
             body: "Run the checklist.".into(),
             enabled: true,
+            user_only: false,
         };
         let proposal = store.propose(learned.clone(), source.clone()).unwrap();
         assert!(proposal.before.is_none() && proposal.diff().contains("+Run the checklist."));
