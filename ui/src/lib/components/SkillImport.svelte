@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ScanBadge from './ScanBadge.svelte';
   import { onDestroy, onMount } from 'svelte';
   import { persistence, type SkillImportCandidate, type SuggestedSkill } from '../persistence';
   export let onDone: (imported: number) => void;
@@ -9,7 +10,6 @@
   let replace: Record<string, boolean> = {};
   /** The owner chose to import despite scan findings. */
   let allowed: Record<string, boolean> = {};
-  let open: Record<string, boolean> = {};
   let getting: Record<string, boolean> = {};
   let downloads: string[] = [];
   let loaded = false;
@@ -202,28 +202,8 @@
               ? ` · ${files(candidate)}`
               : ''}
           </p>
-          {#if candidate.findings.length === 0}
-            <p class="badge clean">Scanned: no issues found</p>
-          {:else}
-            <button
-              class="badge warn"
-              aria-expanded={open[candidate.source] ?? false}
-              onclick={() => (open[candidate.source] = !open[candidate.source])}
-              >Scanned: {candidate.findings.length}
-              {candidate.findings.length === 1 ? 'warning' : 'warnings'}</button
-            >
-            {#if open[candidate.source]}
-              <ul class="findings" aria-label={`Scan warnings for ${candidate.skill.name}`}>
-                {#each candidate.findings as finding}
-                  <li>
-                    <span class={finding.severity}>{finding.severity}</span>
-                    <code>{finding.file}:{finding.line}</code>
-                    {finding.reason}
-                    <pre>{finding.excerpt}</pre>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
+          <ScanBadge findings={candidate.findings} name={candidate.skill.name} />
+          {#if candidate.findings.length > 0}
             {#if allowed[candidate.source]}
               <p class="note">Allowed by you despite the warnings.</p>
             {:else}
@@ -402,52 +382,6 @@
   }
   .meta {
     color: var(--text-muted);
-  }
-  .badge {
-    display: inline-block;
-    font-size: 11.5px;
-    margin-top: 8px;
-    padding: 3px 8px;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
-  }
-  .badge.clean {
-    color: var(--ok);
-  }
-  .badge.warn {
-    color: var(--warn);
-    background: transparent;
-  }
-  .findings {
-    list-style: none;
-    margin: 8px 0 0;
-    padding: 0;
-    font-size: 12px;
-  }
-  .findings li {
-    margin-bottom: 8px;
-  }
-  .findings span {
-    text-transform: uppercase;
-    font-size: 10.5px;
-    font-weight: 700;
-    margin-right: 6px;
-  }
-  .findings .high {
-    color: var(--err);
-  }
-  .findings .medium {
-    color: var(--warn);
-  }
-  .findings pre {
-    margin: 4px 0 0;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    font-size: 11.5px;
-    background: var(--bg-base);
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
   }
   .decide {
     display: flex;

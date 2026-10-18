@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type Skill, type SkillProposal } from '../persistence';
+  import { persistence, type Skill, type SkillFinding, type SkillProposal } from '../persistence';
   import Icon from './Icon.svelte';
+  import ScanBadge from './ScanBadge.svelte';
   import SkillImport from './SkillImport.svelte';
   import { platform } from '../platform';
   export let onClose: () => void;
@@ -9,6 +10,8 @@
   let skills: Skill[] = [];
   let warnings: string[] = [];
   let proposals: SkillProposal[] = [];
+  let scans: Record<string, SkillFinding[]> = {};
+  let proposalScans: Record<string, SkillFinding[]> = {};
   let drafts: Record<string, { description: string; body: string }> = {};
   let sourceMessages: Record<string, string> = {};
   let editing: Skill | null = null;
@@ -27,7 +30,9 @@
       })),
     ]);
     skills = result.skills;
+    scans = result.scans ?? {};
     proposals = pending.proposals;
+    proposalScans = ('scans' in pending && pending.scans) || {};
     warnings = [...result.warnings, ...pending.warnings];
     // Edits in progress are kept; new proposals start from the proposed text.
     drafts = Object.fromEntries(
@@ -235,6 +240,9 @@
             <article class="proposal">
               <strong>{proposal.skill.name}</strong>
               <small>{proposal.before ? 'Updates this skill' : 'New skill'}</small>
+              {#if proposalScans[proposal.id]}<div>
+                  <ScanBadge findings={proposalScans[proposal.id]} name={proposal.skill.name} />
+                </div>{/if}
               <p class="hint">
                 Source session: {proposal.source.sessionId}<br />Message: {proposal.source
                   .messageId}
@@ -283,17 +291,21 @@
           No skills yet. Add a workflow to use in future agent tasks.
         </p>{/if}
       {#each skills as skill (skill.name)}<article>
+          <div class="body">
+            <button
+              class="skill"
+              onclick={() => {
+                creating = false;
+                editing = { ...skill };
+              }}
+              ><strong>{skill.name}</strong>{#if skill.userOnly}{' '}<span class="typed"
+                  >Runs only when you type /{skill.name}</span
+                >{/if}
+              <p>{skill.description}</p></button
+            >
+            {#if scans[skill.name]}<ScanBadge findings={scans[skill.name]} name={skill.name} />{/if}
+          </div>
           <button
-            class="skill"
-            onclick={() => {
-              creating = false;
-              editing = { ...skill };
-            }}
-            ><strong>{skill.name}</strong>{#if skill.userOnly}{' '}<span class="typed"
-                >Runs only when you type /{skill.name}</span
-              >{/if}
-            <p>{skill.description}</p></button
-          ><button
             class:enabled={skill.enabled}
             class="toggle"
             disabled={busy}
@@ -416,8 +428,12 @@
     padding: 16px;
     margin: 10px 0;
   }
-  .skill {
+  .body {
     flex: 1;
+    min-width: 0;
+  }
+  .skill {
+    width: 100%;
     min-width: 0;
     text-align: left;
     background: transparent;

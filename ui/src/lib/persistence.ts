@@ -149,11 +149,22 @@ export const persistence = {
   migrate: (sessions: SessionSummary[]) => command<void>('migrate_sessions', { sessions }),
   preferences: () => command<Preferences>('load_preferences'),
   savePreferences: (preferences: Preferences) => command<void>('save_preferences', { preferences }),
-  skills: () => command<{ skills: Skill[]; warnings: string[] }>('list_skills'),
+  skills: () =>
+    command<{
+      skills: Skill[];
+      warnings: string[];
+      /** Safety-scan findings per skill name, rescanned on every listing. */
+      scans?: Record<string, SkillFinding[]>;
+    }>('list_skills'),
   saveSkill: (skill: Skill) => command<void>('save_skill', { skill }),
   removeSkill: (name: string) => command<void>('delete_skill', { name }),
   skillProposals: () =>
-    command<{ proposals: SkillProposal[]; warnings: string[] }>('list_skill_proposals'),
+    command<{
+      proposals: SkillProposal[];
+      warnings: string[];
+      /** Safety-scan findings per proposal ID. */
+      scans?: Record<string, SkillFinding[]>;
+    }>('list_skill_proposals'),
   approveSkillProposal: (id: string, description: string, body: string) =>
     command<void>('approve_skill_proposal', { id, description, body }),
   rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),

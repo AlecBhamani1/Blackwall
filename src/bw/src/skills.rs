@@ -27,11 +27,12 @@ pub async fn run(directory: &Path, args: &[String]) -> Result<(), String> {
                     "new skill"
                 };
                 println!(
-                    "{} [{kind}] {}\nSource: session {} / message {}\n{}",
+                    "{} [{kind}] {}\nSource: session {} / message {}\n{}\n{}",
                     proposal.id,
                     proposal.skill.name,
                     proposal.source.session_id,
                     proposal.source.message_id,
+                    scan_summary(&proposal.scan()),
                     crate::memory::visible(&proposal.diff())
                 );
             }
@@ -87,24 +88,7 @@ fn describe(candidate: &skill_import::ImportCandidate) {
                 .join(", ")
         );
     }
-    if candidate.findings.is_empty() {
-        println!("  Scan: no issues found");
-    } else {
-        println!("  Scan: {} warning(s)", candidate.findings.len());
-        for finding in &candidate.findings {
-            println!(
-                "    [{}] {}:{} {}\n      {}",
-                serde_json::to_value(finding.severity)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-                finding.file,
-                finding.line,
-                finding.reason,
-                crate::memory::visible(&finding.excerpt)
-            );
-        }
-    }
+    println!("{}", scan_summary(&candidate.findings));
     for note in &candidate.notes {
         println!("  {note}");
     }
@@ -149,6 +133,28 @@ fn import_one(
 /// Without a path, list skills found in other harnesses' folders. With one, import every skill
 /// there. Saved skills of the same name are kept unless `--replace` is given, and skills with scan
 /// findings are blocked unless `--allow-anyway` is given.
+/// The scan result as printed for an import candidate or a proposal: a clean line, or each finding.
+fn scan_summary(findings: &[blackwall_core::skill_scan::Finding]) -> String {
+    if findings.is_empty() {
+        return "  Scan: no issues found".into();
+    }
+    let mut text = format!("  Scan: {} warning(s)", findings.len());
+    for finding in findings {
+        text.push_str(&format!(
+            "\n    [{}] {}:{} {}\n      {}",
+            serde_json::to_value(finding.severity)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            finding.file,
+            finding.line,
+            finding.reason,
+            crate::memory::visible(&finding.excerpt)
+        ));
+    }
+    text
+}
+
 fn import(store: &SkillStore, args: &[String]) -> Result<(), String> {
     let replace = args.iter().any(|arg| arg == "--replace");
     let allow = args.iter().any(|arg| arg == "--allow-anyway");
