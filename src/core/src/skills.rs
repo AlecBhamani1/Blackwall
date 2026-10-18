@@ -685,13 +685,16 @@ impl SkillStore {
         let _writing = writing();
         let document = validate(skill)?;
         let result = (|| {
-            let folder = self
-                .directory
-                .open_dir(staged)
-                .map_err(|_| SkillError::File)?;
-            folder
-                .write(SKILL_FILE, document.as_bytes())
-                .map_err(|_| SkillError::File)?;
+            // Scoped so the handle is closed before the rename: Windows cannot rename an open folder.
+            {
+                let folder = self
+                    .directory
+                    .open_dir(staged)
+                    .map_err(|_| SkillError::File)?;
+                folder
+                    .write(SKILL_FILE, document.as_bytes())
+                    .map_err(|_| SkillError::File)?;
+            }
             let mut aside = None;
             if self.contains(&skill.name) {
                 if !replace {
@@ -870,6 +873,7 @@ mod tests {
         folder.create_dir_all("scripts").unwrap();
         folder.write("scripts/fill.py", "print('fill')").unwrap();
         folder.write("forms.md", "Field notes").unwrap();
+        drop(folder);
         let skill = Skill {
             name: "pdf".into(),
             description: "PDFs.".into(),
