@@ -300,7 +300,17 @@ pub async fn with_skills<T: Send + 'static>(
 pub async fn list_skills(app: AppHandle) -> Result<serde_json::Value, String> {
     with_skills(&app, |store| {
         let (skills, warnings) = store.list()?;
-        Ok(serde_json::json!({"skills":skills,"warnings":warnings}))
+        // Scanned on every listing, so a badge follows edits made here or on disk.
+        let scans: serde_json::Map<_, _> = skills
+            .iter()
+            .map(|skill| {
+                (
+                    skill.name.clone(),
+                    serde_json::json!(store.scan(&skill.name)),
+                )
+            })
+            .collect();
+        Ok(serde_json::json!({"skills":skills,"warnings":warnings,"scans":scans}))
     })
     .await
 }
@@ -319,7 +329,11 @@ pub async fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
 pub async fn list_skill_proposals(app: AppHandle) -> Result<serde_json::Value, String> {
     with_skills(&app, |store| {
         let (proposals, warnings) = store.proposals()?;
-        Ok(serde_json::json!({"proposals":proposals,"warnings":warnings}))
+        let scans: serde_json::Map<_, _> = proposals
+            .iter()
+            .map(|proposal| (proposal.id.clone(), serde_json::json!(proposal.scan())))
+            .collect();
+        Ok(serde_json::json!({"proposals":proposals,"warnings":warnings,"scans":scans}))
     })
     .await
 }
