@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { persistence, type Skill, type SkillProposal } from '../persistence';
   import Icon from './Icon.svelte';
+  import SkillImport from './SkillImport.svelte';
   import { platform } from '../platform';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
@@ -12,6 +13,8 @@
   let sourceMessages: Record<string, string> = {};
   let editing: Skill | null = null;
   let creating = false;
+  let importing = false;
+  let notice = '';
   let busy = false;
   let error = '';
   const desktop = persistence.available();
@@ -43,9 +46,7 @@
   async function showSource(proposal: SkillProposal) {
     try {
       const session = await persistence.load(proposal.source.sessionId);
-      const message = session?.messages.find(
-        (message) => message.id === proposal.source.messageId,
-      );
+      const message = session?.messages.find((message) => message.id === proposal.source.messageId);
       sourceMessages[proposal.id] = message
         ? message.content.slice(0, 2000) + (message.content.length > 2000 ? '\n[excerpt]' : '')
         : 'The source conversation or message is no longer available.';
@@ -145,6 +146,19 @@
   </header>
   <div class="content">
     {#if !desktop}<p>Skills are available in the installed Blackwall desktop app.</p>
+    {:else if importing}
+      <SkillImport
+        onCancel={() => {
+          importing = false;
+          // Some skills may have been imported before one failed.
+          void load().catch(() => (error = 'Your skills could not be refreshed.'));
+        }}
+        onDone={(imported) => {
+          importing = false;
+          notice = imported === 1 ? 'Imported 1 skill.' : `Imported ${imported} skills.`;
+          void load().catch(() => (error = 'Your skills could not be refreshed.'));
+        }}
+      />
     {:else if editing}
       <form onsubmit={save}>
         <label for="skill-name">Name</label><input
@@ -189,19 +203,29 @@
       </form>
     {:else}
       <div class="intro">
-        <span>Stored as Markdown files on this {platform.device}.</span><button
-          class="primary"
-          onclick={() => {
-            creating = true;
-            editing = { name: '', description: '', body: '', enabled: true };
-          }}>New skill</button
+        <span>Stored as Markdown files on this {platform.device}.</span><span class="buttons"
+          ><button
+            class="secondary"
+            onclick={() => {
+              notice = '';
+              importing = true;
+            }}>Import skills</button
+          ><button
+            class="primary"
+            onclick={() => {
+              creating = true;
+              editing = { name: '', description: '', body: '', enabled: true };
+            }}>New skill</button
+          ></span
         >
       </div>
+      {#if notice}<p role="status" class="notice">{notice}</p>{/if}
       {#if proposals.length}
         <section aria-label="Proposed skills" class="proposals">
           <h3>Pending review · {proposals.length}</h3>
           <p class="hint">
-            The agent proposed these after <code>/learn</code>. Nothing is used until you approve it.
+            The agent proposed these after <code>/learn</code>. Nothing is used until you approve
+            it.
           </p>
           {#each proposals as proposal (proposal.id)}
             <article class="proposal">
@@ -345,6 +369,15 @@
   }
   .actions > span {
     flex: 1;
+  }
+  .buttons {
+    display: flex;
+    gap: 8px;
+  }
+  .notice {
+    color: var(--ok);
+    font-size: 12px;
+    margin: 0 0 12px;
   }
   .primary,
   .secondary,

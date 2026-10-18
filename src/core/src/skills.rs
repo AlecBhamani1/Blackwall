@@ -50,6 +50,12 @@ pub enum SkillError {
     Pending,
     #[error("This proposal could not be read. Reject it by its ID.")]
     Invalid,
+    #[error("A skill with this name already exists. Choose to replace it, or rename one of them.")]
+    Exists,
+    #[error("A skill folder can hold at most 200 files and 5 MB.")]
+    Folder,
+    #[error("The safety scan found something in this skill. Review the findings, then allow or block it.")]
+    Flagged,
 }
 /// A learned skill waiting for owner review. `before` is the skill it would replace, so approval
 /// can refuse a proposal made against an older version.
@@ -85,6 +91,21 @@ impl SkillProposal {
 }
 const PROPOSALS: &str = ".proposals";
 static APPROVALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Saving, installing, replacing, and removing skills run one at a time in a process.
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A hidden folder name for staged or replaced skills, with the time it was made, so a sweep can
+/// tell its age even when a moved folder keeps an older modification time.
+fn leftover(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    format!("{prefix}{now}-{:016x}", rand::random::<u64>())
+}
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 const MAX_PROPOSALS: usize = 20;
 /// A proposal holds up to two skills; JSON escaping can grow each body several times.
 const MAX_PROPOSAL: usize = 256 * 1024;
@@ -129,9 +150,31 @@ pub fn parse(text: &str) -> Result<Skill, SkillError> {
         enabled: frontmatter.enabled,
     })
 }
+/// The saved file for a skill, after the same checks as reading one back.
+pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
+    validate_name(&skill.name)?;
+    let document = format!(
+        "---\nname: {}\ndescription: {}\nenabled: {}\n---\n\n{}\n",
+        skill.name,
+        serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
+        skill.enabled,
+        skill.body
+    );
+    parse(&document)?;
+    Ok(document)
+}
+/// A skill is `<name>.md`, or a folder `<name>/SKILL.md` with bundled files such as scripts and
+/// references, as imported from other harnesses.
 pub struct SkillStore {
     directory: Dir,
+    path: std::path::PathBuf,
 }
+const SKILL_FILE: &str = "SKILL.md";
+/// Bundled files a folder skill may hold, together.
+pub const MAX_FOLDER_FILES: usize = 200;
+pub const MAX_FOLDER_BYTES: u64 = 5 * 1024 * 1024;
+/// One bundled file the agent can read through `read_skill`.
+const MAX_BUNDLED_READ: u64 = 64 * 1024;
 impl SkillStore {
     pub fn open(path: &Path) -> Result<Self, SkillError> {
         if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -148,10 +191,125 @@ impl SkillStore {
         }
         #[cfg(not(unix))]
         std::fs::create_dir_all(path).map_err(|_| SkillError::File)?;
-        Ok(Self {
+        let store = Self {
             directory: Dir::open_ambient_dir(path, cap_std::ambient_authority())
                 .map_err(|_| SkillError::File)?,
-        })
+            path: path.to_owned(),
+        };
+        store.sweep();
+        Ok(store)
+    }
+    /// Remove staged or replaced folders an interrupted import left behind. Recent ones may belong
+    /// to an import still running in another process, so only those over an hour old go.
+    fn sweep(&self) {
+        let Ok(entries) = self.directory.entries() else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok).take(1000) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let made = name
+                .strip_prefix(".import-")
+                .or_else(|| name.strip_prefix(".replaced-"))
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let stale = made.is_some_and(|made| now.saturating_sub(made) > 3600);
+            if stale && (name.starts_with(".import-") || name.starts_with(".replaced-")) {
+                let _ = self
+                    .directory
+                    .remove_dir_all(&name)
+                    .or_else(|_| self.directory.remove_file(&name));
+            }
+        }
+    }
+    /// The skill's file, relative to the store: `<name>.md`, or `<name>/SKILL.md` for a real
+    /// folder (not a link).
+    fn file_of(&self, name: &str) -> Option<String> {
+        let single = format!("{name}.md");
+        if self.directory.symlink_metadata(&single).is_ok() {
+            return Some(single);
+        }
+        self.directory
+            .symlink_metadata(name)
+            .is_ok_and(|metadata| metadata.is_dir())
+            .then(|| format!("{name}/{SKILL_FILE}"))
+    }
+    /// The folder of a folder skill, for running its bundled scripts.
+    pub fn folder(&self, name: &str) -> Option<std::path::PathBuf> {
+        validate_name(name).ok()?;
+        self.file_of(name)
+            .filter(|file| file.ends_with(SKILL_FILE))
+            .map(|_| self.path.join(name))
+    }
+    /// Bundled files of a folder skill, as `/`-separated relative paths, sorted and bounded.
+    pub fn files(&self, name: &str) -> Vec<String> {
+        fn walk(directory: &Dir, prefix: &str, depth: usize, out: &mut Vec<String>) {
+            let Ok(entries) = directory.entries() else {
+                return;
+            };
+            let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                if out.len() >= MAX_FOLDER_FILES {
+                    return;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = format!("{prefix}{name}");
+                if kind.is_file() && path != SKILL_FILE {
+                    out.push(path);
+                } else if kind.is_dir() && depth < 8 {
+                    if let Ok(child) = entry.open_dir() {
+                        walk(&child, &format!("{path}/"), depth + 1, out);
+                    }
+                }
+            }
+        }
+        let mut out = vec![];
+        if self.folder(name).is_some() {
+            if let Ok(folder) = self.directory.open_dir(name) {
+                walk(&folder, "", 0, &mut out);
+            }
+        }
+        out
+    }
+    /// One bundled text file of a folder skill, bounded. Paths stay inside the folder.
+    pub fn read_file(&self, name: &str, file: &str) -> Result<String, SkillError> {
+        let relative = Path::new(file);
+        if self.folder(name).is_none()
+            || file.is_empty()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(SkillError::File);
+        }
+        let folder = self
+            .directory
+            .open_dir(name)
+            .map_err(|_| SkillError::File)?;
+        if !folder
+            .symlink_metadata(relative)
+            .map_err(|_| SkillError::File)?
+            .is_file()
+        {
+            return Err(SkillError::File);
+        }
+        let mut bytes = vec![];
+        folder
+            .open(relative)
+            .map_err(|_| SkillError::File)?
+            .take(MAX_BUNDLED_READ + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SkillError::File)?;
+        if bytes.len() as u64 > MAX_BUNDLED_READ {
+            return Err(SkillError::Limit);
+        }
+        String::from_utf8(bytes).map_err(|_| SkillError::Limit)
     }
     pub fn list(&self) -> Result<(Vec<Skill>, Vec<String>), SkillError> {
         let mut skills = vec![];
@@ -163,11 +321,22 @@ impl SkillStore {
             .take(200)
         {
             let entry = entry.map_err(|_| SkillError::File)?;
-            if !entry.file_type().map_err(|_| SkillError::File)?.is_file() {
-                continue;
-            }
+            let kind = entry.file_type().map_err(|_| SkillError::File)?;
             let filename = entry.file_name().to_string_lossy().into_owned();
-            let Some(name) = filename.strip_suffix(".md") else {
+            let name = if kind.is_file() {
+                match filename.strip_suffix(".md") {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else if kind.is_dir()
+                && !filename.starts_with('.')
+                && self
+                    .directory
+                    .try_exists(format!("{filename}/{SKILL_FILE}"))
+                    .unwrap_or(false)
+            {
+                filename.as_str()
+            } else {
                 continue;
             };
             match self.read(name) {
@@ -180,7 +349,7 @@ impl SkillStore {
     }
     pub fn read(&self, name: &str) -> Result<Skill, SkillError> {
         validate_name(name)?;
-        let filename = format!("{name}.md");
+        let filename = self.file_of(name).ok_or(SkillError::File)?;
         if !self
             .directory
             .symlink_metadata(&filename)
@@ -203,29 +372,74 @@ impl SkillStore {
         }
         Ok(skill)
     }
-    pub fn save(&self, skill: &Skill) -> Result<(), SkillError> {
-        validate_name(&skill.name)?;
-        let document = format!(
-            "---\nname: {}\ndescription: {}\nenabled: {}\n---\n\n{}\n",
-            skill.name,
-            serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
-            skill.enabled,
-            skill.body
-        );
-        parse(&document)?;
+    /// Whether a skill file or folder with this name exists, even one that cannot be read.
+    pub fn contains(&self, name: &str) -> bool {
+        validate_name(name).is_ok()
+            && (self
+                .directory
+                .symlink_metadata(format!("{name}.md"))
+                .is_ok()
+                || self.directory.symlink_metadata(name).is_ok())
+    }
+    /// Save a new skill, refusing to replace any existing file with that name, even one written
+    /// at the same moment.
+    pub fn create(&self, skill: &Skill) -> Result<(), SkillError> {
+        let _writing = writing();
+        let document = validate(skill)?;
+        if self.contains(&skill.name) {
+            return Err(SkillError::Exists);
+        }
+        let temporary = self.write_temporary(&document)?;
+        let linked =
+            self.directory
+                .hard_link(&temporary, &self.directory, format!("{}.md", skill.name));
+        let _ = self.directory.remove_file(&temporary);
+        linked.map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => SkillError::Exists,
+            _ => SkillError::File,
+        })
+    }
+    fn write_temporary(&self, document: &str) -> Result<String, SkillError> {
+        Self::write_temporary_in(&self.directory, document)
+    }
+    fn write_temporary_in(directory: &Dir, document: &str) -> Result<String, SkillError> {
         let temporary = format!(".skill-{:016x}", rand::random::<u64>());
         let result = (|| {
-            let mut file = self
-                .directory
+            let mut file = directory
                 .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
                 .map_err(|_| SkillError::File)?;
             file.write_all(document.as_bytes())
                 .map_err(|_| SkillError::File)?;
-            file.sync_all().map_err(|_| SkillError::File)?;
-            self.directory
-                .rename(&temporary, &self.directory, format!("{}.md", skill.name))
-                .map_err(|_| SkillError::File)
+            file.sync_all().map_err(|_| SkillError::File)
         })();
+        if result.is_err() {
+            let _ = directory.remove_file(&temporary);
+        }
+        result.map(|()| temporary)
+    }
+    pub fn save(&self, skill: &Skill) -> Result<(), SkillError> {
+        let _writing = writing();
+        let document = validate(skill)?;
+        // A folder skill keeps its bundled files; only its SKILL.md changes.
+        if self.folder(&skill.name).is_some() {
+            let folder = self
+                .directory
+                .open_dir(&skill.name)
+                .map_err(|_| SkillError::File)?;
+            let temporary = Self::write_temporary_in(&folder, &document)?;
+            let result = folder
+                .rename(&temporary, &folder, SKILL_FILE)
+                .map_err(|_| SkillError::File);
+            if result.is_err() {
+                let _ = folder.remove_file(temporary);
+            }
+            return result;
+        }
+        let temporary = self.write_temporary(&document)?;
+        let result = self
+            .directory
+            .rename(&temporary, &self.directory, format!("{}.md", skill.name))
+            .map_err(|_| SkillError::File);
         if result.is_err() {
             let _ = self.directory.remove_file(temporary);
         }
@@ -293,10 +507,10 @@ impl SkillStore {
     /// The current skill, or `None` only when no file exists; other failures block a change.
     fn current(&self, name: &str) -> Result<Option<Skill>, SkillError> {
         validate_name(name)?;
-        match self.directory.symlink_metadata(format!("{name}.md")) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            _ => self.read(name).map(Some),
+        if self.file_of(name).is_none() {
+            return Ok(None);
         }
+        self.read(name).map(Some)
     }
     /// Record a proposal without changing any skill. Its contents pass the same validation as a save.
     pub fn propose(
@@ -397,10 +611,135 @@ impl SkillStore {
             .map_err(|_| SkillError::Missing)
     }
     pub fn remove(&self, name: &str) -> Result<(), SkillError> {
+        let _writing = writing();
         validate_name(name)?;
+        if self.folder(name).is_some() {
+            return self
+                .directory
+                .remove_dir_all(name)
+                .map_err(|_| SkillError::File);
+        }
         self.directory
             .remove_file(format!("{name}.md"))
             .map_err(|_| SkillError::File)
+    }
+    /// A hidden folder to assemble a folder skill in before `install` moves it into place.
+    pub fn staging(&self) -> Result<(String, Dir), SkillError> {
+        let name = leftover(".import-");
+        self.directory
+            .create_dir(&name)
+            .and_then(|()| self.directory.open_dir(&name))
+            .map(|folder| (name, folder))
+            .map_err(|_| SkillError::File)
+    }
+    /// Replace any saved skill of this name, file or folder, with a single-file skill. The old one
+    /// is moved aside first and put back if the new one cannot be saved.
+    pub fn replace_with_file(&self, skill: &Skill) -> Result<(), SkillError> {
+        let _writing = writing();
+        let document = validate(skill)?;
+        let temporary = self.write_temporary(&document)?;
+        let old = if self.folder(&skill.name).is_some() {
+            Some(skill.name.clone())
+        } else {
+            self.contains(&skill.name)
+                .then(|| format!("{}.md", skill.name))
+        };
+        let trash = leftover(".replaced-");
+        if let Some(old) = &old {
+            if self.directory.rename(old, &self.directory, &trash).is_err() {
+                let _ = self.directory.remove_file(&temporary);
+                return Err(SkillError::File);
+            }
+        }
+        let moved = self
+            .directory
+            .rename(&temporary, &self.directory, format!("{}.md", skill.name))
+            .map_err(|_| SkillError::File);
+        match (&moved, &old) {
+            (Ok(()), Some(_)) => {
+                let _ = self
+                    .directory
+                    .remove_dir_all(&trash)
+                    .or_else(|_| self.directory.remove_file(&trash));
+            }
+            (Err(_), Some(old)) => {
+                let _ = self.directory.remove_file(&temporary);
+                let _ = self.directory.rename(&trash, &self.directory, old);
+            }
+            (Err(_), None) => {
+                let _ = self.directory.remove_file(&temporary);
+            }
+            (Ok(()), None) => {}
+        }
+        moved
+    }
+    /// Remove a staged folder that will not be installed.
+    pub fn discard(&self, staged: &str) {
+        if staged.starts_with(".import-") {
+            let _ = self.directory.remove_dir_all(staged);
+        }
+    }
+    /// Move a staged folder skill into place. A skill with this name is kept unless `replace`;
+    /// a replaced one is moved aside first and removed once the new one is in place.
+    pub fn install(&self, staged: &str, skill: &Skill, replace: bool) -> Result<(), SkillError> {
+        let _writing = writing();
+        let document = validate(skill)?;
+        let result = (|| {
+            // Scoped so the handle is closed before the rename: Windows cannot rename an open folder.
+            {
+                let folder = self
+                    .directory
+                    .open_dir(staged)
+                    .map_err(|_| SkillError::File)?;
+                folder
+                    .write(SKILL_FILE, document.as_bytes())
+                    .map_err(|_| SkillError::File)?;
+            }
+            let mut aside = None;
+            if self.contains(&skill.name) {
+                if !replace {
+                    return Err(SkillError::Exists);
+                }
+                let old = if self.folder(&skill.name).is_some() {
+                    skill.name.clone()
+                } else {
+                    format!("{}.md", skill.name)
+                };
+                let trash = leftover(".replaced-");
+                self.directory
+                    .rename(&old, &self.directory, &trash)
+                    .map_err(|_| SkillError::File)?;
+                aside = Some(trash);
+            }
+            let moved = self
+                .directory
+                .rename(staged, &self.directory, &skill.name)
+                .map_err(|_| SkillError::File);
+            if let Some(trash) = aside {
+                if moved.is_ok() {
+                    let _ = self
+                        .directory
+                        .remove_dir_all(&trash)
+                        .or_else(|_| self.directory.remove_file(&trash));
+                } else {
+                    let old = if self
+                        .directory
+                        .symlink_metadata(&trash)
+                        .is_ok_and(|m| m.is_dir())
+                    {
+                        skill.name.clone()
+                    } else {
+                        format!("{}.md", skill.name)
+                    };
+                    let _ = self.directory.rename(&trash, &self.directory, old);
+                }
+            }
+            moved
+        })();
+        if result.is_err() {
+            let _ = self.directory.remove_dir_all(staged);
+        }
+        result
     }
     pub fn seed(&self) -> Result<(), SkillError> {
         // A marker prevents deleted bundled skills from reappearing after relaunch.
@@ -442,7 +781,40 @@ pub fn prompt(skills: &[Skill]) -> String {
     }
 }
 pub fn definition() -> serde_json::Value {
-    serde_json::json!({"type":"function","function":{"name":"read_skill","description":"Load the instructions of an enabled user workflow listed in the system prompt. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}})
+    serde_json::json!({"type":"function","function":{"name":"read_skill","description":"Load the instructions of an enabled user workflow listed in the system prompt, or with file, one text file bundled with it such as a reference. Workflows never grant tool permissions.","parameters":{"type":"object","properties":{"name":{"type":"string"},"file":{"type":"string","description":"Optional path of a bundled file, as listed with the workflow's instructions"}},"required":["name"],"additionalProperties":false}}})
+}
+/// Handle a `read_skill` call for an enabled skill: its instructions, with the bundled files and
+/// where they are, or one bundled text file. Blocking.
+pub fn read_call(directory: &Path, skills: &[Skill], arguments: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        name: String,
+        file: Option<String>,
+    }
+    let input: Input =
+        serde_json::from_str(arguments).map_err(|_| "Provide a workflow name.".to_owned())?;
+    let instructions = instructions(skills, &input.name)
+        .ok_or_else(|| "No enabled workflow has that name.".to_owned())?;
+    let store = SkillStore::open(directory).map_err(|error| error.to_string())?;
+    if let Some(file) = input.file {
+        let text = store.read_file(&input.name, &file).map_err(|_| {
+            "That file is not a readable text file bundled with this workflow.".to_owned()
+        })?;
+        return Ok(format!(
+            "<skill-file skill={:?} path={file:?}>\n{text}\n</skill-file>",
+            input.name
+        ));
+    }
+    let files = store.files(&input.name);
+    match store.folder(&input.name) {
+        Some(folder) if !files.is_empty() => Ok(format!(
+            "{instructions}\nBundled files, in {}: {}.\nRead a text file with read_skill and file. Run a bundled script with the shell tool using its full path; every command needs the owner's approval.",
+            folder.display(),
+            files.join(", ")
+        )),
+        _ => Ok(instructions),
+    }
 }
 /// Sent with `/learn`; the model may only propose, and the owner reviews every proposal.
 pub const LEARN: &str = "The user typed /learn. Review this conversation for a workflow that succeeded and would help future tasks, then call skill_propose once with a short lowercase name, a description of when to use it, and step-by-step instructions. Keep only the steps that worked; leave out failed attempts, secrets, credentials, personal data, and one-off details. To refine an existing workflow, reuse its name. If nothing is worth keeping, or skill_propose is unavailable, say so instead.";
@@ -493,6 +865,88 @@ pub fn instructions(skills: &[Skill], name: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_call_lists_and_reads_bundled_files_of_enabled_skills() {
+        let path = std::env::temp_dir().join(format!("blackwall-skills-{}", rand::random::<u64>()));
+        let store = SkillStore::open(&path).unwrap();
+        let (staged, folder) = store.staging().unwrap();
+        folder.create_dir_all("scripts").unwrap();
+        folder.write("scripts/fill.py", "print('fill')").unwrap();
+        folder.write("forms.md", "Field notes").unwrap();
+        drop(folder);
+        let skill = Skill {
+            name: "pdf".into(),
+            description: "PDFs.".into(),
+            body: "Run scripts/fill.py.".into(),
+            enabled: true,
+        };
+        store.install(&staged, &skill, false).unwrap();
+        let skills = vec![
+            skill.clone(),
+            Skill {
+                name: "off".into(),
+                enabled: false,
+                ..skill
+            },
+        ];
+        let text = read_call(&path, &skills, r#"{"name":"pdf"}"#).unwrap();
+        assert!(text.contains("Run scripts/fill.py."));
+        assert!(text.contains(&format!(
+            "in {}: forms.md, scripts/fill.py.",
+            path.join("pdf").display()
+        )));
+        let file = read_call(&path, &skills, r#"{"name":"pdf","file":"forms.md"}"#).unwrap();
+        assert!(file.contains("Field notes") && file.starts_with("<skill-file"));
+        // A /learn proposal for a folder skill shows the saved skill, so approval checks it.
+        let proposal = store
+            .propose(
+                Skill {
+                    body: "Revised.".into(),
+                    ..skills[0].clone()
+                },
+                crate::storage::MemorySource {
+                    session_id: "session_1".into(),
+                    message_id: "message_1".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(proposal.before.unwrap().body, "Run scripts/fill.py.");
+        for bad in [
+            r#"{"name":"pdf","file":"../pdf/forms.md"}"#,
+            r#"{"name":"pdf","file":"missing.md"}"#,
+            r#"{"name":"off"}"#,
+            r#"{"name":"pdf","extra":1}"#,
+        ] {
+            assert!(read_call(&path, &skills, bad).is_err(), "{bad}");
+        }
+        drop(store); // Windows cannot remove a folder the store still holds open.
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn opening_removes_only_leftovers_over_an_hour_old() {
+        let path = std::env::temp_dir().join(format!("blackwall-skills-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for name in [
+            format!(".import-{}-a", now - 7200),
+            format!(".replaced-{}-b", now - 7200),
+            format!(".import-{now}-c"),
+            ".import-legacy".into(),
+        ] {
+            std::fs::create_dir_all(path.join(name)).unwrap();
+        }
+        SkillStore::open(&path).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [format!(".import-{now}-c"), ".import-legacy".into()]);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn malformed_skills_are_rejected_and_lifecycle_persists() {
         assert!(parse("no frontmatter").is_err());

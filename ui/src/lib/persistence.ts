@@ -78,6 +78,33 @@ export interface TraceSpan {
   attributes: Record<string, unknown>;
   events: string[];
 }
+export interface SkillFinding {
+  severity: 'medium' | 'high';
+  reason: string;
+  file: string;
+  line: number;
+  excerpt: string;
+}
+export interface SkillImportCandidate {
+  origin: string;
+  source: string;
+  skill: Skill | null;
+  error: string | null;
+  notes: string[];
+  exists: boolean;
+  files: string[];
+  license: string | null;
+  findings: SkillFinding[];
+}
+export interface SuggestedSkill {
+  name: string;
+  description: string;
+  repository: string;
+  path: string;
+  commit: string;
+  license: string;
+  saved: boolean;
+}
 export interface McpServer {
   name: string;
   command: string[];
@@ -128,6 +155,16 @@ export const persistence = {
   approveSkillProposal: (id: string, description: string, body: string) =>
     command<void>('approve_skill_proposal', { id, description, body }),
   rejectSkillProposal: (id: string) => command<void>('reject_skill_proposal', { id }),
+  findSkillImports: () => command<SkillImportCandidate[]>('find_skill_imports'),
+  chooseSkillImport: (folder: boolean) =>
+    command<SkillImportCandidate[] | null>('choose_skill_import', { folder }),
+  importSkill: (source: string, replace: boolean, allow: boolean) =>
+    command<Skill>('import_skill', { source, replace, allow }),
+  suggestedSkills: () => command<SuggestedSkill[]>('list_suggested_skills'),
+  getSuggestedSkill: (name: string) =>
+    command<SkillImportCandidate>('get_suggested_skill', { name }),
+  discardSkillDownloads: (sources: string[]) =>
+    command<void>('discard_skill_downloads', { sources }),
   traces: () => command<TraceSummary[]>('list_traces'),
   trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),

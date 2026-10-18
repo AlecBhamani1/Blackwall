@@ -197,6 +197,7 @@ impl Agent<'_> {
             None => Default::default(),
         };
         let mcp_directory = user_directory.map(std::path::Path::to_path_buf);
+        let skills_directory = user_directory.map(|directory| directory.join("skills"));
         let skills = match user_directory {
             Some(directory) => {
                 let directory = directory.join("skills");
@@ -487,6 +488,7 @@ impl Agent<'_> {
                     let command_tools = &command_tools;
                     let mcp = &mcp;
                     let skills = &skills;
+                    let skills_directory = &skills_directory;
                     let proposals = &proposals;
                     async move {
                         let tool_span = trace.map(|trace| {
@@ -559,17 +561,22 @@ impl Agent<'_> {
                                 None => Err(tools::ToolError::Denied),
                             }
                         } else if call.function.name == "read_skill" {
-                            serde_json::from_str::<Value>(&call.function.arguments)
-                                .ok()
-                                .and_then(|args| args["name"].as_str().map(str::to_owned))
-                                .ok_or(tools::ToolError::Arguments)
-                                .and_then(|name| {
-                                    crate::skills::instructions(skills, &name).ok_or_else(|| {
-                                        tools::ToolError::Execution(
-                                            "No enabled workflow has that name.".into(),
-                                        )
+                            match skills_directory {
+                                Some(directory) => {
+                                    let directory = directory.clone();
+                                    let skills = skills.to_vec();
+                                    let arguments = call.function.arguments.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        crate::skills::read_call(&directory, &skills, &arguments)
                                     })
-                                })
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        Err("Skills could not be accessed.".into())
+                                    })
+                                    .map_err(tools::ToolError::Execution)
+                                }
+                                None => Err(tools::ToolError::Denied),
+                            }
                         } else if call.function.name == "skill_propose" {
                             match proposals {
                                 Some((directory, source)) => crate::skills::propose_call(

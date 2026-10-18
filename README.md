@@ -93,6 +93,9 @@ reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
 `/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
 proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
+`bw skills import <path>` brings in `SKILL.md` skills from Claude Code, Codex, and other agents,
+and `bw skills get <name>` downloads a suggested one; each is scanned for hidden instructions and
+data leaks first.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
 `bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
 one as a tree; the desktop **Runs** panel shows the same traces. See

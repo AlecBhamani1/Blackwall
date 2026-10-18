@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Import skills written for Claude Code, Codex, and other agents in the `SKILL.md` format, with their
+  scripts and reference files, from the desktop Skills panel or `bw skills`. Skills in their usual
+  folders are listed, and nine suggested skills from the official Anthropic and OpenAI repositories
+  and Matt Pocock's skills download at reviewed versions. Every import is scanned locally for hidden
+  instructions and data leaks, and a skill with findings needs Allow anyway.
+
 - Choose read-only (default), workspace-write, or explicitly unsandboxed command execution in
   desktop Agent mode and CLI settings. macOS Seatbelt enforces filesystem restrictions and
   default-off network access for shells, command tools, and descendants; protects application data,

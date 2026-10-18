@@ -2,6 +2,7 @@
 use blackwall_core::storage::{LocalStore, MemoryEntry, StorageError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 pub async fn with_store<T: Send + 'static>(
     app: &AppHandle,
@@ -363,6 +364,134 @@ pub async fn read_trace(
     tokio::task::spawn_blocking(move || blackwall_core::trace::read(&directory, &id))
         .await
         .map_err(|_| "This trace could not be read.")?
+}
+
+/// Skills found in other harnesses' folders (Claude Code, Codex, Agent Skills), ready to review.
+#[tauri::command]
+pub async fn find_skill_imports(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::skill_import::ImportCandidate>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| "Your home folder could not be found.")?;
+    with_skills(&app, move |store| {
+        let mut found: Vec<_> = blackwall_core::skill_import::known_folders(&home)
+            .into_iter()
+            .flat_map(|(origin, folder)| blackwall_core::skill_import::scan(origin, &folder))
+            .collect();
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(found)
+    })
+    .await
+}
+/// Pick a skill file or folder to review for import. `None` when the picker is cancelled.
+#[tauri::command]
+pub async fn choose_skill_import(
+    app: AppHandle,
+    folder: bool,
+) -> Result<Option<Vec<blackwall_core::skill_import::ImportCandidate>>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let picker = app.clone();
+    let chosen = tokio::task::spawn_blocking(move || {
+        let dialog = picker.dialog().file().set_title("Choose skills to import");
+        if folder {
+            dialog.blocking_pick_folder()
+        } else {
+            dialog.add_filter("Skill", &["md"]).blocking_pick_file()
+        }
+    })
+    .await
+    .map_err(|_| "The picker could not open.")?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let path = chosen
+        .into_path()
+        .map_err(|_| "Choose a local file or folder.")?;
+    let origin = if folder {
+        "Chosen folder"
+    } else {
+        "Chosen file"
+    };
+    with_skills(&app, move |store| {
+        let mut found = blackwall_core::skill_import::scan(origin, &path);
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(Some(found))
+    })
+    .await
+}
+/// Import one skill found by `find_skill_imports`, `choose_skill_import`, or
+/// `get_suggested_skill`. `allow` is the owner's choice to import despite scan findings.
+#[tauri::command]
+pub async fn import_skill(
+    app: AppHandle,
+    source: String,
+    replace: bool,
+    allow: bool,
+) -> Result<blackwall_core::skills::Skill, String> {
+    let path = std::path::PathBuf::from(&source);
+    let skill = with_skills(&app, move |store| {
+        blackwall_core::skill_import::import(&store, &path, replace, allow)
+    })
+    .await?;
+    blackwall_core::skill_suggest::discard(std::path::Path::new(&source));
+    Ok(skill)
+}
+/// Suggested skills from the official repositories, marking ones already saved.
+#[tauri::command]
+pub async fn list_suggested_skills(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_skills(&app, |store| {
+        Ok(serde_json::json!(blackwall_core::skill_suggest::SUGGESTED
+            .iter()
+            .map(|suggested| {
+                let mut entry = serde_json::json!(suggested);
+                entry["saved"] = store.contains(suggested.name).into();
+                entry
+            })
+            .collect::<Vec<_>>()))
+    })
+    .await
+}
+/// Download a suggested skill at its reviewed version and scan it for review. Nothing is saved
+/// until `import_skill`.
+#[tauri::command]
+pub async fn get_suggested_skill(
+    app: AppHandle,
+    name: String,
+) -> Result<blackwall_core::skill_import::ImportCandidate, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let suggested = blackwall_core::skill_suggest::find(&name).ok_or("Unknown suggested skill.")?;
+    let source = blackwall_core::skill_suggest::download(suggested, &std::env::temp_dir()).await?;
+    let origin = suggested.repository;
+    let scanned = source.clone();
+    let found = with_skills(&app, move |store| {
+        let mut found = blackwall_core::skill_import::scan(origin, &scanned);
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(found)
+    })
+    .await;
+    match found.map(|mut found| found.pop()) {
+        Ok(Some(candidate)) => Ok(candidate),
+        Ok(None) => {
+            blackwall_core::skill_suggest::discard(&source);
+            Err("The downloaded skill could not be read.".into())
+        }
+        Err(error) => {
+            blackwall_core::skill_suggest::discard(&source);
+            Err(error)
+        }
+    }
+}
+/// Remove downloads that were reviewed but not imported.
+#[tauri::command]
+pub async fn discard_skill_downloads(sources: Vec<String>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for source in sources {
+            blackwall_core::skill_suggest::discard(std::path::Path::new(&source));
+        }
+    })
+    .await;
 }
 
 /// MCP edits share the CLI's validation; secret values go only to the credential store.
