@@ -328,7 +328,8 @@ edit, and delete are available; automatic fact extraction and a Postgres memory 
 The advanced context-window setting changes the displayed estimate, not the model server's configured
 context length or a guaranteed token budget.
 
-**Skills** manages reusable instructions stored as `~/.blackwall/skills/<name>.md`. Create, edit,
+**Skills** manages reusable instructions stored as `~/.blackwall/skills/<name>.md`, or as a folder
+`<name>/SKILL.md` with bundled files for an imported skill. Create, edit,
 enable/disable, and delete skills in the panel. Two starter workflows are seeded once:
 `repo-orientation` and `bugfix-triage`. Removing one does not recreate it on the next launch.
 
@@ -348,6 +349,15 @@ Agent runs list each enabled skill's name and description, within an 8,000-byte 
 model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
 usable.
 They cannot grant tool permissions.
+
+Type `/name` at the start of a message to run a saved skill directly, in an Agent chat, the CLI, or
+`bw run`. The agent gets that skill's instructions for the turn, and the rest of the message is the
+request, as in `/pdf fill form.pdf from data.json`. In the desktop app, typing `/` lists the
+commands and enabled skills. For a skill that should run only this way, check **Run only when I
+type /name** in the editor, or add `disable-model-invocation: true` to its frontmatter. Agent runs
+do not list such a skill, and `read_skill` cannot load it except in the turn you typed it. Typing
+`/name` for a disabled skill answers that it is turned off. A skill cannot take a built-in command's
+name, such as `help`, `learn`, or `review`.
 
 Type `/learn` in an Agent conversation to have the model propose a skill from the workflow that
 worked, leaving out failed attempts and secrets. The model can only propose: `skill_propose` stores
@@ -385,10 +395,14 @@ piped into a shell. Findings show the file, line, and text. A clean scan reads "
 found", which means none of these patterns matched, not that a skill is safe. A skill with findings
 is imported only if you choose **Allow anyway** (`--allow-anyway` in the CLI); **Block** drops it.
 The files are read and scanned again at import, so a change after the preview is caught.
+Saved skills and pending `/learn` proposals show the same badge in the Skills panel. Skills are
+rescanned each time the panel lists them, so the badge follows edits; `bw skills` shows the scan on
+pending proposals.
 
 The preview also shows the license, the bundled files, and what conversion changed. Names are
 converted to lowercase with hyphens, descriptions over 500 bytes are shortened, and settings such
-as `allowed-tools` are ignored, because skills never grant permissions. A saved skill is replaced
+as `allowed-tools` are ignored, because skills never grant permissions. `disable-model-invocation`
+is kept, so the skill runs only when you type its name. A saved skill is replaced
 only when you choose to (`--replace` in the CLI). The agent reads a skill's bundled text files
 through `read_skill`, and runs its scripts with the shell tool by their full path, so each command
 still needs your approval.

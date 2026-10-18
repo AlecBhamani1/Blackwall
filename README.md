@@ -48,7 +48,7 @@ a SmartScreen or Gatekeeper warning.
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
-  demand and can be proposed from a successful run with `/learn`
+  demand, run directly with `/name`, and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
@@ -95,7 +95,7 @@ Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their
 proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
 `bw skills import <path>` brings in `SKILL.md` skills from Claude Code, Codex, and other agents,
 and `bw skills get <name>` downloads a suggested one; each is scanned for hidden instructions and
-data leaks first.
+data leaks first. Type `/name` to run a saved skill directly, as in `/pdf fill form.pdf`.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
 `bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
 one as a tree; the desktop **Runs** panel shows the same traces. See
