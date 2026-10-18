@@ -919,6 +919,7 @@ mod tests {
         ] {
             assert!(read_call(&path, &skills, bad).is_err(), "{bad}");
         }
+        drop(store); // Windows cannot remove a folder the store still holds open.
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
