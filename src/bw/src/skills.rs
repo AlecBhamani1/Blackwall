@@ -251,26 +251,26 @@ mod tests {
             "blackwall-skill-import-{}-{unique}",
             std::process::id()
         ));
-        let source = root.join("source/review");
+        let source = root.join("source/review-diff");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(
             source.join("SKILL.md"),
-            "---\nname: review\ndescription: Review changes.\n---\nRead the diff.",
+            "---\nname: review-diff\ndescription: Review changes.\n---\nRead the diff.",
         )
         .unwrap();
         let store = SkillStore::open(&root.join("skills")).unwrap();
         let path = root.join("source").to_string_lossy().into_owned();
         import(&store, std::slice::from_ref(&path)).unwrap();
-        assert_eq!(store.read("review").unwrap().body, "Read the diff.");
+        assert_eq!(store.read("review-diff").unwrap().body, "Read the diff.");
         std::fs::write(
             source.join("SKILL.md"),
-            "---\nname: review\ndescription: Review changes.\n---\nRead it twice.",
+            "---\nname: review-diff\ndescription: Review changes.\n---\nRead it twice.",
         )
         .unwrap();
         import(&store, std::slice::from_ref(&path)).unwrap();
-        assert_eq!(store.read("review").unwrap().body, "Read the diff.");
+        assert_eq!(store.read("review-diff").unwrap().body, "Read the diff.");
         import(&store, &[path, "--replace".into()]).unwrap();
-        assert_eq!(store.read("review").unwrap().body, "Read it twice.");
+        assert_eq!(store.read("review-diff").unwrap().body, "Read it twice.");
         assert!(import(&store, &["a".into(), "b".into()]).is_err());
         drop(store); // Windows cannot remove a folder the store still holds open.
         std::fs::remove_dir_all(root).unwrap();

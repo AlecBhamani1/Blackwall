@@ -262,6 +262,50 @@ impl Agent<'_> {
         {
             instructions.push(json!({"role":"system","content":crate::skills::LEARN}));
         }
+        // `/name` runs a saved skill, including one hidden from the model's own list.
+        let mut invoked = None;
+        let typed = source
+            .last()
+            .filter(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .filter(|text| text.trim_start().starts_with('/'))
+            .map(str::to_owned);
+        if let (false, Some(directory), Some(text)) = (compact, &skills_directory, typed) {
+            let (directory, saved) = (directory.clone(), skills.clone());
+            match instruction_task(move || crate::skills::invocation(&directory, &saved, &text))
+                .await?
+            {
+                Some(crate::skills::Invocation::Run {
+                    name,
+                    instructions: text,
+                }) => {
+                    instructions.push(json!({"role":"system","content":text}));
+                    invoked = Some(name);
+                }
+                Some(crate::skills::Invocation::Off(answer)) => {
+                    (self.emit)(AgentEvent::AssistantDelta {
+                        request_id: request_id.into(),
+                        delta: answer.clone(),
+                    });
+                    state
+                        .transcript
+                        .push(json!({"role":"assistant","content":answer}));
+                    state.complete_source(&source, &answer);
+                    (self.emit)(AgentEvent::ContextUpdated {
+                        request_id: request_id.into(),
+                        state: state.clone(),
+                    });
+                    (self.emit)(AgentEvent::TurnComplete {
+                        request_id: request_id.into(),
+                        message: ChatMessage::new(MessageRole::Assistant, &answer),
+                        finish_reason: Some("stop".into()),
+                        usage: None,
+                    });
+                    return Ok(answer);
+                }
+                None => {}
+            }
+        }
 
         let mut definitions = tools::definitions(self.web_enabled, true);
         definitions.extend(command_tools.definitions());
@@ -273,7 +317,7 @@ impl Agent<'_> {
                 definitions.push(crate::memory::recall_definition());
             }
         }
-        if skills.iter().any(|skill| skill.enabled) {
+        if invoked.is_some() || skills.iter().any(|skill| skill.enabled && !skill.user_only) {
             definitions.push(crate::skills::definition());
         }
         if proposals.is_some() {
@@ -490,6 +534,7 @@ impl Agent<'_> {
                     let skills = &skills;
                     let skills_directory = &skills_directory;
                     let proposals = &proposals;
+                    let invoked = &invoked;
                     async move {
                         let tool_span = trace.map(|trace| {
                             let mut attributes = vec![
@@ -566,8 +611,14 @@ impl Agent<'_> {
                                     let directory = directory.clone();
                                     let skills = skills.to_vec();
                                     let arguments = call.function.arguments.clone();
+                                    let invoked = invoked.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        crate::skills::read_call(&directory, &skills, &arguments)
+                                        crate::skills::read_call(
+                                            &directory,
+                                            &skills,
+                                            &arguments,
+                                            invoked.as_deref(),
+                                        )
                                     })
                                     .await
                                     .unwrap_or_else(|_| {
@@ -1649,6 +1700,7 @@ mod tests {
                     description: "Ship a release.".into(),
                     body: "Run the release checklist.".into(),
                     enabled,
+                    user_only: false,
                 })
                 .unwrap();
         }
@@ -1670,6 +1722,119 @@ mod tests {
             "Loaded."
         );
         drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// Answers one of three turns: a plain message, `/release` typed, or a model call that must not happen.
+    struct TypedSkillModel {
+        typed: bool,
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for TypedSkillModel {
+        fn generate<'a>(
+            &'a self,
+            messages: &'a [Value],
+            definitions: &'a [Value],
+            _delta: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let system = messages
+                    .iter()
+                    .filter(|message| message["role"] == "system")
+                    .filter_map(|message| message["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let offered = definitions
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "read_skill");
+                if !self.typed {
+                    // A skill that runs only when typed is neither listed nor offered.
+                    assert!(!system.contains("release"));
+                    assert!(!offered);
+                    return Ok(ModelTurn {
+                        content: "Plain.".into(),
+                        ..Default::default()
+                    });
+                }
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    assert!(system.contains("The user typed /release"));
+                    assert!(system.contains("Run the release checklist."));
+                    assert!(offered);
+                    return Ok(ModelTurn {
+                        calls: vec![ToolCall {
+                            id: "typed".into(),
+                            function: ToolFunction {
+                                name: "read_skill".into(),
+                                arguments: r#"{"name":"release"}"#.into(),
+                            },
+                        }],
+                        ..Default::default()
+                    });
+                }
+                let output = messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == "typed")
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                assert!(output.contains("Run the release checklist."));
+                Ok(ModelTurn {
+                    content: "Released.".into(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn typed_skills_run_by_name_and_stay_hidden_from_the_model() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-typed-skill-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        let store = crate::skills::SkillStore::open(&directory.join("user/skills")).unwrap();
+        for (name, enabled) in [("release", true), ("draft", false)] {
+            store
+                .save(&crate::skills::Skill {
+                    name: name.into(),
+                    description: "Ship a release.".into(),
+                    body: "Run the release checklist.".into(),
+                    enabled,
+                    user_only: true,
+                })
+                .unwrap();
+        }
+        drop(store);
+        let run = |typed: bool, message: &'static str| {
+            let directory = directory.clone();
+            async move {
+                let model = TypedSkillModel {
+                    typed,
+                    step: Mutex::new(0),
+                };
+                let agent = Agent {
+                    backend: &model,
+                    workspace: Workspace::open(&directory.join("project")).unwrap(),
+                    web_enabled: false,
+                    approvals: Approvals::default(),
+                    emit: Arc::new(|_| {}),
+                };
+                agent
+                    .run_with_user_instructions(
+                        "typed",
+                        vec![json!({"role":"user","content":message})],
+                        Some(&directory.join("user")),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(run(false, "Summarize the changes.").await, "Plain.");
+        assert_eq!(run(true, "/release v2.1").await, "Released.");
+        // A turned-off skill answers without calling the model.
+        assert_eq!(
+            run(false, "/draft").await,
+            "The skill /draft is turned off. Turn it on in Skills to use it."
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
     struct LearnModel {

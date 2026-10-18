@@ -6,6 +6,7 @@
     mentionAtCaret,
     type AttachmentReference,
   } from '../attachmentReferences';
+  import { persistence } from '../persistence';
   import type { Attachment, PendingAttachment } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
   import Icon from './Icon.svelte';
@@ -28,12 +29,26 @@
   let mentionIndex = 0;
   let draftSessionId = sessionId;
   let attachmentNotice = '';
+  // Typing / at the start of a message lists the commands and saved skills it can run.
+  const BUILT_IN_COMMANDS = [
+    { name: 'compact', hint: 'Summarize older context' },
+    { name: 'context', hint: 'Show the context budget' },
+    { name: 'init', hint: 'Propose an AGENTS.md for this project' },
+    { name: 'learn', hint: 'Propose a skill from this conversation' },
+    { name: 'recall', hint: 'Search saved messages' },
+    { name: 'review', hint: 'Review Git changes' },
+  ];
+  let commands = BUILT_IN_COMMANDS;
+  let slash: string | null = null;
+  let slashIndex = 0;
 
   $: canSend = !disabled && !busy && !submitting && Boolean(text.trim() || attachments.length);
   $: references = attachmentReferences([...chatAttachments, ...attachments]);
   $: suggestions = mention
     ? references.filter(({ label }) => label.toLowerCase().includes(mention!.query.toLowerCase()))
     : [];
+  $: commandSuggestions =
+    slash === null ? [] : commands.filter(({ name }) => name.startsWith(slash!)).slice(0, 8);
   $: if (sessionId !== draftSessionId) {
     attachments.forEach(revokeAttachmentPreview);
     attachments = [];
@@ -46,6 +61,33 @@
   function updateMention() {
     mention = mentionAtCaret(text, textarea.selectionStart);
     mentionIndex = 0;
+    const typed = /^\/([a-z0-9-]*)$/.exec(text.slice(0, textarea.selectionStart));
+    if (typed && slash === null) void loadSkills();
+    slash = typed ? typed[1] : null;
+    slashIndex = 0;
+  }
+
+  async function loadSkills() {
+    try {
+      const { skills } = await persistence.skills();
+      const saved = skills
+        .filter((skill) => skill.enabled)
+        .map((skill) => ({ name: skill.name, hint: skill.description }));
+      commands = [...BUILT_IN_COMMANDS, ...saved].sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      commands = BUILT_IN_COMMANDS;
+    }
+  }
+
+  async function selectCommand(name: string) {
+    const after = text.slice(textarea.selectionStart);
+    const insertion = `/${name} `;
+    text = insertion + after;
+    slash = null;
+    await tick();
+    textarea.focus();
+    textarea.setSelectionRange(insertion.length, insertion.length);
+    resizeTextarea();
   }
 
   async function selectReference(reference: AttachmentReference) {
@@ -113,6 +155,7 @@
     if (!accepted) return;
     text = '';
     mention = null;
+    slash = null;
     attachments = [];
     attachmentNotice = '';
     await tick();
@@ -122,6 +165,26 @@
 
   function keydown(event: KeyboardEvent) {
     if (event.isComposing) return;
+    if (commandSuggestions.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        slashIndex =
+          (slashIndex + direction + commandSuggestions.length) % commandSuggestions.length;
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        void selectCommand((commandSuggestions[slashIndex] ?? commandSuggestions[0]).name);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        slash = null;
+        return;
+      }
+    }
     if (mention && suggestions.length) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault();
@@ -180,6 +243,23 @@
   <div class="composer" role="group" aria-label="Message composer">
     <AttachmentTray {attachments} removable onRemove={removeAttachment} />
 
+    {#if commandSuggestions.length > 0}
+      <div class="file-suggestions" id="command-suggestions" role="listbox" aria-label="Commands">
+        {#each commandSuggestions as command, index (command.name)}
+          <button
+            id={`command-suggestion-${index}`}
+            role="option"
+            aria-selected={index === slashIndex}
+            class:highlighted={index === slashIndex}
+            onmousedown={(event) => event.preventDefault()}
+            onclick={() => selectCommand(command.name)}
+          >
+            <span>/{command.name}</span><span class="command-hint">{command.hint}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     {#if suggestions.length > 0}
       <div
         class="file-suggestions"
@@ -208,10 +288,18 @@
       bind:value={text}
       rows="1"
       aria-label="Message Blackwall"
-      placeholder="Message Blackwall · @ to reference a file"
+      placeholder="Message Blackwall · @ to reference a file · / for commands"
       aria-autocomplete="list"
-      aria-controls={suggestions.length ? 'file-suggestions' : undefined}
-      aria-activedescendant={suggestions.length ? `file-suggestion-${mentionIndex}` : undefined}
+      aria-controls={commandSuggestions.length
+        ? 'command-suggestions'
+        : suggestions.length
+          ? 'file-suggestions'
+          : undefined}
+      aria-activedescendant={commandSuggestions.length
+        ? `command-suggestion-${slashIndex}`
+        : suggestions.length
+          ? `file-suggestion-${mentionIndex}`
+          : undefined}
       oninput={input}
       onclick={updateMention}
       onkeyup={(event) => {
@@ -453,6 +541,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .file-suggestions .command-hint {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-left: auto;
   }
 
   @media (max-width: 560px) {

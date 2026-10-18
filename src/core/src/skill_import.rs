@@ -150,7 +150,12 @@ pub fn convert(
     let ignored: Vec<_> = frontmatter
         .keys()
         .filter_map(serde_yaml_ng::Value::as_str)
-        .filter(|key| !matches!(*key, "name" | "description" | "enabled" | "license"))
+        .filter(|key| {
+            !matches!(
+                *key,
+                "name" | "description" | "enabled" | "license" | "disable-model-invocation"
+            )
+        })
         .collect();
     if !ignored.is_empty() {
         notes.push(format!(
@@ -166,7 +171,17 @@ pub fn convert(
             .get("enabled")
             .and_then(serde_yaml_ng::Value::as_bool)
             .unwrap_or(true),
+        // The loose parser reads every value as text, so accept "true" as well.
+        user_only: frontmatter
+            .get("disable-model-invocation")
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true")),
     };
+    if skill.user_only {
+        notes.push(format!(
+            "Runs only when you type /{}; the model does not use it on its own.",
+            skill.name
+        ));
+    }
     crate::skills::validate(&skill)?;
     let license = text_of("license").map(|value| value.chars().take(80).collect());
     Ok((skill, notes, license))
@@ -631,6 +646,22 @@ mod tests {
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].contains("PDF_Tools"));
         assert!(notes[1].contains("allowed-tools.") && !notes[1].contains("license"));
+        assert!(!skill.user_only);
+        // disable-model-invocation is kept: the skill runs only when the user types its name.
+        let (skill, notes, _) = convert(
+            "---\nname: deploy\ndescription: Deploy.\ndisable-model-invocation: true\n---\nShip it.",
+            "",
+        )
+        .unwrap();
+        assert!(skill.user_only);
+        assert_eq!(
+            notes,
+            ["Runs only when you type /deploy; the model does not use it on its own."]
+        );
+        assert!(matches!(
+            convert("---\nname: help\ndescription: Help.\n---\nBody", ""),
+            Err(SkillError::Reserved)
+        ));
         let long = format!("---\ndescription: {}\n---\nBody", "é".repeat(400));
         let (skill, notes, _) = convert(&long, "Folder Name").unwrap();
         assert_eq!(skill.name, "folder-name");
@@ -713,6 +744,7 @@ mod tests {
                 description: "Mine.".into(),
                 body: "Keep".into(),
                 enabled: true,
+                user_only: false,
             })
             .unwrap();
         let mut found = scan("Chosen folder", &source.0);

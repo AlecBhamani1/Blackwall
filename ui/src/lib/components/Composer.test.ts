@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { persistence } from '../persistence';
 import Composer from './Composer.svelte';
 
 function renderComposer(onSend = vi.fn().mockResolvedValue(true)) {
@@ -141,5 +142,27 @@ describe('Composer', () => {
     await rerender({ sessionId: 'second', chatAttachments: [] });
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
     expect(textbox).toHaveValue('');
+  });
+  it('lists commands and enabled skills after / and inserts the chosen one', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({
+      skills: [
+        { name: 'pdf', description: 'Fill PDFs.', body: 'b', enabled: true, userOnly: true },
+        { name: 'off', description: 'Off.', body: 'b', enabled: false },
+      ],
+      warnings: [],
+    });
+    const { onSend } = renderComposer();
+    const textbox = screen.getByRole('textbox', { name: 'Message Blackwall' });
+    await user.type(textbox, '/');
+    expect(await screen.findByRole('option', { name: /\/pdf/ })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /\/off/ })).not.toBeInTheDocument();
+    await user.type(textbox, 'pd');
+    expect(screen.getAllByRole('option')).toHaveLength(1);
+    await user.keyboard('{Enter}');
+    expect(textbox).toHaveValue('/pdf ');
+    expect(onSend).not.toHaveBeenCalled();
+    await user.type(textbox, 'fill this{Enter}');
+    expect(onSend).toHaveBeenCalledWith('/pdf fill this', []);
   });
 });

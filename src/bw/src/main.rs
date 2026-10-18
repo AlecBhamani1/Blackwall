@@ -31,6 +31,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /recall <words> [filters]  Search saved messages; same filters as bw sessions search
   /settings recall on|off   Enable or disable the agent recall tool (default off)
   /learn                    Propose a reusable skill from this conversation for review
+  /<skill> [request]        Run a saved skill now, including one that runs only when typed
   /context                  Show estimated budget and last server token usage
   /compact                  Summarize older context; retain the original transcript
   /settings context <n>     Configure model context limit in tokens
@@ -392,6 +393,12 @@ async fn chat(
                     "context" if value.is_empty() => {
                         conversation.context_report(store, directory, settings)
                     }
+                    // A saved skill's name runs it; the agent loads the skill for this turn.
+                    _ if saved_skill(directory, name) => {
+                        conversation
+                            .turn(store, directory, settings, line, Some(input))
+                            .await
+                    }
                     _ => slash(store, directory, settings, conversation, name, value),
                 }
             } else {
@@ -408,6 +415,12 @@ async fn chat(
             eprintln!("bw: {error}");
         }
     }
+}
+
+fn saved_skill(directory: &std::path::Path, name: &str) -> bool {
+    !blackwall_core::skills::COMMANDS.contains(&name)
+        && blackwall_core::skills::SkillStore::open(&directory.join("skills"))
+            .is_ok_and(|skills| skills.contains(name))
 }
 
 fn slash(

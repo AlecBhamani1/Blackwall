@@ -184,6 +184,10 @@
           required
           disabled={busy}
           placeholder="Describe the steps Blackwall should follow…"></textarea>
+        <label class="check"
+          ><input type="checkbox" bind:checked={editing.userOnly} disabled={busy} /> Run only when I
+          type /{editing.name || 'name'}</label
+        >
         <p class="hint">
           Enabled skills guide agent tasks. They never bypass approval for file changes, commands,
           or web access.
@@ -285,7 +289,9 @@
               creating = false;
               editing = { ...skill };
             }}
-            ><strong>{skill.name}</strong>
+            ><strong>{skill.name}</strong>{#if skill.userOnly}{' '}<span class="typed"
+                >Runs only when you type /{skill.name}</span
+              >{/if}
             <p>{skill.description}</p></button
           ><button
             class:enabled={skill.enabled}
@@ -297,8 +303,9 @@
         </article>{/each}
       <p class="hint">
         Agent runs list enabled skills by name and description and load one when it is relevant.
-        Keep descriptions specific and use a model that supports tools. Type <code>/learn</code>
-        after a task that worked to have the agent propose a skill from it.
+        Keep descriptions specific and use a model that supports tools. Type <code>/name</code> to
+        run a skill directly; a skill set to run only when typed waits for that. Type
+        <code>/learn</code> after a task that worked to have the agent propose a skill from it.
       </p>
     {/if}
     {#each warnings as warning}<p class="warning">{warning}</p>{/each}
@@ -419,6 +426,20 @@
   .skill strong {
     font-size: 13px;
     font-weight: 570;
+  }
+  .typed {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 8px;
+  }
+  label.check {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .check input {
+    width: auto;
+    margin: 0;
   }
   .skill p {
     color: var(--text-muted);
