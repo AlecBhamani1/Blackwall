@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5]
+
+Milestone: [v0.1.5](https://github.com/AlecBhamani1/Blackwall/milestone/2).
+Release preparation and acceptance limits: [0.1.5 notes](docs/releases/0.1.5.md).
+Publication is pending the checked production promotion.
+
 ### Added
 
 - Import skills written for Claude Code, Codex, and other agents in the `SKILL.md` format, with their
@@ -98,6 +104,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a pinned `npx` command; the list ships with the app and is not offered on Windows.
 
 ### Fixed
+
+- Update DOMPurify to 3.4.17 to include upstream sanitization security fixes.
 
 - Send Blackwall's instructions as one system message, first. Chat templates such as Qwen's reject
   any other system message, so Agent runs failed with HTTP 400 on vLLM servers.
