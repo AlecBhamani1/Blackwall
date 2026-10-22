@@ -54,30 +54,34 @@ afterEach(() => {
   delete window.__TAURI_INTERNALS__;
 });
 
-it('keeps mode and project locked, separates histories, and resets and restores Agent projects', async () => {
+it('uses only sidebar modes, separates histories, and resets and restores locked Agent projects', async () => {
   const user = userEvent.setup();
   render(App);
   const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
-  const modes = within(screen.getByLabelText('Conversation mode'));
   const historyModes = within(screen.getByLabelText('History mode'));
   await screen.findByRole('combobox', { name: 'Model' });
+  expect(screen.getAllByRole('button', { name: 'Chat' })).toHaveLength(1);
+  expect(screen.getAllByRole('button', { name: 'Agent' })).toHaveLength(1);
   expect(screen.queryByRole('button', { name: 'Choose project folder' })).not.toBeInTheDocument();
   await user.type(input, 'Plain conversation{Enter}');
-  await waitFor(() => expect(modes.getByRole('button', { name: 'Agent' })).toBeDisabled());
+  await screen.findByRole('button', { name: /Plain conversation/ });
   await fireEvent.click(historyModes.getByRole('button', { name: 'Agent' }));
   await screen.findByRole('button', { name: 'Choose project folder' });
   expect(screen.queryByRole('button', { name: /Plain conversation/ })).not.toBeInTheDocument();
   await fireEvent.click(screen.getByRole('button', { name: 'Choose project folder' }));
   await user.type(input, 'Project task{Enter}');
   await waitFor(() => expect(screen.getByRole('button', { name: 'demo' })).toBeDisabled());
-  expect(modes.getByRole('button', { name: 'Chat' })).toBeDisabled();
+  expect(historyModes.getByRole('button', { name: 'Agent' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
   expect(vi.mocked(localModelClient.streamChat).mock.calls.at(-1)?.[0]).toMatchObject({
     agentMode: true,
     workspace: '/projects/demo',
   });
   await fireEvent.click(screen.getByRole('button', { name: /New chat/ }));
   expect(await screen.findByRole('button', { name: 'Choose project folder' })).toBeEnabled();
-  expect(modes.getByRole('button', { name: 'Agent' })).toHaveClass('active');
+  expect(historyModes.getByRole('button', { name: 'Agent' })).toHaveClass('active');
   await fireEvent.click(screen.getByRole('button', { name: /Project task/ }));
   expect(await screen.findByRole('button', { name: 'demo' })).toBeDisabled();
   await fireEvent.click(historyModes.getByRole('button', { name: 'Chat' }));
@@ -92,7 +96,7 @@ it('sends the selected command boundary and resets full access on a new session'
   const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
   await screen.findByRole('combobox', { name: 'Model' });
   await fireEvent.click(
-    within(screen.getByLabelText('Conversation mode')).getByRole('button', { name: 'Agent' }),
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
   );
   const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
   const network = screen.getByRole('checkbox', { name: 'Command network' });

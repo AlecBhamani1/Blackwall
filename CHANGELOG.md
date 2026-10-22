@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Use the Chat and Agent selector beneath Blackwall in the sidebar; remove the duplicate selector
+  above the conversation.
+
 ## [0.1.5]
 
 Milestone: [v0.1.5](https://github.com/AlecBhamani1/Blackwall/milestone/2).
