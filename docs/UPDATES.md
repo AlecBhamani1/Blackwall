@@ -42,6 +42,12 @@ Beta and stable replace the same application and use the same local data. An old
 may not understand data formats introduced by a future beta; back up local data before testing
 versions that change storage formats.
 
+The 0.1.5 batch (including its betas) upgrades the shared SQLite database from schema version 2
+to 4 for reviewed memories and message search. Back up the application data before first launch.
+Version 0.1.4 refuses the upgraded database. Selecting Stable and installing 0.1.4 does not undo
+the migration: returning to it requires restoring a pre-upgrade backup and discards later changes.
+See the [0.1.5 acceptance notes](releases/0.1.5.md) before testing that return path.
+
 ## Platform updater bundles
 
 | Updater platform | Signed update bundle | Other downloads |
