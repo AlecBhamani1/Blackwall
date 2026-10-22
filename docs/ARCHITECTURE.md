@@ -113,7 +113,8 @@ sharing](SHARING.md) for deployment and the complete threat model.
   skills, web policy, and sharing protocol. It does not depend on Tauri or Svelte.
 - `src/relay/` owns the separately deployable public HTTP/WebSocket edge and keeps sessions only in
   memory.
-- `src/bw/` runs and resumes core agent tasks from the command line with explicit terminal approvals.
+- `src/bw/` runs and resumes core agent tasks from the command line with explicit terminal approvals,
+  or headlessly with JSON output and prompts denied.
 
 Model/tool events use `blackwall://event`; setup download progress uses `blackwall://download`.
 Both carry a request identifier.
@@ -134,8 +135,8 @@ are not stored. Browser-only development history keeps metadata without the full
 ## Current persistence and trust model
 
 Native history, preferences, and user-approved memory use versioned SQLite. Markdown skills live
-in a restricted local directory. The platform credential store holds model/relay secrets and the
-optional app-lock verifier.
+in a restricted local directory. The platform credential store holds model/relay secrets, MCP server
+secrets, and the optional app-lock verifier.
 The data lifecycle and lock limits are described below.
 
 The configured model machine and the self-hosted relay are inside the user's trust boundary. Do not
@@ -161,7 +162,7 @@ project are rejected. Literal search is bounded and skips dependency folders. Ed
 diff and compare the original file again before an atomic replacement.
 
 Shell actions display the exact command and working directory. They run with the user's account
-permissions, **without an OS sandbox**. Each command has a two-minute deadline, separate 64 KiB
+permissions, **without an OS sandbox**. Each command has a configurable deadline (two minutes by default), separate 64 KiB
 stdout/stderr limits, and a process-group guard that kills descendants on cancellation. Known model,
 relay, and signing secrets are removed from the inherited environment. Other account access remains
 possible and is covered by the explicit command approval.
@@ -183,8 +184,12 @@ retains supported attachment payloads. Migration is transactional and marked onc
 is retained as a fallback copy. Preferences patches use an immediate SQLite transaction. The UI queues
 failed writes in order and exposes retry/export without discarding the pending operations.
 
-`~/.blackwall/skills/*.md` contains validated YAML-frontmatter Markdown skills. Enabled instructions
-enter agent context under a bounded budget. Only user-saved facts enter memory; automatic learning
+`~/.blackwall/skills/*.md` contains validated YAML-frontmatter Markdown skills. Agent context lists
+enabled skills by name and description under a bounded budget, and the model loads one with
+`read_skill`. After `/learn`, `skill_propose` records a proposal under `skills/.proposals`; nothing
+is loaded until the owner approves it, and approval refuses a skill that changed after the proposal.
+`policy.json`, `tools.json`, and `mcp.json` in the data folder hold owner rules, command tools, and
+MCP servers; projects cannot supply them. Only user-saved facts enter memory; automatic learning
 and the optional Postgres adapter are not implemented. Guests never receive owner memory, skills,
 workspace tools, or conversation history.
 

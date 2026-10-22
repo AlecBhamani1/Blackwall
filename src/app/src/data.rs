@@ -2,6 +2,7 @@
 use blackwall_core::storage::{LocalStore, MemoryEntry, StorageError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 pub async fn with_store<T: Send + 'static>(
     app: &AppHandle,
@@ -53,6 +54,18 @@ pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {
     with_store(&app, |store| store.list_sessions()).await
 }
 #[tauri::command]
+pub async fn search_sessions(
+    app: AppHandle,
+    query: blackwall_core::storage::RecallQuery,
+) -> Result<blackwall_core::storage::RecallResults, String> {
+    let results = with_store(&app, move |store| {
+        store.search_messages(blackwall_core::memory::MemoryClient::Desktop, &query)
+    })
+    .await?;
+    crate::auth::require_unlocked(&app).await?;
+    Ok(results)
+}
+#[tauri::command]
 pub async fn load_session(app: AppHandle, id: String) -> Result<Option<Value>, String> {
     with_store(&app, move |store| store.load_session(&id)).await
 }
@@ -82,6 +95,50 @@ pub async fn delete_memory(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn list_memory_proposals(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::storage::MemoryProposal>, String> {
+    with_store(&app, |store| store.memory_proposals()).await
+}
+#[tauri::command]
+pub async fn approve_memory_proposal(
+    app: AppHandle,
+    id: String,
+    content: Option<String>,
+) -> Result<(), String> {
+    with_store(&app, move |store| {
+        store.approve_memory(&id, content.as_deref())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn reject_memory_proposal(app: AppHandle, id: String) -> Result<(), String> {
+    with_store(&app, move |store| store.reject_memory(&id)).await
+}
+
+/// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
+pub(crate) async fn trace_options(
+    directory: std::path::PathBuf,
+) -> blackwall_core::trace::TraceOptions {
+    let saved = tokio::task::spawn_blocking(move || {
+        LocalStore::open(&directory)
+            .ok()?
+            .setting("preferences")
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    blackwall_core::trace::TraceOptions {
+        enabled: saved["tracesEnabled"].as_bool().unwrap_or(true),
+        content: saved["traceContent"].as_bool().unwrap_or(false),
+    }
+}
+
+#[tauri::command]
 pub async fn load_preferences(app: AppHandle) -> Result<Value, String> {
     with_store(&app, |store| {
         Ok(store
@@ -104,7 +161,14 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "connectionName"
                 | "relayUrl"
                 | "contextWindow"
+                | "outputTokens"
+                | "autoCompact"
+                | "maxIterations"
+                | "commandTimeoutSeconds"
                 | "memoryEnabled"
+                | "recallEnabled"
+                | "tracesEnabled"
+                | "traceContent"
                 | "workspace"
                 | "connections"
         )
@@ -126,6 +190,30 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         }
     }
     if object
+        .get("autoCompact")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid automatic compaction setting.".into());
+    }
+    if object
+        .get("outputTokens")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=32768).contains(&n)))
+    {
+        return Err("Choose an output reserve between 1 and 32,768 tokens.".into());
+    }
+    if object
+        .get("maxIterations")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=100).contains(&n)))
+    {
+        return Err("Choose an iteration limit between 1 and 100.".into());
+    }
+    if object
+        .get("commandTimeoutSeconds")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (10..=3600).contains(&n)))
+    {
+        return Err("Choose a command time limit between 10 and 3,600 seconds.".into());
+    }
+    if object
         .values()
         .any(|v| v.as_str().is_some_and(|s| s.len() > 2048))
     {
@@ -136,6 +224,18 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|value| !value.is_boolean())
     {
         return Err("Invalid memory setting.".into());
+    }
+    if object
+        .get("recallEnabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("Invalid recall setting.".into());
+    }
+    if ["tracesEnabled", "traceContent"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_boolean()))
+    {
+        return Err("Invalid trace setting.".into());
     }
     for key in ["model", "connectionName", "relayUrl", "workspace"] {
         if object.get(key).is_some_and(|value| !value.is_string()) {
@@ -200,7 +300,17 @@ pub async fn with_skills<T: Send + 'static>(
 pub async fn list_skills(app: AppHandle) -> Result<serde_json::Value, String> {
     with_skills(&app, |store| {
         let (skills, warnings) = store.list()?;
-        Ok(serde_json::json!({"skills":skills,"warnings":warnings}))
+        // Scanned on every listing, so a badge follows edits made here or on disk.
+        let scans: serde_json::Map<_, _> = skills
+            .iter()
+            .map(|skill| {
+                (
+                    skill.name.clone(),
+                    serde_json::json!(store.scan(&skill.name)),
+                )
+            })
+            .collect();
+        Ok(serde_json::json!({"skills":skills,"warnings":warnings,"scans":scans}))
     })
     .await
 }
@@ -214,6 +324,275 @@ pub async fn save_skill(
 #[tauri::command]
 pub async fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
     with_skills(&app, move |store| store.remove(&name)).await
+}
+#[tauri::command]
+pub async fn list_skill_proposals(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_skills(&app, |store| {
+        let (proposals, warnings) = store.proposals()?;
+        let scans: serde_json::Map<_, _> = proposals
+            .iter()
+            .map(|proposal| (proposal.id.clone(), serde_json::json!(proposal.scan())))
+            .collect();
+        Ok(serde_json::json!({"proposals":proposals,"warnings":warnings,"scans":scans}))
+    })
+    .await
+}
+/// Approve a proposal, with the owner's edited description and instructions when given.
+#[tauri::command]
+pub async fn approve_skill_proposal(
+    app: AppHandle,
+    id: String,
+    description: String,
+    body: String,
+) -> Result<(), String> {
+    with_skills(&app, move |store| {
+        store
+            .approve_edited(&id, Some((description, body)))
+            .map(|_| ())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn reject_skill_proposal(app: AppHandle, id: String) -> Result<(), String> {
+    with_skills(&app, move |store| store.reject(&id)).await
+}
+
+/// The 50 newest agent-run traces. Each file is parsed, so the list stays short.
+#[tauri::command]
+pub async fn list_traces(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::trace::TraceSummary>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::list(&directory, 50))
+        .await
+        .map_err(|_| "Traces could not be read.".into())
+}
+#[tauri::command]
+pub async fn read_trace(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<blackwall_core::trace::SpanView>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    tokio::task::spawn_blocking(move || blackwall_core::trace::read(&directory, &id))
+        .await
+        .map_err(|_| "This trace could not be read.")?
+}
+
+/// Skills found in other harnesses' folders (Claude Code, Codex, Agent Skills), ready to review.
+#[tauri::command]
+pub async fn find_skill_imports(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::skill_import::ImportCandidate>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| "Your home folder could not be found.")?;
+    with_skills(&app, move |store| {
+        let mut found: Vec<_> = blackwall_core::skill_import::known_folders(&home)
+            .into_iter()
+            .flat_map(|(origin, folder)| blackwall_core::skill_import::scan(origin, &folder))
+            .collect();
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(found)
+    })
+    .await
+}
+/// Pick a skill file or folder to review for import. `None` when the picker is cancelled.
+#[tauri::command]
+pub async fn choose_skill_import(
+    app: AppHandle,
+    folder: bool,
+) -> Result<Option<Vec<blackwall_core::skill_import::ImportCandidate>>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let picker = app.clone();
+    let chosen = tokio::task::spawn_blocking(move || {
+        let dialog = picker.dialog().file().set_title("Choose skills to import");
+        if folder {
+            dialog.blocking_pick_folder()
+        } else {
+            dialog.add_filter("Skill", &["md"]).blocking_pick_file()
+        }
+    })
+    .await
+    .map_err(|_| "The picker could not open.")?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let path = chosen
+        .into_path()
+        .map_err(|_| "Choose a local file or folder.")?;
+    let origin = if folder {
+        "Chosen folder"
+    } else {
+        "Chosen file"
+    };
+    with_skills(&app, move |store| {
+        let mut found = blackwall_core::skill_import::scan(origin, &path);
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(Some(found))
+    })
+    .await
+}
+/// Import one skill found by `find_skill_imports`, `choose_skill_import`, or
+/// `get_suggested_skill`. `allow` is the owner's choice to import despite scan findings.
+#[tauri::command]
+pub async fn import_skill(
+    app: AppHandle,
+    source: String,
+    replace: bool,
+    allow: bool,
+) -> Result<blackwall_core::skills::Skill, String> {
+    let path = std::path::PathBuf::from(&source);
+    let skill = with_skills(&app, move |store| {
+        blackwall_core::skill_import::import(&store, &path, replace, allow)
+    })
+    .await?;
+    blackwall_core::skill_suggest::discard(std::path::Path::new(&source));
+    Ok(skill)
+}
+/// Suggested skills from the official repositories, marking ones already saved.
+#[tauri::command]
+pub async fn list_suggested_skills(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_skills(&app, |store| {
+        Ok(serde_json::json!(blackwall_core::skill_suggest::SUGGESTED
+            .iter()
+            .map(|suggested| {
+                let mut entry = serde_json::json!(suggested);
+                entry["saved"] = store.contains(suggested.name).into();
+                entry
+            })
+            .collect::<Vec<_>>()))
+    })
+    .await
+}
+/// Download a suggested skill at its reviewed version and scan it for review. Nothing is saved
+/// until `import_skill`.
+#[tauri::command]
+pub async fn get_suggested_skill(
+    app: AppHandle,
+    name: String,
+) -> Result<blackwall_core::skill_import::ImportCandidate, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let suggested = blackwall_core::skill_suggest::find(&name).ok_or("Unknown suggested skill.")?;
+    let source = blackwall_core::skill_suggest::download(suggested, &std::env::temp_dir()).await?;
+    let origin = suggested.repository;
+    let scanned = source.clone();
+    let found = with_skills(&app, move |store| {
+        let mut found = blackwall_core::skill_import::scan(origin, &scanned);
+        blackwall_core::skill_import::mark(&store, &mut found);
+        Ok(found)
+    })
+    .await;
+    match found.map(|mut found| found.pop()) {
+        Ok(Some(candidate)) => Ok(candidate),
+        Ok(None) => {
+            blackwall_core::skill_suggest::discard(&source);
+            Err("The downloaded skill could not be read.".into())
+        }
+        Err(error) => {
+            blackwall_core::skill_suggest::discard(&source);
+            Err(error)
+        }
+    }
+}
+/// Remove downloads that were reviewed but not imported.
+#[tauri::command]
+pub async fn discard_skill_downloads(sources: Vec<String>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for source in sources {
+            blackwall_core::skill_suggest::discard(std::path::Path::new(&source));
+        }
+    })
+    .await;
+}
+
+/// MCP edits share the CLI's validation; secret values go only to the credential store.
+/// Like saved model keys, the lock is checked first and not held, so a credential store prompt
+/// cannot stall the rest of the app.
+async fn with_mcp<T: Send + 'static>(
+    app: &AppHandle,
+    operation: impl FnOnce(&std::path::Path) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    crate::auth::require_unlocked(app).await?;
+    let directory = crate::identity::data_directory(app)?;
+    tokio::task::spawn_blocking(move || operation(&directory))
+        .await
+        .map_err(|_| "The MCP task could not finish.")?
+}
+#[tauri::command]
+pub async fn list_mcp_servers(app: AppHandle) -> Result<serde_json::Value, String> {
+    with_mcp(&app, |directory| {
+        Ok(serde_json::json!(blackwall_core::mcp::read_config(
+            directory
+        )?))
+    })
+    .await
+}
+#[tauri::command]
+pub async fn add_mcp_server(app: AppHandle, name: String, command: String) -> Result<(), String> {
+    let command = command.split_whitespace().map(str::to_owned).collect();
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::add_server(directory, &name, command).map(|_| ())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn set_mcp_server_enabled(
+    app: AppHandle,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::set_enabled(directory, &name, enabled)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn remove_mcp_server(app: AppHandle, name: String) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::remove_server(directory, &name)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn save_mcp_secret(
+    app: AppHandle,
+    name: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::save_secret(directory, &name, &key, &value)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn list_mcp_tool_rules(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::policy::ToolRule>, String> {
+    with_mcp(&app, |directory| {
+        blackwall_core::policy::tool_rules(directory)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn remove_mcp_tool_rule(
+    app: AppHandle,
+    rule: blackwall_core::policy::ToolRule,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::policy::remove_tool_rule(directory, &rule)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn delete_mcp_secret(app: AppHandle, name: String, key: String) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::delete_secret(directory, &name, &key)
+    })
+    .await
 }
 
 #[cfg(test)]

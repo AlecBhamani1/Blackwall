@@ -8,6 +8,7 @@ import { ModelRequestError, nativeModelError } from './modelError';
 afterEach(() => {
   delete window.__TAURI_INTERNALS__;
   vi.resetAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('native chat failure boundary', () => {
@@ -18,6 +19,8 @@ describe('native chat failure boundary', () => {
     await localModelClient.streamChat(
       {
         requestId: 'agent-test',
+        sessionId: 'session-test',
+        sourceMessageId: 'message-test',
         model: 'model',
         messages: [],
         agentMode: true,
@@ -30,9 +33,89 @@ describe('native chat failure boundary', () => {
     expect(native.invoke).toHaveBeenCalledWith(
       'stream_chat',
       expect.objectContaining({
-        options: { enabled: true, workspace: '/projects/current', webEnabled: false },
+        options: {
+          enabled: true,
+          workspace: '/projects/current',
+          webEnabled: false,
+          executionProfile: 'read-only',
+          commandNetwork: false,
+          sessionId: 'session-test',
+          sourceMessageId: 'message-test',
+        },
       }),
     );
+  });
+
+  it('delivers validated instruction provenance through native streaming events', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          type: 'instructions_loaded',
+          requestId: 'guidance',
+          sources: ['AGENTS.md'],
+          warnings: ['Skipped malformed guidance.'],
+        },
+      });
+      listener({
+        payload: {
+          type: 'instructions_loaded',
+          requestId: 'guidance',
+          sources: [123],
+          warnings: [],
+        },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'guidance' } });
+      return { requestId: 'guidance' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'guidance', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledTimes(2);
+    expect(onEvent).toHaveBeenCalledWith({
+      type: 'instructions_loaded',
+      requestId: 'guidance',
+      sources: ['AGENTS.md'],
+      warnings: ['Skipped malformed guidance.'],
+    });
+  });
+
+  it('keeps the MCP tool an approval can be saved for and drops malformed ones', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    const approval = { type: 'approval_request', requestId: 'tools', kind: 'exec', detail: 'd' };
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          ...approval,
+          approvalId: 'a1',
+          tool: { server: 'context7', tool: 'context7__query-docs' },
+        },
+      });
+      listener({
+        payload: { ...approval, approvalId: 'a2', tool: { server: 'docs', tool: 'other__x' } },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'tools' } });
+      return { requestId: 'tools' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'tools', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith({
+      ...approval,
+      approvalId: 'a1',
+      tool: { server: 'context7', tool: 'context7__query-docs' },
+    });
+    expect(onEvent).toHaveBeenCalledWith({ ...approval, approvalId: 'a2' });
   });
 
   it('reports local storage failure without blaming the model or exposing native details', async () => {
@@ -76,5 +159,101 @@ describe('native chat failure boundary', () => {
       'private',
     );
     expect(nativeModelError('private key').message).not.toContain('private');
+  });
+});
+
+describe('browser model discovery', () => {
+  it('lists each model id once', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).endsWith('/api/tags')
+          ? Response.json({
+              models: [
+                { name: 'qwen3.6:latest', size: 2 },
+                { name: 'qwen3.6:latest', size: 2 },
+                { name: 'llama3.2:1b', size: 1 },
+              ],
+            })
+          : Response.json({ data: [{ id: 'a' }, { id: 'a' }, { id: 'b' }] }),
+      ),
+    );
+    expect((await localModelClient.discoverModels()).map(({ id }) => id)).toEqual([
+      'llama3.2:1b',
+      'qwen3.6:latest',
+    ]);
+    expect(
+      (await localModelClient.discoverModels('https://models.example/api')).map(({ id }) => id),
+    ).toEqual(['a', 'b']);
+  });
+});
+
+describe('browser model context transport', () => {
+  it('caps generated output and retains separately reported server usage', async () => {
+    const { webcrypto } = await import('node:crypto');
+    vi.stubGlobal('crypto', webcrypto);
+    const response =
+      'data: {"choices":[{"delta":{"content":"Answer"},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":77,"completion_tokens":12,"total_tokens":89}}\n\ndata: [DONE]\n\n';
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(response, { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const event = vi.fn();
+    const delta = vi.fn();
+    await localModelClient.streamChat(
+      {
+        requestId: 'browser-budget',
+        model: 'fixture',
+        messages: [{ role: 'user', content: 'Task' }],
+        contextBudget: { contextWindow: 8192, outputTokens: 1024, autoCompact: false },
+      },
+      { onDelta: delta, onEvent: event },
+      new AbortController().signal,
+    );
+    const payload = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(payload.max_tokens).toBe(1024);
+    expect(payload.stream_options).toEqual({ include_usage: true });
+    expect(delta).toHaveBeenCalledWith('Answer');
+    expect(event).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'context_report',
+        report: expect.objectContaining({
+          serverUsage: { promptTokens: 77, completionTokens: 12, totalTokens: 89 },
+        }),
+      }),
+    );
+    expect(event).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'context_updated',
+        state: expect.objectContaining({ coveredMessages: 2, checkpoints: [] }),
+      }),
+    );
+    vi.unstubAllGlobals();
+  });
+  it('rejects an unfinished stream without committing a history snapshot', async () => {
+    const { webcrypto } = await import('node:crypto');
+    vi.stubGlobal('crypto', webcrypto);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('data: {"choices":[{"delta":{"content":"Partial"}}]}\n\n', { status: 200 }),
+      ),
+    );
+    const event = vi.fn();
+    await expect(
+      localModelClient.streamChat(
+        {
+          requestId: 'incomplete',
+          model: 'fixture',
+          messages: [{ role: 'user', content: 'Task' }],
+        },
+        { onDelta: vi.fn(), onEvent: event },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('incomplete');
+    expect(event.mock.calls.some(([entry]) => entry.type === 'context_updated')).toBe(false);
+    vi.unstubAllGlobals();
   });
 });

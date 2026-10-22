@@ -42,8 +42,13 @@ a SmartScreen or Gatekeeper warning.
 - Native SQLite history with attachment contents, migration, and ordered save retries
 - Optional desktop passphrase lock that stops active work and guest sharing
 - Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
+- Owner-selected command profiles with macOS filesystem isolation and default-off command network
+- Owner allow, ask, and deny rules for agent actions, with a redacted local audit log
+- Owner-defined command tools and local MCP servers behind the same approvals, with MCP secrets
+  kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
-- User-managed local memory and reusable Markdown skills
+- Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
+  demand, run directly with `/name`, and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
 - Four independently revocable named QR/browser invitations, saved relay credentials, and updater support
 
@@ -63,23 +68,62 @@ limits, memory, skills, and troubleshooting.
 
 ## Use Blackwall in your terminal
 
-With Rust 1.90+ installed, build the CLI from this checkout:
+On macOS, Linux, or Windows with a POSIX shell (such as Git Bash), install the latest CLI with
+Rust 1.90+ and Cargo available:
 
 ```sh
-cargo install --locked --path src/bw
+curl -fsSL https://raw.githubusercontent.com/AlecBhamani1/Blackwall/partial/scripts/install-cli.sh | sh
+```
+
+The installer works from any directory and installs `bw` onto Cargo's executable path. Then run:
+
+```sh
 bw setup
 bw
 ```
 
+If Rust is not installed, follow the link printed by the installer to install it first. To build
+from a local checkout instead, use `cargo install --locked --path src/bw`.
+
 Setup asks for an existing OpenAI-compatible service address and its model ID, then saves your
 choices. Type `/commands` during chat to see the available controls. Change settings with
 `/model <id>`, `/endpoint <url>`, `/web on|off`, `/memory on|off`, or `/settings <name> <value>`.
+Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
+reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
+Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
+`/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
+proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
+`bw skills import <path>` brings in `SKILL.md` skills from Claude Code, Codex, and other agents,
+and `bw skills get <name>` downloads a suggested one; each is scanned for hidden instructions and
+data leaks first. Type `/name` to run a saved skill directly, as in `/pdf fill form.pdf`.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+`bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
+one as a tree; the desktop **Runs** panel shows the same traces. See
+[Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
-an Agent conversation in its saved project. See the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for
-credentials, approvals, and configuration precedence.
+an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resume` for scripts and
+CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied. See
+the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
+
+Use `bw review` or `/review` in CLI or desktop Agent chat to inspect Git changes without agent tools. Choose `--uncommitted`,
+`--commit <ref>`, or `--base <ref>`; add `--json` for structured findings and separate hypotheses.
+See [Git review](docs/GIT_REVIEW.md) for target semantics, evidence limits, and isolation.
+
+Saved message search works offline with `bw sessions search "search words"`, `/recall search words`
+in the CLI, or **Search history** and `/recall` in desktop. Results include bounded excerpts and
+session/message references; project and updated-date filters help narrow the history. Agent recall
+is off by default; enable it with `bw config set recall on` or the desktop search panel.
+See [Conversation recall](docs/CONVERSATION_RECALL.md) for limits, migration, and privacy.
+
+## Project working agreements
+
+CLI and desktop Agent tasks discover `AGENTS.md` guidance, with `AGENTS.override.md` taking
+precedence in each directory. Source lists and discovery warnings are visible in both clients.
+Use `/init` to review a starter instruction file before writing it. See
+[Project instructions](docs/PROJECT_INSTRUCTIONS.md) for ordering, nested scopes, bounds,
+and approval behavior.
 
 ## Run the desktop app
 

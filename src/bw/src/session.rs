@@ -2,11 +2,14 @@ use crate::{input::Input, settings::Settings};
 use blackwall_core::{
     agent::Agent,
     approvals::Approvals,
-    connection::{normalize_endpoint, same_origin},
+    connection::{normalize_endpoint, same_origin, served_budget},
+    context::{ContextRun, ContextState},
+    memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
     protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
     skills::SkillStore,
     storage::LocalStore,
+    storage::MemorySource,
     tools::Workspace,
     ChatMessage, ChatRequest,
 };
@@ -108,22 +111,151 @@ impl Conversation {
         Ok(())
     }
 
+    fn memory_tools(&self, directory: &Path) -> Option<MemoryTools> {
+        let message_id = self.session["messages"]
+            .as_array()?
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")?["id"]
+            .as_str()?;
+        Some(MemoryTools {
+            directory: directory.into(),
+            client: MemoryClient::Cli,
+            workspace: Some(self.workspace.to_string_lossy().into_owned()),
+            source: MemorySource {
+                session_id: self.id().into(),
+                message_id: message_id.into(),
+            },
+        })
+    }
+    fn saved_context(&self) -> Result<Option<ContextState>, String> {
+        self.session
+            .get("contextState")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|_| "The saved context is invalid.".into())
+            })
+            .transpose()
+    }
+    pub fn context_report(
+        &self,
+        store: &LocalStore,
+        directory: &Path,
+        settings: &Settings,
+    ) -> Result<(), String> {
+        let messages = context(store, directory, settings, &self.session)?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, self.saved_context()?.as_ref())
+            .map_err(|e| e.to_string())?;
+        let mut messages = instructions;
+        let workspace = execution_workspace(&self.workspace, directory, settings)?;
+        let guidance =
+            blackwall_core::instructions::Instructions::discover(&workspace, Some(directory));
+        if !guidance.prompt().is_empty() {
+            messages.insert(0, json!({"role":"system","content":guidance.prompt()}));
+        }
+        messages.insert(0, blackwall_core::agent::default_instructions(&workspace));
+        messages.extend(state.effective());
+        let mut definitions = blackwall_core::tools::definitions(settings.web_enabled, true);
+        if self.memory_tools(directory).is_some()
+            && store
+                .memory_enabled(MemoryClient::Cli)
+                .map_err(|e| e.to_string())?
+        {
+            definitions.extend(blackwall_core::memory::definitions());
+        }
+        if self.memory_tools(directory).is_some()
+            && store
+                .recall_enabled(MemoryClient::Cli)
+                .map_err(|e| e.to_string())?
+        {
+            definitions.push(blackwall_core::memory::recall_definition());
+        }
+        let skills = SkillStore::open(&directory.join("skills"))
+            .and_then(|skills| skills.list())
+            .map_err(|error| error.to_string())?;
+        if skills.0.iter().any(|skill| skill.enabled) {
+            definitions.push(blackwall_core::skills::definition());
+        }
+        let report = settings
+            .budget
+            .report(&messages, &definitions, state.server_usage);
+        println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
+        Ok(())
+    }
+    pub async fn compact(
+        &mut self,
+        store: &LocalStore,
+        directory: &Path,
+        settings: &Settings,
+        input: &mut Input,
+    ) -> Result<(), String> {
+        self.flush(store)?;
+        let budget = served_budget(&settings.endpoint, &settings.model, settings.budget).await;
+        let backend = HttpModel::new(
+            &settings.endpoint,
+            &settings.model,
+            environment_key(&settings.endpoint),
+        )
+        .and_then(|m| m.with_budget(budget))
+        .map_err(|e| e.to_string())?;
+        let messages = context(store, directory, settings, &self.session)?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, self.saved_context()?.as_ref())
+            .map_err(|e| e.to_string())?;
+        let memory = self.memory_tools(directory);
+        let (_, snapshot, result) = execute(
+            &backend,
+            execution_workspace(&self.workspace, directory, settings)?,
+            settings.web_enabled,
+            ContextRun {
+                source,
+                state,
+                budget,
+                instructions,
+                compact: true,
+                trace: settings.trace,
+            },
+            Some(input),
+            memory.as_ref(),
+            directory,
+        )
+        .await;
+        result?;
+        if let Some(snapshot) = snapshot {
+            let mut candidate = self.session.clone();
+            candidate["contextState"] = json!(snapshot);
+            candidate["updatedAt"] = json!(now()?);
+            store.save_session(&candidate).map_err(|e| e.to_string())?;
+            self.session = candidate;
+        }
+        println!("Context compacted. Original transcript retained.");
+        Ok(())
+    }
+
     pub async fn turn(
         &mut self,
         store: &LocalStore,
         directory: &Path,
         settings: &Settings,
         prompt: &str,
-        input: &mut Input,
+        input: Option<&mut Input>,
     ) -> Result<(), String> {
+        // Without input, the run is headless: JSON lines, and prompts are denied.
+        let json = input.is_none();
         self.flush(store)?;
+        let budget = served_budget(&settings.endpoint, &settings.model, settings.budget).await;
         let backend = HttpModel::new(
             &settings.endpoint,
             &settings.model,
             environment_key(&settings.endpoint),
         )
+        .and_then(|backend| backend.with_budget(budget))
         .map_err(|error| error.to_string())?;
-        let workspace = Workspace::open(&self.workspace).map_err(|error| error.to_string())?;
+        let workspace = execution_workspace(&self.workspace, directory, settings)?;
         let timestamp = now()?;
         let mut candidate = self.session.clone();
         let history = candidate["messages"]
@@ -142,13 +274,36 @@ impl Conversation {
             .save_session(&candidate)
             .map_err(|error| error.to_string())?;
         self.session = candidate;
-        let (answer, result) =
-            execute(&backend, workspace, settings.web_enabled, messages, input).await;
+        let memory = self.memory_tools(directory);
+        let saved = self.saved_context()?;
+        let (instructions, source): (Vec<_>, Vec<_>) =
+            messages.into_iter().partition(|m| m["role"] == "system");
+        let state = ContextState::restore(&source, saved.as_ref()).map_err(|e| e.to_string())?;
+        let (answer, snapshot, result) = execute(
+            &backend,
+            workspace,
+            settings.web_enabled,
+            ContextRun {
+                source,
+                state,
+                budget,
+                instructions,
+                compact: false,
+                trace: settings.trace,
+            },
+            input,
+            memory.as_ref(),
+            directory,
+        )
+        .await;
+        if let Some(snapshot) = snapshot {
+            self.session["contextState"] = json!(snapshot);
+        }
         let status = if result.is_ok() { "complete" } else { "error" };
         let content = if answer.is_empty() {
             result.as_ref().err().cloned().unwrap_or_default()
         } else {
-            answer
+            answer.clone()
         };
         self.session["messages"].as_array_mut().ok_or("The conversation is invalid.")?.push(
             json!({"id":format!("assistant_{timestamp}_{}",SEQUENCE.fetch_add(1,Ordering::Relaxed)),"role":"assistant","content":content,"attachments":[],"status":status,"createdAt":timestamp})
@@ -156,7 +311,12 @@ impl Conversation {
         self.session["updatedAt"] = json!(now()?);
         self.dirty = true;
         self.flush(store)?;
-        eprintln!("Saved conversation {}", self.id());
+        if json {
+            let result = json!({"type":"result","sessionId":self.id(),"status":status,"answer":answer,"error":result.as_ref().err()});
+            println!("{result}");
+        } else {
+            eprintln!("Saved conversation {}", self.id());
+        }
         result
     }
 }
@@ -170,16 +330,15 @@ fn context(
     let history: Vec<ChatMessage> = serde_json::from_value(session["messages"].clone())
         .map_err(|_| "The saved conversation is invalid.")?;
     let request = ChatRequest::new("cli-context", &settings.model, history);
-    request.validate().map_err(|error| error.to_string())?;
+    if !request.messages.is_empty() {
+        request.validate().map_err(|error| error.to_string())?;
+    }
     let mut messages = model::messages(&request);
-    if settings.memory_enabled {
-        let memory = blackwall_core::memory::context(
-            &store.memories("").map_err(|error| error.to_string())?,
-            4000,
-        );
-        if !memory.is_empty() {
-            messages.insert(0, json!({"role":"system","content":memory}));
-        }
+    let memory = store
+        .memory_context(MemoryClient::Cli, session["workspace"].as_str(), 4000)
+        .map_err(|error| error.to_string())?;
+    if !memory.is_empty() {
+        messages.insert(0, json!({"role":"system","content":memory}));
     }
     let skills = SkillStore::open(&directory.join("skills")).map_err(|error| error.to_string())?;
     skills.seed().map_err(|error| error.to_string())?;
@@ -194,7 +353,7 @@ fn context(
     Ok(messages)
 }
 
-fn environment_key(endpoint: &str) -> Option<String> {
+pub(crate) fn environment_key(endpoint: &str) -> Option<String> {
     let configured = env::var("BLACKWALL_MODEL_ENDPOINT")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -222,9 +381,12 @@ async fn execute(
     backend: &HttpModel,
     workspace: Workspace,
     web_enabled: bool,
-    messages: Vec<Value>,
-    input: &mut Input,
-) -> (String, Result<(), String>) {
+    run: ContextRun,
+    mut input: Option<&mut Input>,
+    memory: Option<&MemoryTools>,
+    directory: &Path,
+) -> (String, Option<ContextState>, Result<(), String>) {
+    let json = input.is_none();
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
     let emit = Arc::new(move |event| {
@@ -238,15 +400,21 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let work = agent.run(&request_id, messages);
+    let work = agent.run_context_with_guidance(&request_id, run, memory, Some(directory));
     tokio::pin!(work);
     let mut answer = String::new();
+    let mut snapshot = None;
     let mut pending: Option<ResolveApprovalRequest> = None;
     let result = loop {
         tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => break Err("Task stopped. You can continue this conversation.".into()),
-            line = input.read(), if pending.is_some() => {
+            line = async {
+                match input.as_deref_mut() {
+                    Some(input) => input.read().await,
+                    None => Ok(None),
+                }
+            }, if pending.is_some() => {
                 match line {
                     Ok(line) => {
                         if let Some(mut request) = pending.take() {
@@ -257,17 +425,13 @@ async fn execute(
                     Err(error) => break Err(error),
                 }
             }
-            event = incoming.recv() => if let Some(event) = event { match event {
-                AgentEvent::AssistantDelta { delta, .. } => { answer.push_str(&delta); print!("{delta}"); let _ = io::stdout().flush(); }
-                AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
-                AgentEvent::ToolResult { success: false, output, .. } => eprintln!("{output}"),
-                AgentEvent::ApprovalRequest { request_id, approval_id, detail, .. } => {
-                    eprintln!("\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies.");
-                    pending = Some(ResolveApprovalRequest { request_id, approval_id, decision: ApprovalDecision::Deny });
+            event = incoming.recv() => if let Some(event) = event {
+                render_event(event, &mut answer, &mut pending, &mut snapshot, json);
+                // Nobody can answer a prompt in a headless run, so it is denied at once.
+                if let Some(request) = pending.take_if(|_| json) {
+                    if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
                 }
-                AgentEvent::SubagentStatus { state, summary, .. } => eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default()),
-                _ => {}
-            } },
+            },
             result = &mut work => match result {
                 Ok(complete) => break Ok(complete),
                 Err(error) => break Err(error.to_string()),
@@ -275,19 +439,119 @@ async fn execute(
         }
     };
     // A ready model future can enqueue events and complete in one poll. Render those
-    // deltas before returning so even a fast final response reaches stdout.
+    // events before returning so fast completions retain text and instruction provenance.
     while let Ok(event) = incoming.try_recv() {
-        if let AgentEvent::AssistantDelta { delta, .. } = event {
-            answer.push_str(&delta);
-            print!("{delta}");
-        }
+        render_event(event, &mut answer, &mut pending, &mut snapshot, json);
     }
     let _ = io::stdout().flush();
     let result = result.map(|complete| {
         answer = complete;
     });
-    println!();
-    (answer, result)
+    if !json {
+        println!();
+    }
+    (answer, snapshot, result)
+}
+
+fn render_event(
+    event: AgentEvent,
+    answer: &mut String,
+    pending: &mut Option<ResolveApprovalRequest>,
+    snapshot: &mut Option<ContextState>,
+    json: bool,
+) {
+    if json {
+        // Context snapshots are internal state; every other event is one JSON line.
+        if let AgentEvent::ContextUpdated { state, .. } = event {
+            *snapshot = Some(state);
+            return;
+        }
+        println!("{}", serde_json::to_string(&event).unwrap_or_default());
+        match event {
+            AgentEvent::AssistantDelta { delta, .. } => answer.push_str(&delta),
+            AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } => {
+                *pending = Some(ResolveApprovalRequest {
+                    request_id,
+                    approval_id,
+                    decision: ApprovalDecision::Deny,
+                })
+            }
+            _ => {}
+        }
+        return;
+    }
+    match event {
+        AgentEvent::ContextUpdated { state, .. } => *snapshot = Some(state),
+        AgentEvent::AssistantDelta { delta, .. } => {
+            answer.push_str(&delta);
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        }
+        AgentEvent::InstructionsLoaded {
+            sources,
+            warnings,
+            agent_id,
+            ..
+        } => {
+            eprintln!(
+                "\n{}Instructions: {}",
+                agent_id
+                    .map(|id| format!("[agent {id}] "))
+                    .unwrap_or_default(),
+                if sources.is_empty() {
+                    "none".into()
+                } else {
+                    sources.join(", ")
+                }
+            );
+            for warning in warnings {
+                eprintln!("Instruction warning: {warning}");
+            }
+        }
+        AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
+        AgentEvent::ToolResult {
+            success: false,
+            output,
+            ..
+        } => eprintln!("{output}"),
+        AgentEvent::ApprovalRequest {
+            request_id,
+            approval_id,
+            detail,
+            ..
+        } => {
+            eprintln!(
+                "\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies."
+            );
+            *pending = Some(ResolveApprovalRequest {
+                request_id,
+                approval_id,
+                decision: ApprovalDecision::Deny,
+            });
+        }
+        AgentEvent::SubagentStatus { state, summary, .. } => {
+            eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default())
+        }
+        _ => {}
+    }
+}
+
+fn execution_workspace(
+    path: &Path,
+    directory: &Path,
+    settings: &Settings,
+) -> Result<Workspace, String> {
+    let mut workspace = Workspace::open(path).map_err(|error| error.to_string())?;
+    workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
+        profile: settings.execution_profile,
+        network: settings.command_network,
+        data_directory: Some(directory.into()),
+    };
+    Ok(workspace)
 }
 
 #[cfg(test)]

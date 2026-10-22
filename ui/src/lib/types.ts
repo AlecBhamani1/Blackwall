@@ -29,6 +29,8 @@ export interface ChatMessage {
   error?: string;
   tools?: ToolEntry[];
   children?: ChildEntry[];
+  /** Restored tool activity is inert history, never live approval state. */
+  historical?: boolean;
 }
 
 export interface ModelInfo {
@@ -57,19 +59,73 @@ export interface ModelMessage {
   attachments?: AttachmentPayload[];
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+export interface ContextBudget {
+  contextWindow: number;
+  outputTokens: number;
+  autoCompact: boolean;
+  /** Omitted limits use the runtime defaults of 20 iterations and 120 seconds. */
+  maxIterations?: number;
+  commandTimeoutSeconds?: number;
+}
+export interface ContextReport {
+  estimatedPromptTokens: number;
+  toolTokens: number;
+  outputTokens: number;
+  safetyTokens: number;
+  contextWindow: number;
+  serverUsage?: TokenUsage;
+}
+export interface ContextSummary {
+  taskRequirements: string[];
+  corrections: string[];
+  decisions: string[];
+  changedFiles: string[];
+  checks: string[];
+  unfinishedWork: string[];
+  relevantContext: string[];
+}
+export interface ContextState {
+  transcript: Record<string, unknown>[];
+  checkpoints: Array<{ through: number; sourceHash: string; summary: ContextSummary }>;
+  coveredMessages: number;
+  sourceHash: string;
+  serverUsage?: TokenUsage;
+}
+
 export interface ChatRequest {
   requestId: string;
+  sessionId?: string;
+  sourceMessageId?: string;
   agentMode?: boolean;
   workspace?: string;
   webEnabled?: boolean;
+  executionProfile?: 'read-only' | 'workspace-write' | 'unsandboxed';
+  commandNetwork?: boolean;
   endpoint?: string;
   model?: string;
   messages: ModelMessage[];
+  contextBudget?: ContextBudget;
+  contextState?: ContextState;
+  compact?: boolean;
 }
 
 export type AgentEvent =
+  | {
+      type: 'instructions_loaded';
+      requestId: string;
+      agentId?: string;
+      sources: string[];
+      warnings: string[];
+    }
+  | { type: 'context_report'; requestId: string; report: ContextReport }
+  | { type: 'context_updated'; requestId: string; state: ContextState }
   | { type: 'assistant_delta'; requestId: string; delta: string }
-  | { type: 'turn_complete'; requestId: string; finishReason?: string }
+  | { type: 'turn_complete'; requestId: string; finishReason?: string; usage?: TokenUsage }
   | { type: 'error'; requestId: string; message: string; code?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
@@ -80,6 +136,7 @@ export type AgentEvent =
       approvalId: string;
       kind: string;
       detail: string;
+      tool?: ApprovalTool;
     };
 
 export interface ChildEntry {
@@ -94,11 +151,27 @@ export interface ToolEntry {
   output?: string;
   status: 'running' | 'complete' | 'error' | 'stopped';
 }
+/** The MCP tool an approval is for; `tool` is the namespaced `server__tool` name. */
+export interface ApprovalTool {
+  server: string;
+  tool: string;
+}
+
+export type ApprovalDecision =
+  | 'allow'
+  | 'always_allow'
+  | 'deny'
+  | 'allow_tool_in_project'
+  | 'allow_tool'
+  | 'allow_server_in_project'
+  | 'allow_server';
+
 export interface PendingApproval {
   requestId: string;
   approvalId: string;
   kind: string;
   detail: string;
+  tool?: ApprovalTool;
 }
 
 export interface StreamCallbacks {
@@ -117,6 +190,8 @@ export interface SessionSummary {
   title: string;
   updatedAt: number;
   messages: ChatMessage[];
+  contextState?: ContextState;
+  contextReport?: ContextReport;
 }
 
 export interface AttachmentRejection {

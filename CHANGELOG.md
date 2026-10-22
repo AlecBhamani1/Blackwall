@@ -7,6 +7,129 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5]
+
+Milestone: [v0.1.5](https://github.com/AlecBhamani1/Blackwall/milestone/2).
+Release preparation and acceptance limits: [0.1.5 notes](docs/releases/0.1.5.md).
+Publication is pending the checked production promotion.
+
+### Added
+
+- Import skills written for Claude Code, Codex, and other agents in the `SKILL.md` format, with their
+  scripts and reference files, from the desktop Skills panel or `bw skills`. Skills in their usual
+  folders are listed, and nine suggested skills from the official Anthropic and OpenAI repositories
+  and Matt Pocock's skills download at reviewed versions. Every import is scanned locally for hidden
+  instructions and data leaks, and a skill with findings needs Allow anyway.
+
+- Choose read-only (default), workspace-write, or explicitly unsandboxed command execution in
+  desktop Agent mode and CLI settings. macOS Seatbelt enforces filesystem restrictions and
+  default-off network access for shells, command tools, and descendants; protects application data,
+  credentials and project metadata; and fails closed if unavailable. Restricted execution on other
+  platforms fails closed until a backend is supported. Existing CLI settings migrate to read-only.
+
+- Inspect Git changes with `bw review` and CLI/desktop Agent `/review`, using exclusive working-tree, commit,
+  or base-branch targets. Return prioritized findings separately from unverified hypotheses,
+  with bounded untracked text and JSON output. Review runs without model tools or write access.
+
+- Review agent runs in the desktop **Runs** panel: recent runs with their model and tool calls,
+  tokens, and failures, each run as a tree of steps with any captured content, and settings to turn
+  traces and content capture on or off.
+
+- Record a local OpenTelemetry trace of each CLI and desktop Agent run, with model and tool spans,
+  token counts, errors, and approval requests. `bw traces` lists recent runs and `bw traces show`
+  prints one as a tree. Traces are on by default and keep the newest 200; prompt, answer, and tool
+  text is recorded only with `bw config set trace-content on`, redacted and size-limited.
+
+- Search saved desktop and CLI message text locally with `bw sessions search`, `/recall`, and desktop
+  Search history. Filter by project and updated date, open referenced messages without changing
+  their saved mode, and optionally enable a bounded, project-scoped agent recall tool. Existing
+  histories migrate in small batches; edits and deletions remove their old search excerpts.
+
+- Load scoped `AGENTS.md` and `AGENTS.override.md` guidance in CLI and desktop Agent tasks,
+  with bounded discovery, visible source lists and warnings, and a reviewed `/init` proposal
+  that preserves existing project instructions.
+
+- Review agent-proposed preferences, project conventions, and environment lessons in desktop Memory
+  or `bw memory`. Proposals show their source and replacement text; approval, editing, rejection,
+  and forgetting persist across clients. Scoped injection stays bounded, disabled memory blocks
+  learning, and guest chats never receive owner memories.
+
+- Budget model requests for tool definitions, generated output, and a safety reserve. Add `/context`
+  and `/compact` to the CLI and chat composer, with optional automatic compaction, retained original
+  transcripts, and separate resumable checkpoints that never restore historical approvals.
+
+- Add a one-line installer for the latest development Blackwall CLI, available from any directory.
+
+- Configure the Agent iteration limit and shell command time limit next to the context controls in
+  desktop Memory and `bw config`. Defaults remain 20 iterations and two minutes.
+  
+- Decide agent actions with owner-defined allow, ask, and deny rules in `~/.blackwall/policy.json`.
+  Projects cannot add rules, chained shell commands never match an allow rule, invalid files fall
+  back to asking, and every decision is recorded in a redacted local audit log.
+
+- Run owner-defined command tools from `~/.blackwall/tools.json` in Agent mode, such as another
+  assistant's command line, without a shell and behind Exec approval and owner rules.
+
+- Connect local MCP servers listed in `~/.blackwall/mcp.json` to Agent runs. Their tools are named
+  by server, can be limited per server, and every call needs Exec approval or an owner rule.
+
+- Load enabled skills on demand in Agent runs. The prompt lists each skill's name and description
+  within the shared budget, and the model reads a skill's instructions with `read_skill`, so far
+  larger libraries fit.
+
+- Propose skills from successful work with `/learn`. Proposals keep their source, never load until
+  approved with `bw skills` or in the desktop, and cannot overwrite a skill the owner changed after
+  the proposal.
+
+- Review proposed skills in the desktop **Skills** dialog: see the source and the saved skill, edit
+  the proposed description and instructions, then approve or reject.
+
+- Run CLI tasks headlessly with `bw run --json`, printing agent events as JSON lines and denying
+  any action that owner rules leave to an approval prompt.
+
+- Add, list, enable, disable, and remove MCP servers with `bw mcp`, without editing `mcp.json` by
+  hand.
+
+- Keep MCP server access tokens in the platform credential store. `bw mcp secret` saves one from
+  standard input, `mcp.json` holds only its name, and the server receives it when it starts.
+
+- Manage MCP servers and their secrets from **MCP servers** in the desktop sidebar, sharing the
+  CLI's validation and credential store.
+
+- Always allow an MCP tool, or every tool from its server, from its approval card, in one project
+  or every project. The choice is saved as an owner rule with new `tool` and `project` fields, and
+  **MCP servers** lists and removes these rules.
+
+- Suggest common MCP servers in the desktop **Add server** form. Picking one fills in its name and
+  a pinned `npx` command; the list ships with the app and is not offered on Windows.
+
+### Fixed
+
+- Update DOMPurify to 3.4.17 to include upstream sanitization security fixes.
+
+- Send Blackwall's instructions as one system message, first. Chat templates such as Qwen's reject
+  any other system message, so Agent runs failed with HTTP 400 on vLLM servers.
+
+- Flush each policy audit record before the decision returns. Tokio finishes file writes in the
+  background, so a record could be missing when the log was read right after a decision.
+
+- Update the TLS dependency to include upstream security fixes.
+
+- Find programs installed with Homebrew or npm for command tools, MCP servers, and shell commands
+  when the macOS app is opened from the Dock, using the login shell's `PATH`.
+
+- Save MCP server names such as `Context7` or `My Jira` in lowercase with hyphens instead of
+  rejecting them, say which part of an MCP server is invalid, and show startup warnings, such as a
+  server that did not start, without expanding the project instructions entry.
+
+- Use portable paths in instruction source lists and directory scopes on Windows.
+
+- Size requests to the context window Ollama loaded the selected model with, reserving a quarter
+  of it (up to 32,768 tokens) for output, so long replies are no longer cut off at 4,096 tokens.
+
+- List each discovered model once in the desktop picker, first-run setup, and browser client, so
+  Ollama models with several runner variants no longer make the picker unavailable.
+
 ## [0.1.4] - 2026-10-01
 
 Milestone: [v0.1.4](https://github.com/AlecBhamani1/Blackwall/milestone/1).

@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: usize = 64 * 1024;
 
 /// Project-relative labels use `/` everywhere; Windows file names cannot contain `\`.
-fn label(path: &Path) -> Option<String> {
+pub(crate) fn label(path: &Path) -> Option<String> {
     let label = path.to_str()?;
     Some(if cfg!(windows) {
         label.replace('\\', "/")
@@ -47,10 +47,25 @@ pub enum ToolError {
     #[error("{0}")]
     Execution(String),
 }
+impl ToolError {
+    /// A stable name for traces, without any tool output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::File => "file",
+            Self::Limit => "limit",
+            Self::Arguments => "arguments",
+            Self::Denied => "denied",
+            Self::Changed => "changed",
+            Self::Execution(_) => "execution",
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Workspace {
-    directory: Arc<Dir>,
+    pub(crate) directory: Arc<Dir>,
     pub path: PathBuf,
+    pub execution: crate::sandbox::ExecutionPolicy,
 }
 impl Workspace {
     pub fn open(path: &Path) -> Result<Self, ToolError> {
@@ -60,9 +75,10 @@ impl Workspace {
         Ok(Self {
             directory: Arc::new(directory),
             path,
+            execution: Default::default(),
         })
     }
-    fn checked(path: &str) -> Result<&Path, ToolError> {
+    pub(crate) fn checked(path: &str) -> Result<&Path, ToolError> {
         let path = Path::new(path);
         if path.as_os_str().len() > 2048
             || path.is_absolute()
@@ -165,7 +181,7 @@ impl Workspace {
         }
         String::from_utf8(bytes).map_err(|_| ToolError::Limit)
     }
-    fn original(&self, path: &str) -> Result<Option<String>, ToolError> {
+    pub(crate) fn original(&self, path: &str) -> Result<Option<String>, ToolError> {
         let checked = Self::checked(path)?;
         match self.directory.symlink_metadata(checked) {
             Ok(metadata) if metadata.file_type().is_symlink() => Err(ToolError::Path),
@@ -243,11 +259,7 @@ impl Workspace {
     }
 }
 
-const SHELL_DESCRIPTION: &str = if cfg!(windows) {
-    "Propose a Windows PowerShell command in the project directory. Always requires user approval. Commands are not sandboxed."
-} else {
-    "Propose a shell command in the project directory. Always requires user approval. Commands are not sandboxed."
-};
+const SHELL_DESCRIPTION: &str = "Propose a shell command in the project directory. Requires approval and runs under the owner's execution profile. Approval does not bypass filesystem or network restrictions.";
 fn file_definitions() -> Vec<Value> {
     [("read_file","Read a UTF-8 text file inside the selected project.",json!({"path":{"type":"string"}}),vec!["path"]),
      ("list_files","List up to 500 entries in a project directory. Use '.' for the project root.",json!({"path":{"type":"string"}}),vec!["path"]),
@@ -283,6 +295,7 @@ pub async fn execute(
     request_id: &str,
     approvals: &Approvals,
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    command_timeout: Duration,
 ) -> Result<String, ToolError> {
     let arguments: Value =
         serde_json::from_str(&call.function.arguments).map_err(|_| ToolError::Arguments)?;
@@ -309,7 +322,7 @@ pub async fn execute(
                 workspace.path.display()
             );
             if !approvals
-                .request(request_id, ApprovalKind::File, detail, emit)
+                .request(request_id, ApprovalKind::File, path, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {
@@ -323,15 +336,24 @@ pub async fn execute(
             if command.trim().is_empty() || command.len() > 8000 {
                 return Err(ToolError::Arguments);
             }
-            let detail=format!("Project: {}\nCommand: {command}\n\nThis command runs with your account permissions. It can access files outside the project and use the network.",workspace.path.display());
+            let detail = format!(
+                "Project: {}\nCommand: {command}\n\n{}",
+                workspace.path.display(),
+                workspace.execution.description()
+            );
             if !approvals
-                .request(request_id, ApprovalKind::Exec, detail, emit)
+                .request(request_id, ApprovalKind::Exec, command, detail, emit)
                 .await
                 .map_err(ToolError::Execution)?
             {
                 return Err(ToolError::Denied);
             }
-            shell(&workspace.path, command).await
+            run_with_timeout(
+                &workspace.path,
+                crate::sandbox::wrap(workspace, shell_command(command))?,
+                command_timeout,
+            )
+            .await
         }
         "web_fetch" => {
             crate::web::fetch(
@@ -373,10 +395,8 @@ impl Drop for ProcessGroup {
 }
 #[cfg(unix)]
 fn shell_command(command: &str) -> tokio::process::Command {
-    use std::os::unix::process::CommandExt;
     let mut process = tokio::process::Command::new("/bin/sh");
     process.arg("-c").arg(command);
-    process.as_std_mut().process_group(0);
     process
 }
 #[cfg(windows)]
@@ -398,9 +418,11 @@ fn shell_command(command: &str) -> tokio::process::Command {
         .arg(base64::engine::general_purpose::STANDARD.encode(bytes));
     process
 }
+#[cfg(test)]
 async fn shell(directory: &Path, command: &str) -> Result<String, ToolError> {
     shell_with_timeout(directory, command, Duration::from_secs(120)).await
 }
+#[cfg(test)]
 async fn shell_with_timeout(
     directory: &Path,
     command: &str,
@@ -414,123 +436,254 @@ async fn shell_with_timeout(
         ))
     }
     #[cfg(any(unix, windows))]
+    run_with_timeout(directory, shell_command(command), timeout).await
+}
+/// Run a resolved program with separate arguments, never parsed by a shell.
+pub(crate) async fn program_with_timeout(
+    workspace: &Workspace,
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    #[cfg(not(any(unix, windows)))]
     {
-        let mut process = shell_command(command);
-        process
-            .current_dir(directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Do not inherit the model or relay secrets from Blackwall's environment.
-        for key in [
-            "BLACKWALL_MODEL_API_KEY",
-            "BLACKWALL_RELAY_TOKEN",
-            "TAURI_SIGNING_PRIVATE_KEY",
-            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
-        ] {
-            process.env_remove(key);
-        }
-        #[cfg(unix)]
-        let mut child = process
-            .spawn()
-            .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
-        #[cfg(unix)]
-        let _group = ProcessGroup(
-            child
-                .id()
-                .ok_or(ToolError::Execution("The command did not start.".into()))?,
-        );
-        #[cfg(windows)]
-        let mut child = {
-            use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
-            use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-
-            let mut process = CommandWrap::from(process);
-            // The wrapper spawns suspended, assigns the process to a kill-on-close job,
-            // then resumes it. Descendants cannot escape before assignment or by parent exit.
-            process
-                .wrap(CreationFlags(CREATE_NO_WINDOW))
-                .wrap(KillOnDrop)
-                .wrap(JobObject);
-            process
-                .spawn()
-                .map_err(|_| ToolError::Execution("The command could not start.".into()))?
-        };
-        #[cfg(unix)]
-        let stdout = child.stdout.take().ok_or(ToolError::File)?;
-        #[cfg(windows)]
-        let stdout = child.stdout().take().ok_or(ToolError::File)?;
-        #[cfg(unix)]
-        let stderr = child.stderr.take().ok_or(ToolError::File)?;
-        #[cfg(windows)]
-        let stderr = child.stderr().take().ok_or(ToolError::File)?;
-        let mut out_task = Box::pin(async {
-            let mut bytes = vec![];
-            stdout
-                .take(MAX_FILE as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let mut err_task = Box::pin(async {
-            let mut bytes = vec![];
-            stderr
-                .take(MAX_FILE as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let mut wait_task = Box::pin(async {
-            #[cfg(unix)]
-            {
-                child.wait().await
-            }
-            #[cfg(windows)]
-            {
-                // Wait on the shell itself, retaining the owning job. Stop descendants as
-                // soon as the shell exits so inherited output pipes cannot hold capture open.
-                // Dropping the job also stops them if this wait is cancelled before then.
-                let status = child.inner_mut().wait().await?;
-                child.start_kill()?;
-                Ok::<_, std::io::Error>(status)
-            }
-        });
-        let capture = async {
-            // A completed capped read reports overflow immediately, rather than waiting for a
-            // child blocked on a full pipe. The process group/job kills descendants on return.
-            let mut out = None;
-            let mut err = None;
-            let mut status = None;
-            while out.is_none() || err.is_none() || status.is_none() {
-                tokio::select! {
-                    result=&mut out_task, if out.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}out=Some(bytes);},
-                    result=&mut err_task, if err.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}err=Some(bytes);},
-                    result=&mut wait_task, if status.is_none()=>status=Some(result.map_err(|_|ToolError::File)?),
-                }
-            }
-            let successful = status.is_some_and(|status| status.success());
-            let output = format!(
-                "Exit: {}\n{}{}",
-                status
-                    .and_then(|s| s.code())
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".into()),
-                String::from_utf8_lossy(&out.unwrap_or_default()),
-                String::from_utf8_lossy(&err.unwrap_or_default())
-            );
-            if successful {
-                Ok(output)
-            } else {
-                Err(ToolError::Execution(output))
-            }
-        };
-        tokio::time::timeout(timeout, capture).await.map_err(|_| {
-            ToolError::Execution(
-                "The command exceeded its two-minute limit and was stopped.".into(),
-            )
-        })?
+        let _ = (workspace, program, args, timeout);
+        Err(ToolError::Execution(
+            "Owner tools are not supported on this platform.".into(),
+        ))
     }
+    #[cfg(any(unix, windows))]
+    {
+        let mut process = tokio::process::Command::new(program);
+        process.args(args);
+        run_with_timeout(
+            &workspace.path,
+            crate::sandbox::wrap(workspace, process)?,
+            timeout,
+        )
+        .await
+    }
+}
+static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+/// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
+/// start with only the system directories, so tools installed with Homebrew or npm are missing.
+pub fn set_search_path(path: std::ffi::OsString) {
+    let _ = SEARCH_PATH.set(path);
+}
+/// The `PATH` used to find programs: the login-shell one when the desktop app set it.
+pub(crate) fn search_path() -> Option<std::ffi::OsString> {
+    SEARCH_PATH
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))
+}
+/// Blackwall's model and relay secrets, which child programs never inherit.
+#[cfg(any(unix, windows))]
+const SECRET_ENV: [&str; 4] = [
+    "BLACKWALL_MODEL_API_KEY",
+    "BLACKWALL_RELAY_TOKEN",
+    "TAURI_SIGNING_PRIVATE_KEY",
+    "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+];
+/// A long-running program with piped standard streams, such as an MCP server. Dropping it stops
+/// the program and its descendants, like a finished or cancelled shell command.
+#[cfg(any(unix, windows))]
+pub(crate) struct ServerProcess {
+    #[cfg(unix)]
+    _child: tokio::process::Child,
+    #[cfg(unix)]
+    _group: ProcessGroup,
+    #[cfg(windows)]
+    _child: Box<dyn process_wrap::tokio::ChildWrapper>,
+}
+#[cfg(any(unix, windows))]
+pub(crate) type ServerStreams = (
+    ServerProcess,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+    tokio::process::ChildStderr,
+);
+/// Start a resolved program without a shell, in `directory`, without Blackwall's secrets but with
+/// the server's own `environment`.
+#[cfg(any(unix, windows))]
+pub(crate) fn spawn_server(
+    directory: &Path,
+    program: &Path,
+    args: &[String],
+    environment: &[(String, String)],
+) -> Result<ServerStreams, ToolError> {
+    let start = || ToolError::Execution("The program could not start.".into());
+    let mut process = tokio::process::Command::new(program);
+    process
+        .args(args)
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for key in SECRET_ENV {
+        process.env_remove(key);
+    }
+    if let Some(path) = SEARCH_PATH.get() {
+        process.env("PATH", path);
+    }
+    process.envs(environment.iter().map(|(name, value)| (name, value)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
+        let mut child = process.spawn().map_err(|_| start())?;
+        let group = ProcessGroup(child.id().ok_or_else(start)?);
+        let stdin = child.stdin.take().ok_or_else(start)?;
+        let stdout = child.stdout.take().ok_or_else(start)?;
+        let stderr = child.stderr.take().ok_or_else(start)?;
+        Ok((
+            ServerProcess {
+                _child: child,
+                _group: group,
+            },
+            stdin,
+            stdout,
+            stderr,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        let mut process = CommandWrap::from(process);
+        process
+            .wrap(CreationFlags(CREATE_NO_WINDOW))
+            .wrap(KillOnDrop)
+            .wrap(JobObject);
+        let mut child = process.spawn().map_err(|_| start())?;
+        let stdin = child.stdin().take().ok_or_else(start)?;
+        let stdout = child.stdout().take().ok_or_else(start)?;
+        let stderr = child.stderr().take().ok_or_else(start)?;
+        Ok((ServerProcess { _child: child }, stdin, stdout, stderr))
+    }
+}
+/// Bounded, time-limited capture with the same descendant cleanup for every process.
+#[cfg(any(unix, windows))]
+pub(crate) async fn run_with_timeout(
+    directory: &Path,
+    mut process: tokio::process::Command,
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    process
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for key in SECRET_ENV {
+        process.env_remove(key);
+    }
+    if let Some(path) = SEARCH_PATH.get() {
+        process.env("PATH", path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
+    }
+    #[cfg(unix)]
+    let mut child = process
+        .spawn()
+        .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+    #[cfg(unix)]
+    let _group = ProcessGroup(
+        child
+            .id()
+            .ok_or(ToolError::Execution("The command did not start.".into()))?,
+    );
+    #[cfg(windows)]
+    let mut child = {
+        use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let mut process = CommandWrap::from(process);
+        // The wrapper spawns suspended, assigns the process to a kill-on-close job,
+        // then resumes it. Descendants cannot escape before assignment or by parent exit.
+        process
+            .wrap(CreationFlags(CREATE_NO_WINDOW))
+            .wrap(KillOnDrop)
+            .wrap(JobObject);
+        process
+            .spawn()
+            .map_err(|_| ToolError::Execution("The command could not start.".into()))?
+    };
+    #[cfg(unix)]
+    let stdout = child.stdout.take().ok_or(ToolError::File)?;
+    #[cfg(windows)]
+    let stdout = child.stdout().take().ok_or(ToolError::File)?;
+    #[cfg(unix)]
+    let stderr = child.stderr.take().ok_or(ToolError::File)?;
+    #[cfg(windows)]
+    let stderr = child.stderr().take().ok_or(ToolError::File)?;
+    let mut out_task = Box::pin(async {
+        let mut bytes = vec![];
+        stdout
+            .take(MAX_FILE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let mut err_task = Box::pin(async {
+        let mut bytes = vec![];
+        stderr
+            .take(MAX_FILE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let mut wait_task = Box::pin(async {
+        #[cfg(unix)]
+        {
+            child.wait().await
+        }
+        #[cfg(windows)]
+        {
+            // Wait on the shell itself, retaining the owning job. Stop descendants as
+            // soon as the shell exits so inherited output pipes cannot hold capture open.
+            // Dropping the job also stops them if this wait is cancelled before then.
+            let status = child.inner_mut().wait().await?;
+            child.start_kill()?;
+            Ok::<_, std::io::Error>(status)
+        }
+    });
+    let capture = async {
+        // A completed capped read reports overflow immediately, rather than waiting for a
+        // child blocked on a full pipe. The process group/job kills descendants on return.
+        let mut out = None;
+        let mut err = None;
+        let mut status = None;
+        while out.is_none() || err.is_none() || status.is_none() {
+            tokio::select! {
+                result=&mut out_task, if out.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}out=Some(bytes);},
+                result=&mut err_task, if err.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}err=Some(bytes);},
+                result=&mut wait_task, if status.is_none()=>status=Some(result.map_err(|_|ToolError::File)?),
+            }
+        }
+        let successful = status.is_some_and(|status| status.success());
+        let output = format!(
+            "Exit: {}\n{}{}",
+            status
+                .and_then(|s| s.code())
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            String::from_utf8_lossy(&out.unwrap_or_default()),
+            String::from_utf8_lossy(&err.unwrap_or_default())
+        );
+        if successful {
+            Ok(output)
+        } else {
+            Err(ToolError::Execution(output))
+        }
+    };
+    tokio::time::timeout(timeout, capture).await.map_err(|_| {
+        ToolError::Execution("The command exceeded its time limit and was stopped.".into())
+    })?
 }
 
 #[cfg(test)]

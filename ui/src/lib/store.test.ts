@@ -372,6 +372,44 @@ describe('chat controller', () => {
     expect(get(controller.notice)).toBe(get(controller.connectionError));
   });
 
+  it('shows instruction sources and warnings and replaces them when nested guidance loads', async () => {
+    const client = mockClient();
+    client.streamChat = vi.fn(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        sources: ['AGENTS.md'],
+        warnings: [],
+      });
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        sources: ['AGENTS.md', 'src/AGENTS.override.md'],
+        warnings: ['Skipped oversized guidance.'],
+      });
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        agentId: 'child',
+        sources: ['AGENTS.md', 'nested/AGENTS.md'],
+        warnings: [],
+      });
+      callbacks.onDelta('Applied project conventions.');
+    });
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Inspect this project', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const tools = get(controller.messages).at(-1)?.tools;
+    expect(tools).toHaveLength(2);
+    expect(tools?.[1]).toMatchObject({ id: 'instructions_child', status: 'complete' });
+    expect(tools?.[1].output).toContain('nested/AGENTS.md');
+    expect(tools?.[0]).toMatchObject({ name: 'project_instructions', status: 'error' });
+    expect(tools?.[0].output).toContain('AGENTS.md, src/AGENTS.override.md');
+    expect(tools?.[0].output).toContain('Warning: Skipped oversized guidance.');
+    controller.destroy();
+  });
+
   it('finishes visible tool and child activity when the parent request fails', async () => {
     const client = mockClient();
     client.streamChat = vi.fn(async (request, callbacks) => {
@@ -517,6 +555,71 @@ describe('native conversation persistence', () => {
       load: vi.fn().mockResolvedValue(null),
     };
   }
+  it('recalls across modes without model calls or replaying historical tools and clears recall on lock', async () => {
+    const storage = await nativeStorage();
+    const saved: SessionSummary = {
+      id: 'saved-agent',
+      title: 'Saved agent',
+      mode: 'agent',
+      workspace: '/project',
+      updatedAt: 1,
+      messages: [
+        {
+          id: 'old-message',
+          role: 'assistant',
+          content: 'Historical answer',
+          status: 'complete',
+          createdAt: 1,
+          attachments: [],
+          tools: [
+            {
+              id: 'old-tool',
+              name: 'shell',
+              arguments: '{"command":"touch replayed"}',
+              status: 'running',
+            },
+          ],
+        },
+      ],
+    };
+    storage.list.mockResolvedValue([]);
+    storage.load.mockImplementation(async (id: string) =>
+      id === saved.id ? saved : { ...saved, id, mode: 'chat' },
+    );
+    storage.search = vi.fn().mockResolvedValue({ results: [], remainingSessions: 0 });
+    const restore = vi.spyOn(agentClient, 'restoreWorkspace').mockResolvedValue('/project');
+    const run = vi.spyOn(agentClient, 'resolve').mockResolvedValue(undefined);
+    const client = mockClient();
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    expect(get(controller.agentMode)).toBe(false);
+    expect(await controller.send('/recall historical', [])).toBe(true);
+    expect(get(controller.recallText)).toBe('historical');
+    await controller.searchRecall({ query: 'historical' });
+    expect(storage.search).toHaveBeenCalledWith({ query: 'historical' });
+    await controller.openRecallResult(saved.id, 0);
+    expect(get(controller.agentMode)).toBe(true);
+    expect(get(controller.workspace)).toBe('/project');
+    expect(get(controller.focusedMessageId)).toBe('old-message');
+    expect(get(controller.messages)[0]).toMatchObject({
+      historical: true,
+      tools: [{ status: 'stopped' }],
+    });
+    expect(get(controller.approval)).toBeNull();
+    expect(run).not.toHaveBeenCalled();
+    expect(client.streamChat).not.toHaveBeenCalled();
+    await controller.openRecallResult('saved-chat', 0);
+    expect(get(controller.agentMode)).toBe(false);
+    expect(get(controller.workspace)).toBe('');
+    expect(restore).toHaveBeenCalledTimes(1);
+    controller.showRecall();
+    await controller.suspend();
+    expect(get(controller.recallText)).toBeNull();
+    controller.destroy();
+    restore.mockRestore();
+    run.mockRestore();
+  });
+
   it('restores native Agent projects and retains the current chat if a project is unavailable', async () => {
     const storage = await nativeStorage();
     const first: SessionSummary = {
@@ -761,6 +864,113 @@ describe('native conversation persistence', () => {
     expect(
       get(controller.messages).some((message) => message.content === 'Newer turn while saving'),
     ).toBe(true);
+    controller.destroy();
+  });
+});
+
+describe('context commands', () => {
+  it('sends the configured budget and keeps compaction checkpoints separate from the transcript', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    controller.savePreferences({
+      contextWindow: 8192,
+      outputTokens: 1024,
+      autoCompact: true,
+      maxIterations: 40,
+      commandTimeoutSeconds: 600,
+    });
+    await controller.send('Initial task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[0][0].contextBudget).toEqual({
+      contextWindow: 8192,
+      outputTokens: 1024,
+      autoCompact: true,
+      maxIterations: 40,
+      commandTimeoutSeconds: 600,
+    });
+    const original = structuredClone(get(controller.messages));
+    const snapshot = {
+      transcript: [{ role: 'user', content: 'Initial task' }],
+      checkpoints: [],
+      coveredMessages: 1,
+      sourceHash: 'fixture',
+      serverUsage: { promptTokens: 77, completionTokens: 12, totalTokens: 89 },
+    };
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      expect(request.compact).toBe(true);
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: snapshot,
+      });
+      callbacks.onEvent?.({
+        type: 'context_report',
+        requestId: request.requestId,
+        report: {
+          estimatedPromptTokens: 101,
+          toolTokens: 20,
+          outputTokens: 1024,
+          safetyTokens: 409,
+          contextWindow: 8192,
+          serverUsage: snapshot.serverUsage,
+        },
+      });
+    });
+    expect(await controller.send('/compact', [])).toBe(true);
+    expect(get(controller.messages)).toEqual(original);
+    expect(get(controller.sessions)[0].contextState).toEqual(snapshot);
+    await controller.send('/context', []);
+    expect(get(controller.notice)).toContain('101 tokens');
+    expect(get(controller.notice)).toContain('77 prompt, 12 generated');
+    expect(client.streamChat).toHaveBeenCalledTimes(2);
+    await controller.newChat();
+    await controller.send('New task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(vi.mocked(client.streamChat).mock.calls[2][0].contextState).toBeUndefined();
+    controller.destroy();
+  });
+  it('does not commit a failed or cancelled compaction candidate', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Initial task', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const original = structuredClone(get(controller.sessions)[0]);
+    const candidate = {
+      transcript: [],
+      checkpoints: [],
+      coveredMessages: 0,
+      sourceHash: 'candidate',
+    };
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: candidate,
+      });
+      throw new Error('Invalid summary');
+    });
+    expect(await controller.send('/compact', [])).toBe(false);
+    expect(get(controller.sessions)[0]).toEqual(original);
+    let release!: () => void;
+    vi.mocked(client.streamChat).mockImplementationOnce(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'context_updated',
+        requestId: request.requestId,
+        state: candidate,
+      });
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const work = controller.send('/compact', []);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    controller.stop();
+    release();
+    expect(await work).toBe(false);
+    expect(get(controller.sessions)[0].contextState).toBeUndefined();
+    expect(get(controller.messages)).toEqual(original.messages);
     controller.destroy();
   });
 });

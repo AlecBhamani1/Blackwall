@@ -6,6 +6,8 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::context::ContextBudget;
+
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_FRAME: usize = 16 * 1024;
 pub const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
@@ -122,19 +124,84 @@ async fn probe(name: &str, origin: &str, ollama: bool) -> LocalService {
             .and_then(|v| v.as_array())
         {
             result.available = true;
-            result.models = items
-                .iter()
-                .filter_map(|item| {
-                    item.get(if ollama { "name" } else { "id" })
-                        .and_then(|v| v.as_str())
-                })
-                .filter(|name| !name.trim().is_empty() && name.len() <= 256)
-                .take(200)
-                .map(str::to_owned)
-                .collect();
+            result.models = model_names(items, ollama);
         }
     }
     result
+}
+
+/// Size `budget` to the context window Ollama loaded `model` with. Ollama's OpenAI-compatible
+/// route ignores context options, so its `/api/ps` report is the limit that applies. Only
+/// endpoints on Ollama's default port are asked; other services, unloaded models, and
+/// unreachable hosts keep the configured budget.
+pub async fn served_budget(endpoint: &str, model: &str, budget: ContextBudget) -> ContextBudget {
+    let Some(origin) = ollama_origin(endpoint) else {
+        return budget;
+    };
+    let fetch = async {
+        let response = client()?
+            .get(format!("{origin}/api/ps"))
+            .send()
+            .await
+            .map_err(|_| ConnectionError::Unavailable)?;
+        bounded_json(response).await
+    };
+    match tokio::time::timeout(Duration::from_secs(3), fetch).await {
+        Ok(Ok(value)) => sized_to_loaded(budget, &value, model),
+        _ => budget,
+    }
+}
+
+fn ollama_origin(endpoint: &str) -> Option<&str> {
+    endpoint.strip_suffix("/v1").filter(|origin| {
+        Url::parse(origin).is_ok_and(|url| url.port_or_known_default() == Some(11434))
+    })
+}
+
+fn sized_to_loaded(budget: ContextBudget, value: &serde_json::Value, model: &str) -> ContextBudget {
+    // Ollama reports untagged names with their implied `:latest` tag.
+    let tagged = if model.contains(':') {
+        model.to_owned()
+    } else {
+        format!("{model}:latest")
+    };
+    let window = value
+        .get("models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("name").and_then(|v| v.as_str()) == Some(tagged.as_str()))
+        .and_then(|item| item.get("context_length"))
+        .and_then(|v| v.as_u64());
+    let Some(window) = window else {
+        return budget;
+    };
+    let sized = ContextBudget {
+        context_window: window.min(1_000_000),
+        output_tokens: (window / 4).min(32_768) as u32,
+        ..budget
+    };
+    if sized.validate().is_ok() {
+        sized
+    } else {
+        budget
+    }
+}
+
+/// Bounded, non-empty model names in service order. Ollama 0.40 can list one name once per
+/// runner, so only the first occurrence is kept.
+fn model_names(items: &[serde_json::Value], ollama: bool) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get(if ollama { "name" } else { "id" })
+                .and_then(|v| v.as_str())
+        })
+        .filter(|name| !name.trim().is_empty() && name.len() <= 256 && seen.insert(*name))
+        .take(200)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Only probes known loopback services. Never scans a network or uses remote credentials.
@@ -306,6 +373,80 @@ mod tests {
         assert!(ProgressDecoder::default()
             .push(&vec![b'x'; MAX_FRAME + 1])
             .is_err());
+    }
+    #[test]
+    fn budgets_follow_the_loaded_context_window() {
+        let configured = ContextBudget::default();
+        let ps = serde_json::json!({"models": [
+            {"name": "other:latest", "context_length": 8192},
+            {"name": "qwen3.6:35b", "context_length": 102_400}
+        ]});
+        let sized = sized_to_loaded(configured, &ps, "qwen3.6:35b");
+        assert_eq!(sized.context_window, 102_400);
+        assert_eq!(sized.output_tokens, 25_600);
+        assert_eq!(
+            sized_to_loaded(configured, &ps, "other:latest").output_tokens,
+            2048
+        );
+        for unusable in [
+            serde_json::json!({}),
+            serde_json::json!({"models": [{"name": "qwen3.6:35b"}]}),
+            serde_json::json!({"models": [{"name": "qwen3.6:35b", "context_length": 512}]}),
+        ] {
+            assert_eq!(
+                sized_to_loaded(configured, &unusable, "qwen3.6:35b"),
+                configured
+            );
+        }
+        assert_eq!(sized_to_loaded(configured, &ps, "missing"), configured);
+        assert_eq!(
+            sized_to_loaded(configured, &ps, "other").context_window,
+            8192
+        );
+        let huge =
+            serde_json::json!({"models": [{"name": "big:latest", "context_length": 2_000_000}]});
+        assert_eq!(
+            sized_to_loaded(configured, &huge, "big").context_window,
+            1_000_000
+        );
+    }
+    #[test]
+    fn only_ollama_default_port_endpoints_are_probed() {
+        assert_eq!(
+            ollama_origin("http://127.0.0.1:11434/v1"),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(
+            ollama_origin("http://gpu-box:11434/v1"),
+            Some("http://gpu-box:11434")
+        );
+        for other in [
+            "http://127.0.0.1:1234/v1",
+            "https://api.example.com/v1",
+            "http://127.0.0.1:11434/proxy",
+        ] {
+            assert_eq!(ollama_origin(other), None, "{other}");
+        }
+    }
+    #[test]
+    fn discovered_model_names_are_listed_once() {
+        let tags = [
+            serde_json::json!({"name": "qwen3.6:latest"}),
+            serde_json::json!({"name": "qwen3.6:latest"}),
+            serde_json::json!({"name": " "}),
+            serde_json::json!({"name": "llama3.2:1b"}),
+        ];
+        assert_eq!(model_names(&tags, true), ["qwen3.6:latest", "llama3.2:1b"]);
+        assert_eq!(
+            model_names(
+                &[
+                    serde_json::json!({"id": "a"}),
+                    serde_json::json!({"id": "a"})
+                ],
+                false
+            ),
+            ["a"]
+        );
     }
     #[test]
     fn invitations_reject_unsafe_schemes_and_malformed_secrets() {

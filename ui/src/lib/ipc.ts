@@ -1,8 +1,18 @@
+import {
+  contextBudget,
+  checkBudget,
+  contextReport,
+  restoreContext,
+  effectiveContext,
+  compactContext,
+  fingerprint,
+} from './context';
 import { invoke } from '@tauri-apps/api/core';
 import { normalizeEndpoint } from './setup';
 import { nativeModelError } from './modelError';
 import type {
   AgentEvent,
+  ApprovalTool,
   AttachmentPayload,
   ChatRequest,
   ModelInfo,
@@ -10,6 +20,9 @@ import type {
   StreamCallbacks,
   ShareStatus,
   StartShareRequest,
+  TokenUsage,
+  ContextReport,
+  ContextState,
 } from './types';
 
 const MODEL_DISCOVERY_TIMEOUT_MS = 4_000;
@@ -119,6 +132,16 @@ function browserModelRoutes(endpoint?: string): { models: string; tags?: string;
   };
 }
 
+/** Ollama 0.40 can list one model id once per runner; keep the first. */
+function uniqueModels(models: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>();
+  return models.filter(({ id }) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
 async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
   const routes = browserModelRoutes(endpoint);
   try {
@@ -126,16 +149,17 @@ async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
     const tagsResponse = await fetchWithTimeout(routes.tags, MODEL_DISCOVERY_TIMEOUT_MS);
     if (tagsResponse.ok) {
       const payload = (await tagsResponse.json()) as OllamaTagsResponse;
-      const models = (payload.models ?? [])
-        .map((model): ModelInfo | null => {
-          const id = model.model || model.name;
-          return id ? { id, name: id, sizeBytes: model.size } : null;
-        })
-        .filter((model): model is ModelInfo => model !== null)
-        .sort(
-          (a, b) =>
-            (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER),
-        );
+      const models = uniqueModels(
+        (payload.models ?? [])
+          .map((model): ModelInfo | null => {
+            const id = model.model || model.name;
+            return id ? { id, name: id, sizeBytes: model.size } : null;
+          })
+          .filter((model): model is ModelInfo => model !== null),
+      ).sort(
+        (a, b) =>
+          (a.sizeBytes ?? Number.MAX_SAFE_INTEGER) - (b.sizeBytes ?? Number.MAX_SAFE_INTEGER),
+      );
 
       if (models.length > 0) return models;
     }
@@ -149,9 +173,13 @@ async function discoverBrowserModels(endpoint?: string): Promise<ModelInfo[]> {
   }
 
   const payload = (await response.json()) as OpenAIModelsResponse;
-  return (payload.data ?? [])
-    .filter((model): model is Required<Pick<OpenAIModel, 'id'>> & OpenAIModel => Boolean(model.id))
-    .map((model) => ({ id: model.id, name: model.id, ownedBy: model.owned_by }));
+  return uniqueModels(
+    (payload.data ?? [])
+      .filter((model): model is Required<Pick<OpenAIModel, 'id'>> & OpenAIModel =>
+        Boolean(model.id),
+      )
+      .map((model) => ({ id: model.id, name: model.id, ownedBy: model.owned_by })),
+  );
 }
 
 function attachmentContext(attachments: AttachmentPayload[]): string {
@@ -209,7 +237,12 @@ function deltaText(value: unknown): string {
     .join('');
 }
 
-function parseSseBlock(block: string, callbacks: StreamCallbacks): boolean {
+function parseSseBlock(
+  block: string,
+  callbacks: StreamCallbacks,
+  requestId: string,
+  markFinished: () => void,
+): boolean {
   for (const line of block.split(/\r?\n/)) {
     if (!line.startsWith('data:')) continue;
     const data = line.slice(5).trim();
@@ -217,9 +250,25 @@ function parseSseBlock(block: string, callbacks: StreamCallbacks): boolean {
     if (data === '[DONE]') return true;
 
     const payload = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: unknown }; message?: { content?: unknown } }>;
+      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+      choices?: Array<{
+        delta?: { content?: unknown };
+        message?: { content?: unknown };
+        finish_reason?: string;
+      }>;
     };
+    if (payload.usage)
+      callbacks.onEvent?.({
+        type: 'turn_complete',
+        requestId,
+        usage: {
+          promptTokens: payload.usage.prompt_tokens,
+          completionTokens: payload.usage.completion_tokens,
+          totalTokens: payload.usage.total_tokens,
+        },
+      });
     const choice = payload.choices?.[0];
+    if (choice?.finish_reason) markFinished();
     const delta = deltaText(choice?.delta?.content ?? choice?.message?.content);
     if (delta) callbacks.onDelta(delta);
   }
@@ -227,7 +276,8 @@ function parseSseBlock(block: string, callbacks: StreamCallbacks): boolean {
   return false;
 }
 
-async function streamBrowserChat(
+async function streamBrowserMessages(
+  messages: Record<string, unknown>[],
   request: ChatRequest,
   callbacks: StreamCallbacks,
   signal: AbortSignal,
@@ -237,7 +287,9 @@ async function streamBrowserChat(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: request.model,
-      messages: request.messages.map(toOpenAIMessage),
+      messages,
+      max_tokens: contextBudget(request).outputTokens,
+      stream_options: { include_usage: true },
       stream: true,
     }),
     signal,
@@ -260,24 +312,134 @@ async function streamBrowserChat(
   const decoder = new TextDecoder();
   let buffer = '';
   let finished = false;
+  let finishedResponse = false;
+  let received = 0;
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received += value.length;
+      if (received > 8 * 1024 * 1024) throw new Error('The model response exceeds its size limit.');
+      buffer += decoder.decode(value, { stream: true });
 
-  while (!finished) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? '';
-    for (const block of blocks) {
-      if (parseSseBlock(block, callbacks)) {
-        finished = true;
-        break;
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? '';
+      if (new TextEncoder().encode(buffer).length > 1024 * 1024)
+        throw new Error('The model event exceeds its size limit.');
+      for (const block of blocks) {
+        if (
+          parseSseBlock(block, callbacks, request.requestId, () => {
+            finishedResponse = true;
+          })
+        ) {
+          finished = true;
+          break;
+        }
       }
     }
-  }
 
-  if (buffer.trim() && !finished) parseSseBlock(buffer, callbacks);
+    if (buffer.trim() && !finished)
+      finished = parseSseBlock(buffer, callbacks, request.requestId, () => {
+        finishedResponse = true;
+      });
+    if (!finished && !finishedResponse)
+      throw new Error('The model returned an incomplete response. Previous context retained.');
+    callbacks.onComplete?.();
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+async function streamBrowserChat(
+  request: ChatRequest,
+  callbacks: StreamCallbacks,
+  signal: AbortSignal,
+): Promise<void> {
+  const budget = contextBudget(request);
+  const source = request.messages.map(toOpenAIMessage);
+  let state = await restoreContext(source, request.contextState);
+  let messages = effectiveContext(state);
+  if (request.compact || (budget.autoCompact && estimateForThreshold(messages, budget))) {
+    try {
+      state = await compactContext(state, budget, async (chunk) => {
+        let summary = '';
+        await streamBrowserMessages(
+          chunk,
+          request,
+          {
+            onDelta(delta) {
+              summary += delta;
+            },
+          },
+          signal,
+        );
+        if (signal.aborted) throw new DOMException('Compaction stopped.', 'AbortError');
+        return summary;
+      });
+      messages = effectiveContext(state);
+    } catch (error) {
+      if (
+        request.compact ||
+        !(error instanceof Error) ||
+        !error.message.startsWith('There is no older')
+      )
+        throw error;
+    }
+  }
+  checkBudget(messages, budget);
+  const emit = (event: AgentEvent) => {
+    if (!signal.aborted) callbacks.onEvent?.(event);
+  };
+  if (signal.aborted) throw new DOMException('Response stopped.', 'AbortError');
+  emit({
+    type: 'context_report',
+    requestId: request.requestId,
+    report: contextReport(messages, budget, state.serverUsage),
+  });
+  if (request.compact) {
+    emit({ type: 'context_updated', requestId: request.requestId, state });
+    callbacks.onComplete?.();
+    return;
+  }
+  let answer = '';
+  let usage: TokenUsage | undefined;
+  await streamBrowserMessages(
+    messages,
+    request,
+    {
+      onDelta(delta) {
+        answer += delta;
+        callbacks.onDelta(delta);
+      },
+      onEvent(event) {
+        if (event.type === 'turn_complete') usage = event.usage;
+      },
+    },
+    signal,
+  );
+  if (signal.aborted) throw new DOMException('Response stopped.', 'AbortError');
+  state.transcript.push({ role: 'assistant', content: answer });
+  state.coveredMessages = source.length + 1;
+  state.sourceHash = await fingerprint([...source, { role: 'assistant', content: answer }]);
+  state.serverUsage = usage;
+  emit({
+    type: 'context_report',
+    requestId: request.requestId,
+    report: contextReport(messages, budget, usage),
+  });
+  emit({ type: 'context_updated', requestId: request.requestId, state });
+  emit({ type: 'turn_complete', requestId: request.requestId, usage });
   callbacks.onComplete?.();
+}
+function estimateForThreshold(
+  messages: Record<string, unknown>[],
+  budget: ReturnType<typeof contextBudget>,
+): boolean {
+  return (
+    contextReport(messages, budget).estimatedPromptTokens >
+    (budget.contextWindow - budget.outputTokens - Math.floor(budget.contextWindow / 20)) * 0.9
+  );
 }
 
 function normalizeEvent(payload: unknown): AgentEvent | null {
@@ -286,6 +448,25 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
   const type = String(event.type ?? event.event ?? '');
   const requestId = String(event.requestId ?? event.request_id ?? '');
 
+  if (
+    type === 'instructions_loaded' &&
+    Array.isArray(event.sources) &&
+    event.sources.every((source) => typeof source === 'string') &&
+    Array.isArray(event.warnings) &&
+    event.warnings.every((warning) => typeof warning === 'string')
+  ) {
+    return {
+      type,
+      requestId,
+      ...(typeof event.agentId === 'string' ? { agentId: event.agentId } : {}),
+      sources: event.sources,
+      warnings: event.warnings,
+    };
+  }
+  if (type === 'context_report' && event.report && typeof event.report === 'object')
+    return { type, requestId, report: event.report as ContextReport };
+  if (type === 'context_updated' && event.state && typeof event.state === 'object')
+    return { type, requestId, state: event.state as ContextState };
   if (type === 'assistant_delta') {
     return { type, requestId, delta: String(event.delta ?? event.content ?? '') };
   }
@@ -293,6 +474,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
     return {
       type,
       requestId,
+      usage: event.usage as TokenUsage | undefined,
       finishReason:
         typeof (event.finishReason ?? event.finish_reason) === 'string'
           ? String(event.finishReason ?? event.finish_reason)
@@ -356,8 +538,18 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       approvalId: event.approvalId,
       detail: event.detail,
       kind: event.kind,
+      ...approvalTool(event.tool),
     };
   return null;
+}
+
+/** The MCP tool an approval can be saved for, when the event names one. */
+function approvalTool(value: unknown): { tool?: ApprovalTool } {
+  if (!value || typeof value !== 'object') return {};
+  const { server, tool } = value as Record<string, unknown>;
+  return typeof server === 'string' && typeof tool === 'string' && tool.startsWith(`${server}__`)
+    ? { tool: { server, tool } }
+    : {};
 }
 
 async function streamTauriChat(
@@ -394,6 +586,10 @@ async function streamTauriChat(
         enabled: request.agentMode ?? false,
         workspace: request.workspace ?? null,
         webEnabled: request.webEnabled ?? false,
+        executionProfile: request.executionProfile ?? 'read-only',
+        commandNetwork: request.commandNetwork ?? false,
+        sessionId: request.sessionId ?? null,
+        sourceMessageId: request.sourceMessageId ?? null,
       },
     });
     if (signal.aborted) throw new DOMException('The request was stopped.', 'AbortError');

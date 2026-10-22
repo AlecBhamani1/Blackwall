@@ -1,21 +1,91 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { persistence, type Skill } from '../persistence';
+  import { persistence, type Skill, type SkillFinding, type SkillProposal } from '../persistence';
   import Icon from './Icon.svelte';
+  import ScanBadge from './ScanBadge.svelte';
+  import SkillImport from './SkillImport.svelte';
   import { platform } from '../platform';
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
   let skills: Skill[] = [];
   let warnings: string[] = [];
+  let proposals: SkillProposal[] = [];
+  let scans: Record<string, SkillFinding[]> = {};
+  let proposalScans: Record<string, SkillFinding[]> = {};
+  let drafts: Record<string, { description: string; body: string }> = {};
+  let sourceMessages: Record<string, string> = {};
   let editing: Skill | null = null;
   let creating = false;
+  let importing = false;
+  let notice = '';
   let busy = false;
   let error = '';
   const desktop = persistence.available();
   async function load() {
-    const result = await persistence.skills();
+    const [result, pending] = await Promise.all([
+      persistence.skills(),
+      persistence.skillProposals().catch(() => ({
+        proposals: [],
+        warnings: ['Proposed skills could not be read. Review them with bw skills.'],
+      })),
+    ]);
     skills = result.skills;
-    warnings = result.warnings;
+    scans = result.scans ?? {};
+    proposals = pending.proposals;
+    proposalScans = ('scans' in pending && pending.scans) || {};
+    warnings = [...result.warnings, ...pending.warnings];
+    // Edits in progress are kept; new proposals start from the proposed text.
+    drafts = Object.fromEntries(
+      proposals.map((proposal) => [
+        proposal.id,
+        drafts[proposal.id] ?? {
+          description: proposal.skill.description,
+          body: proposal.skill.body,
+        },
+      ]),
+    );
+  }
+  function saved(skill: Skill) {
+    return `${skill.description}\n\n${skill.body}`;
+  }
+  async function showSource(proposal: SkillProposal) {
+    try {
+      const session = await persistence.load(proposal.source.sessionId);
+      const message = session?.messages.find((message) => message.id === proposal.source.messageId);
+      sourceMessages[proposal.id] = message
+        ? message.content.slice(0, 2000) + (message.content.length > 2000 ? '\n[excerpt]' : '')
+        : 'The source conversation or message is no longer available.';
+    } catch {
+      sourceMessages[proposal.id] = 'The source conversation could not be opened.';
+    }
+  }
+  async function review(proposal: SkillProposal, approve: boolean) {
+    busy = true;
+    error = '';
+    try {
+      if (approve) {
+        const edited = drafts[proposal.id];
+        await persistence.approveSkillProposal(proposal.id, edited.description, edited.body);
+      } else await persistence.rejectSkillProposal(proposal.id);
+    } catch (cause) {
+      error =
+        typeof cause === 'string'
+          ? cause
+          : 'This proposal could not be reviewed. Refresh and try again; the skill may have changed.';
+      busy = false;
+      return;
+    }
+    // The review is done; a failed refresh must not read as a failed review.
+    proposals = proposals.filter((pending) => pending.id !== proposal.id);
+    delete drafts[proposal.id];
+    delete sourceMessages[proposal.id];
+    try {
+      await load();
+    } catch {
+      error = 'The proposal was reviewed, but your skills could not be refreshed.';
+    } finally {
+      busy = false;
+    }
   }
   async function save(event: SubmitEvent) {
     event.preventDefault();
@@ -81,6 +151,19 @@
   </header>
   <div class="content">
     {#if !desktop}<p>Skills are available in the installed Blackwall desktop app.</p>
+    {:else if importing}
+      <SkillImport
+        onCancel={() => {
+          importing = false;
+          // Some skills may have been imported before one failed.
+          void load().catch(() => (error = 'Your skills could not be refreshed.'));
+        }}
+        onDone={(imported) => {
+          importing = false;
+          notice = imported === 1 ? 'Imported 1 skill.' : `Imported ${imported} skills.`;
+          void load().catch(() => (error = 'Your skills could not be refreshed.'));
+        }}
+      />
     {:else if editing}
       <form onsubmit={save}>
         <label for="skill-name">Name</label><input
@@ -106,6 +189,10 @@
           required
           disabled={busy}
           placeholder="Describe the steps Blackwall should follow…"></textarea>
+        <label class="check"
+          ><input type="checkbox" bind:checked={editing.userOnly} disabled={busy} /> Run only when I
+          type /{editing.name || 'name'}</label
+        >
         <p class="hint">
           Enabled skills guide agent tasks. They never bypass approval for file changes, commands,
           or web access.
@@ -125,27 +212,100 @@
       </form>
     {:else}
       <div class="intro">
-        <span>Stored as Markdown files on this {platform.device}.</span><button
-          class="primary"
-          onclick={() => {
-            creating = true;
-            editing = { name: '', description: '', body: '', enabled: true };
-          }}>New skill</button
+        <span>Stored as Markdown files on this {platform.device}.</span><span class="buttons"
+          ><button
+            class="secondary"
+            onclick={() => {
+              notice = '';
+              importing = true;
+            }}>Import skills</button
+          ><button
+            class="primary"
+            onclick={() => {
+              creating = true;
+              editing = { name: '', description: '', body: '', enabled: true };
+            }}>New skill</button
+          ></span
         >
       </div>
+      {#if notice}<p role="status" class="notice">{notice}</p>{/if}
+      {#if proposals.length}
+        <section aria-label="Proposed skills" class="proposals">
+          <h3>Pending review · {proposals.length}</h3>
+          <p class="hint">
+            The agent proposed these after <code>/learn</code>. Nothing is used until you approve
+            it.
+          </p>
+          {#each proposals as proposal (proposal.id)}
+            <article class="proposal">
+              <strong>{proposal.skill.name}</strong>
+              <small>{proposal.before ? 'Updates this skill' : 'New skill'}</small>
+              {#if proposalScans[proposal.id]}<div>
+                  <ScanBadge findings={proposalScans[proposal.id]} name={proposal.skill.name} />
+                </div>{/if}
+              <p class="hint">
+                Source session: {proposal.source.sessionId}<br />Message: {proposal.source
+                  .messageId}
+              </p>
+              <button class="secondary" disabled={busy} onclick={() => showSource(proposal)}
+                >View source message</button
+              >
+              {#if sourceMessages[proposal.id]}<pre>{sourceMessages[proposal.id]}</pre>{/if}
+              {#if proposal.before}<label for={`before-${proposal.id}`}>Saved skill (−)</label>
+                <pre id={`before-${proposal.id}`}>{saved(proposal.before)}</pre>{/if}
+              <label for={`description-${proposal.id}`}>Proposed description (+) · editable</label
+              ><input
+                id={`description-${proposal.id}`}
+                aria-label={`Proposed description for ${proposal.skill.name}`}
+                bind:value={drafts[proposal.id].description}
+                maxlength="500"
+                disabled={busy}
+              /><label for={`body-${proposal.id}`}>Proposed instructions (+) · editable</label
+              ><textarea
+                id={`body-${proposal.id}`}
+                aria-label={`Proposed instructions for ${proposal.skill.name}`}
+                bind:value={drafts[proposal.id].body}
+                rows="8"
+                maxlength="30000"
+                disabled={busy}></textarea>
+              <div class="review-actions">
+                <button
+                  class="primary"
+                  aria-label={`Approve ${proposal.skill.name}`}
+                  disabled={busy ||
+                    !drafts[proposal.id]?.description.trim() ||
+                    !drafts[proposal.id]?.body.trim()}
+                  onclick={() => review(proposal, true)}>Approve</button
+                ><button
+                  class="secondary"
+                  aria-label={`Reject ${proposal.skill.name}`}
+                  disabled={busy}
+                  onclick={() => review(proposal, false)}>Reject</button
+                >
+              </div>
+            </article>
+          {/each}
+        </section>
+      {/if}
       {#if skills.length === 0}<p class="empty">
           No skills yet. Add a workflow to use in future agent tasks.
         </p>{/if}
       {#each skills as skill (skill.name)}<article>
+          <div class="body">
+            <button
+              class="skill"
+              onclick={() => {
+                creating = false;
+                editing = { ...skill };
+              }}
+              ><strong>{skill.name}</strong>{#if skill.userOnly}{' '}<span class="typed"
+                  >Runs only when you type /{skill.name}</span
+                >{/if}
+              <p>{skill.description}</p></button
+            >
+            {#if scans[skill.name]}<ScanBadge findings={scans[skill.name]} name={skill.name} />{/if}
+          </div>
           <button
-            class="skill"
-            onclick={() => {
-              creating = false;
-              editing = { ...skill };
-            }}
-            ><strong>{skill.name}</strong>
-            <p>{skill.description}</p></button
-          ><button
             class:enabled={skill.enabled}
             class="toggle"
             disabled={busy}
@@ -154,8 +314,10 @@
           >
         </article>{/each}
       <p class="hint">
-        Blackwall includes enabled skills when they fit its context budget. Keep instructions
-        focused and use a model that supports tools.
+        Agent runs list enabled skills by name and description and load one when it is relevant.
+        Keep descriptions specific and use a model that supports tools. Type <code>/name</code> to
+        run a skill directly; a skill set to run only when typed waits for that. Type
+        <code>/learn</code> after a task that worked to have the agent propose a skill from it.
       </p>
     {/if}
     {#each warnings as warning}<p class="warning">{warning}</p>{/each}
@@ -227,6 +389,15 @@
   .actions > span {
     flex: 1;
   }
+  .buttons {
+    display: flex;
+    gap: 8px;
+  }
+  .notice {
+    color: var(--ok);
+    font-size: 12px;
+    margin: 0 0 12px;
+  }
   .primary,
   .secondary,
   .delete,
@@ -257,8 +428,12 @@
     padding: 16px;
     margin: 10px 0;
   }
-  .skill {
+  .body {
     flex: 1;
+    min-width: 0;
+  }
+  .skill {
+    width: 100%;
     min-width: 0;
     text-align: left;
     background: transparent;
@@ -267,6 +442,20 @@
   .skill strong {
     font-size: 13px;
     font-weight: 570;
+  }
+  .typed {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 8px;
+  }
+  label.check {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .check input {
+    width: auto;
+    margin: 0;
   }
   .skill p {
     color: var(--text-muted);
@@ -306,6 +495,41 @@
     color: var(--text-muted);
     font-size: 12px;
     padding: 25px 0;
+  }
+  .proposals {
+    margin-bottom: 24px;
+  }
+  .proposals h3 {
+    font-size: 14px;
+    margin: 0 0 8px;
+  }
+  .proposal {
+    display: block;
+  }
+  .proposal small {
+    margin-left: 8px;
+    color: var(--text-muted);
+    font-size: 11.5px;
+  }
+  .proposals label {
+    margin-top: 12px;
+  }
+  .proposals pre {
+    margin: 10px 0 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 240px;
+    overflow: auto;
+    font-size: 12px;
+    background: var(--bg-base);
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .review-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
   }
   .warning {
     color: var(--warn);

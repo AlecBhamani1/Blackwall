@@ -10,7 +10,31 @@ pub struct Settings {
     pub endpoint: String,
     pub model: String,
     pub web_enabled: bool,
+    pub execution_profile: blackwall_core::sandbox::ExecutionProfile,
+    pub command_network: bool,
     pub memory_enabled: bool,
+    pub recall_enabled: bool,
+    pub budget: blackwall_core::context::ContextBudget,
+    /// Local run traces; on by default, with prompts and outputs off by default.
+    pub trace: blackwall_core::trace::TraceOptions,
+}
+
+/// Traces are on unless the owner turned them off.
+fn trace_options(
+    object: &serde_json::Map<String, Value>,
+    invalid: &str,
+) -> Result<blackwall_core::trace::TraceOptions, String> {
+    let flag = |key: &str, default: bool| {
+        object
+            .get(key)
+            .map(|value| value.as_bool().ok_or_else(|| invalid.to_owned()))
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    Ok(blackwall_core::trace::TraceOptions {
+        enabled: flag("tracesEnabled", true)?,
+        content: flag("traceContent", false)?,
+    })
 }
 
 impl Settings {
@@ -20,6 +44,7 @@ impl Settings {
 
     /// Check all fields before changing either normalized value.
     pub fn validate(&mut self) -> Result<(), String> {
+        self.budget.validate().map_err(|error| error.to_string())?;
         let endpoint = validated_endpoint(&self.endpoint)?;
         let model = validated_model(&self.model)?;
         self.endpoint = endpoint;
@@ -34,7 +59,13 @@ impl Settings {
             "endpoint": validated.endpoint,
             "model": validated.model,
             "webEnabled": validated.web_enabled,
+            "executionProfile": validated.execution_profile,
+            "commandNetwork": validated.command_network,
             "memoryEnabled": validated.memory_enabled,
+            "recallEnabled": validated.recall_enabled,
+            "contextBudget": validated.budget,
+            "tracesEnabled": validated.trace.enabled,
+            "traceContent": validated.trace.content,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -56,8 +87,41 @@ impl Settings {
             "endpoint" => updated.endpoint = value.into(),
             "model" => updated.model = value.into(),
             "web" => updated.web_enabled = on_or_off(value)?,
+            "profile" => updated.execution_profile = value.parse()?,
+            "command-network" => updated.command_network = on_or_off(value)?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
-            _ => return Err("Choose a setting: model, endpoint, web, or memory.".into()),
+            "recall" => updated.recall_enabled = on_or_off(value)?,
+            "traces" => updated.trace.enabled = on_or_off(value)?,
+            "trace-content" => updated.trace.content = on_or_off(value)?,
+            "context" => {
+                updated.budget.context_window = value
+                    .parse()
+                    .map_err(|_| "Enter a context limit in tokens.")?
+            }
+            "output" => {
+                updated.budget.output_tokens = value
+                    .parse()
+                    .map_err(|_| "Enter an output reserve in tokens.")?
+            }
+            "compact" => updated.budget.auto_compact = on_or_off(value)?,
+            "iterations" => {
+                updated.budget.max_iterations = value
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=100).contains(n))
+                    .ok_or("Enter an iteration limit between 1 and 100.")?
+            }
+            "timeout" => {
+                updated.budget.command_timeout_seconds = value
+                    .parse()
+                    .ok()
+                    .filter(|n| (10..=3600).contains(n))
+                    .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
+            }
+            _ => return Err(
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, context, output, compact, iterations, or timeout."
+                    .into(),
+            ),
         }
         updated.validate()?;
         persist(&updated)?;
@@ -72,9 +136,17 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
+            if self.recall_enabled { "on" } else { "off" },
+            if self.trace.enabled { "on" } else { "off" },
+            if self.trace.content { "on" } else { "off" },
+            self.budget.context_window, self.budget.output_tokens,
+            if self.budget.auto_compact { "on" } else { "off" },
+            self.budget.max_iterations, self.budget.command_timeout_seconds,
+            self.execution_profile.name(),
+            if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
         )
     }
 }
@@ -121,7 +193,57 @@ fn load_with_environment(
         endpoint,
         model,
         web_enabled: false,
+        execution_profile: Default::default(),
+        command_network: false,
         memory_enabled,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or("Invalid recall setting."))
+            .transpose()?
+            .unwrap_or(false),
+        trace: trace_options(object, "Invalid trace setting.")?,
+        budget: blackwall_core::context::ContextBudget {
+            context_window: object
+                .get("contextWindow")
+                .map(|v| v.as_u64().ok_or("Invalid context limit."))
+                .transpose()?
+                .unwrap_or(32000),
+            output_tokens: object
+                .get("outputTokens")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid output reserve.")
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    (object
+                        .get("contextWindow")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(32000)
+                        / 4)
+                    .min(4096) as u32
+                }),
+            auto_compact: object
+                .get("autoCompact")
+                .map(|v| v.as_bool().ok_or("Invalid automatic compaction setting."))
+                .transpose()?
+                .unwrap_or(false),
+            max_iterations: object
+                .get("maxIterations")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid iteration limit.")
+                })
+                .transpose()?
+                .unwrap_or(20),
+            command_timeout_seconds: object
+                .get("commandTimeoutSeconds")
+                .map(|v| v.as_u64().ok_or("Invalid command time limit."))
+                .transpose()?
+                .unwrap_or(120),
+        },
     };
     settings.validate()?;
     Ok(settings)
@@ -134,12 +256,36 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "endpoint" | "model" | "webEnabled" | "memoryEnabled"
+            "endpoint"
+                | "model"
+                | "webEnabled"
+                | "executionProfile"
+                | "commandNetwork"
+                | "memoryEnabled"
+                | "recallEnabled"
+                | "contextBudget"
+                | "tracesEnabled"
+                | "traceContent"
         )
     }) {
         return Err(invalid.into());
     }
     let mut settings = Settings {
+        execution_profile: object
+            .get("executionProfile")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
+        command_network: object
+            .get("commandNetwork")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
+        budget: object
+            .get("contextBudget")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
         endpoint: object
             .get("endpoint")
             .and_then(Value::as_str)
@@ -154,10 +300,16 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .get("webEnabled")
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
+        recall_enabled: object
+            .get("recallEnabled")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
         memory_enabled: object
             .get("memoryEnabled")
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
+        trace: trace_options(object, invalid)?,
     };
     settings
         .validate()
@@ -248,7 +400,15 @@ mod tests {
                 endpoint: DEFAULT_ENDPOINT.into(),
                 model: DEFAULT_MODEL.into(),
                 web_enabled: false,
+                execution_profile: Default::default(),
+                command_network: false,
                 memory_enabled: false,
+                recall_enabled: false,
+                budget: Default::default(),
+                trace: blackwall_core::trace::TraceOptions {
+                    enabled: true,
+                    content: false,
+                },
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -327,6 +487,15 @@ mod tests {
             .unwrap();
         settings.set(&store, "model", " trimmed-model ").unwrap();
         settings.set(&store, "web", "ON").unwrap();
+        settings.set(&store, "recall", "on").unwrap();
+        assert!(settings.recall_enabled);
+        settings.set(&store, "context", "8192").unwrap();
+        settings.set(&store, "output", "1024").unwrap();
+        settings.set(&store, "compact", "on").unwrap();
+        settings.set(&store, "iterations", "40").unwrap();
+        settings.set(&store, "timeout", "600").unwrap();
+        settings.set(&store, "traces", "off").unwrap();
+        settings.set(&store, "trace-content", "on").unwrap();
         assert_eq!(settings.endpoint, "https://models.example/v1");
         assert_eq!(settings.model, "trimmed-model");
         drop(store);
@@ -334,7 +503,18 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 4);
+        assert_eq!(saved.as_object().unwrap().len(), 10);
+        assert_eq!(
+            (
+                saved["tracesEnabled"].clone(),
+                saved["traceContent"].clone()
+            ),
+            (json!(false), json!(true))
+        );
+        assert_eq!(
+            saved["contextBudget"],
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
+        );
         assert!(saved.get("apiKey").is_none());
     }
 
@@ -356,6 +536,10 @@ mod tests {
             ("model", "model\u{1b}[31m"),
             ("web", "yes"),
             ("memory", "sometimes"),
+            ("iterations", "0"),
+            ("iterations", "101"),
+            ("timeout", "9"),
+            ("timeout", "3601"),
             ("apiKey", "secret"),
         ] {
             let error = settings.set(&store, key, value).unwrap_err();
@@ -365,6 +549,43 @@ mod tests {
         }
         assert!(settings.set(&store, "model", &"a".repeat(257)).is_err());
         assert_eq!(settings, before);
+        assert!(settings
+            .set(&store, "iterations", "101")
+            .unwrap_err()
+            .contains("between 1 and 100"));
+        assert!(settings
+            .set(&store, "timeout", "9")
+            .unwrap_err()
+            .contains("between 10 and 3,600 seconds"));
+    }
+
+    #[test]
+    fn execution_settings_require_explicit_values_and_persist() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        assert_eq!(settings.execution_profile.name(), "read-only");
+        assert!(!settings.command_network);
+        settings.set(&store, "profile", "workspace-write").unwrap();
+        settings.set(&store, "command-network", "on").unwrap();
+        let loaded = defaults(&store);
+        assert_eq!(loaded.execution_profile.name(), "workspace-write");
+        assert!(loaded.command_network);
+        let before = settings.clone();
+        assert!(settings.set(&store, "profile", "invalid").is_err());
+        assert_eq!(settings, before);
+        settings.set(&store, "profile", "unsandboxed").unwrap();
+        assert!(settings.describe().contains("on (unsandboxed)"));
+        let old = r#"{"endpoint":"http://localhost:11434/v1","model":"fixture","webEnabled":false,"memoryEnabled":false}"#;
+        assert_eq!(
+            saved_settings(old).unwrap().execution_profile.name(),
+            "read-only"
+        );
+        assert!(saved_settings(&old.replace(
+            "\"webEnabled\"",
+            "\"executionProfile\":\"invalid\",\"webEnabled\""
+        ))
+        .is_err());
     }
 
     #[test]
@@ -427,7 +648,12 @@ mod tests {
             endpoint: "models.example".into(),
             model: "\u{1b}[31msecret".into(),
             web_enabled: true,
+            execution_profile: Default::default(),
+            command_network: false,
             memory_enabled: false,
+            recall_enabled: false,
+            budget: Default::default(),
+            trace: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());

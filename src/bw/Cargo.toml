@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-blackwall-core.workspace = true
+blackwall-core = { workspace = true, features = ["credential-store"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

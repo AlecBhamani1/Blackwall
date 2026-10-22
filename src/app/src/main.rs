@@ -10,10 +10,10 @@ mod keychain;
 #[cfg(target_os = "macos")]
 mod lifecycle;
 mod pairing;
-mod secrets;
 mod setup;
 mod updates;
 
+use blackwall_core::secrets;
 use commands::AppState;
 use thiserror::Error;
 
@@ -28,6 +28,8 @@ fn run() -> Result<(), StartupError> {
     let mut context = tauri::generate_context!();
     identity::initialize(&context.config().identifier).map_err(StartupError::Identity)?;
     identity::configure_acceptance_webviews(context.config_mut());
+    #[cfg(target_os = "macos")]
+    lifecycle::adopt_login_path();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -63,7 +65,27 @@ fn run() -> Result<(), StartupError> {
             data::list_skills,
             data::save_skill,
             data::delete_skill,
+            data::list_skill_proposals,
+            data::approve_skill_proposal,
+            data::reject_skill_proposal,
+            data::find_skill_imports,
+            data::choose_skill_import,
+            data::import_skill,
+            data::list_suggested_skills,
+            data::get_suggested_skill,
+            data::discard_skill_downloads,
+            data::list_traces,
+            data::read_trace,
+            data::list_mcp_servers,
+            data::add_mcp_server,
+            data::set_mcp_server_enabled,
+            data::remove_mcp_server,
+            data::save_mcp_secret,
+            data::delete_mcp_secret,
+            data::list_mcp_tool_rules,
+            data::remove_mcp_tool_rule,
             data::list_sessions,
+            data::search_sessions,
             data::load_session,
             data::save_session,
             data::delete_session,
@@ -71,6 +93,9 @@ fn run() -> Result<(), StartupError> {
             data::list_memories,
             data::save_memory,
             data::delete_memory,
+            data::list_memory_proposals,
+            data::approve_memory_proposal,
+            data::reject_memory_proposal,
             data::load_preferences,
             data::save_preferences,
             credentials::save_model_key,

@@ -124,6 +124,15 @@ pub struct ChatRequest {
     /// Maximum generated tokens, if explicitly selected by the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Configured context/output budget; defaults preserve older clients.
+    #[serde(default)]
+    pub context_budget: crate::context::ContextBudget,
+    /// Separately persisted original model transcript and compacted checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<crate::context::ContextState>,
+    /// Request summary-only compaction, without executing tools.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 impl ChatRequest {
@@ -141,6 +150,9 @@ impl ChatRequest {
             attachments: Vec::new(),
             temperature: None,
             max_tokens: None,
+            context_budget: Default::default(),
+            context_state: None,
+            compact: false,
         }
     }
 
@@ -159,6 +171,15 @@ impl ChatRequest {
             if !(0.0..=2.0).contains(&temperature) {
                 return Err(ProtocolError::InvalidTemperature(temperature));
             }
+        }
+        self.context_budget
+            .validate()
+            .map_err(|_| ProtocolError::InvalidContextBudget)?;
+        if self
+            .max_tokens
+            .is_some_and(|n| n == 0 || n > self.context_budget.output_tokens)
+        {
+            return Err(ProtocolError::InvalidContextBudget);
         }
         validate_attachment_group(&self.attachments)?;
         for message in &self.messages {
@@ -278,6 +299,23 @@ pub enum ApprovalDecision {
     AlwaysAllow,
     /// Refuse this operation.
     Deny,
+    /// Permit this MCP tool from now on in this project, saving an owner rule.
+    AllowToolInProject,
+    /// Permit this MCP tool from now on in every project, saving an owner rule.
+    AllowTool,
+    /// Permit every tool from this MCP server from now on in this project, saving an owner rule.
+    AllowServerInProject,
+    /// Permit every tool from this MCP server from now on in every project, saving an owner rule.
+    AllowServer,
+}
+
+/// The MCP tool an approval is for, so the owner can allow it from now on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApprovalTool {
+    /// Server name from the owner's MCP file.
+    pub server: String,
+    /// Namespaced `server__tool` name.
+    pub tool: String,
 }
 
 /// Request to resolve an outstanding approval event.
@@ -312,6 +350,27 @@ pub enum SubagentState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Instruction provenance and safe discovery warnings, without file contents.
+    InstructionsLoaded {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        sources: Vec<String>,
+        warnings: Vec<String>,
+    },
+    /// Latest estimated request budget, distinct from endpoint-reported usage.
+    ContextReport {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        report: crate::context::ContextReport,
+    },
+    /// Original history and checkpoints; no approval state is serialized.
+    ContextUpdated {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        state: crate::context::ContextState,
+    },
     /// Incremental assistant text from a streaming model response.
     AssistantDelta {
         /// Identifier of the request producing this delta.
@@ -358,6 +417,9 @@ pub enum AgentEvent {
         kind: ApprovalKind,
         /// Exact command, file change, host, or delegated capability.
         detail: String,
+        /// The MCP tool, for approvals that can be saved as an owner rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<ApprovalTool>,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -429,7 +491,10 @@ impl AgentEvent {
     /// Returns the correlation identifier shared by every event variant.
     pub fn request_id(&self) -> &str {
         match self {
-            Self::AssistantDelta { request_id, .. }
+            Self::InstructionsLoaded { request_id, .. }
+            | Self::ContextReport { request_id, .. }
+            | Self::ContextUpdated { request_id, .. }
+            | Self::AssistantDelta { request_id, .. }
             | Self::ToolCall { request_id, .. }
             | Self::ToolResult { request_id, .. }
             | Self::ApprovalRequest { request_id, .. }
@@ -445,6 +510,9 @@ impl AgentEvent {
 /// Protocol validation failure detected before I/O.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ProtocolError {
+    /// Invalid model context, output reservation, or agent limits.
+    #[error("Invalid context budget, output reserve, or agent limits.")]
+    InvalidContextBudget,
     /// No request correlation identifier was provided.
     #[error("requestId must not be empty")]
     MissingRequestId,
@@ -519,6 +587,9 @@ mod tests {
             }],
             temperature: Some(0.2),
             max_tokens: Some(512),
+            context_budget: Default::default(),
+            context_state: None,
+            compact: false,
         }
     }
 
@@ -569,6 +640,20 @@ mod tests {
     fn every_event_variant_round_trips_and_retains_request_id() {
         let message = ChatMessage::new(MessageRole::Assistant, "Done");
         let events = vec![
+            AgentEvent::InstructionsLoaded {
+                request_id: "r1".into(),
+                agent_id: None,
+                sources: vec!["AGENTS.md".into()],
+                warnings: vec!["Nested guidance was skipped.".into()],
+            },
+            AgentEvent::ContextReport {
+                request_id: "r1".to_owned(),
+                report: crate::context::ContextBudget::default().report(&[], &[], None),
+            },
+            AgentEvent::ContextUpdated {
+                request_id: "r1".to_owned(),
+                state: crate::context::ContextState::default(),
+            },
             AgentEvent::AssistantDelta {
                 request_id: "r1".to_owned(),
                 delta: "Hello".to_owned(),
@@ -590,6 +675,17 @@ mod tests {
                 approval_id: "a1".to_owned(),
                 kind: ApprovalKind::Exec,
                 detail: "cargo test".to_owned(),
+                tool: None,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "a2".to_owned(),
+                kind: ApprovalKind::Exec,
+                detail: "MCP server: docs".to_owned(),
+                tool: Some(ApprovalTool {
+                    server: "docs".to_owned(),
+                    tool: "docs__search".to_owned(),
+                }),
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),

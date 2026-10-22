@@ -1,6 +1,6 @@
 # Using the current Blackwall development build
 
-Updated 2026-09-30. This guide describes the code in this checkout. It does not imply that a
+Updated 2026-10-06. This guide describes the code in this checkout. It does not imply that a
 published installer contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
 
 Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
@@ -69,6 +69,63 @@ Browser screenshots of the development UI, using a deterministic model fixture:
 [file reference picker](screenshots/chat-file-references.png). These demonstrate the browser flow;
 Finder and macOS screenshot-thumbnail drops still require packaged native acceptance.
 
+## Budget and compact conversations
+
+Open **Memory → Advanced · Context window** to set the context limit configured in your selected
+model service and the output reserve. Settings apply to the selected connection's future requests;
+check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
+tokens, and automatic compaction off. The browser development UI also saves these controls locally.
+When an Ollama service on its default port (11434) has the model loaded, CLI and desktop requests
+use the context window it reports instead, reserving a quarter of it (up to 32,768 tokens) for
+output. Ollama sets that window itself (for example with `OLLAMA_CONTEXT_LENGTH`); requests cannot
+change it. The same section sets the Agent iteration limit (1–100, default
+20) and the command time limit (10–3,600 seconds, default 120). The browser development UI also saves
+these controls locally.
+
+Type `/context` in the composer or CLI to see estimated prompt and tool-definition tokens, the
+output reserve, the 5% safety reserve, and separately labeled server-reported usage when available.
+Server usage describes the last conversation request (excluding summary calls), rather than a
+running total or an exact measurement of the current checkpoint. Estimates use serialized UTF-8
+text bytes divided by three plus message framing, including text attachments. Image inputs use a
+4,096-token estimate per image rather than counting encoded image bytes as text. They are not tokenizer
+counts and cannot guarantee that every model accepts a request. The configured budget supplements
+the existing serialized size ceilings; output requests send an explicit `max_tokens` cap.
+
+Type `/compact` to summarize older assistant/tool context. The two most recent user turns, every
+user requirement and correction, initial instructions, and current memory/skill instructions stay
+intact. Older assistant/tool material becomes a structured checkpoint covering requirements,
+corrections, decisions, changed files, checks, unfinished work, and relevant context. Completed
+recent tool-call/result groups remain intact. Optional automatic compaction attempts this at 90%
+of the available prompt budget, including tool definitions. Large retained instructions, attachments,
+or recent turns can still exceed the budget; shorten them or select an appropriate configured limit.
+
+The full visible conversation and original model transcript remain saved. Checkpoints live in a
+separate `contextState.checkpoints` array in the saved session record and resume through the same
+transactional session store; no database schema migration is needed. Checkpoint hashes bind them
+to their original transcript prefix. Session exports include both originals and checkpoints.
+Summaries run without tools. Historical actions are data, never executed during resume, and approval
+rules are scoped to their original run. Invalid, failed, or cancelled summaries leave the previous
+context intact. Existing saved conversations without checkpoints continue normally.
+
+CLI equivalents:
+
+```sh
+bw config set context 32000
+bw config set output 4096
+bw config set compact on
+bw config set iterations 20
+bw config set timeout 120
+```
+
+During interactive CLI chat, use `/settings context <tokens>`, `/settings output <tokens>`,
+`/settings compact on|off`, `/settings iterations <count>`, and `/settings timeout <seconds>`.
+`/compact` does not add a user or assistant message. Ctrl+C cancels
+summary generation. The original transcript remains subject to the conversation store's size limit;
+compaction releases model prompt space, not disk space.
+
+Scripted browser verification: [budget controls](screenshots/context-budget.png) and
+[separate estimates and server usage](screenshots/context-usage.png).
+
 ## Share with guests
 
 In Settings, give the guest link an optional name, choose an expiry, and create the link. Copy it or
@@ -99,16 +156,150 @@ is the authority for file tools; a folder must be selected again after reopening
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
 The last option remembers only the exact action until the current run ends. It does not grant a
 permanent project or domain policy. Expired and cancelled approval handles cannot authorize actions.
+MCP tool approvals also offer **Always allow**, for that tool or every tool from its server, in this
+project or every project. It saves an owner rule in `policy.json`, applies it to the rest of the
+run, and allows the call; if the rule cannot be saved, the call does not run and says why. The
+server's page in **MCP servers** lists these rules and removes them; a removal applies from the next
+run. Removing a server also removes its rules, so a later server with the same name starts asking.
 
-Shell commands run as your user account and are not sandboxed. macOS and Linux run them with
-`/bin/sh`; Windows runs them in Windows PowerShell. Their output is bounded, they have a two-minute
-limit, and cancellation terminates their process group or Windows Job Object, including children
-whose parent shell has already exited. Review the command itself when
-deciding; the selected project folder does not constrain what an approved shell command can access.
+To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
+(`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
+`deny`), a `kind` (`exec`, `file`, or `network`), and one matching field:
+
+```json
+{"rules":[
+  {"decision":"allow","kind":"exec","command":"cargo test"},
+  {"decision":"deny","kind":"file","path":".git"},
+  {"decision":"allow","kind":"network","host":"*.docs.rs"}
+]}
+```
+
+`command` matches the leading words of a shell command, `path` matches a workspace-relative path and
+everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. For MCP calls,
+an `exec` rule can use `tool` instead: a server name such as `context7` matches all of that server's
+tools, and `server__tool` matches one. `tool` rules never match shell commands. Any rule can add
+`project` with an absolute folder path, and then applies only to runs in that project. Ask and deny
+path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
+and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
+prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
+instead of matching an allow rule. Edits inside the data folder always ask, even when the project
+contains it. Rules load when a run starts. If the file is invalid, every action asks and the prompt
+shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
+common credential forms redacted; the log rotates at 1 MiB.
+
+To let Agent mode call other programs, such as another coding assistant's command line, list them
+in `tools.json` in the same data folder:
+
+```json
+{"tools":[
+  {"name":"ask_claude","description":"Ask Claude a question","command":["claude","-p","{prompt}"]}
+]}
+```
+
+Each tool runs its program directly, without a shell, in the project folder. The program must be a
+name found in an absolute `PATH` directory or an absolute path. Batch files (`.bat`, `.cmd`) are
+refused, and on Windows the program must be an `.exe`. An argument written as a whole `{name}` becomes a text parameter the model
+fills in; values that start with `-` (or `/` on Windows) are rejected so the model cannot add
+options. Every call needs Exec approval and is matched by rules
+against the configured command, so `{"decision":"allow","kind":"exec","command":"claude -p"}` allows
+it without a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
+owner tools are offered and the run shows a warning.
+
+Local MCP servers that use standard input and output can be listed in `mcp.json` in the same data
+folder:
+
+```json
+{"servers":[
+  {"name":"files","command":["npx","-y","@modelcontextprotocol/server-filesystem","/path/to/folder"],"denyTools":["write_file"]}
+]}
+```
+
+Each enabled server starts when an Agent run starts, in the data folder, without a shell, and stops
+when the run ends; pass a project path as an argument when a server needs one. Programs follow the
+same rules as command tools, so on Windows a server needs an `.exe` launcher such as `node` rather
+than `npx`. Server names use lowercase letters, digits, and `-`; names added with `bw mcp add` or
+the desktop are lowercased, with spaces and underscores as hyphens. Its tools are offered
+as `server__tool`, such as `files__read_text_file`; `allowTools` limits a server to the listed
+tools, `denyTools` hides tools, and `"enabled":false` keeps a server from starting. Tools whose
+names are invalid or already used are skipped with a warning. Every call needs Exec approval, and
+rules match the namespaced name, so `{"decision":"allow","kind":"exec","command":"files__read_text_file"}`
+allows that tool; server descriptions and hints never grant permission. Calls use the command time
+limit, and a server that times out is not used again in that run. Text results are returned to the
+model; other content is noted but omitted. Servers inherit your environment without the
+credentials Blackwall itself uses. A server that needs an access token lists its environment
+variable name under `secrets`; the value lives only in the platform credential store and is given to
+that server's process when it starts. If the file is invalid, a secret is missing, or a server does
+not start, the run continues without those tools and shows a warning.
+
+In the desktop app, **MCP servers** in the sidebar lists the servers with enable and disable
+toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
+password field. It uses the same validation and credential store as the CLI. **Add server** offers
+suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
+thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
+form with a pinned package version; filesystem and remote ask for a folder or address at the end of
+the command. The list ships with the app and is never downloaded, but `npx -y` downloads the pinned
+package from npm the first time the server starts, without asking again. Suggestions start with
+`npx`, so they are not offered on Windows.
+
+The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
+an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
+`bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
+they are saved, apply from the next Agent run, and an invalid or linked file is reported rather than
+replaced.
+Tool lists are edited in the file. `bw mcp secret <name> <NAME>` reads a value from standard input,
+for example `pbpaste | bw mcp secret jira JIRA_API_TOKEN` on macOS, saves it in the credential store,
+and adds the name to the server; it refuses to read from a terminal, where the value would be shown.
+Add `--delete` to remove one, and `bw mcp remove` deletes a server's saved secrets.
+
+On macOS, the desktop app finds programs for command tools, MCP servers, and shell commands with
+your login shell's `PATH`, so tools installed with Homebrew or npm work when Blackwall is opened from
+the Dock. It asks the shell once at startup and keeps the system default if that takes more than
+five seconds.
+
+Shell commands and owner-defined command tools use an owner-selected execution profile. In desktop
+Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
+CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
+`bw config set command-network on|off`; `/settings` offers the same controls. The default is
+read-only with command network disabled. Desktop selections reset when switching conversations;
+CLI selections persist. Old saved settings acquire the safe defaults.
+
+On macOS, Seatbelt applies before the shell/program starts and is inherited by descendants:
+
+| Profile | Filesystem access | Command network |
+| --- | --- | --- |
+| Read-only | Read project and system runtime files; no project writes | Disabled unless explicitly enabled |
+| Workspace-write | Also write inside the selected project, excluding protected paths | Disabled unless explicitly enabled |
+| Unsandboxed | Full account permissions | Always enabled |
+
+Sandboxed commands cannot read or write Blackwall's data directory, credential directories such as
+`.ssh`, `.aws`, `.gnupg`, `.config`, or the owner's `Library`. Project metadata and agent configuration
+folders (`.git`, `.hg`, `.svn`, `.agents`, `.codex`, `.claude`) are protected at every depth;
+`AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` remain readable but cannot be changed by commands.
+System runtime reads include `/System`, `/usr`, `/bin`, `/sbin`, and `/opt/homebrew`; arbitrary
+external source trees, home-installed runtimes and shared temporary folders are not granted. Put
+build output and scratch files inside the project when using workspace-write.
+
+Approval still applies to commands, including exact command text and working folder. Approval or
+an allow rule never widens the profile. A denied action must be reported to the owner; change the
+profile explicitly before proposing it again. A missing/broken macOS backend fails closed with no
+unsandboxed retry. Linux and Windows currently fail closed for restricted profiles; full account
+execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
+Windows uses Windows PowerShell.
+
+Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
+and timeouts terminate the process group or Windows Job Object. Restricted macOS commands cannot
+create a new process group/session to escape cleanup: direct `setpgid`/`setsid` calls and
+`posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
+`posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
+command tools; separately configured MCP servers retain their own account permissions and approvals.
+File tools remain workspace jailed, with reviewed edits; **Web access** controls the separate web
+tools and does not enable command network. Model connections remain available with command network off.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
-20 model/tool iterations; each child stops after eight. Pure child batches have a maximum concurrency
+the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency
 of three. The selected model must support OpenAI-compatible tool calls for Agent mode to work well.
+Blackwall's instructions and any project guidance reach the model as one system message at the start,
+because some chat templates, such as Qwen's on vLLM, reject any other system message.
 
 Tool entries are collapsed by default and can be expanded to inspect results. Restored transcripts
 show past actions without executing them again. A fresh model turn currently receives the prior prose
@@ -137,7 +328,8 @@ edit, and delete are available; automatic fact extraction and a Postgres memory 
 The advanced context-window setting changes the displayed estimate, not the model server's configured
 context length or a guaranteed token budget.
 
-**Skills** manages reusable instructions stored as `~/.blackwall/skills/<name>.md`. Create, edit,
+**Skills** manages reusable instructions stored as `~/.blackwall/skills/<name>.md`, or as a folder
+`<name>/SKILL.md` with bundled files for an imported skill. Create, edit,
 enable/disable, and delete skills in the panel. Two starter workflows are seeded once:
 `repo-orientation` and `bugfix-triage`. Removing one does not recreate it on the next launch.
 
@@ -153,11 +345,95 @@ and report concrete findings with file paths.
 
 Names use lowercase letters, numbers, and hyphens, up to 64 characters. A file must be valid UTF-8
 Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are reported and skipped.
-Enabled skills enter agent context when they fit the shared 8,000-byte budget.
-They cannot grant tool permissions. Skills are currently managed by the user; agent-generated skill
-creation and automatic learning are not implemented.
+Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
+model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
+usable.
+They cannot grant tool permissions.
+
+Type `/name` at the start of a message to run a saved skill directly, in an Agent chat, the CLI, or
+`bw run`. The agent gets that skill's instructions for the turn, and the rest of the message is the
+request, as in `/pdf fill form.pdf from data.json`. In the desktop app, typing `/` lists the
+commands and enabled skills. For a skill that should run only this way, check **Run only when I
+type /name** in the editor, or add `disable-model-invocation: true` to its frontmatter. Agent runs
+do not list such a skill, and `read_skill` cannot load it except in the turn you typed it. Typing
+`/name` for a disabled skill answers that it is turned off. A skill cannot take a built-in command's
+name, such as `help`, `learn`, or `review`.
+
+Type `/learn` in an Agent conversation to have the model propose a skill from the workflow that
+worked, leaving out failed attempts and secrets. The model can only propose: `skill_propose` stores
+the proposal with its source session and message under `skills/.proposals`, and nothing is loaded
+until the owner approves it. `bw skills` lists pending proposals with a diff against the current
+skill, `bw skills approve <id>` saves one and keeps the proposal in `skills/.proposals/approved` as
+a record of its source, and `bw skills reject <id>` discards it, even one that can no longer be
+read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
+kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
+
+In the desktop app, **Skills** lists pending proposals under **Pending review**. Each one shows its
+source session and message, the saved skill it would replace, and the proposed description and
+instructions, which can be edited before **Approve**. Edits keep the proposed name and pass the same
+validation as a saved skill; **Reject** discards the proposal.
+
+To reuse skills written for other agents, choose **Import skills** in the Skills panel or use
+`bw skills`. Blackwall reads the `SKILL.md` format used by Claude Code, Codex, and most published
+skills: a folder with a `SKILL.md` whose frontmatter has a name and description, and optional
+bundled files such as scripts and references. The whole folder is imported, up to 200 files and
+5 MB; links and hidden files are left out. The panel lists skills found in `~/.claude/skills`,
+`~/.codex/skills`, and `~/.agents/skills`, and **Choose folder…** or **Choose file…** adds others.
+`bw skills import` lists the same folders, and `bw skills import <path>` imports a `SKILL.md`, a
+skill folder, or a folder of them.
+
+**Suggested** lists skills from the official Anthropic and OpenAI skill repositories and Matt
+Pocock's engineering skills, each pinned to a reviewed commit. **Get** (or `bw skills get <name>`;
+`bw skills suggested` lists them) downloads that version from GitHub for review; Blackwall goes
+online only when you ask.
+
+Before anything is saved, each skill is scanned locally for patterns that often hide prompt
+injection or send data away: invisible characters and hidden comments, instructions to ignore you
+or hide actions, uploads to remote addresses and paste or webhook services, scripts that read secret
+files such as `~/.ssh` or `.env`, long encoded blocks, code that decodes and runs itself, and downloads
+piped into a shell. Findings show the file, line, and text. A clean scan reads "Scanned: no issues
+found", which means none of these patterns matched, not that a skill is safe. A skill with findings
+is imported only if you choose **Allow anyway** (`--allow-anyway` in the CLI); **Block** drops it.
+The files are read and scanned again at import, so a change after the preview is caught.
+Saved skills and pending `/learn` proposals show the same badge in the Skills panel. Skills are
+rescanned each time the panel lists them, so the badge follows edits; `bw skills` shows the scan on
+pending proposals.
+
+The preview also shows the license, the bundled files, and what conversion changed. Names are
+converted to lowercase with hyphens, descriptions over 500 bytes are shortened, and settings such
+as `allowed-tools` are ignored, because skills never grant permissions. `disable-model-invocation`
+is kept, so the skill runs only when you type its name. A saved skill is replaced
+only when you choose to (`--replace` in the CLI). The agent reads a skill's bundled text files
+through `read_skill`, and runs its scripts with the shell tool by their full path, so each command
+still needs your approval.
 
 Guest chats never receive owner memory, skills, project tools, or local conversation history.
+
+## Agent traces
+
+Each CLI and desktop Agent run records a local trace in `~/.blackwall/traces` (or the
+`BLACKWALL_DATA_DIR` data folder). A trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with
+a span for the run, each model call, and each tool call, using the OpenTelemetry generative AI names
+(`invoke_agent`, `chat`, `execute_tool`). Spans keep timings, the model, token counts the server
+reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the newest 200
+traces and never sends them anywhere.
+
+`bw traces` lists recent runs with their duration, model and tool calls, tokens, and any failure.
+`bw traces show <id>` prints one run as a tree. Turn traces off with `bw config set traces off`.
+
+By default a trace holds no prompt, answer, tool argument, or tool output text. `bw config set
+trace-content on` also records tool arguments, tool results, and model answers, each redacted like
+audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. A value
+redacted anywhere in a run is removed wherever else it appears in that trace, such as when the model
+repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
+output is also content, so without it the trace only says the tool reported an error. If a trace
+with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
+turn it on only while investigating a run.
+
+In the desktop app, **Runs** lists the 50 newest runs and opens one as a tree of model and tool steps,
+with failures, approval requests, and any captured content. **Record agent runs** and **Include
+content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
+Subagent runs and compaction requests are not traced yet.
 
 ## App lock
 
@@ -196,6 +472,7 @@ Setup does not test connectivity or launch/download a model. `npm run cli -- set
 | `/model <id>`, `/endpoint <url>` | Change the model or service for the next turn |
 | `/web on\|off`, `/memory on\|off` | Enable or disable web tools or saved memory injection |
 | `/workspace <path>` | Start a new conversation in another project; relative paths use the current project |
+| `/review [target]` | Read-only Git review; `--uncommitted`, `--commit <ref>`, or `--base <ref>` ([limits and behavior](GIT_REVIEW.md)) |
 | `/new` | Start a new conversation in the current project |
 | `/sessions`, `/resume <id>` | List conversations or restore an Agent conversation and its project |
 | `/quit`, `/exit` | Exit; EOF also exits |
@@ -209,8 +486,17 @@ database; `BLACKWALL_DATA_DIR` selects a different data folder, including its me
 
 For an authenticated service, set `BLACKWALL_MODEL_API_KEY` and the matching
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`). Environment keys are sent only to that origin, even
-after `/endpoint` changes. The CLI does not store keys or use desktop credential-store entries.
+after `/endpoint` changes. The CLI does not store model keys or use desktop credential-store entries;
+MCP server secrets are the exception, shared through the credential store with desktop.
 Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol preview without a model call.
+
+`bw run --json "prompt"` and `bw resume SESSION_ID --json "prompt"` run without prompting, for scripts
+and CI. Each agent event except context snapshots is printed to standard output as one JSON object
+per line, ending with a `result` line that has the session ID, `status`, the answer, and any error.
+Standard input is not read: actions that owner rules allow run, and anything that would show an
+approval prompt is denied.
+The command exits with a nonzero status when the run fails; errors before the run starts, such as
+invalid settings, are reported only on standard error.
 
 The CLI shares core tools, approval rules, enabled memory, skills, and native sessions with desktop.
 Type `yes` to authorize the displayed action once; other input or EOF denies it. Web tools are off

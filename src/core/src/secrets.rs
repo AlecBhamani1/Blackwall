@@ -3,7 +3,7 @@
 //! Service and account names are identical on every platform.
 
 /// The credential store's user-facing name, for use mid-sentence.
-pub(crate) const STORE: &str = if cfg!(target_os = "macos") {
+pub const STORE: &str = if cfg!(target_os = "macos") {
     "Keychain"
 } else if cfg!(windows) {
     "Windows Credential Manager"
@@ -11,7 +11,7 @@ pub(crate) const STORE: &str = if cfg!(target_os = "macos") {
     "the system keyring"
 };
 /// The recovery step for an unresponsive store, written to precede ", then …".
-pub(crate) const RECOVER: &str = if cfg!(target_os = "macos") {
+pub const RECOVER: &str = if cfg!(target_os = "macos") {
     "Respond to any macOS Keychain prompt and unlock your login keychain if needed"
 } else if cfg!(windows) {
     "Make sure you are signed in to Windows and Credential Manager is available"
@@ -22,20 +22,18 @@ pub(crate) const RECOVER: &str = if cfg!(target_os = "macos") {
 const UNAVAILABLE: &str = "No system keyring is available. Install and unlock a Secret Service provider such as GNOME Keyring or KWallet, then try again.";
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum SecretError {
+pub enum SecretError {
     /// The saved value is not valid UTF-8.
     Invalid,
     /// The platform cannot store a value this large.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     TooLong,
     /// No credential store is running or reachable.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unavailable,
     /// The store refused or failed the operation; callers explain what was affected.
     Failed,
 }
 impl SecretError {
-    pub(crate) fn explain(self, failure: impl Into<String>) -> String {
+    pub fn explain(self, failure: impl Into<String>) -> String {
         match self {
             Self::Invalid => "The saved access key is not valid text.".into(),
             Self::TooLong => format!("This access key is too long for {STORE}."),
@@ -45,7 +43,7 @@ impl SecretError {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "credential-store", target_os = "macos"))]
 mod platform {
     use super::SecretError;
     use security_framework::passwords::{
@@ -74,7 +72,7 @@ mod platform {
     }
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(all(feature = "credential-store", any(windows, target_os = "linux")))]
 mod platform {
     use super::SecretError;
     use keyring::{Entry, Error};
@@ -111,7 +109,10 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+#[cfg(not(all(
+    feature = "credential-store",
+    any(target_os = "macos", windows, target_os = "linux")
+)))]
 mod platform {
     use super::SecretError;
     pub fn get(_: &str, _: &str) -> Result<Option<String>, SecretError> {
@@ -125,16 +126,16 @@ mod platform {
     }
 }
 
-/// Blocking: call from `spawn_blocking` or `crate::keychain::read`.
-pub(crate) fn get(service: &str, account: &str) -> Result<Option<String>, SecretError> {
+/// Blocking: call from `spawn_blocking` or the desktop `keychain::read`.
+pub fn get(service: &str, account: &str) -> Result<Option<String>, SecretError> {
     platform::get(service, account)
 }
 /// Blocking: call from `spawn_blocking`.
-pub(crate) fn set(service: &str, account: &str, value: &str) -> Result<(), SecretError> {
+pub fn set(service: &str, account: &str, value: &str) -> Result<(), SecretError> {
     platform::set(service, account, value)
 }
 /// Blocking: call from `spawn_blocking`. Removing a missing value succeeds.
-pub(crate) fn delete(service: &str, account: &str) -> Result<(), SecretError> {
+pub fn delete(service: &str, account: &str) -> Result<(), SecretError> {
     platform::delete(service, account)
 }
 

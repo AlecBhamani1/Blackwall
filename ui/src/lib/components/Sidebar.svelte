@@ -8,16 +8,17 @@
     AppUpdateProgress,
     AppUpdateState,
   } from '../updates';
+  import type { Preferences } from '../persistence';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
+  import McpDialog from './McpDialog.svelte';
+  import RunsDialog from './RunsDialog.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
-  export let onPreferences: (preferences: {
-    memoryEnabled: boolean;
-    contextWindow: number;
-  }) => void = () => {};
+  export let contextPreferences: Preferences = {};
+  export let onPreferences: (preferences: Preferences) => void = () => {};
   export let onLock: () => Promise<void> = async () => {};
   export let visible = true;
   export let showModes = false;
@@ -48,6 +49,8 @@
   let settingsOpen = false;
   let memoryOpen = false;
   let skillsOpen = false;
+  let mcpOpen = false;
+  let runsOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -102,6 +105,12 @@
   >
   <button class="memory-button" onclick={() => (skillsOpen = true)}
     >Skills <span>Reusable workflows</span></button
+  >
+  <button class="memory-button" onclick={() => (mcpOpen = true)}
+    >MCP servers <span>Tools from local servers</span></button
+  >
+  <button class="memory-button" onclick={() => (runsOpen = true)}
+    >Runs <span>Traces of agent runs</span></button
   >
   <section class="history">
     <div class="section-label">Recent</div>
@@ -159,7 +168,13 @@
 </aside>
 
 {#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
-{#if memoryOpen}<MemoryDialog {onPreferences} onClose={() => (memoryOpen = false)} />{/if}
+{#if mcpOpen}<McpDialog onClose={() => (mcpOpen = false)} />{/if}
+{#if runsOpen}<RunsDialog onClose={() => (runsOpen = false)} />{/if}
+{#if memoryOpen}<MemoryDialog
+    {onPreferences}
+    {contextPreferences}
+    onClose={() => (memoryOpen = false)}
+  />{/if}
 
 <SettingsDialog
   {onLock}

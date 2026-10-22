@@ -1,8 +1,10 @@
 <script lang="ts">
   import type { ToolEntry } from '../types';
   import Icon from './Icon.svelte';
+  export let historical = false;
   export let tools: ToolEntry[] = [];
   const labels: Record<string, string> = {
+    project_instructions: 'Project instructions',
     read_file: 'Read file',
     search_files: 'Search files',
     list_files: 'List files',
@@ -12,6 +14,14 @@
     web_search: 'Search the web',
     spawn_agent: 'Delegate task',
   };
+  // Startup warnings, such as an MCP server that did not start, are shown without expanding.
+  function warnings(tool: ToolEntry): string[] {
+    if (tool.name !== 'project_instructions') return [];
+    return (tool.output ?? '')
+      .split('\n')
+      .filter((line) => line.startsWith('Warning: '))
+      .map((line) => line.slice('Warning: '.length));
+  }
   function detail(tool: ToolEntry): string {
     try {
       const args = JSON.parse(tool.arguments);
@@ -22,7 +32,7 @@
   }
 </script>
 
-<div class="tool-activity" aria-label="Agent actions">
+<div class="tool-activity" aria-label={historical ? 'Historical agent actions' : 'Agent actions'}>
   {#each tools as tool (tool.id)}
     <details class:failed={tool.status === 'error'}>
       <summary
@@ -38,10 +48,13 @@
               size={12}
             />{/if}</span
         ><strong>{labels[tool.name] ?? tool.name}</strong><span class="detail">{detail(tool)}</span
-        ><small>{tool.status}</small></summary
+        ><small>{historical ? 'History · ' : ''}{tool.status}</small></summary
       >
       <pre>{tool.output ?? tool.arguments}</pre>
     </details>
+    {#each warnings(tool) as warning}
+      <p class="warning">{warning}</p>
+    {/each}
   {/each}
 </div>
 
@@ -93,6 +106,13 @@
   small {
     font-size: 10px;
     color: var(--text-muted);
+  }
+  .warning {
+    margin: 0;
+    padding: 0 12px;
+    font-size: 11.5px;
+    color: var(--err);
+    overflow-wrap: anywhere;
   }
   pre {
     max-height: 300px;

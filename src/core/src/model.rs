@@ -22,6 +22,17 @@ pub enum ModelError {
     )]
     Limit,
 }
+impl ModelError {
+    /// A stable name for traces.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Http(_) => "http",
+            Self::Invalid => "invalid_response",
+            Self::Limit => "limit",
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ToolFunction {
     pub name: String,
@@ -44,6 +55,13 @@ pub struct ModelTurn {
     pub usage: Option<TokenUsage>,
 }
 pub trait ModelBackend: Send + Sync {
+    fn context_budget(&self) -> crate::context::ContextBudget {
+        Default::default()
+    }
+    /// The requested model's name, recorded in traces.
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
     fn generate<'a>(
         &'a self,
         messages: &'a [Value],
@@ -56,6 +74,9 @@ pub struct HttpModel {
     endpoint: String,
     key: Option<String>,
     model: String,
+    budget: crate::context::ContextBudget,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
 }
 impl HttpModel {
     pub fn new(endpoint: &str, model: &str, key: Option<String>) -> Result<Self, ModelError> {
@@ -68,10 +89,34 @@ impl HttpModel {
             endpoint: normalize_endpoint(endpoint).map_err(|_| ModelError::Invalid)?,
             key,
             model: model.into(),
+            budget: Default::default(),
+            temperature: None,
+            max_tokens: None,
         })
     }
 }
+impl HttpModel {
+    pub fn with_sampling(mut self, temperature: Option<f32>, max_tokens: Option<u32>) -> Self {
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+        self
+    }
+    pub fn with_budget(
+        mut self,
+        budget: crate::context::ContextBudget,
+    ) -> Result<Self, ModelError> {
+        budget.validate().map_err(|_| ModelError::Limit)?;
+        self.budget = budget;
+        Ok(self)
+    }
+}
 impl ModelBackend for HttpModel {
+    fn context_budget(&self) -> crate::context::ContextBudget {
+        self.budget
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
     fn generate<'a>(
         &'a self,
         messages: &'a [Value],
@@ -79,7 +124,20 @@ impl ModelBackend for HttpModel {
         delta: &'a mut (dyn FnMut(String) + Send),
     ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
         Box::pin(async move {
-            let mut payload = json!({"model":self.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+            if self
+                .max_tokens
+                .is_some_and(|n| n == 0 || n > self.budget.output_tokens)
+                || self.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t))
+            {
+                return Err(ModelError::Invalid);
+            }
+            self.budget
+                .check(messages, tools)
+                .map_err(|_| ModelError::Limit)?;
+            let mut payload = json!({"model":self.model,"messages":one_system_message(messages),"stream":true,"stream_options":{"include_usage":true},"max_tokens":self.max_tokens.unwrap_or(self.budget.output_tokens)});
+            if let Some(temperature) = self.temperature {
+                payload["temperature"] = json!(temperature);
+            }
             if !tools.is_empty() {
                 payload["tools"] = json!(tools);
             }
@@ -248,6 +306,25 @@ impl StreamDecoder {
     }
 }
 
+/// Send every text system message as one, first. Chat templates such as Qwen's reject a system
+/// message anywhere but first, so Blackwall's separate instruction blocks go out as one.
+fn one_system_message(messages: &[Value]) -> Vec<Value> {
+    let (system, rest): (Vec<_>, Vec<_>) = messages
+        .iter()
+        .partition(|m| m["role"] == "system" && m["content"].is_string());
+    if system.is_empty() {
+        return messages.to_vec();
+    }
+    let content = system
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    std::iter::once(json!({"role":"system","content":content}))
+        .chain(rest.into_iter().cloned())
+        .collect()
+}
+
 pub fn messages(request: &ChatRequest) -> Vec<Value> {
     let last_user = request
         .messages
@@ -318,6 +395,26 @@ mod tests {
         let turn = decoder.finish(&mut |_| {}).unwrap();
         assert_eq!(text, "Hi 🦀");
         assert_eq!(turn.calls[0].function.arguments, "{\"path\":\"a\"}");
+    }
+    #[test]
+    fn system_messages_are_sent_as_one_first() {
+        let messages = [
+            json!({"role":"system","content":"Base"}),
+            json!({"role":"system","content":"Guidance"}),
+            json!({"role":"user","content":"Hi"}),
+            json!({"role":"system","content":"Later"}),
+        ];
+        let sent = one_system_message(&messages);
+        assert_eq!(
+            sent,
+            [
+                json!({"role":"system","content":"Base\n\nGuidance\n\nLater"}),
+                messages[2].clone()
+            ]
+        );
+        let single = [messages[0].clone(), messages[2].clone()];
+        assert_eq!(one_system_message(&single), single);
+        assert!(one_system_message(&[]).is_empty());
     }
     #[test]
     fn truncated_stream_is_an_error() {
