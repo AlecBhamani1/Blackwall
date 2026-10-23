@@ -6,6 +6,7 @@ import { createChatController } from './store';
 import { nativeModelError } from './modelError';
 import { prepareAttachments, MAX_ATTACHMENT_TOTAL_BYTES } from './attachments';
 import type { Attachment, SessionSummary } from './types';
+import type { Preferences } from './persistence';
 
 function mockClient(): LocalModelClient {
   return {
@@ -22,6 +23,23 @@ function mockClient(): LocalModelClient {
 }
 
 describe('chat controller', () => {
+  it('can discover the browser proxy without an explicit endpoint address', async () => {
+    const client = mockClient();
+    client.modelEndpoint = vi.fn().mockResolvedValue('');
+    const controller = createChatController(client);
+    expect(await controller.initialize()).toBe(true);
+    expect(client.discoverModels).toHaveBeenCalledWith(undefined);
+    expect(get(controller.connectionState)).toBe('ready');
+    expect(get(controller.preferences).connections).toBeUndefined();
+    await controller.send('Use the configured proxy', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(client.streamChat).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: undefined }),
+      expect.anything(),
+      expect.anything(),
+    );
+    controller.destroy();
+  });
   it.each(['chat', 'agent'] as const)(
     'locks %s mode and its project after sending',
     async (mode) => {
@@ -498,6 +516,107 @@ describe('chat controller', () => {
     expect(get(controller.models)).toHaveLength(1);
   });
 
+  it('retains unnamed advanced connections and their models after restarting', async () => {
+    const client = mockClient();
+    client.discoverModels = vi.fn().mockResolvedValue([
+      { id: 'small', name: 'Small' },
+      { id: 'large', name: 'Large' },
+    ]);
+    const controller = createChatController(client);
+    await controller.configureEndpoint('https://FIRST.example:443/');
+    controller.chooseModel('large');
+    await controller.configureEndpoint('https://second.example/v1', 'Second service');
+    controller.chooseModel('small');
+    controller.destroy();
+
+    const reloaded = createChatController(client);
+    await reloaded.initialize();
+    expect(get(reloaded.preferences).connections).toEqual([
+      { endpoint: 'https://second.example/v1', name: 'Second service', model: 'small' },
+      { endpoint: 'https://first.example/v1', name: 'first.example', model: 'large' },
+    ]);
+    await reloaded.configureEndpoint('https://first.example/v1/');
+    expect(get(reloaded.selectedModel)).toBe('large');
+    expect(get(reloaded.preferences).connections).toHaveLength(2);
+    await reloaded.configureEndpoint('https://second.example/v1');
+    expect(get(reloaded.selectedModel)).toBe('small');
+    expect(get(reloaded.preferences).connections?.[0].name).toBe('Second service');
+    reloaded.destroy();
+  });
+
+  it('migrates the previous browser endpoint before connecting to another service', async () => {
+    window.localStorage.setItem('blackwall.endpoint.v1', 'https://old.example');
+    window.localStorage.setItem('blackwall.model.v1', 'old-model');
+    const controller = createChatController(mockClient());
+    await controller.configureEndpoint('https://new.example');
+    expect(get(controller.preferences).connections).toContainEqual({
+      endpoint: 'https://old.example/v1',
+      name: 'old.example',
+      model: 'old-model',
+    });
+    controller.destroy();
+  });
+
+  it('does not silently evict old profiles when the connection list is full', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    for (let index = 0; index < 20; index++) {
+      expect(await controller.configureEndpoint(`https://service-${index}.example`)).toBe(true);
+    }
+    expect(await controller.configureEndpoint('https://extra.example')).toBe(false);
+    expect(get(controller.connectionError)).toContain('Forget one');
+    expect(get(controller.preferences).connections).toHaveLength(20);
+    expect(client.discoverModels).toHaveBeenCalledTimes(20);
+    expect(await controller.configureEndpoint('https://service-0.example/v1')).toBe(true);
+    controller.forgetConnection('https://service-1.example/v1');
+    expect(await controller.configureEndpoint('https://extra.example')).toBe(true);
+    expect(get(controller.preferences).connections).toHaveLength(20);
+    controller.destroy();
+  });
+
+  it('keeps an explicitly forgotten active browser connection forgotten after restarting', async () => {
+    const controller = createChatController(mockClient());
+    await controller.configureEndpoint('https://service.example');
+    controller.forgetConnection('https://service.example/v1');
+    controller.destroy();
+    const reloaded = createChatController(mockClient());
+    await reloaded.initialize();
+    expect(get(reloaded.preferences).connections).toEqual([]);
+    reloaded.destroy();
+  });
+
+  it('ignores an older switch completion and retains the working service when the latest switch fails', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.configureEndpoint('https://working.example', 'Working service');
+    let finish!: (catalog: Array<{ id: string; name: string }>) => void;
+    client.discoverModels = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      )
+      .mockRejectedValueOnce(new Error('Offline'));
+    const older = controller.configureEndpoint('https://slow.example');
+    await vi.waitFor(() => expect(client.discoverModels).toHaveBeenCalledTimes(1));
+    expect(await controller.configureEndpoint('https://offline.example')).toBe(false);
+    finish([{ id: 'stale', name: 'Stale model' }]);
+    expect(await older).toBe(false);
+    expect(get(controller.connectionState)).toBe('ready');
+    expect(get(controller.endpoint)).toBe('https://working.example');
+    expect(get(controller.selectedModel)).toBe('remote-model:latest');
+    expect(get(controller.preferences).connections).toEqual([
+      {
+        endpoint: 'https://working.example/v1',
+        name: 'Working service',
+        model: 'remote-model:latest',
+      },
+    ]);
+    controller.destroy();
+  });
+
   it('does not resurrect a deleted active conversation', async () => {
     const controller = createChatController(mockClient());
     await controller.initialize();
@@ -555,6 +674,77 @@ describe('native conversation persistence', () => {
       load: vi.fn().mockResolvedValue(null),
     };
   }
+
+  it('keeps legacy and new native connections through save failures, retry and restart', async () => {
+    let saved: Preferences = {
+      endpoint: 'https://legacy.example',
+      model: 'large',
+      connections: [
+        { endpoint: 'https://named.example/v1', name: 'Named service', model: 'small' },
+      ],
+    };
+    const storage = await nativeStorage();
+    storage.preferences.mockImplementation(async () => structuredClone(saved));
+    storage.savePreferences.mockImplementation(async (patch: Preferences) => {
+      saved = { ...saved, ...structuredClone(patch) };
+    });
+    const client = mockClient();
+    client.discoverModels = vi.fn().mockResolvedValue([
+      { id: 'small', name: 'Small' },
+      { id: 'large', name: 'Large' },
+    ]);
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    storage.savePreferences.mockRejectedValueOnce(new Error('Disk full'));
+    await controller.configureEndpoint('https://new.example');
+    controller.chooseModel('small');
+    await vi.waitFor(() =>
+      expect(get(controller.persistenceError)).toContain('could not be saved'),
+    );
+    expect(get(controller.preferences).connections).toHaveLength(3);
+    await controller.retryPersistence();
+    expect(get(controller.persistenceError)).toBe('');
+    controller.destroy();
+
+    const reloaded = createChatController(client, storage);
+    await reloaded.initialize();
+    expect(get(reloaded.endpoint)).toBe('https://new.example');
+    expect(get(reloaded.selectedModel)).toBe('small');
+    await reloaded.configureEndpoint('https://legacy.example/v1');
+    expect(get(reloaded.selectedModel)).toBe('large');
+    expect(get(reloaded.preferences).connections).toHaveLength(3);
+    reloaded.forgetConnection('https://legacy.example/v1');
+    await reloaded.suspend();
+    await reloaded.initialize();
+    expect(get(reloaded.preferences).connections).toHaveLength(2);
+    expect(
+      get(reloaded.preferences).connections?.some(
+        (profile) => profile.endpoint === 'https://legacy.example/v1',
+      ),
+    ).toBe(false);
+    reloaded.destroy();
+  });
+
+  it('migrates an offline legacy endpoint before a different native connection succeeds', async () => {
+    const storage = await nativeStorage();
+    storage.preferences.mockResolvedValue({
+      endpoint: 'https://offline.example',
+      model: 'old-model',
+    });
+    const client = mockClient();
+    client.discoverModels = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Offline'))
+      .mockResolvedValue([{ id: 'small', name: 'Small' }]);
+    const controller = createChatController(client, storage);
+    expect(await controller.initialize()).toBe(false);
+    await controller.configureEndpoint('https://new.example');
+    expect(get(controller.preferences).connections).toEqual([
+      { endpoint: 'https://new.example/v1', name: 'new.example', model: 'small' },
+      { endpoint: 'https://offline.example/v1', name: 'offline.example', model: 'old-model' },
+    ]);
+    controller.destroy();
+  });
   it('recalls across modes without model calls or replaying historical tools and clears recall on lock', async () => {
     const storage = await nativeStorage();
     const saved: SessionSummary = {

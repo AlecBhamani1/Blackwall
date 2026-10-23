@@ -8,6 +8,7 @@ import {
 import { attachmentReferences, referencedAttachments } from './attachmentReferences';
 import { createId } from './id';
 import { normalizeEndpoint, connectionHelp } from './setup';
+import { connectionName, connectionProfiles, MAX_CONNECTIONS } from './connections';
 import { agentClient } from './agent';
 import {
   persistence,
@@ -38,6 +39,7 @@ const SESSION_STORAGE_KEY = 'blackwall.sessions.v1';
 const MODEL_STORAGE_KEY = 'blackwall.model.v1';
 const ENDPOINT_STORAGE_KEY = 'blackwall.endpoint.v1';
 const CONTEXT_STORAGE_KEY = 'blackwall.context-preferences.v1';
+const CONNECTIONS_STORAGE_KEY = 'blackwall.connections.v1';
 const MAX_SAVED_SESSIONS = 30;
 
 function canUseStorage(): boolean {
@@ -103,6 +105,25 @@ function storedContextPreferences(): Preferences {
   } catch {
     return {};
   }
+}
+
+function storedConnections(): Preferences {
+  if (!canUseStorage()) return {};
+  try {
+    const saved = window.localStorage.getItem(CONNECTIONS_STORAGE_KEY);
+    if (saved !== null) return { connections: connectionProfiles(JSON.parse(saved)) };
+    const endpoint = window.localStorage.getItem(ENDPOINT_STORAGE_KEY);
+    if (endpoint) {
+      return {
+        connections: connectionProfiles([
+          { endpoint, model: window.localStorage.getItem(MODEL_STORAGE_KEY) ?? undefined },
+        ]),
+      };
+    }
+  } catch {
+    // A malformed browser preference must not prevent startup.
+  }
+  return {};
 }
 
 function persistedMessages(messages: ChatMessage[], retainContents = false): ChatMessage[] {
@@ -287,7 +308,7 @@ export function createChatController(
   const preferences = writable<Preferences>({
     contextWindow: 32000,
     memoryEnabled: false,
-    ...(!native ? storedContextPreferences() : {}),
+    ...(!native ? { ...storedContextPreferences(), ...storedConnections() } : {}),
   });
   let storageReady = !native;
   let storageInitialization: Promise<void> | null = null;
@@ -339,10 +360,57 @@ export function createChatController(
         ]);
         if (destroyed) return;
         sessions.set(savedSessions);
-        preferences.set({ contextWindow: 32000, memoryEnabled: false, ...savedPreferences });
+        const connections =
+          savedPreferences.connections === undefined && !savedPreferences.endpoint
+            ? undefined
+            : connectionProfiles(
+                savedPreferences.connections ??
+                  (savedPreferences.endpoint
+                    ? [
+                        {
+                          endpoint: savedPreferences.endpoint,
+                          name: savedPreferences.connectionName,
+                          model: savedPreferences.model,
+                        },
+                      ]
+                    : []),
+              );
+        // Older advanced settings saved an active address without a profile. The active
+        // name is now written on every successful connection, so later explicit forgets
+        // stay forgotten, including across restarts.
+        if (connections && savedPreferences.endpoint && !savedPreferences.connectionName) {
+          const legacy = connectionProfiles([
+            { endpoint: savedPreferences.endpoint, model: savedPreferences.model },
+          ])[0];
+          if (
+            legacy &&
+            connections.length < MAX_CONNECTIONS &&
+            !connections.some((profile) => profile.endpoint === legacy.endpoint)
+          ) {
+            connections.unshift(legacy);
+          }
+        }
+        preferences.set({
+          contextWindow: 32000,
+          memoryEnabled: false,
+          ...savedPreferences,
+          connections,
+        });
         if (savedPreferences.endpoint) endpoint.set(savedPreferences.endpoint);
         if (savedPreferences.model) selectedModel.set(savedPreferences.model);
         storageReady = true;
+        if (connections)
+          savePreferences({
+            connections,
+            ...(savedPreferences.endpoint
+              ? {
+                  connectionName: connectionName(
+                    savedPreferences.endpoint,
+                    savedPreferences.connectionName,
+                  ),
+                }
+              : {}),
+          });
         persistenceError.set('');
       } catch {
         persistenceError.set(
@@ -370,6 +438,12 @@ export function createChatController(
               commandTimeoutSeconds: merged.commandTimeoutSeconds ?? 120,
             }),
           );
+          if (merged.connections) {
+            window.localStorage.setItem(
+              CONNECTIONS_STORAGE_KEY,
+              JSON.stringify(connectionProfiles(merged.connections)),
+            );
+          }
         } catch {
           /* In-memory preferences remain usable. */
         }
@@ -381,6 +455,7 @@ export function createChatController(
   let activeRequest: AbortController | null = null;
   let compacting = false;
   let connectionAttempt = 0;
+  let connectionHealthy = false;
   let runGeneration = 0;
   let destroyed = false;
 
@@ -488,13 +563,13 @@ export function createChatController(
     });
   }
 
-  async function initialize(candidate?: string): Promise<boolean> {
+  async function initialize(candidate?: string, name?: string): Promise<boolean> {
     await initializeStorage();
     const previousModels = get(models);
     // A cached catalog survives disconnects. Only preserve a currently working,
     // different connection when trying an alternative server fails.
     const preserveConnection =
-      get(connectionState) === 'ready' &&
+      connectionHealthy &&
       previousModels.length > 0 &&
       !!candidate &&
       !!get(endpoint) &&
@@ -526,18 +601,43 @@ export function createChatController(
       const preferred = profileModel ?? get(selectedModel);
       const choice = catalog.some((model) => model.id === preferred) ? preferred : catalog[0].id;
       selectedModel.set(choice);
-      if (candidate) {
-        endpoint.set(candidate);
-        savePreferences({ endpoint: candidate, model: choice });
+      if (configuredEndpoint) {
+        const normalized = normalizeEndpoint(configuredEndpoint);
+        const settings = get(preferences);
+        const existing = settings.connections?.find((profile) => profile.endpoint === normalized);
+        const label = connectionName(normalized, name || existing?.name);
+        // Refreshes must not resurrect an explicitly forgotten connection.
+        const remember = candidate || settings.connections === undefined;
+        endpoint.set(configuredEndpoint);
+        savePreferences({
+          endpoint: configuredEndpoint,
+          model: choice,
+          connectionName: label,
+          ...(remember
+            ? {
+                connections: [
+                  { endpoint: normalized, name: label, model: choice },
+                  ...(settings.connections ?? []).filter(
+                    (profile) => profile.endpoint !== normalized,
+                  ),
+                ],
+              }
+            : {}),
+        });
+      } else {
+        // Browser development may discover models through its implicit proxy.
+        savePreferences({ model: choice });
       }
       try {
         if (canUseStorage()) {
           window.localStorage.setItem(MODEL_STORAGE_KEY, choice);
-          if (candidate) window.localStorage.setItem(ENDPOINT_STORAGE_KEY, candidate);
+          if (configuredEndpoint)
+            window.localStorage.setItem(ENDPOINT_STORAGE_KEY, configuredEndpoint);
         }
       } catch {
         /* A working connection remains usable without browser storage. */
       }
+      connectionHealthy = true;
       connectionState.set('ready');
       connectionError.set('');
       notice.set('');
@@ -545,6 +645,7 @@ export function createChatController(
     } catch (error) {
       if (destroyed || attempt !== connectionAttempt) return false;
       const detail = connectionHelp(error);
+      connectionHealthy = preserveConnection;
       connectionState.set(preserveConnection ? 'ready' : 'offline');
       if (preserveConnection) models.set(previousModels);
       connectionError.set(detail);
@@ -563,27 +664,27 @@ export function createChatController(
     }
 
     if (get(runState) !== 'idle') {
-      notice.set('Stop the current response before changing connections.');
+      const detail = 'Stop the current response before changing connections.';
+      connectionError.set(detail);
+      notice.set(detail);
       return false;
     }
     try {
-      normalizeEndpoint(next);
+      const normalized = normalizeEndpoint(next);
+      await initializeStorage();
+      const connections = get(preferences).connections ?? [];
+      if (
+        connections.length >= MAX_CONNECTIONS &&
+        !connections.some((profile) => profile.endpoint === normalized)
+      ) {
+        connectionError.set('You have 20 saved connections. Forget one before adding another.');
+        return false;
+      }
     } catch (cause) {
       connectionError.set(connectionHelp(cause));
       return false;
     }
-    const connected = await initialize(next);
-    if (connected && name?.trim()) {
-      const normalized = normalizeEndpoint(next);
-      const connections = get(preferences).connections ?? [];
-      savePreferences({
-        connections: [
-          { endpoint: normalized, name: name.trim().slice(0, 80), model: get(selectedModel) },
-          ...connections.filter((profile) => profile.endpoint !== normalized),
-        ].slice(0, 20),
-      });
-    }
-    return connected;
+    return initialize(next, name);
   }
 
   function chooseModel(modelId: string): void {
@@ -917,6 +1018,7 @@ export function createChatController(
         if (!stopped) {
           notice.set(error instanceof Error ? error.message : 'The model request failed.');
           if (error instanceof ModelRequestError && error.connectionLost) {
+            connectionHealthy = false;
             connectionState.set('offline');
             connectionError.set(error.message);
           }
@@ -1135,6 +1237,7 @@ export function createChatController(
     commandNetwork.set(false);
     activeSessionId.set(createId('session'));
     models.set([]);
+    connectionHealthy = false;
     connectionState.set('checking');
     storageReady = !native;
     storageInitialization = null;

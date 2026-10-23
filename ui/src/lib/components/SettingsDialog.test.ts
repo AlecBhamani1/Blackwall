@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { GuestShareClient } from '../ipc';
 import SettingsDialog from './SettingsDialog.svelte';
+import { credentialClient } from '../credentials';
 
 const MODEL = 'qwen3:27b';
 const SHARE_URL = 'https://blackwall.test/chat/guest-token';
@@ -219,6 +220,80 @@ describe('SettingsDialog', () => {
     expect(
       await screen.findByText('Connected and loaded the available models.'),
     ).toBeInTheDocument();
+  });
+
+  it('switches and forgets saved endpoints in Settings and keeps failed switches visible', async () => {
+    const user = userEvent.setup();
+    const connections = [
+      { endpoint: 'https://first.example/v1', name: 'First service' },
+      { endpoint: 'https://second.example/v1', name: 'Second service' },
+    ];
+    let complete!: (value: boolean) => void;
+    const onConfigureEndpoint = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const onPreferences = vi.fn();
+    const view = render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'https://first.example/v1',
+        connectionState: 'ready',
+        contextPreferences: { connections },
+        onConfigureEndpoint,
+        onPreferences,
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    await user.click(screen.getByRole('button', { name: 'Connect to Second service' }));
+    expect(onConfigureEndpoint).toHaveBeenCalledWith('https://second.example/v1');
+    expect(screen.getByRole('button', { name: 'Forget First service' })).toBeDisabled();
+    await view.rerender({ connectionError: 'This service needs an access key.' });
+    complete(false);
+    expect(await screen.findByRole('alert')).toHaveTextContent('access key');
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Connect to First service' })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Forget Second service' }));
+    expect(onPreferences).toHaveBeenCalledWith({ connections: [connections[0]] });
+  });
+
+  it('manages a saved service key without changing the active connection', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    const status = vi.spyOn(credentialClient, 'status').mockResolvedValue(true);
+    const save = vi.spyOn(credentialClient, 'saveModel').mockResolvedValue(undefined);
+    const onConfigureEndpoint = vi.fn();
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        onConfigureEndpoint,
+        endpoint: 'https://first.example',
+        contextPreferences: {
+          connections: [
+            { endpoint: 'https://first.example/v1', name: 'First service' },
+            { endpoint: 'https://second.example/v1', name: 'Second service' },
+          ],
+        },
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await user.click(screen.getByText('Access keys', { selector: 'summary' }));
+    expect(screen.getByLabelText('Model service').querySelectorAll('option')).toHaveLength(2);
+    await user.selectOptions(screen.getByLabelText('Model service'), 'https://second.example/v1');
+    await waitFor(() =>
+      expect(status).toHaveBeenLastCalledWith('model', 'https://second.example/v1'),
+    );
+    await user.type(screen.getByLabelText('New access key'), 'second-service-key');
+    await user.click(screen.getByRole('button', { name: 'Verify and save key' }));
+    expect(save).toHaveBeenCalledExactlyOnceWith('https://second.example/v1', 'second-service-key');
+    expect(onConfigureEndpoint).not.toHaveBeenCalled();
   });
 
   it('creates a temporary share and exposes both its QR code and copyable link', async () => {
