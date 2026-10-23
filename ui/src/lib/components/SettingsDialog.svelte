@@ -17,6 +17,14 @@
   import Icon from './Icon.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
+  import McpDialog from './McpDialog.svelte';
+  import RunsDialog from './RunsDialog.svelte';
+  import {
+    settingsEntries,
+    settingsGroups,
+    type SettingsPage,
+    type SettingsPanel,
+  } from '../settingsNavigation';
   import type { Preferences } from '../persistence';
 
   export let contextPreferences: Preferences = {};
@@ -50,12 +58,55 @@
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let keysOpen = false;
-  let activePanel: 'memory' | 'skills' | null = null;
+  let activePanel: SettingsPanel | null = null;
+  let selectedSetting: SettingsPage | null = null;
+  let settingsQuery = '';
+  let settingsOrder = 'category';
+  let dialogContent: HTMLElement;
   let panelButton: HTMLButtonElement;
 
-  function openPanel(panel: 'memory' | 'skills', button: HTMLButtonElement): void {
+  $: matchingSettings = settingsEntries.filter((entry) => {
+    if (entry.desktopOnly && !isDesktop()) return false;
+    const text =
+      `${entry.title} ${entry.description} ${entry.group} ${entry.keywords}`.toLowerCase();
+    return settingsQuery
+      .toLowerCase()
+      .trim()
+      .split(/\s+/)
+      .every((word) => text.includes(word));
+  });
+  $: menuGroups =
+    settingsOrder === 'alphabetical'
+      ? [
+          {
+            title: 'All settings',
+            entries: [...matchingSettings].sort((a, b) => a.title.localeCompare(b.title)),
+          },
+        ]
+      : settingsGroups.map((title) => ({
+          title,
+          entries: matchingSettings.filter((entry) => entry.group === title),
+        }));
+
+  async function openSetting(
+    entry: (typeof settingsEntries)[number],
+    button: HTMLButtonElement,
+  ): Promise<void> {
     panelButton = button;
-    activePanel = panel;
+    if (entry.kind === 'dialog') activePanel = entry.id;
+    else {
+      selectedSetting = entry.id;
+      await tick();
+      dialogContent.scrollTop = 0;
+      dialogContent.focus();
+    }
+  }
+
+  async function returnToMenu(): Promise<void> {
+    const previous = selectedSetting;
+    selectedSetting = null;
+    await tick();
+    dialog.querySelector<HTMLElement>(`[data-setting-id="${previous}"]`)?.focus();
   }
 
   async function closePanel(): Promise<void> {
@@ -91,7 +142,7 @@
 
   async function focusGuestResult(): Promise<void> {
     await tick();
-    if (!open || activePanel || !dialog) return;
+    if (!open || selectedSetting !== 'sharing' || activePanel || !dialog) return;
     const active = document.activeElement;
     if (active !== document.body && !dialog.contains(active)) return;
     // Creating/revoking a link removes the initiating control from the DOM.
@@ -308,20 +359,24 @@
     previouslyOpen = open;
     if (open) {
       copied = false;
+      selectedSetting = null;
+      settingsQuery = '';
       endpointDraft = endpoint;
       previousEndpoint = endpoint;
       endpointFeedback = '';
       endpointInputError = '';
-      void refresh();
       void tick().then(() => dialog?.focus());
-      pollTimer = window.setInterval(() => void refresh(true), 10_000);
     } else {
       activePanel = null;
-      if (pollTimer !== undefined) {
-        window.clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
     }
+  }
+
+  $: if (open && selectedSetting === 'sharing') {
+    void refresh();
+    pollTimer = window.setInterval(() => void refresh(true), 10_000);
+  } else if (pollTimer !== undefined) {
+    window.clearInterval(pollTimer);
+    pollTimer = undefined;
   }
 
   $: if (!endpointBusy && endpoint !== previousEndpoint) {
@@ -351,431 +406,477 @@
       <header>
         <div>
           <h2 id="settings-title">Settings</h2>
-          <p>Manage your preferences, model connection, and guest access.</p>
+          <p>Find preferences, integrations, and app tools.</p>
         </div>
         <button class="icon-button" aria-label="Close settings" onclick={onClose}>
           <Icon name="x" size={18} />
         </button>
       </header>
 
-      <div class="dialog-content">
-        <section class="preferences-section" aria-label="Preferences">
-          <button
-            class="preference-button"
-            aria-haspopup="dialog"
-            onclick={(event) => openPanel('memory', event.currentTarget)}
-          >
-            <span><strong>Memory</strong><small>Saved preferences & context</small></span>
-            <Icon name="chevron-right" size={16} />
-          </button>
-          <button
-            class="preference-button"
-            aria-haspopup="dialog"
-            onclick={(event) => openPanel('skills', event.currentTarget)}
-          >
-            <span><strong>Skills</strong><small>Reusable workflows</small></span>
-            <Icon name="chevron-right" size={16} />
-          </button>
-        </section>
-        <section class="connection-section" aria-labelledby="connection-heading">
-          <div class="section-heading">
-            <div>
-              <h3 id="connection-heading">Model connection</h3>
-              <p>Use any Ollama or OpenAI-compatible endpoint you can reach.</p>
-            </div>
-            <span
-              class:connected={connectionState === 'ready'}
-              class:checking={connectionState === 'checking'}
-              class="connection-badge"
-            >
-              <span></span>
-              {connectionState === 'ready'
-                ? 'Connected'
-                : connectionState === 'checking'
-                  ? 'Checking'
-                  : 'Offline'}
-            </span>
-          </div>
-
-          <button class="connect-button setup-button" onclick={onSetup}>Set up a connection</button>
-          <details class="advanced-connection">
-            <summary>Advanced · Enter a server address</summary>
-            <form class="endpoint-form" onsubmit={connectEndpoint}>
-              <label for="model-endpoint">Endpoint URL</label>
+      <div class="dialog-content" tabindex="-1" bind:this={dialogContent}>
+        {#if selectedSetting === null}
+          <div class="menu-controls">
+            <label class="settings-search">
+              <Icon name="search" size={16} />
               <input
-                id="model-endpoint"
-                bind:value={endpointDraft}
-                placeholder="http://localhost:11434/v1"
-                autocomplete="url"
-                autocapitalize="none"
-                spellcheck="false"
-                disabled={endpointBusy}
+                type="search"
+                aria-label="Search settings"
+                placeholder="Search settings"
+                bind:value={settingsQuery}
               />
-              <p class="endpoint-hint">
-                You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall
-                adds <code>/v1</code> automatically.
-              </p>
-
-              {#if endpointInputError}
-                <p class="connection-error" role="alert">{endpointInputError}</p>
-              {:else if endpointFeedback}
-                <p class="connection-success" role="status">{endpointFeedback}</p>
-              {:else if connectionError}
-                <p class="connection-error" role="alert">{connectionError}</p>
-              {/if}
-
-              <button
-                class="connect-button"
-                disabled={endpointBusy || connectionState === 'checking'}
-                type="submit"
-              >
-                {endpointBusy || connectionState === 'checking'
-                  ? 'Checking endpoint…'
-                  : 'Save and reconnect'}
-              </button>
-            </form>
-          </details>
-        </section>
-
-        <section class="share-section">
-          <PairingPanel
-            mode="host"
-            onCreated={rememberRelayUrl}
-            {model}
-            {endpoint}
-            bind:relayUrl={relayUrlDraft}
-            bind:relayKey={relayTokenDraft}
-          />
-        </section>
-        <section class="share-section" aria-labelledby="share-heading">
-          <div class="section-heading">
-            <div>
-              <h3 id="share-heading">Share your model</h3>
-              <p>Create a temporary browser link for someone you trust.</p>
-            </div>
-            {#if status.active}
-              <span class="live-badge"><span></span>Live</span>
-            {/if}
+            </label>
+            <label class="settings-order">
+              <span>Sort by</span>
+              <select aria-label="Settings order" bind:value={settingsOrder}>
+                <option value="category">Category</option>
+                <option value="alphabetical">Name (A–Z)</option>
+              </select>
+            </label>
           </div>
-
-          {#if busy === 'loading'}
-            <div class="loading-row" role="status">
-              <span class="spinner"></span>
-              Checking guest access…
-            </div>
-          {:else if status.active && !creatingLink}
-            <div class="active-share">
-              <div class="share-summary">
-                <div>
-                  <span class="summary-label">Sharing</span>
-                  <strong title={status.name || status.model}
-                    >{status.name || status.model || model}</strong
-                  >{#if status.name}<small>{status.model || model}</small>{/if}
-                </div>
-                <div>
-                  <span class="summary-label">Access</span>
-                  <strong>{status.networkLabel || 'Hosted relay'}</strong>
-                </div>
-              </div>
-
-              {#if status.qrDataUrl && status.shareUrl}
-                <div class="qr-wrap">
-                  <img src={status.qrDataUrl} alt="QR code for guest chat link" />
-                  <div>
-                    <strong>Scan to open</strong>
-                    <p>Guests can scan this code with their phone camera.</p>
-                  </div>
-                </div>
-
-                <label class="link-label" for="guest-link">Guest link</label>
-                <div class="link-field">
-                  <input
-                    id="guest-link"
-                    readonly
-                    value={status.shareUrl}
-                    onclick={(event) => event.currentTarget.select()}
-                  />
-                  <button class:copied aria-label="Copy guest link" onclick={copyLink}>
-                    <Icon name={copied ? 'check' : 'copy'} size={15} />
-                    <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
-                  </button>
-                </div>
-              {:else}
-                <div class="notice warning">
-                  This link is active, but its access code is no longer available in this window.
-                  Revoke this link below and create a replacement if you need to share it again.
-                </div>
+          <nav aria-label="Settings menu">
+            {#each menuGroups as group}
+              {#if group.entries.length}
+                <section class="settings-group" aria-label={group.title}>
+                  <h3>{group.title}</h3>
+                  {#each group.entries as entry (entry.id)}
+                    <button
+                      class="preference-button"
+                      data-setting-id={entry.id}
+                      title={entry.description}
+                      aria-haspopup={entry.kind === 'dialog' ? 'dialog' : undefined}
+                      onclick={(event) => openSetting(entry, event.currentTarget)}
+                    >
+                      <Icon name={entry.icon} size={19} />
+                      <span><strong>{entry.title}</strong></span>
+                      <Icon name="chevron-right" size={16} />
+                    </button>
+                  {/each}
+                </section>
               {/if}
-
-              <div class="share-meta">
-                <span>{expiresLabel(status.expiresAt)}</span>
-                <span
-                  >{status.requestCount ?? 0}
-                  {(status.requestCount ?? 0) === 1 ? 'request' : 'requests'}</span
-                >
+            {/each}
+            {#if matchingSettings.length === 0}
+              <p class="no-settings" role="status">
+                No settings match “{settingsQuery}”. Try another search.
+              </p>
+            {/if}
+          </nav>
+        {:else}
+          <button class="back-button" onclick={returnToMenu}>
+            <Icon name="chevron-left" size={16} /> All settings
+          </button>
+        {/if}
+        {#if selectedSetting === 'connection'}
+          <section class="connection-section" aria-labelledby="connection-heading">
+            <div class="section-heading">
+              <div>
+                <h3 id="connection-heading">Model connection</h3>
+                <p>Use any Ollama or OpenAI-compatible endpoint you can reach.</p>
               </div>
-
-              <div class="notice warning">
-                Anyone with this link can send prompts and files to your model until it expires or
-                you stop sharing.
-              </div>
-
-              <button
-                class="check-button"
-                disabled={!!busy || sharedLinks.length >= 4}
-                onclick={() => (creatingLink = true)}>Create another guest link</button
+              <span
+                class:connected={connectionState === 'ready'}
+                class:checking={connectionState === 'checking'}
+                class="connection-badge"
               >
-              <button class="stop-button" disabled={busy === 'stopping'} onclick={stop}>
-                {busy === 'stopping' ? 'Stopping…' : 'Stop sharing'}
-              </button>
+                <span></span>
+                {connectionState === 'ready'
+                  ? 'Connected'
+                  : connectionState === 'checking'
+                    ? 'Checking'
+                    : 'Offline'}
+              </span>
             </div>
-          {:else}
-            <div class="inactive-share">
-              <div class="endpoint-form">
-                <label for="invite-name">Name this guest link <span>(optional)</span></label><input
-                  id="invite-name"
-                  bind:value={inviteName}
-                  maxlength={60}
-                  placeholder="For example, Alex’s phone"
-                  disabled={busy === 'starting'}
-                />
-              </div>
-              {#if creatingLink}<button
-                  class="check-button"
-                  disabled={!!busy}
-                  onclick={() => (creatingLink = false)}>Back to active links</button
-                >{/if}
-              <div class="relay-form">
-                <label for="relay-url">Hosted relay URL</label>
+
+            <button class="connect-button setup-button" onclick={onSetup}
+              >Set up a connection</button
+            >
+            <details class="advanced-connection">
+              <summary>Advanced · Enter a server address</summary>
+              <form class="endpoint-form" onsubmit={connectEndpoint}>
+                <label for="model-endpoint">Endpoint URL</label>
                 <input
-                  id="relay-url"
-                  bind:value={relayUrlDraft}
-                  placeholder="https://relay.example.com"
+                  id="model-endpoint"
+                  bind:value={endpointDraft}
+                  placeholder="http://localhost:11434/v1"
                   autocomplete="url"
                   autocapitalize="none"
                   spellcheck="false"
-                  disabled={busy === 'starting'}
-                  onchange={rememberRelayUrl}
+                  disabled={endpointBusy}
                 />
-                <p class="relay-hint">
-                  Saved on this {platform.device}. Change this origin whenever you move the relay to
-                  another server.
+                <p class="endpoint-hint">
+                  You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall
+                  adds <code>/v1</code> automatically.
                 </p>
 
-                <label for="relay-token">Relay token <span>(optional)</span></label>
-                <input
-                  id="relay-token"
-                  type="password"
-                  bind:value={relayTokenDraft}
-                  placeholder="Use the saved relay token when blank"
-                  autocomplete="off"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  disabled={busy === 'starting'}
-                />
-                <p class="relay-hint">
-                  Saved in {platform.storeName} after the relay accepts it. Never included in guest links.
-                </p>
+                {#if endpointInputError}
+                  <p class="connection-error" role="alert">{endpointInputError}</p>
+                {:else if endpointFeedback}
+                  <p class="connection-success" role="status">{endpointFeedback}</p>
+                {:else if connectionError}
+                  <p class="connection-error" role="alert">{connectionError}</p>
+                {/if}
+
+                <button
+                  class="connect-button"
+                  disabled={endpointBusy || connectionState === 'checking'}
+                  type="submit"
+                >
+                  {endpointBusy || connectionState === 'checking'
+                    ? 'Checking endpoint…'
+                    : 'Save and reconnect'}
+                </button>
+              </form>
+            </details>
+          </section>
+        {/if}
+        {#if selectedSetting === 'sharing'}
+          <section class="share-section">
+            <PairingPanel
+              mode="host"
+              onCreated={rememberRelayUrl}
+              {model}
+              {endpoint}
+              bind:relayUrl={relayUrlDraft}
+              bind:relayKey={relayTokenDraft}
+            />
+          </section>
+          <section class="share-section" aria-labelledby="share-heading">
+            <div class="section-heading">
+              <div>
+                <h3 id="share-heading">Share your model</h3>
+                <p>Create a temporary browser link for someone you trust.</p>
               </div>
-
-              <div class="model-row">
-                <span>Model</span>
-                <strong>{model || 'No model selected'}</strong>
-              </div>
-
-              <fieldset disabled={busy === 'starting'}>
-                <legend>Link expires after</legend>
-                <div class="expiry-options">
-                  {#each expiryOptions as option}
-                    <label class:checked={expiry === option.value}>
-                      <input
-                        type="radio"
-                        name="share-expiry"
-                        value={option.value}
-                        bind:group={expiry}
-                      />
-                      <span>{option.label}</span>
-                    </label>
-                  {/each}
-                </div>
-              </fieldset>
-
-              <div class="notice">
-                Blackwall must stay open and connected to the hosted relay while guests are
-                chatting. No inbound port or VPN is required.
-              </div>
-
-              <button class="start-button" disabled={!model || busy === 'starting'} onclick={start}>
-                {busy === 'starting' ? 'Creating link…' : 'Create guest link'}
-              </button>
+              {#if status.active}
+                <span class="live-badge"><span></span>Live</span>
+              {/if}
             </div>
-          {/if}
 
-          {#if sharedLinks.length}
-            <div class="guest-list" aria-label="Active guest links">
-              <h4>Active links · {sharedLinks.length} of 4</h4>
-              {#each sharedLinks as link (link.id)}
-                <div class="guest-row">
-                  <button
-                    class="guest-select"
-                    class:selected={status.id === link.id}
-                    disabled={!!busy}
-                    onclick={() => {
-                      mergeStatus(link);
-                      creatingLink = false;
-                    }}
-                    ><strong>{link.name || 'Guest link'}</strong><small
-                      >{link.model} · {expiresLabel(link.expiresAt)} · {link.requestCount ?? 0} requests</small
-                    ></button
-                  ><button
-                    class="guest-revoke"
-                    aria-label={`Revoke ${link.name || 'guest link'}`}
-                    disabled={!!busy}
-                    onclick={() => link.id && revoke(link.id)}>Revoke</button
+            {#if busy === 'loading'}
+              <div class="loading-row" role="status">
+                <span class="spinner"></span>
+                Checking guest access…
+              </div>
+            {:else if status.active && !creatingLink}
+              <div class="active-share">
+                <div class="share-summary">
+                  <div>
+                    <span class="summary-label">Sharing</span>
+                    <strong title={status.name || status.model}
+                      >{status.name || status.model || model}</strong
+                    >{#if status.name}<small>{status.model || model}</small>{/if}
+                  </div>
+                  <div>
+                    <span class="summary-label">Access</span>
+                    <strong>{status.networkLabel || 'Hosted relay'}</strong>
+                  </div>
+                </div>
+
+                {#if status.qrDataUrl && status.shareUrl}
+                  <div class="qr-wrap">
+                    <img src={status.qrDataUrl} alt="QR code for guest chat link" />
+                    <div>
+                      <strong>Scan to open</strong>
+                      <p>Guests can scan this code with their phone camera.</p>
+                    </div>
+                  </div>
+
+                  <label class="link-label" for="guest-link">Guest link</label>
+                  <div class="link-field">
+                    <input
+                      id="guest-link"
+                      readonly
+                      value={status.shareUrl}
+                      onclick={(event) => event.currentTarget.select()}
+                    />
+                    <button class:copied aria-label="Copy guest link" onclick={copyLink}>
+                      <Icon name={copied ? 'check' : 'copy'} size={15} />
+                      <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                {:else}
+                  <div class="notice warning">
+                    This link is active, but its access code is no longer available in this window.
+                    Revoke this link below and create a replacement if you need to share it again.
+                  </div>
+                {/if}
+
+                <div class="share-meta">
+                  <span>{expiresLabel(status.expiresAt)}</span>
+                  <span
+                    >{status.requestCount ?? 0}
+                    {(status.requestCount ?? 0) === 1 ? 'request' : 'requests'}</span
                   >
                 </div>
-              {/each}
-              <p>
-                Each link has separate access. Revoke one here, or use Stop sharing to revoke every
-                link.
-              </p>
-            </div>
-          {/if}
-          {#if error}
-            <p class="error" role="alert" data-guest-error tabindex="-1">{error}</p>
-          {/if}
 
-          <p class="privacy-note">
-            Guest chats are routed through this Blackwall app to your configured model endpoint.
-          </p>
-        </section>
+                <div class="notice warning">
+                  Anyone with this link can send prompts and files to your model until it expires or
+                  you stop sharing.
+                </div>
 
-        {#if isDesktop()}
-          <details class="access-keys" bind:open={keysOpen}>
-            <summary>Access keys</summary>
-            <p>
-              Manage saved keys for your current model service and configured relay. Keys are shared
-              by connections using the same service origin.
-            </p>
-            {#if keysOpen}
-              {#if isPairedEndpoint(endpoint)}<p class="notice">
-                  This connection uses a paired device key. Manage it under connection setup →
-                  paired computers.
-                </p>{:else if endpoint}<CredentialSettings {endpoint} />{/if}
-              {#if credentialRelayUrl}<CredentialSettings
-                  kind="relay"
-                  endpoint={credentialRelayUrl}
-                />{/if}
-              {#if !endpoint && !credentialRelayUrl}<p>
-                  Connect a model or configure a relay to manage its access key.
-                </p>{/if}
-              <p>
-                Keys supplied through environment variables are managed outside Blackwall and are
-                unaffected by removal here.
-              </p>
-            {/if}
-          </details>
-        {/if}
-        {#if isDesktop()}
-          <details class="access-keys">
-            <summary>App lock</summary>
-            <LockSettings {onLock} />
-          </details>
-        {/if}
-
-        <section class="update-section" aria-labelledby="update-heading">
-          <div class="section-heading">
-            <div>
-              <h3 id="update-heading">App updates</h3>
-              <p>Choose stable releases or try upcoming features in beta.</p>
-            </div>
-            {#if currentVersion}
-              <span class="version-badge">{versionLabel(currentVersion)}</span>
-            {/if}
-          </div>
-
-          <label class="channel-label" for="update-channel">Update channel</label>
-          <select
-            id="update-channel"
-            value={updateChannel}
-            disabled={updateState === 'downloading' || updateState === 'unsupported'}
-            onchange={(event) =>
-              onUpdateChannelChange(event.currentTarget.value as AppUpdateChannel)}
-          >
-            <option value="stable">Stable</option>
-            <option value="beta">Beta</option>
-          </select>
-          <p class="channel-help">
-            {#if updateChannel === 'beta'}
-              Try features before they reach the stable release. Beta builds may have bugs.
-            {:else}
-              Get tested releases. Switching from beta offers the latest stable version.
-            {/if}
-          </p>
-
-          {#if updateState === 'downloading'}
-            <div class="update-card" role="status">
-              <strong
-                >Installing {availableUpdate
-                  ? versionLabel(availableUpdate.version)
-                  : 'update'}…</strong
-              >
-              <p>Blackwall will restart when the signed update is ready.</p>
-              <div
-                class:indeterminate={!updateProgress.totalBytes}
-                class="progress-track"
-                aria-label="Update download progress"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow={downloadPercent(updateProgress)}
-                role="progressbar"
-              >
-                <span style={`width: ${downloadPercent(updateProgress)}%`}></span>
-              </div>
-            </div>
-          {:else if availableUpdate}
-            <div class="update-card available">
-              <div>
-                <span class="update-label">Update available</span>
-                <strong>{versionLabel(availableUpdate.version)}</strong>
-              </div>
-              {#if availableUpdate.body}
-                <p class="release-notes">{availableUpdate.body}</p>
-              {/if}
-              {#if updateError}
-                <p class="update-error" role="alert">{updateError}</p>
-              {/if}
-              <button class="install-button" onclick={onInstallUpdate}
-                >Install update and restart</button
-              >
-            </div>
-          {:else}
-            <div class="update-status">
-              {#if updateState === 'checking'}
-                <span class="spinner"></span>
-                <span>Checking GitHub for a signed update…</span>
-              {:else if updateState === 'current'}
-                <Icon name="check" size={15} />
-                <span
-                  >Blackwall is up to date on the {updateChannel === 'beta' ? 'beta' : 'stable'} channel.</span
+                <button
+                  class="check-button"
+                  disabled={!!busy || sharedLinks.length >= 4}
+                  onclick={() => (creatingLink = true)}>Create another guest link</button
                 >
-              {:else if updateState === 'unsupported'}
-                <span>Updates are available in the installed desktop app.</span>
-              {:else if updateState === 'error'}
-                <span class="update-error" role="alert">{updateError}</span>
-              {:else}
-                <span>Blackwall checks for updates when it starts.</span>
+                <button class="stop-button" disabled={busy === 'stopping'} onclick={stop}>
+                  {busy === 'stopping' ? 'Stopping…' : 'Stop sharing'}
+                </button>
+              </div>
+            {:else}
+              <div class="inactive-share">
+                <div class="endpoint-form">
+                  <label for="invite-name">Name this guest link <span>(optional)</span></label
+                  ><input
+                    id="invite-name"
+                    bind:value={inviteName}
+                    maxlength={60}
+                    placeholder="For example, Alex’s phone"
+                    disabled={busy === 'starting'}
+                  />
+                </div>
+                {#if creatingLink}<button
+                    class="check-button"
+                    disabled={!!busy}
+                    onclick={() => (creatingLink = false)}>Back to active links</button
+                  >{/if}
+                <div class="relay-form">
+                  <label for="relay-url">Hosted relay URL</label>
+                  <input
+                    id="relay-url"
+                    bind:value={relayUrlDraft}
+                    placeholder="https://relay.example.com"
+                    autocomplete="url"
+                    autocapitalize="none"
+                    spellcheck="false"
+                    disabled={busy === 'starting'}
+                    onchange={rememberRelayUrl}
+                  />
+                  <p class="relay-hint">
+                    Saved on this {platform.device}. Change this origin whenever you move the relay
+                    to another server.
+                  </p>
+
+                  <label for="relay-token">Relay token <span>(optional)</span></label>
+                  <input
+                    id="relay-token"
+                    type="password"
+                    bind:value={relayTokenDraft}
+                    placeholder="Use the saved relay token when blank"
+                    autocomplete="off"
+                    autocapitalize="none"
+                    spellcheck="false"
+                    disabled={busy === 'starting'}
+                  />
+                  <p class="relay-hint">
+                    Saved in {platform.storeName} after the relay accepts it. Never included in guest
+                    links.
+                  </p>
+                </div>
+
+                <div class="model-row">
+                  <span>Model</span>
+                  <strong>{model || 'No model selected'}</strong>
+                </div>
+
+                <fieldset disabled={busy === 'starting'}>
+                  <legend>Link expires after</legend>
+                  <div class="expiry-options">
+                    {#each expiryOptions as option}
+                      <label class:checked={expiry === option.value}>
+                        <input
+                          type="radio"
+                          name="share-expiry"
+                          value={option.value}
+                          bind:group={expiry}
+                        />
+                        <span>{option.label}</span>
+                      </label>
+                    {/each}
+                  </div>
+                </fieldset>
+
+                <div class="notice">
+                  Blackwall must stay open and connected to the hosted relay while guests are
+                  chatting. No inbound port or VPN is required.
+                </div>
+
+                <button
+                  class="start-button"
+                  disabled={!model || busy === 'starting'}
+                  onclick={start}
+                >
+                  {busy === 'starting' ? 'Creating link…' : 'Create guest link'}
+                </button>
+              </div>
+            {/if}
+
+            {#if sharedLinks.length}
+              <div class="guest-list" aria-label="Active guest links">
+                <h4>Active links · {sharedLinks.length} of 4</h4>
+                {#each sharedLinks as link (link.id)}
+                  <div class="guest-row">
+                    <button
+                      class="guest-select"
+                      class:selected={status.id === link.id}
+                      disabled={!!busy}
+                      onclick={() => {
+                        mergeStatus(link);
+                        creatingLink = false;
+                      }}
+                      ><strong>{link.name || 'Guest link'}</strong><small
+                        >{link.model} · {expiresLabel(link.expiresAt)} · {link.requestCount ?? 0} requests</small
+                      ></button
+                    ><button
+                      class="guest-revoke"
+                      aria-label={`Revoke ${link.name || 'guest link'}`}
+                      disabled={!!busy}
+                      onclick={() => link.id && revoke(link.id)}>Revoke</button
+                    >
+                  </div>
+                {/each}
+                <p>
+                  Each link has separate access. Revoke one here, or use Stop sharing to revoke
+                  every link.
+                </p>
+              </div>
+            {/if}
+            {#if error}
+              <p class="error" role="alert" data-guest-error tabindex="-1">{error}</p>
+            {/if}
+
+            <p class="privacy-note">
+              Guest chats are routed through this Blackwall app to your configured model endpoint.
+            </p>
+          </section>
+        {/if}
+        {#if selectedSetting === 'security'}
+          {#if isDesktop()}
+            <details class="access-keys" bind:open={keysOpen}>
+              <summary>Access keys</summary>
+              <p>
+                Manage saved keys for your current model service and configured relay. Keys are
+                shared by connections using the same service origin.
+              </p>
+              {#if keysOpen}
+                {#if isPairedEndpoint(endpoint)}<p class="notice">
+                    This connection uses a paired device key. Manage it under connection setup →
+                    paired computers.
+                  </p>{:else if endpoint}<CredentialSettings {endpoint} />{/if}
+                {#if credentialRelayUrl}<CredentialSettings
+                    kind="relay"
+                    endpoint={credentialRelayUrl}
+                  />{/if}
+                {#if !endpoint && !credentialRelayUrl}<p>
+                    Connect a model or configure a relay to manage its access key.
+                  </p>{/if}
+                <p>
+                  Keys supplied through environment variables are managed outside Blackwall and are
+                  unaffected by removal here.
+                </p>
+              {/if}
+            </details>
+          {/if}
+          {#if isDesktop()}
+            <details class="access-keys">
+              <summary>App lock</summary>
+              <LockSettings {onLock} />
+            </details>
+          {/if}
+        {/if}
+        {#if selectedSetting === 'updates'}
+          <section class="update-section" aria-labelledby="update-heading">
+            <div class="section-heading">
+              <div>
+                <h3 id="update-heading">App updates</h3>
+                <p>Choose stable releases or try upcoming features in beta.</p>
+              </div>
+              {#if currentVersion}
+                <span class="version-badge">{versionLabel(currentVersion)}</span>
               {/if}
             </div>
-            <button
-              class="check-button"
-              disabled={updateState === 'checking' || updateState === 'unsupported'}
-              onclick={onCheckForUpdates}
+
+            <label class="channel-label" for="update-channel">Update channel</label>
+            <select
+              id="update-channel"
+              value={updateChannel}
+              disabled={updateState === 'downloading' || updateState === 'unsupported'}
+              onchange={(event) =>
+                onUpdateChannelChange(event.currentTarget.value as AppUpdateChannel)}
             >
-              {updateState === 'checking' ? 'Checking…' : 'Check for updates'}
-            </button>
-          {/if}
-        </section>
+              <option value="stable">Stable</option>
+              <option value="beta">Beta</option>
+            </select>
+            <p class="channel-help">
+              {#if updateChannel === 'beta'}
+                Try features before they reach the stable release. Beta builds may have bugs.
+              {:else}
+                Get tested releases. Switching from beta offers the latest stable version.
+              {/if}
+            </p>
+
+            {#if updateState === 'downloading'}
+              <div class="update-card" role="status">
+                <strong
+                  >Installing {availableUpdate
+                    ? versionLabel(availableUpdate.version)
+                    : 'update'}…</strong
+                >
+                <p>Blackwall will restart when the signed update is ready.</p>
+                <div
+                  class:indeterminate={!updateProgress.totalBytes}
+                  class="progress-track"
+                  aria-label="Update download progress"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={downloadPercent(updateProgress)}
+                  role="progressbar"
+                >
+                  <span style={`width: ${downloadPercent(updateProgress)}%`}></span>
+                </div>
+              </div>
+            {:else if availableUpdate}
+              <div class="update-card available">
+                <div>
+                  <span class="update-label">Update available</span>
+                  <strong>{versionLabel(availableUpdate.version)}</strong>
+                </div>
+                {#if availableUpdate.body}
+                  <p class="release-notes">{availableUpdate.body}</p>
+                {/if}
+                {#if updateError}
+                  <p class="update-error" role="alert">{updateError}</p>
+                {/if}
+                <button class="install-button" onclick={onInstallUpdate}
+                  >Install update and restart</button
+                >
+              </div>
+            {:else}
+              <div class="update-status">
+                {#if updateState === 'checking'}
+                  <span class="spinner"></span>
+                  <span>Checking GitHub for a signed update…</span>
+                {:else if updateState === 'current'}
+                  <Icon name="check" size={15} />
+                  <span
+                    >Blackwall is up to date on the {updateChannel === 'beta' ? 'beta' : 'stable'} channel.</span
+                  >
+                {:else if updateState === 'unsupported'}
+                  <span>Updates are available in the installed desktop app.</span>
+                {:else if updateState === 'error'}
+                  <span class="update-error" role="alert">{updateError}</span>
+                {:else}
+                  <span>Blackwall checks for updates when it starts.</span>
+                {/if}
+              </div>
+              <button
+                class="check-button"
+                disabled={updateState === 'checking' || updateState === 'unsupported'}
+                onclick={onCheckForUpdates}
+              >
+                {updateState === 'checking' ? 'Checking…' : 'Check for updates'}
+              </button>
+            {/if}
+          </section>
+        {/if}
       </div>
     </div>
   </div>
@@ -783,44 +884,110 @@
     <MemoryDialog {contextPreferences} {onPreferences} onClose={closePanel} />
   {:else if activePanel === 'skills'}
     <SkillsDialog onClose={closePanel} />
+  {:else if activePanel === 'mcp'}
+    <McpDialog onClose={closePanel} />
+  {:else if activePanel === 'runs'}
+    <RunsDialog onClose={closePanel} />
   {/if}
 {/if}
 
 <style>
-  .preferences-section {
+  .menu-controls {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 20px;
+    gap: 12px;
     margin-bottom: 20px;
   }
-  .preference-button {
+  .settings-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 0 10px;
+    color: var(--text-muted);
+  }
+  .settings-search:focus-within {
+    border-color: var(--accent);
+  }
+  .settings-search input {
+    min-width: 0;
+    width: 100%;
+    height: 36px;
+    border: 0;
+    background: transparent;
+    color: var(--text-primary);
+    outline: none;
+    font-size: 13px;
+  }
+  .settings-order {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
-    padding: 12px;
+    gap: 12px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .settings-order select {
+    width: auto;
+    margin: 0;
+    padding: 6px 10px;
+  }
+  .settings-group + .settings-group {
+    margin-top: 22px;
+  }
+  .settings-group h3 {
+    padding: 0 10px 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .preference-button {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 10px;
+    min-height: 44px;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
     text-align: left;
   }
-  .preference-button:hover {
+  .preference-button:hover,
+  .back-button:hover {
     background: var(--bg-hover);
+    color: var(--text-primary);
   }
   .preference-button span {
     display: flex;
+    flex: 1;
+    min-width: 0;
     flex-direction: column;
     gap: 4px;
   }
   .preference-button strong {
     color: var(--text-primary);
     font-size: 14px;
-    font-weight: 600;
+    font-weight: 500;
   }
-  .preference-button small {
+  .back-button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 20px;
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    background: transparent;
+    color: var(--text-muted);
     font-size: 12px;
+  }
+  .no-settings {
+    padding: 16px 10px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
   }
 
   .access-keys {

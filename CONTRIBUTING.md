@@ -54,6 +54,15 @@ Use typed errors in the core and reserve `anyhow` for application edges. Avoid `
 `expect` in production code. All I/O must be asynchronous where practical, timeout-capped, and
 bounded in output size.
 
+## Settings and management tools
+
+Place new preferences, integrations, and management tools in Settings. Keep the chat sidebar
+focused on conversation modes, creating chats, and history. Register each settings destination in
+`ui/src/lib/settingsNavigation.ts`, including its purpose-based group, icon, description, and
+search keywords. Wire its page or dialog into `SettingsDialog.svelte` and preserve focus when
+returning from it. This keeps new settings discoverable through category grouping, search, and
+alphabetical sorting without adding separate sidebar shortcuts.
+
 ## Quality checks
 
 Run the checks relevant to your change before opening a pull request:

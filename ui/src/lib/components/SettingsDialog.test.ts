@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { GuestShareClient } from '../ipc';
@@ -25,6 +25,121 @@ function mockClient(): GuestShareClient {
 }
 
 describe('SettingsDialog', () => {
+  it('groups settings by purpose and can sort every destination by name', async () => {
+    const user = userEvent.setup();
+    const client = mockClient();
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client } });
+
+    const menu = within(screen.getByRole('navigation', { name: 'Settings menu' }));
+    expect(
+      within(menu.getByRole('region', { name: 'General' })).getByRole('button', {
+        name: /Model connection/,
+      }),
+    ).toBeInTheDocument();
+    const ai = within(menu.getByRole('region', { name: 'AI capabilities' }));
+    for (const name of ['Memory', 'Skills', 'MCP servers']) {
+      expect(ai.getByRole('button', { name: new RegExp(name) })).toBeInTheDocument();
+    }
+    expect(
+      within(menu.getByRole('region', { name: 'Workflows' })).getByRole('button', { name: /Runs/ }),
+    ).toBeInTheDocument();
+    expect(client.shareStatus).not.toHaveBeenCalled();
+
+    await user.selectOptions(screen.getByLabelText('Settings order'), 'alphabetical');
+    expect(menu.queryByRole('region', { name: 'AI capabilities' })).not.toBeInTheDocument();
+    expect(
+      menu.getAllByRole('button').map((button) => button.querySelector('strong')?.textContent),
+    ).toEqual([
+      'App updates',
+      'MCP servers',
+      'Memory',
+      'Model connection',
+      'Runs',
+      'Sharing & pairing',
+      'Skills',
+    ]);
+    await user.selectOptions(screen.getByLabelText('Settings order'), 'category');
+    expect(menu.getByRole('region', { name: 'AI capabilities' })).toBeInTheDocument();
+  });
+
+  it('keeps access keys and app lock together under Security on desktop', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
+    const general = within(screen.getByRole('region', { name: 'General' }));
+    await user.click(general.getByRole('button', { name: 'Security' }));
+    expect(screen.getByText('Access keys', { selector: 'summary' })).toBeInTheDocument();
+    await user.click(screen.getByText('App lock', { selector: 'summary' }));
+    expect(screen.getByRole('heading', { name: 'App lock' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'All settings' }));
+    expect(screen.getByRole('button', { name: 'Security' })).toHaveFocus();
+  });
+
+  it('filters by related terms and category, and explains an empty result', async () => {
+    const user = userEvent.setup();
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
+    const search = screen.getByRole('searchbox', { name: 'Search settings' });
+    const menu = within(screen.getByRole('navigation', { name: 'Settings menu' }));
+    await user.type(search, '  TOOLS  ');
+    expect(menu.getAllByRole('button')).toHaveLength(1);
+    expect(menu.getByRole('button', { name: /MCP servers/ })).toBeInTheDocument();
+    await user.clear(search);
+    await user.type(search, 'workflows');
+    expect(menu.getAllByRole('button')).toHaveLength(3);
+    await user.clear(search);
+    await user.type(search, 'nothing matches');
+    expect(menu.queryAllByRole('button')).toHaveLength(0);
+    expect(menu.getByRole('status')).toHaveTextContent('No settings match');
+    await user.clear(search);
+    expect(menu.getByRole('button', { name: /Runs/ })).toBeInTheDocument();
+  });
+
+  it('polls guest access only while the sharing page is open', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = mockClient();
+      const invites = { list: vi.fn().mockResolvedValue([]), revoke: vi.fn() };
+      const view = render(SettingsDialog, {
+        props: { open: true, onClose: vi.fn(), client, invites },
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(client.shareStatus).not.toHaveBeenCalled();
+      await fireEvent.click(screen.getByRole('button', { name: 'Sharing & pairing' }));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(client.shareStatus).toHaveBeenCalledTimes(2);
+      await fireEvent.click(screen.getByRole('button', { name: 'All settings' }));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(client.shareStatus).toHaveBeenCalledTimes(2);
+      await fireEvent.click(screen.getByRole('button', { name: 'Sharing & pairing' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.shareStatus).toHaveBeenCalledTimes(3);
+      await view.rerender({ open: false });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(client.shareStatus).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns from a settings page to the filtered menu and restores keyboard focus', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const view = render(SettingsDialog, { props: { open: true, onClose, client: mockClient() } });
+    await user.type(screen.getByRole('searchbox'), 'beta');
+    await user.click(screen.getByRole('button', { name: /App updates/ }));
+    expect(screen.queryByRole('navigation', { name: 'Settings menu' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Update channel')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'All settings' }));
+    expect(screen.getByRole('searchbox')).toHaveValue('beta');
+    expect(screen.getByRole('button', { name: /App updates/ })).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledOnce();
+    await view.rerender({ open: false });
+    await view.rerender({ open: true });
+    expect(screen.getByRole('searchbox')).toHaveValue('');
+    expect(screen.getByRole('button', { name: /Model connection/ })).toBeInTheDocument();
+  });
+
   it('offers an available signed update and installs it on request', async () => {
     const user = userEvent.setup();
     const onInstallUpdate = vi.fn().mockResolvedValue(undefined);
@@ -46,6 +161,7 @@ describe('SettingsDialog', () => {
       },
     });
 
+    await user.click(screen.getByRole('button', { name: /App updates/ }));
     expect(await screen.findByText('Update available')).toBeInTheDocument();
     expect(screen.getByText('v0.1.9')).toBeInTheDocument();
     expect(screen.getByText('A signed build from main.')).toBeInTheDocument();
@@ -67,6 +183,7 @@ describe('SettingsDialog', () => {
         onUpdateChannelChange,
       },
     });
+    await user.click(screen.getByRole('button', { name: /App updates/ }));
     await user.selectOptions(screen.getByLabelText('Update channel'), 'beta');
     expect(onUpdateChannelChange).toHaveBeenCalledExactlyOnceWith('beta');
     await view.rerender({ updateChannel: 'beta', updateState: 'downloading' });
@@ -91,6 +208,8 @@ describe('SettingsDialog', () => {
       },
     });
 
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    await user.click(screen.getByText('Advanced · Enter a server address'));
     const input = screen.getByLabelText('Endpoint URL');
     await user.clear(input);
     await user.type(input, 'http://192.0.2.10:11434');
@@ -121,6 +240,7 @@ describe('SettingsDialog', () => {
       },
     });
 
+    await user.click(screen.getByRole('button', { name: /Sharing & pairing/ }));
     await screen.findByText('Link expires after');
     await user.type(screen.getByLabelText('Hosted relay URL'), 'https://relay.example.com');
     await user.type(screen.getByLabelText(/Relay token/), 'relay-secret');
@@ -168,6 +288,7 @@ describe('SettingsDialog', () => {
       props: { open: true, model: MODEL, onClose: vi.fn(), client },
     });
 
+    await userEvent.click(screen.getByRole('button', { name: /Sharing & pairing/ }));
     expect(await screen.findByText(/access code is no longer available/i)).toBeInTheDocument();
     expect(screen.getByText('3 requests')).toBeInTheDocument();
   });
@@ -177,6 +298,7 @@ describe('SettingsDialog', () => {
       props: { open: true, model: MODEL, onClose: vi.fn() },
     });
 
+    await userEvent.click(screen.getByRole('button', { name: /Sharing & pairing/ }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Guest sharing requires the Blackwall desktop app.',
     );
@@ -194,6 +316,7 @@ describe('SettingsDialog', () => {
     render(SettingsDialog, {
       props: { open: true, model: MODEL, onClose: vi.fn(), client, invites },
     });
+    await user.click(screen.getByRole('button', { name: /Sharing & pairing/ }));
     const revoke = await screen.findByRole('button', { name: 'Revoke Alex’s phone' });
     invites.list.mockResolvedValue([second]);
     await user.click(revoke);

@@ -1,0 +1,92 @@
+import type { ComponentProps } from 'svelte';
+import type Icon from './components/Icon.svelte';
+
+export type SettingsPage = 'connection' | 'security' | 'updates' | 'sharing';
+export type SettingsPanel = 'memory' | 'skills' | 'mcp' | 'runs';
+export const settingsGroups = ['General', 'AI capabilities', 'Workflows'] as const;
+
+type SettingsEntry = {
+  title: string;
+  description: string;
+  group: (typeof settingsGroups)[number];
+  icon: ComponentProps<typeof Icon>['name'];
+  keywords: string;
+  desktopOnly?: boolean;
+} & ({ kind: 'page'; id: SettingsPage } | { kind: 'dialog'; id: SettingsPanel });
+
+// Register new app configuration and management destinations here, rather than in the chat sidebar.
+export const settingsEntries: readonly SettingsEntry[] = [
+  {
+    id: 'connection',
+    kind: 'page',
+    group: 'General',
+    icon: 'link',
+    title: 'Model connection',
+    description: 'Connect a model service or paired computer',
+    keywords: 'endpoint server ollama openai setup',
+  },
+  {
+    id: 'security',
+    kind: 'page',
+    group: 'General',
+    icon: 'shield',
+    desktopOnly: true,
+    title: 'Security',
+    description: 'Access keys and app lock',
+    keywords: 'credentials token password privacy',
+  },
+  {
+    id: 'updates',
+    kind: 'page',
+    group: 'General',
+    icon: 'refresh',
+    title: 'App updates',
+    description: 'Release channel and signed updates',
+    keywords: 'version stable beta install',
+  },
+  {
+    id: 'memory',
+    kind: 'dialog',
+    group: 'AI capabilities',
+    icon: 'brain',
+    title: 'Memory',
+    description: 'Saved preferences & context',
+    keywords: 'context window tokens limit instructions',
+  },
+  {
+    id: 'skills',
+    kind: 'dialog',
+    group: 'AI capabilities',
+    icon: 'sparkles',
+    title: 'Skills',
+    description: 'Reusable workflows',
+    keywords: 'commands import learning proposals',
+  },
+  {
+    id: 'mcp',
+    kind: 'dialog',
+    group: 'AI capabilities',
+    icon: 'server',
+    title: 'MCP servers',
+    description: 'Tools from local servers',
+    keywords: 'integrations permissions approvals tools',
+  },
+  {
+    id: 'sharing',
+    kind: 'page',
+    group: 'Workflows',
+    icon: 'external-link',
+    title: 'Sharing & pairing',
+    description: 'Guest links and paired devices',
+    keywords: 'share model relay access computers phone',
+  },
+  {
+    id: 'runs',
+    kind: 'dialog',
+    group: 'Workflows',
+    icon: 'history',
+    title: 'Runs',
+    description: 'Traces of agent runs',
+    keywords: 'history logs debug activity',
+  },
+];
