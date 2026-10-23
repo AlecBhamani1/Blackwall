@@ -15,7 +15,12 @@
   import { isDesktop } from '../setup';
   import { platform } from '../platform';
   import Icon from './Icon.svelte';
+  import MemoryDialog from './MemoryDialog.svelte';
+  import SkillsDialog from './SkillsDialog.svelte';
+  import type { Preferences } from '../persistence';
 
+  export let contextPreferences: Preferences = {};
+  export let onPreferences: (preferences: Preferences) => void = () => {};
   export let onLock: () => Promise<void> = async () => {};
   export let onSetup: () => void = () => {};
   export let open = false;
@@ -45,6 +50,19 @@
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let keysOpen = false;
+  let activePanel: 'memory' | 'skills' | null = null;
+  let panelButton: HTMLButtonElement;
+
+  function openPanel(panel: 'memory' | 'skills', button: HTMLButtonElement): void {
+    panelButton = button;
+    activePanel = panel;
+  }
+
+  async function closePanel(): Promise<void> {
+    activePanel = null;
+    await tick();
+    if (open) panelButton?.focus();
+  }
   let expiry: ShareExpiryMinutes = 60;
   let inviteName = '';
   let creatingLink = false;
@@ -73,7 +91,7 @@
 
   async function focusGuestResult(): Promise<void> {
     await tick();
-    if (!open || !dialog) return;
+    if (!open || activePanel || !dialog) return;
     const active = document.activeElement;
     if (active !== document.body && !dialog.contains(active)) return;
     // Creating/revoking a link removes the initiating control from the DOM.
@@ -254,14 +272,14 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (open && event.key === 'Escape') {
+    if (open && !activePanel && event.key === 'Escape') {
       event.preventDefault();
       onClose();
     }
   }
 
   function trapFocus(event: KeyboardEvent): void {
-    if (event.key !== 'Tab') return;
+    if (activePanel || event.key !== 'Tab') return;
     const focusable = Array.from(
       dialog.querySelectorAll<HTMLElement>(
         'button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])',
@@ -297,9 +315,12 @@
       void refresh();
       void tick().then(() => dialog?.focus());
       pollTimer = window.setInterval(() => void refresh(true), 10_000);
-    } else if (pollTimer !== undefined) {
-      window.clearInterval(pollTimer);
-      pollTimer = undefined;
+    } else {
+      activePanel = null;
+      if (pollTimer !== undefined) {
+        window.clearInterval(pollTimer);
+        pollTimer = undefined;
+      }
     }
   }
 
@@ -316,7 +337,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div class="modal-layer">
+  <div class="modal-layer" inert={activePanel !== null}>
     <button class="backdrop" aria-label="Close settings" onclick={onClose}></button>
     <div
       class="settings-dialog"
@@ -330,7 +351,7 @@
       <header>
         <div>
           <h2 id="settings-title">Settings</h2>
-          <p>Configure your model connection and guest access.</p>
+          <p>Manage your preferences, model connection, and guest access.</p>
         </div>
         <button class="icon-button" aria-label="Close settings" onclick={onClose}>
           <Icon name="x" size={18} />
@@ -338,6 +359,24 @@
       </header>
 
       <div class="dialog-content">
+        <section class="preferences-section" aria-label="Preferences">
+          <button
+            class="preference-button"
+            aria-haspopup="dialog"
+            onclick={(event) => openPanel('memory', event.currentTarget)}
+          >
+            <span><strong>Memory</strong><small>Saved preferences & context</small></span>
+            <Icon name="chevron-right" size={16} />
+          </button>
+          <button
+            class="preference-button"
+            aria-haspopup="dialog"
+            onclick={(event) => openPanel('skills', event.currentTarget)}
+          >
+            <span><strong>Skills</strong><small>Reusable workflows</small></span>
+            <Icon name="chevron-right" size={16} />
+          </button>
+        </section>
         <section class="connection-section" aria-labelledby="connection-heading">
           <div class="section-heading">
             <div>
@@ -740,9 +779,50 @@
       </div>
     </div>
   </div>
+  {#if activePanel === 'memory'}
+    <MemoryDialog {contextPreferences} {onPreferences} onClose={closePanel} />
+  {:else if activePanel === 'skills'}
+    <SkillsDialog onClose={closePanel} />
+  {/if}
 {/if}
 
 <style>
+  .preferences-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 20px;
+  }
+  .preference-button {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    text-align: left;
+  }
+  .preference-button:hover {
+    background: var(--bg-hover);
+  }
+  .preference-button span {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .preference-button strong {
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .preference-button small {
+    font-size: 12px;
+  }
+
   .access-keys {
     border-bottom: 1px solid var(--border);
     padding-bottom: 20px;
