@@ -12,7 +12,7 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -178,7 +178,9 @@ impl Drop for OfflineGuard {
 
 struct ModelServer {
     endpoint: String,
-    worker: JoinHandle<Vec<Value>>,
+    stopped: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Vec<Value>>>,
+    expected_requests: usize,
 }
 
 impl ModelServer {
@@ -186,18 +188,21 @@ impl ModelServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let expected_requests = responses.len();
         let worker = thread::spawn(move || {
             let mut requests = Vec::new();
             for frames in responses {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                // CLI setup can launch several processes before making a request. Keep the
+                // listener alive until the test finishes, including on slow Windows runners.
                 let mut stream = loop {
+                    if worker_stopped.load(Ordering::Relaxed) {
+                        return requests;
+                    }
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "The CLI did not call the fixture"
-                            );
                             thread::sleep(Duration::from_millis(5));
                         }
                         Err(error) => panic!("Fixture accept failed: {error}"),
@@ -222,11 +227,37 @@ impl ModelServer {
             }
             requests
         });
-        Self { endpoint, worker }
+        Self {
+            endpoint,
+            stopped,
+            worker: Some(worker),
+            expected_requests,
+        }
     }
 
-    fn finish(self) -> Vec<Value> {
-        self.worker.join().expect("The mock model failed")
+    fn finish(mut self) -> Vec<Value> {
+        self.stopped.store(true, Ordering::Relaxed);
+        let requests = self
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("The mock model failed");
+        assert_eq!(
+            requests.len(),
+            self.expected_requests,
+            "The CLI did not consume all mock responses"
+        );
+        requests
+    }
+}
+
+impl Drop for ModelServer {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -264,6 +295,13 @@ fn answer(text: &str) -> Vec<Value> {
         json!({"choices":[{"delta":{"content":"Fixture "},"finish_reason":null}]}),
         json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]}),
     ]
+}
+
+#[test]
+#[should_panic(expected = "The CLI did not consume all mock responses")]
+fn model_fixture_rejects_missing_requests_when_the_cli_finishes() {
+    let model = ModelServer::start(vec![answer("unused response")]);
+    model.finish();
 }
 
 fn proposed_write() -> Vec<Value> {
