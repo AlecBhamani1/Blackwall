@@ -395,18 +395,6 @@ export function createChatController(
       commandTimeoutSeconds: settings.commandTimeoutSeconds ?? 120,
     };
   }
-  const contextPercent = derived(
-    [messages, preferences, contextReport],
-    ([$messages, $preferences, $report]) => {
-      const estimate = $report
-        ? $report.estimatedPromptTokens + $report.toolTokens
-        : Math.ceil(
-            new TextEncoder().encode(JSON.stringify(asModelMessages($messages))).length / 3,
-          );
-      const window = $report?.contextWindow ?? $preferences.contextWindow ?? 32000;
-      return Math.min(100, Math.round((estimate / window) * 100));
-    },
-  );
   function showContext(): void {
     const report = get(contextReport);
     const currentBudget = budget();
@@ -1181,7 +1169,6 @@ export function createChatController(
     models,
     selectedModel,
     endpoint,
-    contextPercent,
     contextReport: readonly(contextReport),
     showRecall,
     closeRecall,
