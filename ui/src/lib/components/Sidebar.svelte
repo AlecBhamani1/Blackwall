@@ -140,20 +140,6 @@
     >
       <Icon name="gear" size={17} />
     </button>
-    <div class="connection-label">
-      <span
-        class:ready={connectionState === 'ready'}
-        class:offline={connectionState === 'offline'}
-        class="dot"
-      ></span>
-      <span
-        >{connectionState === 'ready'
-          ? 'Model connected'
-          : connectionState === 'checking'
-            ? 'Checking connection'
-            : 'Model offline'}</span
-      >
-    </div>
   </div>
 </aside>
 
@@ -425,11 +411,8 @@
     display: flex;
     min-height: 48px;
     align-items: center;
-    gap: 8px;
     border-top: 1px solid var(--border);
     padding: 0 10px;
-    color: var(--text-faint);
-    font-size: 11.5px;
   }
 
   .settings-button {
@@ -447,34 +430,6 @@
   .settings-button[aria-expanded='true'] {
     background: var(--bg-hover);
     color: var(--text-primary);
-  }
-
-  .connection-label {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 7px;
-  }
-
-  .connection-label > span:last-child {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--warn);
-  }
-
-  .dot.ready {
-    background: var(--ok);
-  }
-
-  .dot.offline {
-    background: var(--err);
   }
 
   @media (max-width: 760px) {
