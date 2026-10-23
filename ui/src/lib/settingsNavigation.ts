@@ -22,8 +22,8 @@ export const settingsEntries: readonly SettingsEntry[] = [
     group: 'General',
     icon: 'link',
     title: 'Model connection',
-    description: 'Connect a model service or paired computer',
-    keywords: 'endpoint server ollama openai setup',
+    description: 'Save and switch model services or paired computers',
+    keywords: 'endpoint server ollama openai setup saved connections switch',
   },
   {
     id: 'security',

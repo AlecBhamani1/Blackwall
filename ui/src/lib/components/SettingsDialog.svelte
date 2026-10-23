@@ -10,6 +10,8 @@
   } from '../updates';
   import LockSettings from './LockSettings.svelte';
   import CredentialSettings from './CredentialSettings.svelte';
+  import SavedConnections from './SavedConnections.svelte';
+  import { connectionProfiles } from '../connections';
   import PairingPanel from './PairingPanel.svelte';
   import { isPairedEndpoint } from '../pairing';
   import { isDesktop } from '../setup';
@@ -132,6 +134,14 @@
   let endpointBusy = false;
   let endpointFeedback = '';
   let endpointInputError = '';
+  let keyEndpoint = '';
+  $: modelKeyConnections = connectionProfiles([
+    ...(endpoint ? [{ endpoint, name: 'Current model service' }] : []),
+    ...(contextPreferences.connections ?? []),
+  ]);
+  $: if (!modelKeyConnections.some((profile) => profile.endpoint === keyEndpoint)) {
+    keyEndpoint = modelKeyConnections[0]?.endpoint ?? '';
+  }
   let relayUrlDraft = typeof window === 'undefined' ? '' : readRelayUrl();
   let credentialRelayUrl = relayUrlDraft;
   let relayTokenDraft = '';
@@ -260,6 +270,11 @@
       return;
     }
 
+    await connectSaved(candidate);
+  }
+
+  async function connectSaved(candidate: string): Promise<void> {
+    if (endpointBusy) return;
     endpointBusy = true;
     endpointInputError = '';
     endpointFeedback = '';
@@ -486,6 +501,25 @@
               </span>
             </div>
 
+            <SavedConnections
+              connections={contextPreferences.connections ?? []}
+              currentEndpoint={endpoint}
+              busy={endpointBusy || connectionState === 'checking'}
+              onConnect={connectSaved}
+              onForget={(address) =>
+                onPreferences({
+                  connections: (contextPreferences.connections ?? []).filter(
+                    (profile) => profile.endpoint !== address,
+                  ),
+                })}
+            />
+            {#if endpointInputError}
+              <p class="connection-error" role="alert">{endpointInputError}</p>
+            {:else if endpointFeedback}
+              <p class="connection-success" role="status">{endpointFeedback}</p>
+            {:else if connectionError}
+              <p class="connection-error" role="alert">{connectionError}</p>
+            {/if}
             <button class="connect-button setup-button" onclick={onSetup}
               >Set up a connection</button
             >
@@ -506,14 +540,6 @@
                   You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall
                   adds <code>/v1</code> automatically.
                 </p>
-
-                {#if endpointInputError}
-                  <p class="connection-error" role="alert">{endpointInputError}</p>
-                {:else if endpointFeedback}
-                  <p class="connection-success" role="status">{endpointFeedback}</p>
-                {:else if connectionError}
-                  <p class="connection-error" role="alert">{connectionError}</p>
-                {/if}
 
                 <button
                   class="connect-button"
@@ -753,14 +779,22 @@
             <details class="access-keys" bind:open={keysOpen}>
               <summary>Access keys</summary>
               <p>
-                Manage saved keys for your current model service and configured relay. Keys are
-                shared by connections using the same service origin.
+                Manage saved keys for your model services and configured relay. Keys are shared by
+                connections using the same service origin.
               </p>
               {#if keysOpen}
-                {#if isPairedEndpoint(endpoint)}<p class="notice">
+                {#if modelKeyConnections.length > 1}
+                  <label for="key-connection">Model service</label>
+                  <select class="key-connection" id="key-connection" bind:value={keyEndpoint}>
+                    {#each modelKeyConnections as profile}
+                      <option value={profile.endpoint}>{profile.name} · {profile.endpoint}</option>
+                    {/each}
+                  </select>
+                {/if}
+                {#if isPairedEndpoint(keyEndpoint)}<p class="notice">
                     This connection uses a paired device key. Manage it under connection setup →
                     paired computers.
-                  </p>{:else if endpoint}<CredentialSettings {endpoint} />{/if}
+                  </p>{:else if keyEndpoint}<CredentialSettings endpoint={keyEndpoint} />{/if}
                 {#if credentialRelayUrl}<CredentialSettings
                     kind="relay"
                     endpoint={credentialRelayUrl}
@@ -892,6 +926,16 @@
 {/if}
 
 <style>
+  .key-connection {
+    width: 100%;
+    margin: 8px 0;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font: inherit;
+  }
   .menu-controls {
     display: flex;
     flex-direction: column;

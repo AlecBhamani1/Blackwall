@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Keep advanced model connections when adding another endpoint. Switch among saved services in
+  Settings, restore each service's selected model, and retain browser connections after restarting.
+  Manage a saved service's access key without switching away from the current model.
+
 - Show all slash commands and enabled skills in a scrollable menu above the chat input. Filter
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
