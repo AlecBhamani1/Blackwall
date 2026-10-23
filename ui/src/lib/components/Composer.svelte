@@ -41,6 +41,7 @@
   let commands = BUILT_IN_COMMANDS;
   let slash: string | null = null;
   let slashIndex = 0;
+  let commandList: HTMLDivElement | undefined;
 
   $: canSend = !disabled && !busy && !submitting && Boolean(text.trim() || attachments.length);
   $: references = attachmentReferences([...chatAttachments, ...attachments]);
@@ -48,12 +49,16 @@
     ? references.filter(({ label }) => label.toLowerCase().includes(mention!.query.toLowerCase()))
     : [];
   $: commandSuggestions =
-    slash === null ? [] : commands.filter(({ name }) => name.startsWith(slash!)).slice(0, 8);
+    slash === null ? [] : commands.filter(({ name }) => name.startsWith(slash!));
+  $: if (slashIndex >= commandSuggestions.length) slashIndex = 0;
+  $: scrollCommandIntoView(slashIndex, commandSuggestions);
   $: if (sessionId !== draftSessionId) {
     attachments.forEach(revokeAttachmentPreview);
     attachments = [];
     text = '';
     mention = null;
+    slash = null;
+    slashIndex = 0;
     attachmentNotice = '';
     draftSessionId = sessionId;
   }
@@ -61,10 +66,20 @@
   function updateMention() {
     mention = mentionAtCaret(text, textarea.selectionStart);
     mentionIndex = 0;
-    const typed = /^\/([a-z0-9-]*)$/.exec(text.slice(0, textarea.selectionStart));
-    if (typed && slash === null) void loadSkills();
-    slash = typed ? typed[1] : null;
+    const typed = /^\/([a-z0-9-]*)(?=\s|$)/.exec(text);
+    const caret = textarea.selectionStart;
+    const inCommand = typed && caret > 0 && caret <= typed[0].length;
+    if (inCommand && slash === null) void loadSkills();
+    slash = inCommand ? text.slice(1, caret) : null;
     slashIndex = 0;
+  }
+
+  async function scrollCommandIntoView(index: number, matches: typeof commands) {
+    if (!matches[index]) return;
+    await tick();
+    commandList
+      ?.querySelector<HTMLElement>(`#command-suggestion-${index}`)
+      ?.scrollIntoView?.({ block: 'nearest' });
   }
 
   async function loadSkills() {
@@ -80,13 +95,17 @@
   }
 
   async function selectCommand(name: string) {
-    const after = text.slice(textarea.selectionStart);
-    const insertion = `/${name} `;
+    const command = /^\/[a-z0-9-]*/.exec(text);
+    if (!command) return;
+    const after = text.slice(command[0].length);
+    const hasSeparator = /^\s/.test(after);
+    const insertion = `/${name}${hasSeparator ? '' : ' '}`;
     text = insertion + after;
     slash = null;
     await tick();
     textarea.focus();
-    textarea.setSelectionRange(insertion.length, insertion.length);
+    const caret = insertion.length + (hasSeparator ? 1 : 0);
+    textarea.setSelectionRange(caret, caret);
     resizeTextarea();
   }
 
@@ -165,6 +184,12 @@
 
   function keydown(event: KeyboardEvent) {
     if (event.isComposing) return;
+    if (slash !== null && event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      slash = null;
+      return;
+    }
     if (commandSuggestions.length) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault();
@@ -176,12 +201,6 @@
       if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
         event.preventDefault();
         void selectCommand((commandSuggestions[slashIndex] ?? commandSuggestions[0]).name);
-        return;
-      }
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        event.stopPropagation();
-        slash = null;
         return;
       }
     }
@@ -240,120 +259,136 @@
     </div>
   {/if}
 
-  <div class="composer" role="group" aria-label="Message composer">
-    <AttachmentTray {attachments} removable onRemove={removeAttachment} />
-
-    {#if commandSuggestions.length > 0}
-      <div class="file-suggestions" id="command-suggestions" role="listbox" aria-label="Commands">
-        {#each commandSuggestions as command, index (command.name)}
-          <button
-            id={`command-suggestion-${index}`}
-            role="option"
-            aria-selected={index === slashIndex}
-            class:highlighted={index === slashIndex}
-            onmousedown={(event) => event.preventDefault()}
-            onclick={() => selectCommand(command.name)}
-          >
-            <span>/{command.name}</span><span class="command-hint">{command.hint}</span>
-          </button>
-        {/each}
+  <div class="composer-container">
+    {#if slash !== null}
+      <div class="command-menu">
+        <div class="command-heading">Commands</div>
+        <div
+          class="file-suggestions command-suggestions"
+          id="command-suggestions"
+          role="listbox"
+          aria-label="Commands"
+          bind:this={commandList}
+        >
+          {#each commandSuggestions as command, index (command.name)}
+            <button
+              id={`command-suggestion-${index}`}
+              role="option"
+              aria-selected={index === slashIndex}
+              class:highlighted={index === slashIndex}
+              onmousedown={(event) => event.preventDefault()}
+              onclick={() => selectCommand(command.name)}
+            >
+              <span class="command-name">/{command.name}</span>
+              <span class="command-hint">{command.hint}</span>
+            </button>
+          {/each}
+        </div>
+        {#if commandSuggestions.length === 0}
+          <p class="command-empty" role="status">No matching commands</p>
+        {/if}
+        <div class="command-help">↑ ↓ to navigate · Enter or Tab to insert · Esc to close</div>
       </div>
     {/if}
 
-    {#if suggestions.length > 0}
-      <div
-        class="file-suggestions"
-        id="file-suggestions"
-        role="listbox"
-        aria-label="Files in this chat"
-      >
-        {#each suggestions as reference, index (reference.attachment.id)}
-          <button
-            id={`file-suggestion-${index}`}
-            role="option"
-            aria-selected={index === mentionIndex}
-            class:highlighted={index === mentionIndex}
-            onmousedown={(event) => event.preventDefault()}
-            onclick={() => selectReference(reference)}
-          >
-            <Icon name={reference.attachment.kind === 'image' ? 'image' : 'file'} size={16} />
-            <span>{reference.label}</span>
-          </button>
-        {/each}
-      </div>
-    {/if}
+    <div class="composer" role="group" aria-label="Message composer">
+      <AttachmentTray {attachments} removable onRemove={removeAttachment} />
 
-    <textarea
-      bind:this={textarea}
-      bind:value={text}
-      rows="1"
-      aria-label="Message Blackwall"
-      placeholder="Message Blackwall · @ to reference a file · / for commands"
-      aria-autocomplete="list"
-      aria-controls={commandSuggestions.length
-        ? 'command-suggestions'
-        : suggestions.length
-          ? 'file-suggestions'
-          : undefined}
-      aria-activedescendant={commandSuggestions.length
-        ? `command-suggestion-${slashIndex}`
-        : suggestions.length
-          ? `file-suggestion-${mentionIndex}`
-          : undefined}
-      oninput={input}
-      onclick={updateMention}
-      onkeyup={(event) => {
-        if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention();
-      }}
-      onkeydown={keydown}
-      onpaste={paste}></textarea>
-
-    <div class="composer-actions">
-      <div class="left-actions">
-        <button
-          class="attach"
-          aria-label="Add photos or files"
-          title="Add photos or files"
-          onclick={chooseFiles}
-          disabled={busy || submitting}
+      {#if suggestions.length > 0}
+        <div
+          class="file-suggestions"
+          id="file-suggestions"
+          role="listbox"
+          aria-label="Files in this chat"
         >
-          <Icon name="paperclip" size={18} />
-        </button>
-        <span class="local-hint">Sent only to your model</span>
-      </div>
-
-      {#if busy}
-        <button
-          class="send active"
-          aria-label="Stop response"
-          title="Stop response"
-          onclick={onStop}
-        >
-          <Icon name="stop" size={16} />
-        </button>
-      {:else}
-        <button
-          class="send"
-          class:active={canSend}
-          aria-label="Send message"
-          title="Send message"
-          disabled={!canSend}
-          onclick={submit}
-        >
-          <Icon name="arrow-up" size={18} strokeWidth={2.1} />
-        </button>
+          {#each suggestions as reference, index (reference.attachment.id)}
+            <button
+              id={`file-suggestion-${index}`}
+              role="option"
+              aria-selected={index === mentionIndex}
+              class:highlighted={index === mentionIndex}
+              onmousedown={(event) => event.preventDefault()}
+              onclick={() => selectReference(reference)}
+            >
+              <Icon name={reference.attachment.kind === 'image' ? 'image' : 'file'} size={16} />
+              <span>{reference.label}</span>
+            </button>
+          {/each}
+        </div>
       {/if}
-    </div>
 
-    <input
-      class="sr-only"
-      bind:this={fileInput}
-      type="file"
-      multiple
-      accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.rtf,.html,.css,.js,.ts,.tsx,.jsx,.py,.rs,.go,.java,.c,.cpp,.h,.zip"
-      onchange={selectedFiles}
-      tabindex="-1"
-    />
+      <textarea
+        bind:this={textarea}
+        bind:value={text}
+        rows="1"
+        aria-label="Message Blackwall"
+        placeholder="Message Blackwall · @ to reference a file · / for commands"
+        aria-autocomplete="list"
+        aria-controls={slash !== null
+          ? 'command-suggestions'
+          : suggestions.length
+            ? 'file-suggestions'
+            : undefined}
+        aria-activedescendant={commandSuggestions.length
+          ? `command-suggestion-${slashIndex}`
+          : suggestions.length
+            ? `file-suggestion-${mentionIndex}`
+            : undefined}
+        oninput={input}
+        onclick={updateMention}
+        onkeyup={(event) => {
+          if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention();
+        }}
+        onkeydown={keydown}
+        onpaste={paste}></textarea>
+
+      <div class="composer-actions">
+        <div class="left-actions">
+          <button
+            class="attach"
+            aria-label="Add photos or files"
+            title="Add photos or files"
+            onclick={chooseFiles}
+            disabled={busy || submitting}
+          >
+            <Icon name="paperclip" size={18} />
+          </button>
+          <span class="local-hint">Sent only to your model</span>
+        </div>
+
+        {#if busy}
+          <button
+            class="send active"
+            aria-label="Stop response"
+            title="Stop response"
+            onclick={onStop}
+          >
+            <Icon name="stop" size={16} />
+          </button>
+        {:else}
+          <button
+            class="send"
+            class:active={canSend}
+            aria-label="Send message"
+            title="Send message"
+            disabled={!canSend}
+            onclick={submit}
+          >
+            <Icon name="arrow-up" size={18} strokeWidth={2.1} />
+          </button>
+        {/if}
+      </div>
+
+      <input
+        class="sr-only"
+        bind:this={fileInput}
+        type="file"
+        multiple
+        accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.rtf,.html,.css,.js,.ts,.tsx,.jsx,.py,.rs,.go,.java,.c,.cpp,.h,.zip"
+        onchange={selectedFiles}
+        tabindex="-1"
+      />
+    </div>
   </div>
 
   <p class="composer-caption">Enter to send <span>·</span> Shift + Enter for a new line</p>
@@ -364,6 +399,55 @@
     width: min(calc(100% - 32px), var(--composer-width));
     margin: 0 auto;
     padding: 10px 0 7px;
+  }
+
+  .composer-container {
+    position: relative;
+  }
+
+  .command-menu {
+    position: absolute;
+    z-index: 10;
+    bottom: calc(100% + 8px);
+    width: 100%;
+    overflow: hidden;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    background: var(--bg-panel);
+    box-shadow: var(--shadow-composer);
+  }
+
+  .command-heading,
+  .command-help,
+  .command-empty {
+    padding: 8px 14px;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+
+  .command-heading {
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+  }
+
+  .command-help {
+    border-top: 1px solid var(--border);
+    color: var(--text-faint);
+  }
+
+  .command-empty {
+    margin: 0;
+  }
+
+  .file-suggestions.command-suggestions {
+    max-height: min(280px, 35vh);
+    border-bottom: 0;
+  }
+
+  .command-suggestions .command-name {
+    flex-shrink: 0;
+    max-width: 55%;
+    color: var(--text-primary);
   }
 
   .composer {
