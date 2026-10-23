@@ -7,6 +7,11 @@
     | 'file'
     | 'folder'
     | 'search'
+    | 'brain'
+    | 'history'
+    | 'server'
+    | 'shield'
+    | 'sparkles'
     | 'gear'
     | 'image'
     | 'chevron-right'
@@ -65,6 +70,21 @@
   {:else if name === 'search'}
     <circle cx="10.5" cy="10.5" r="6.5" />
     <path d="m16 16 5 5" />
+  {:else if name === 'brain'}
+    <path
+      d="M12 18V5a3 3 0 0 0-5.8-1A4 4 0 0 0 4 11a4 4 0 0 0 2 7.5A3 3 0 0 0 12 18Zm0 0a3 3 0 0 0 6 .5 4 4 0 0 0 2-7.5 4 4 0 0 0-2.2-7A3 3 0 0 0 12 5M8 9a4 4 0 0 0 4-4M16 9a4 4 0 0 1-4-4M8 14a4 4 0 0 1 4 4M16 14a4 4 0 0 0-4 4"
+    />
+  {:else if name === 'history'}
+    <path d="M3 3v6h6M3 9a9 9 0 1 1 0 6M12 7v5l3 2" />
+  {:else if name === 'server'}
+    <rect x="3" y="3" width="18" height="7" rx="2" />
+    <rect x="3" y="14" width="18" height="7" rx="2" />
+    <path d="M7 6.5h.01M7 17.5h.01M12 10v4" />
+  {:else if name === 'shield'}
+    <path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z" />
+    <path d="m8 12 3 3 5-6" />
+  {:else if name === 'sparkles'}
+    <path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3ZM20 2v4M18 4h4" />
   {:else if name === 'gear'}
     <circle cx="12" cy="12" r="3" />
     <path

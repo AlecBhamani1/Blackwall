@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Move MCP servers and Runs into Settings. Group settings into General, AI capabilities, and
+  Workflows, with search and optional alphabetical sorting.
+
 - Remove the bottom status bar and the sidebar connection indicator to reduce duplicate model,
   context, and conversation mode information.
 

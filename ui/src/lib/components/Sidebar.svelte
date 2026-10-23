@@ -11,8 +11,6 @@
   import type { Preferences } from '../persistence';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
-  import McpDialog from './McpDialog.svelte';
-  import RunsDialog from './RunsDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
   export let contextPreferences: Preferences = {};
@@ -45,8 +43,6 @@
   export let onClose: () => void;
 
   let settingsOpen = false;
-  let mcpOpen = false;
-  let runsOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -96,12 +92,6 @@
     <kbd>⌘N</kbd>
   </button>
 
-  <button class="memory-button" onclick={() => (mcpOpen = true)}
-    >MCP servers <span>Tools from local servers</span></button
-  >
-  <button class="memory-button" onclick={() => (runsOpen = true)}
-    >Runs <span>Traces of agent runs</span></button
-  >
   <section class="history">
     <div class="section-label">Recent</div>
     {#if sessions.length === 0}
@@ -142,9 +132,6 @@
     </button>
   </div>
 </aside>
-
-{#if mcpOpen}<McpDialog onClose={() => (mcpOpen = false)} />{/if}
-{#if runsOpen}<RunsDialog onClose={() => (runsOpen = false)} />{/if}
 
 <SettingsDialog
   {contextPreferences}
@@ -191,26 +178,6 @@
     color: var(--text-primary);
   }
 
-  .memory-button {
-    margin: -6px 10px 20px;
-    padding: 9px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    text-align: left;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12px;
-  }
-  .memory-button:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-  .memory-button span {
-    font-size: 10px;
-    color: var(--text-muted);
-  }
   aside {
     position: relative;
     z-index: 20;

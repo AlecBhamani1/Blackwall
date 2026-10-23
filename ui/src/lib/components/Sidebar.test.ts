@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import Sidebar from './Sidebar.svelte';
 
-it('manages Memory and Skills through Settings and returns focus after closing each panel', async () => {
+it('manages Memory, Skills, MCP servers, and Runs through Settings and returns focus after closing each panel', async () => {
   const user = userEvent.setup();
   Object.defineProperties(HTMLDialogElement.prototype, {
     showModal: {
@@ -36,12 +36,13 @@ it('manages Memory and Skills through Settings and returns focus after closing e
   });
 
   const sidebar = within(screen.getByRole('complementary', { name: 'Chat history' }));
-  expect(sidebar.queryByRole('button', { name: /Memory/ })).not.toBeInTheDocument();
-  expect(sidebar.queryByRole('button', { name: /Skills/ })).not.toBeInTheDocument();
+  for (const name of ['Memory', 'Skills', 'MCP servers', 'Runs']) {
+    expect(sidebar.queryByRole('button', { name: new RegExp(name) })).not.toBeInTheDocument();
+  }
   await user.click(sidebar.getByRole('button', { name: 'Open settings' }));
   const settings = screen.getByRole('dialog', { name: 'Settings' });
 
-  for (const panel of ['Memory', 'Skills']) {
+  for (const panel of ['Memory', 'Skills', 'MCP servers', 'Runs']) {
     const button = within(settings).getByRole('button', { name: new RegExp(panel) });
     await user.click(button);
     const dialog = screen.getByRole('dialog', { name: panel });
@@ -59,7 +60,11 @@ it('manages Memory and Skills through Settings and returns focus after closing e
     // Native dialogs handle Escape themselves; it must not also close Settings.
     await fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(settings).toBeInTheDocument();
-    await user.click(within(dialog).getByRole('button', { name: `Close ${panel.toLowerCase()}` }));
+    await user.click(
+      within(dialog).getByRole('button', {
+        name: `Close ${panel === 'MCP servers' ? panel : panel.toLowerCase()}`,
+      }),
+    );
     await waitFor(() => expect(button).toHaveFocus());
     expect(screen.queryByRole('dialog', { name: panel })).not.toBeInTheDocument();
     expect(settings.parentElement).toHaveProperty('inert', false);
