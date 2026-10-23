@@ -601,32 +601,38 @@ export function createChatController(
       const preferred = profileModel ?? get(selectedModel);
       const choice = catalog.some((model) => model.id === preferred) ? preferred : catalog[0].id;
       selectedModel.set(choice);
-      const normalized = normalizeEndpoint(configuredEndpoint);
-      const settings = get(preferences);
-      const existing = settings.connections?.find((profile) => profile.endpoint === normalized);
-      const label = connectionName(normalized, name || existing?.name);
-      // Refreshes must not resurrect an explicitly forgotten connection.
-      const remember = candidate || settings.connections === undefined;
-      endpoint.set(configuredEndpoint);
-      savePreferences({
-        endpoint: configuredEndpoint,
-        model: choice,
-        connectionName: label,
-        ...(remember
-          ? {
-              connections: [
-                { endpoint: normalized, name: label, model: choice },
-                ...(settings.connections ?? []).filter(
-                  (profile) => profile.endpoint !== normalized,
-                ),
-              ],
-            }
-          : {}),
-      });
+      if (configuredEndpoint) {
+        const normalized = normalizeEndpoint(configuredEndpoint);
+        const settings = get(preferences);
+        const existing = settings.connections?.find((profile) => profile.endpoint === normalized);
+        const label = connectionName(normalized, name || existing?.name);
+        // Refreshes must not resurrect an explicitly forgotten connection.
+        const remember = candidate || settings.connections === undefined;
+        endpoint.set(configuredEndpoint);
+        savePreferences({
+          endpoint: configuredEndpoint,
+          model: choice,
+          connectionName: label,
+          ...(remember
+            ? {
+                connections: [
+                  { endpoint: normalized, name: label, model: choice },
+                  ...(settings.connections ?? []).filter(
+                    (profile) => profile.endpoint !== normalized,
+                  ),
+                ],
+              }
+            : {}),
+        });
+      } else {
+        // Browser development may discover models through its implicit proxy.
+        savePreferences({ model: choice });
+      }
       try {
         if (canUseStorage()) {
           window.localStorage.setItem(MODEL_STORAGE_KEY, choice);
-          window.localStorage.setItem(ENDPOINT_STORAGE_KEY, configuredEndpoint);
+          if (configuredEndpoint)
+            window.localStorage.setItem(ENDPOINT_STORAGE_KEY, configuredEndpoint);
         }
       } catch {
         /* A working connection remains usable without browser storage. */

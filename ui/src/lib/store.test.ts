@@ -23,6 +23,23 @@ function mockClient(): LocalModelClient {
 }
 
 describe('chat controller', () => {
+  it('can discover the browser proxy without an explicit endpoint address', async () => {
+    const client = mockClient();
+    client.modelEndpoint = vi.fn().mockResolvedValue('');
+    const controller = createChatController(client);
+    expect(await controller.initialize()).toBe(true);
+    expect(client.discoverModels).toHaveBeenCalledWith(undefined);
+    expect(get(controller.connectionState)).toBe('ready');
+    expect(get(controller.preferences).connections).toBeUndefined();
+    await controller.send('Use the configured proxy', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(client.streamChat).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: undefined }),
+      expect.anything(),
+      expect.anything(),
+    );
+    controller.destroy();
+  });
   it.each(['chat', 'agent'] as const)(
     'locks %s mode and its project after sending',
     async (mode) => {
