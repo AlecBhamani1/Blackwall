@@ -7,7 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep advanced model connections when adding another endpoint. Switch among saved services in
+  Settings, restore each service's selected model, and retain browser connections after restarting.
+  Manage a saved service's access key without switching away from the current model.
+
+- Show all slash commands and enabled skills in a scrollable menu above the chat input. Filter
+  suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
+
 ### Changed
+
+- Move MCP servers and Runs into Settings. Group settings into General, AI capabilities, and
+  Workflows, with search and optional alphabetical sorting.
+
+- Remove the bottom status bar and the sidebar connection indicator to reduce duplicate model,
+  context, and conversation mode information.
+
+- Move Memory and Skills from the sidebar into Settings. Closing either panel returns to Settings.
 
 - Use the Chat and Agent selector beneath Blackwall in the sidebar; remove the duplicate selector
   above the conversation.

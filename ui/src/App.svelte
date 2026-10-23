@@ -14,7 +14,6 @@
   import WorkspaceFiles from './lib/components/WorkspaceFiles.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
-  import StatusBar from './lib/components/StatusBar.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
 
@@ -31,7 +30,6 @@
     models,
     selectedModel,
     endpoint,
-    contextPercent,
     notice,
     connectionError,
     persistenceError,
@@ -343,16 +341,6 @@
           </div>
         {/if}
       </section>
-
-      {#if !setupOpen}
-        <StatusBar
-          mode={$agentMode ? 'Agent mode' : 'Chat mode'}
-          connectionState={$connectionState}
-          runState={$runState}
-          model={$selectedModel}
-          contextPercent={$contextPercent}
-        />
-      {/if}
     </main>
   </div>
 {/if}

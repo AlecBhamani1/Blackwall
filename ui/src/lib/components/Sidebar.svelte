@@ -11,10 +11,6 @@
   import type { Preferences } from '../persistence';
   import Icon from './Icon.svelte';
   import LogoMark from './LogoMark.svelte';
-  import SkillsDialog from './SkillsDialog.svelte';
-  import McpDialog from './McpDialog.svelte';
-  import RunsDialog from './RunsDialog.svelte';
-  import MemoryDialog from './MemoryDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
 
   export let contextPreferences: Preferences = {};
@@ -47,10 +43,6 @@
   export let onClose: () => void;
 
   let settingsOpen = false;
-  let memoryOpen = false;
-  let skillsOpen = false;
-  let mcpOpen = false;
-  let runsOpen = false;
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -100,18 +92,6 @@
     <kbd>⌘N</kbd>
   </button>
 
-  <button class="memory-button" onclick={() => (memoryOpen = true)}
-    >Memory <span>Saved preferences & context</span></button
-  >
-  <button class="memory-button" onclick={() => (skillsOpen = true)}
-    >Skills <span>Reusable workflows</span></button
-  >
-  <button class="memory-button" onclick={() => (mcpOpen = true)}
-    >MCP servers <span>Tools from local servers</span></button
-  >
-  <button class="memory-button" onclick={() => (runsOpen = true)}
-    >Runs <span>Traces of agent runs</span></button
-  >
   <section class="history">
     <div class="section-label">Recent</div>
     {#if sessions.length === 0}
@@ -150,33 +130,12 @@
     >
       <Icon name="gear" size={17} />
     </button>
-    <div class="connection-label">
-      <span
-        class:ready={connectionState === 'ready'}
-        class:offline={connectionState === 'offline'}
-        class="dot"
-      ></span>
-      <span
-        >{connectionState === 'ready'
-          ? 'Model connected'
-          : connectionState === 'checking'
-            ? 'Checking connection'
-            : 'Model offline'}</span
-      >
-    </div>
   </div>
 </aside>
 
-{#if skillsOpen}<SkillsDialog onClose={() => (skillsOpen = false)} />{/if}
-{#if mcpOpen}<McpDialog onClose={() => (mcpOpen = false)} />{/if}
-{#if runsOpen}<RunsDialog onClose={() => (runsOpen = false)} />{/if}
-{#if memoryOpen}<MemoryDialog
-    {onPreferences}
-    {contextPreferences}
-    onClose={() => (memoryOpen = false)}
-  />{/if}
-
 <SettingsDialog
+  {contextPreferences}
+  {onPreferences}
   {onLock}
   open={settingsOpen}
   model={selectedModel}
@@ -219,26 +178,6 @@
     color: var(--text-primary);
   }
 
-  .memory-button {
-    margin: -6px 10px 20px;
-    padding: 9px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    text-align: left;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12px;
-  }
-  .memory-button:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-  .memory-button span {
-    font-size: 10px;
-    color: var(--text-muted);
-  }
   aside {
     position: relative;
     z-index: 20;
@@ -439,11 +378,8 @@
     display: flex;
     min-height: 48px;
     align-items: center;
-    gap: 8px;
     border-top: 1px solid var(--border);
     padding: 0 10px;
-    color: var(--text-faint);
-    font-size: 11.5px;
   }
 
   .settings-button {
@@ -461,34 +397,6 @@
   .settings-button[aria-expanded='true'] {
     background: var(--bg-hover);
     color: var(--text-primary);
-  }
-
-  .connection-label {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 7px;
-  }
-
-  .connection-label > span:last-child {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--warn);
-  }
-
-  .dot.ready {
-    background: var(--ok);
-  }
-
-  .dot.offline {
-    background: var(--err);
   }
 
   @media (max-width: 760px) {

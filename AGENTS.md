@@ -27,6 +27,15 @@ cargo deny --manifest-path src/Cargo.toml check
 
 Use four-space Rust indentation, rustfmt's 100-column limit, `snake_case` functions/modules, and `PascalCase` types. Use two-space Svelte/TypeScript indentation, `PascalCase.svelte` components, and `camelCase` helpers. UI Prettier configuration uses single quotes and 100 columns. Use typed core errors; avoid production `unwrap`/`expect` and unsafe code. Lefthook enforces formatting/static checks and commitlint.
 
+## Settings Navigation
+
+Keep application configuration and management tools in Settings, not the chat-history sidebar.
+Register new destinations in `ui/src/lib/settingsNavigation.ts` with a clear title, description,
+icon, search keywords, and the relevant group: General, AI capabilities, or Workflows. Reuse an
+existing group unless a new one has a distinct purpose. Add the destination's page or dialog to
+`SettingsDialog.svelte`; preserve keyboard focus when returning to the menu and keep Settings
+inert while a child dialog is open. The registry supplies category grouping, search, and A–Z order.
+
 ## Testing Guidelines
 
 Use Rust unit/integration tests and Vitest with jsdom and Svelte Testing Library. Keep tests deterministic and offline with scripted backends/local servers. Cover failures and security boundaries, including traversal, denials, timeouts, and SSRF. `npm test` runs UI tests; `npm --prefix ui run test:coverage` collects coverage. No numeric coverage threshold is configured.
