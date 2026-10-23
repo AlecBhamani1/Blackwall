@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Move Memory and Skills from the sidebar into Settings. Closing either panel returns to Settings.
+
 - Use the Chat and Agent selector beneath Blackwall in the sidebar; remove the duplicate selector
   above the conversation.
 
