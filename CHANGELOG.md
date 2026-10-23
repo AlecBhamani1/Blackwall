@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Show all slash commands and enabled skills in a scrollable menu above the chat input. Filter
+  suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
+
 ### Changed
 
 - Remove the bottom status bar and the sidebar connection indicator to reduce duplicate model,
