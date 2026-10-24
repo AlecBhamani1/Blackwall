@@ -70,6 +70,13 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Chat has no project scope. Only the owner's global rules may authorize web requests.
+    pub async fn load_global(directory: &Path) -> Self {
+        let mut policy = Self::load(directory, directory).await;
+        policy.rules.retain(|rule| rule.project.is_none());
+        policy
+    }
+
     pub async fn load(directory: &Path, workspace: &Path) -> Self {
         let audit = directory.join(AUDIT_FILE);
         let protected = tokio::fs::canonicalize(directory)
@@ -517,6 +524,37 @@ mod tests {
             directory: std::env::temp_dir(),
             workspace: PathBuf::from("/workspace"),
         }
+    }
+
+    #[tokio::test]
+    async fn chat_uses_global_network_rules_and_ignores_project_rules() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-chat-policy-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let directory = tokio::fs::canonicalize(directory).await.unwrap();
+        let rules = json!({"rules":[
+            {"decision":"deny","kind":"network","host":"blocked.example"},
+            {"decision":"allow","kind":"network","host":"allowed.example"},
+            {"decision":"allow","kind":"network","host":"project.example","project":directory}
+        ]});
+        tokio::fs::write(directory.join(POLICY_FILE), rules.to_string())
+            .await
+            .unwrap();
+        let policy = Policy::load_global(&directory).await;
+        assert!(policy.error.is_none());
+        assert_eq!(
+            policy.decide(ApprovalKind::Network, "blocked.example"),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.decide(ApprovalKind::Network, "allowed.example"),
+            Decision::Allow
+        );
+        assert_eq!(
+            policy.decide(ApprovalKind::Network, "project.example"),
+            Decision::Ask
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]

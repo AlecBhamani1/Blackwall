@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Enable Web access in desktop Chat to search the public web and read pages without selecting a
+  project. Chat uses the same request approvals and network protections as Agent, and retains web
+  results in conversation context.
+
 ### Fixed
 
 - Keep advanced model connections when adding another endpoint. Switch among saved services in

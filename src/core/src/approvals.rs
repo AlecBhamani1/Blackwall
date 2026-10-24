@@ -38,6 +38,21 @@ impl Drop for Waiting {
     }
 }
 impl Approvals {
+    /// Apply global owner rules to a run without a selected project.
+    pub async fn load_global_policy(
+        &self,
+        request_id: &str,
+        directory: &Path,
+    ) -> Result<(), String> {
+        let policy = Arc::new(Policy::load_global(directory).await);
+        self.0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .policies
+            .insert(request_id.into(), policy);
+        Ok(())
+    }
+
     /// Apply the owner's rules in `directory` to this run until the run is cleared.
     pub async fn load_policy(
         &self,

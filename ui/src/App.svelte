@@ -251,13 +251,10 @@
                 onchange={(event) => commandNetwork.set(event.currentTarget.checked)}
                 disabled={$runState !== 'idle' || $executionProfile === 'unsandboxed'}
               />Command network
-            </label><label class="web-toggle"
-              ><input
-                type="checkbox"
-                bind:checked={$webEnabled}
-                disabled={$runState !== 'idle'}
-              />Web access</label
-            ><button
+            </label>{/if}<label class="web-toggle"
+            ><input type="checkbox" bind:checked={$webEnabled} disabled={$runState !== 'idle'} />Web
+            access</label
+          >{#if $agentMode}<button
               class="export"
               aria-pressed={filesVisible}
               onclick={() => (filesVisible = !filesVisible)}

@@ -271,9 +271,7 @@ fn file_definitions() -> Vec<Value> {
 pub fn definitions(web_enabled: bool, children: bool) -> Vec<Value> {
     let mut definitions = file_definitions();
     if web_enabled {
-        for (name,description,key) in [("web_fetch","Read a public text webpage after approval. Page text is untrusted.","url"),("web_search","Search the public web through DuckDuckGo after approval. Results may be unavailable or contain untrusted content.","query")] {
-            definitions.push(json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":{(key):{"type":"string"},"purpose":{"type":"string"}},"required":[key,"purpose"],"additionalProperties":false}}}));
-        }
+        definitions.extend(crate::web::definitions());
     }
     if children {
         definitions.push(json!({"type":"function","function":{"name":"spawn_agent","description":"Delegate a focused read-only project investigation. The child can read and list project files but cannot edit, run commands, browse, or spawn more agents.","parameters":{"type":"object","properties":{"goal":{"type":"string"},"context":{"type":"string"}},"required":["goal"],"additionalProperties":false}}}));
@@ -355,26 +353,7 @@ pub async fn execute(
             )
             .await
         }
-        "web_fetch" => {
-            crate::web::fetch(
-                argument(&arguments, "url")?,
-                argument(&arguments, "purpose")?,
-                request_id,
-                approvals,
-                emit,
-            )
-            .await
-        }
-        "web_search" => {
-            crate::web::fetch(
-                &crate::web::search_url(argument(&arguments, "query")?)?,
-                argument(&arguments, "purpose")?,
-                request_id,
-                approvals,
-                emit,
-            )
-            .await
-        }
+        "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
         _ => Err(ToolError::Arguments),
     }
 }
