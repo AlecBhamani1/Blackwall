@@ -14,7 +14,6 @@
   import WorkspaceFiles from './lib/components/WorkspaceFiles.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
-  import StatusBar from './lib/components/StatusBar.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
 
@@ -31,7 +30,6 @@
     models,
     selectedModel,
     endpoint,
-    contextPercent,
     notice,
     connectionError,
     persistenceError,
@@ -227,19 +225,6 @@
 
       {#if !setupOpen && isDesktop()}
         <div class="project-bar">
-          <div class="mode-switch" aria-label="Conversation mode">
-            <button
-              class:active={!$agentMode}
-              disabled={$sessionLocked || $runState !== 'idle'}
-              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
-              onclick={() => controller.chooseMode('chat')}>Chat</button
-            ><button
-              class:active={$agentMode}
-              disabled={$sessionLocked || $runState !== 'idle'}
-              title={$sessionLocked ? 'Start a new chat to change modes' : ''}
-              onclick={() => controller.chooseMode('agent')}>Agent</button
-            >
-          </div>
           {#if $agentMode}<button
               class="project-choice"
               disabled={$sessionLocked || $runState !== 'idle'}
@@ -356,16 +341,6 @@
           </div>
         {/if}
       </section>
-
-      {#if !setupOpen}
-        <StatusBar
-          mode={$agentMode ? 'Agent mode' : 'Chat mode'}
-          connectionState={$connectionState}
-          runState={$runState}
-          model={$selectedModel}
-          contextPercent={$contextPercent}
-        />
-      {/if}
     </main>
   </div>
 {/if}
@@ -438,23 +413,6 @@
   }
   .project-bar > span {
     flex: 1;
-  }
-  .mode-switch {
-    display: flex;
-    padding: 3px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-  }
-  .mode-switch button {
-    border-radius: 4px;
-    background: transparent;
-    color: var(--text-muted);
-    padding: 3px 10px;
-    font-size: 11px;
-  }
-  .mode-switch button.active {
-    background: var(--bg-elevated);
-    color: var(--text-primary);
   }
   .project-choice,
   .export {

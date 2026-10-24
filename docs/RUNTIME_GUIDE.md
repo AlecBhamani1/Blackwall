@@ -12,7 +12,7 @@ lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows
 
 ## Connect a model
 
-1. Open **Settings → Set up a connection**. First launch opens setup automatically when no working
+1. Open **Settings → Model connection → Set up a connection**. First launch opens setup automatically when no working
    model connection is found.
 2. Choose **Use this computer**. Blackwall checks fixed loopback addresses for Ollama and LM Studio.
 3. If a model is installed, choose **Use these models**. If Ollama is missing, choose **Get Ollama**,
@@ -31,13 +31,20 @@ credential. The host and client may run different operating systems; pairing use
 protocol everywhere. Keep Blackwall open, unlocked, and awake on the host with its model service running.
 A configured relay is currently required; no default Blackwall-operated relay is provided yet.
 
-Direct model access remains under advanced setup. Save a reachable OpenAI-compatible address and a
-friendly name after discovery succeeds. Each connection remembers its selected model. Pairing and
-direct connections do not start or reconfigure the model service automatically.
+Direct model access remains under advanced setup. Enter a reachable OpenAI-compatible address and
+an optional friendly name. Every successful connection is saved, including addresses entered in
+Settings' advanced form. **Settings → Model connection** lists saved services with their addresses;
+choose **Connect** to switch. Each connection remembers its selected model, including after restarting
+the desktop app or browser. Failed switches keep the working connection available. Save up to 20
+connections; forget one before adding another when the list is full. Forgetting removes the profile
+and keeps its access key. Pairing and direct connections do not start or reconfigure the model service
+automatically.
 
 For an authenticated service, expand **Access key**. The native app tests the key before saving it
 in the platform credential store, scoped to the service origin. An empty setup field preserves the existing key.
-**Settings → Access keys** shows whether the current model service or configured relay has a saved key.
+**Settings → Security → Access keys** shows whether a model service or configured relay has a saved key.
+Choose a saved model service to manage its key without changing the active connection. Connections
+on the same service origin share a key; forgetting one profile does not remove that shared key.
 Replace a model key with **Verify and save key**, or remove a stored key after reviewing the confirmation.
 To replace a relay key, supply the new token when creating a guest link; it is saved after registration.
 Removal affects future requests, not already-running requests or invitations. Revoke guest links
@@ -231,8 +238,8 @@ variable name under `secrets`; the value lives only in the platform credential s
 that server's process when it starts. If the file is invalid, a secret is missing, or a server does
 not start, the run continues without those tools and shows a warning.
 
-In the desktop app, **MCP servers** in the sidebar lists the servers with enable and disable
-toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
+In the desktop app, **Settings → AI capabilities → MCP servers** lists the servers with enable and
+disable toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
 password field. It uses the same validation and credential store as the CLI. **Add server** offers
 suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
 thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
@@ -430,15 +437,15 @@ output is also content, so without it the trace only says the tool reported an e
 with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
 turn it on only while investigating a run.
 
-In the desktop app, **Runs** lists the 50 newest runs and opens one as a tree of model and tool steps,
-with failures, approval requests, and any captured content. **Record agent runs** and **Include
+In the desktop app, **Settings → Workflows → Runs** lists the 50 newest runs and opens one as a tree
+of model and tool steps, with failures, approval requests, and any captured content. **Record agent runs** and **Include
 content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
 Subagent runs and compaction requests are not traced yet.
 
 ## App lock
 
-Enable **App lock** in Settings with a passphrase of at least 10 characters. Blackwall stores a salted
-Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
+Enable **App lock** in **Settings → General → Security** with a passphrase of at least 10 characters.
+Blackwall stores a salted Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
 sharing after flushing pending conversation saves. Failed attempts incur a short delay, increasing
 after repeated failures. Changing or removing the lock requires the current passphrase.
 

@@ -165,4 +165,129 @@ describe('Composer', () => {
     await user.type(textbox, 'fill this{Enter}');
     expect(onSend).toHaveBeenCalledWith('/pdf fill this', []);
   });
+
+  it('makes every command reachable and scrolls keyboard selections into view', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({
+      skills: Array.from({ length: 12 }, (_, index) => ({
+        name: `skill-${String(index).padStart(2, '0')}`,
+        description: `Workflow ${index}`,
+        body: 'Instructions',
+        enabled: true,
+      })),
+      warnings: [],
+    });
+    const { onSend } = renderComposer();
+    const textbox = screen.getByRole('textbox', { name: 'Message Blackwall' });
+    await user.type(textbox, '/');
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(18));
+    const last = screen.getByRole('option', { name: '/skill-11 Workflow 11' });
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(last, 'scrollIntoView', { configurable: true, value: scrollIntoView });
+
+    await user.keyboard('{ArrowUp}');
+
+    expect(last).toHaveAttribute('aria-selected', 'true');
+    expect(textbox).toHaveAttribute('aria-activedescendant', last.id);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+    await user.keyboard('{Tab}');
+    expect(textbox).toHaveValue('/skill-11 ');
+    expect(textbox).toHaveFocus();
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('narrows skill names while typing and inserts a clicked command', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({
+      skills: ['skill-creator', 'skill-review', 'pdf'].map((name) => ({
+        name,
+        description: `Run ${name}`,
+        body: 'Instructions',
+        enabled: true,
+      })),
+      warnings: [],
+    });
+    const { onSend } = renderComposer();
+    const textbox = screen.getByRole('textbox', { name: 'Message Blackwall' });
+    await user.type(textbox, '/sk');
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(2));
+    await user.type(textbox, 'ill-c');
+    expect(screen.getAllByRole('option')).toHaveLength(1);
+    await user.click(screen.getByRole('option', { name: '/skill-creator Run skill-creator' }));
+    expect(textbox).toHaveValue('/skill-creator ');
+    expect(textbox).toHaveFocus();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('keeps built-in commands available when saved skills cannot be loaded', async () => {
+    const user = userEvent.setup();
+    const skills = vi.spyOn(persistence, 'skills').mockRejectedValue(new Error('Unavailable'));
+    renderComposer();
+    await user.type(screen.getByRole('textbox', { name: 'Message Blackwall' }), '/');
+    await waitFor(() => expect(skills).toHaveBeenCalledOnce());
+    expect(screen.getAllByRole('option')).toHaveLength(6);
+    for (const name of ['compact', 'context', 'init', 'learn', 'recall', 'review']) {
+      expect(screen.getByRole('option', { name: new RegExp(`^/${name} `) })).toBeInTheDocument();
+    }
+  });
+
+  it('shows an empty result and lets Escape dismiss it without sending', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({ skills: [], warnings: [] });
+    const { onSend } = renderComposer();
+    const textbox = screen.getByRole('textbox', { name: 'Message Blackwall' });
+    await user.type(textbox, '/unknown');
+    expect(screen.getByRole('status')).toHaveTextContent('No matching commands');
+    expect(textbox).not.toHaveAttribute('aria-activedescendant');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(textbox).toHaveValue('/unknown');
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each(['Read /re', 'https://example.com', '/review explain changes', '/tmp/file'])(
+    'does not suggest commands inside prose, URLs, arguments, or paths: %s',
+    async (draft) => {
+      const user = userEvent.setup();
+      vi.spyOn(persistence, 'skills').mockResolvedValue({ skills: [], warnings: [] });
+      renderComposer();
+      await user.type(screen.getByRole('textbox', { name: 'Message Blackwall' }), draft);
+      expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    },
+  );
+
+  it('replaces the whole command when editing its name and preserves arguments', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({ skills: [], warnings: [] });
+    const { onSend } = renderComposer();
+    const textbox = screen.getByRole('textbox', {
+      name: 'Message Blackwall',
+    }) as HTMLTextAreaElement;
+    await user.type(textbox, '/review explain changes');
+    textbox.setSelectionRange(1, 1);
+    await fireEvent.click(textbox);
+    await user.click(screen.getByRole('option', { name: /^\/recall / }));
+    expect(textbox).toHaveValue('/recall explain changes');
+    expect(textbox.selectionStart).toBe('/recall '.length);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('clears command suggestions when switching conversations', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({ skills: [], warnings: [] });
+    const { rerender } = render(Composer, {
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      sessionId: 'first',
+    });
+    const textbox = screen.getByRole('textbox', { name: 'Message Blackwall' });
+    await user.type(textbox, '/');
+    await user.keyboard('{ArrowDown}');
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+    await rerender({ sessionId: 'second' });
+    expect(textbox).toHaveValue('');
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(textbox).not.toHaveAttribute('aria-activedescendant');
+  });
 });

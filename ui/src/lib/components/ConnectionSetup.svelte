@@ -14,6 +14,8 @@
   import LogoMark from './LogoMark.svelte';
   import Icon from './Icon.svelte';
   import PairingPanel from './PairingPanel.svelte';
+  import SavedConnections from './SavedConnections.svelte';
+  import { connectionName as profileName } from '../connections';
   import { credentialStoreError, platform } from '../platform';
 
   export let onConnect: (endpoint: string, name?: string) => Promise<boolean>;
@@ -86,7 +88,7 @@
         accessKey = '';
       }
       if (await onConnect(endpoint, name)) {
-        connectedName = name;
+        connectedName = name || profileName(endpoint);
         step = 'success';
         await tick();
         heading?.focus();
@@ -197,25 +199,18 @@
         <div class="error" role="alert" tabindex="-1" bind:this={errorMessage}>{error}</div>
       {/if}
       {#if connections.length}
-        <div class="remembered" aria-label="Saved connections">
-          <p class="saved-label">Your computers</p>
-          {#each connections as profile}
-            <div class="saved-row">
-              <button
-                aria-label={`Connect to ${profile.name}`}
-                disabled={busy}
-                onclick={() => connect(profile.endpoint, profile.name)}
-                ><span class="footer-dot"></span><strong>{profile.name}</strong><span
-                  >{busy ? 'Connecting…' : 'Connect'}</span
-                ></button
-              ><button
-                class="forget"
-                aria-label={`Forget ${profile.name}`}
-                disabled={busy}
-                onclick={() => onForget(profile.endpoint)}><Icon name="x" size={14} /></button
-              >
-            </div>
-          {/each}
+        <div class="remembered">
+          <SavedConnections
+            {connections}
+            {currentEndpoint}
+            {busy}
+            onConnect={(endpoint) =>
+              connect(
+                endpoint,
+                connections.find((profile) => profile.endpoint === endpoint)?.name ?? '',
+              )}
+            {onForget}
+          />
         </div>
       {/if}
       <div class="choices">
@@ -394,7 +389,7 @@
       <form
         onsubmit={(event) => {
           event.preventDefault();
-          void connect(address, connectionName.trim() || 'Model service');
+          void connect(address, connectionName.trim());
         }}
       >
         <label for="connection-name">Connection name</label><input
@@ -499,39 +494,6 @@
 <style>
   .remembered {
     margin: 24px 0;
-  }
-  .saved-label {
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-  .saved-row {
-    display: flex;
-    gap: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .saved-row > button:first-child {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 12px;
-    flex: 1;
-    padding: 14px 0;
-    background: transparent;
-    text-align: left;
-  }
-  .saved-row strong {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .saved-row span:last-child {
-    color: var(--accent);
-    font-size: 12px;
-  }
-  .forget {
-    background: transparent;
-    color: var(--text-muted);
-    padding: 12px;
   }
 
   .setup-scroll {
