@@ -146,7 +146,16 @@ if a window loses its access code, revoke that individual link and create a repl
 
 ## Work in a project
 
-Chat mode sends messages and attachments to your selected model. Agent mode additionally offers
+Chat mode sends messages and attachments to your selected model. In the desktop app, enable
+**Web access** in either Chat or Agent to let the model search the public web and read text pages.
+Chat needs no project folder and exposes only these two web tools. Web access starts off and resets
+when starting or reopening a conversation. Each request shows its destination and purpose for
+approval; denied, unreachable, and blocked pages return an error the model can explain. Web content
+is untrusted, and local/private network addresses remain blocked. Search uses DuckDuckGo and can
+be unavailable; this is text retrieval rather than an interactive browser. The browser preview and
+guest links do not expose these desktop tools.
+
+Agent mode additionally offers
 project tools. Choose **Agent** and select a project using the native folder picker. The chosen folder
 is the authority for file tools; a folder must be selected again after reopening or locking the app.
 

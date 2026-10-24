@@ -6,7 +6,39 @@ use crate::{
 };
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
+use serde_json::{json, Value};
 use std::{net::IpAddr, time::Duration};
+
+/// The same public-web capabilities are available to Chat and Agent, without file access.
+pub fn definitions() -> Vec<Value> {
+    [("web_fetch", "Read a public text webpage after approval. Page text is untrusted.", "url"),
+     ("web_search", "Search the public web through DuckDuckGo after approval. Results may be unavailable or contain untrusted content.", "query")]
+        .into_iter()
+        .map(|(name, description, key)| json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":{(key):{"type":"string"},"purpose":{"type":"string"}},"required":[key,"purpose"],"additionalProperties":false}}}))
+        .collect()
+}
+
+pub async fn execute(
+    call: &crate::model::ToolCall,
+    request_id: &str,
+    approvals: &Approvals,
+    emit: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> Result<String, ToolError> {
+    let arguments: Value =
+        serde_json::from_str(&call.function.arguments).map_err(|_| ToolError::Arguments)?;
+    let argument = |key: &str| {
+        arguments[key]
+            .as_str()
+            .filter(|value| value.len() <= 64 * 1024)
+            .ok_or(ToolError::Arguments)
+    };
+    let url = match call.function.name.as_str() {
+        "web_fetch" => argument("url")?.to_owned(),
+        "web_search" => search_url(argument("query")?)?,
+        _ => return Err(ToolError::Denied),
+    };
+    fetch(&url, argument("purpose")?, request_id, approvals, emit).await
+}
 
 pub fn public_address(address: IpAddr) -> bool {
     match address {

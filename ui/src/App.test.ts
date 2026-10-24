@@ -54,6 +54,31 @@ afterEach(() => {
   delete window.__TAURI_INTERNALS__;
 });
 
+it('lets Chat opt into web research without a project and resets access for a new chat', async () => {
+  const user = userEvent.setup();
+  render(App);
+  const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await screen.findByRole('combobox', { name: 'Model' });
+  const web = screen.getByRole('checkbox', { name: 'Web access' });
+  expect(web).not.toBeChecked();
+  expect(screen.queryByRole('button', { name: 'Choose project folder' })).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('combobox', { name: 'Command execution profile' }),
+  ).not.toBeInTheDocument();
+  await user.click(web);
+  await user.type(input, 'Find current information{Enter}');
+  await waitFor(() =>
+    expect(vi.mocked(localModelClient.streamChat).mock.calls.at(-1)?.[0]).toMatchObject({
+      agentMode: false,
+      webEnabled: true,
+      workspace: undefined,
+    }),
+  );
+  await waitFor(() => expect(web).toBeEnabled());
+  await fireEvent.click(screen.getByRole('button', { name: /New chat/ }));
+  expect(web).not.toBeChecked();
+});
+
 it('uses only sidebar modes, separates histories, and resets and restores locked Agent projects', async () => {
   const user = userEvent.setup();
   render(App);

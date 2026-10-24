@@ -190,6 +190,8 @@ impl From<blackwall_core::context::ContextError> for CommandError {
             ContextError::History => "context_history_invalid",
             ContextError::Summary => "context_summary_invalid",
             ContextError::Nothing => "context_nothing_to_compact",
+            ContextError::Iterations => "chat_iteration_limit",
+            ContextError::Approval(_) => "chat_approval_error",
         };
         Self {
             code,
@@ -561,7 +563,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=stream_chat_events(api_key.as_deref(),&state.default_endpoint,&app,request,&source,context)=>result,
+            result=stream_chat_events(api_key.as_deref(),&state.default_endpoint,&app,request,&source,context,options.web_enabled.then_some(&agent.approvals))=>result,
         }
     };
     if let Err(error) = stream_result {
@@ -726,6 +728,7 @@ async fn stream_chat_events(
     request: ChatRequest,
     source: &[serde_json::Value],
     context: blackwall_core::context::ContextState,
+    web_approvals: Option<&blackwall_core::approvals::Approvals>,
 ) -> Result<(), CommandError> {
     let endpoint = selected_endpoint(&request, default_endpoint).map_err(CommandError::from)?;
     let backend = blackwall_core::model::HttpModel::new(
@@ -740,24 +743,38 @@ async fn stream_chat_events(
         .into_iter()
         .take(request.messages.len().saturating_sub(source.len()))
         .collect();
-    blackwall_core::context::chat(
-        &backend,
-        &request.request_id,
-        blackwall_core::context::ContextRun {
-            source: source.to_vec(),
-            state: context,
-            budget: request.context_budget,
-            instructions,
-            compact: request.compact,
-            trace: Default::default(),
-        },
-        &|event| {
-            let _ = emit_event(app, &event);
-        },
-    )
-    .await
-    .map(|_| ())
-    .map_err(CommandError::from)
+    let run = blackwall_core::context::ContextRun {
+        source: source.to_vec(),
+        state: context,
+        budget: request.context_budget,
+        instructions,
+        compact: request.compact,
+        trace: Default::default(),
+    };
+    let emit = |event| {
+        let _ = emit_event(app, &event);
+    };
+    let result = match web_approvals {
+        Some(approvals) => {
+            let directory =
+                crate::identity::data_directory(app).map_err(|message| CommandError {
+                    code: "storage_error",
+                    message,
+                    retryable: false,
+                })?;
+            blackwall_core::context::chat_with_web(
+                &backend,
+                &request.request_id,
+                run,
+                approvals,
+                Some(&directory),
+                &emit,
+            )
+            .await
+        }
+        None => blackwall_core::context::chat(&backend, &request.request_id, run, &emit).await,
+    };
+    result.map(|_| ()).map_err(CommandError::from)
 }
 
 fn emit_event(app: &AppHandle, event: &AgentEvent) -> Result<(), BridgeError> {
