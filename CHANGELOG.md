@@ -15,6 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Let readers scroll up during a streamed response without being pulled back down. Resume
+  automatic scrolling when they return to the bottom of the conversation.
+
 - Keep advanced model connections when adding another endpoint. Switch among saved services in
   Settings, restore each service's selected model, and retain browser connections after restarting.
   Manage a saved service's access key without switching away from the current model.
