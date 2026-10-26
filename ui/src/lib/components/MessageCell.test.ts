@@ -17,6 +17,80 @@ function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe('MessageCell', () => {
+  it('interleaves tool groups with streamed text and preserves expansion as results arrive', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    const intro = 'I will search.\n\n';
+    const followup = 'I will read the page.\n\n';
+    const tools = [
+      {
+        id: 'search',
+        name: 'web_search',
+        arguments: '{}',
+        contentOffset: intro.length,
+        status: 'running' as const,
+      },
+      {
+        id: 'search-2',
+        name: 'web_search',
+        arguments: '{}',
+        contentOffset: intro.length,
+        status: 'complete' as const,
+      },
+    ];
+    const { container, rerender } = render(MessageCell, {
+      props: { message: message({ content: intro, status: 'streaming', tools }) },
+    });
+    const group = container.querySelector<HTMLDetailsElement>('.tool-group')!;
+    expect(group.open).toBe(false);
+    await user.click(screen.getByText('2 tool calls'));
+    await rerender({
+      message: message({
+        content: intro + followup + 'The answer.',
+        tools: [
+          { ...tools[0], status: 'complete', output: 'Search results' },
+          tools[1],
+          {
+            id: 'fetch',
+            name: 'web_fetch',
+            arguments: '{}',
+            contentOffset: intro.length + followup.length,
+            status: 'complete',
+          },
+        ],
+      }),
+    });
+    const parts = container.querySelectorAll(
+      '.message-body > .markdown, .message-body > .tool-activity',
+    );
+    expect(Array.from(parts, (part) => part.textContent)).toEqual([
+      expect.stringContaining('I will search.'),
+      expect.stringContaining('2 tool calls'),
+      expect.stringContaining('I will read the page.'),
+      expect.stringContaining('1 tool call'),
+      expect.stringContaining('The answer.'),
+    ]);
+    expect(container.querySelector('.tool-group')).toBe(group);
+    expect(group.open).toBe(true);
+    expect(container.querySelectorAll<HTMLDetailsElement>('.tool-group')[1].open).toBe(false);
+    await user.click(screen.getByRole('button', { name: 'Copy response' }));
+    expect(writeText).toHaveBeenCalledWith(intro + followup + 'The answer.');
+  });
+
+  it('groups legacy calls before the answer and renders tool-only responses', async () => {
+    const tools = [{ id: 'read', name: 'read_file', arguments: '{}', status: 'stopped' as const }];
+    const { container, rerender } = render(MessageCell, {
+      props: { message: message({ tools, historical: true }) },
+    });
+    expect(container.querySelector('.message-body')?.firstElementChild).toHaveClass(
+      'tool-activity',
+    );
+    expect(screen.getByText('History · 1 stopped')).toBeVisible();
+    expect(screen.getByText('Hello')).toBeVisible();
+    await rerender({ message: message({ tools, content: '', status: 'stopped' }) });
+    expect(screen.getByText('1 tool call')).toBeVisible();
+  });
+
   it('renders model markdown and sanitizes executable markup', () => {
     const { container } = render(MessageCell, {
       props: { message: message({ content: '**Safe** <script>window.bad = true</script>' }) },

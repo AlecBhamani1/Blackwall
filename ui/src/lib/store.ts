@@ -875,6 +875,12 @@ export function createChatController(
                             {
                               id: `instructions${event.agentId ? `_${event.agentId}` : ''}`,
                               name: 'project_instructions',
+                              contentOffset:
+                                message.tools?.find(
+                                  (tool) =>
+                                    tool.id ===
+                                    `instructions${event.agentId ? `_${event.agentId}` : ''}`,
+                                )?.contentOffset ?? message.content.length,
                               arguments: JSON.stringify({
                                 path: event.sources.join(', ') || 'None',
                               }),
@@ -926,6 +932,7 @@ export function createChatController(
                               id: event.toolCallId,
                               name: event.name,
                               arguments: event.arguments,
+                              contentOffset: message.content.length,
                               status: 'running',
                             },
                           ],
