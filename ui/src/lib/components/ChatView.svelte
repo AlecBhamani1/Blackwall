@@ -15,12 +15,15 @@
 
   function onScroll() {
     if (!scroller) return;
-    followsTail = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
+    // Only follow at the bottom; allow fractional pixel rounding, not a scroll-up gesture.
+    followsTail = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 2;
   }
 
   async function followMessages() {
     if (!followsTail || !scroller) return;
     await tick();
+    // The reader may have scrolled or focused a recalled message while rendering.
+    if (!followsTail || !scroller) return;
     scroller.scrollTop = scroller.scrollHeight;
   }
 
@@ -58,7 +61,6 @@
     flex: 1;
     overflow-y: auto;
     overscroll-behavior: contain;
-    scroll-behavior: smooth;
   }
 
   .transcript {
