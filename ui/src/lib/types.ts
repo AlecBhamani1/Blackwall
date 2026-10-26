@@ -148,6 +148,8 @@ export interface ToolEntry {
   id: string;
   name: string;
   arguments: string;
+  /** Position in the response text when called; absent in older saved conversations. */
+  contentOffset?: number;
   output?: string;
   status: 'running' | 'complete' | 'error' | 'stopped';
 }

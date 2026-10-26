@@ -1,6 +1,7 @@
 <script lang="ts">
   import ToolActivity from './ToolActivity.svelte';
   import { copyableMarkdown } from '../copyableMarkdown';
+  import { messageTimeline } from '../messageTimeline';
   import type { ChatMessage } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
   import Icon from './Icon.svelte';
@@ -8,6 +9,7 @@
 
   export let message: ChatMessage;
   let copied = false;
+  $: parts = messageTimeline(message);
 
   async function copyMessage() {
     if (!message.content || !navigator.clipboard) return;
@@ -31,8 +33,14 @@
 
     {#if message.role === 'user'}
       {#if message.content}<div class="user-content">{message.content}</div>{/if}
-    {:else if message.content}
-      <div class="markdown" use:copyableMarkdown={message.content}></div>
+    {:else}
+      {#each parts as part (part.id)}
+        {#if part.type === 'text'}
+          <div class="markdown" use:copyableMarkdown={part.content}></div>
+        {:else}
+          <ToolActivity tools={part.tools} historical={message.historical ?? false} />
+        {/if}
+      {/each}
     {/if}
 
     {#if message.children?.length}<div class="children" aria-label="Delegated tasks">
@@ -41,10 +49,6 @@
             <p>{child.summary}</p>
           </details>{/each}
       </div>{/if}
-    {#if message.tools?.length}<ToolActivity
-        tools={message.tools}
-        historical={message.historical ?? false}
-      />{/if}
 
     {#if message.status === 'streaming'}
       <span class="streaming-cursor" aria-label="Blackwall is responding"></span>

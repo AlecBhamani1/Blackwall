@@ -27,6 +27,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Show tool calls where they occur in the response, grouped into collapsible sections with
+  individual arguments and results available on expansion.
+
 - Move MCP servers and Runs into Settings. Group settings into General, AI capabilities, and
   Workflows, with search and optional alphabetical sorting.
 

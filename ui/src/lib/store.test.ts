@@ -359,6 +359,69 @@ describe('chat controller', () => {
     expect(get(controller.sessions)[0]?.title).toBe('Hello');
   });
 
+  it('retains call positions across results and reopening a saved conversation', async () => {
+    const client = mockClient();
+    client.streamChat = vi.fn(async (request, callbacks) => {
+      callbacks.onDelta('Searching 🌐.\n\n');
+      for (const toolCallId of ['search', 'search-2']) {
+        callbacks.onEvent?.({
+          type: 'tool_call',
+          requestId: request.requestId,
+          toolCallId,
+          name: 'web_search',
+          arguments: '{}',
+        });
+      }
+      callbacks.onDelta('Reading.\n\n');
+      callbacks.onEvent?.({
+        type: 'tool_call',
+        requestId: request.requestId,
+        toolCallId: 'fetch',
+        name: 'web_fetch',
+        arguments: '{}',
+      });
+      callbacks.onEvent?.({
+        type: 'tool_result',
+        requestId: request.requestId,
+        toolCallId: 'search',
+        output: 'Found pages',
+        success: true,
+      });
+      callbacks.onEvent?.({
+        type: 'tool_result',
+        requestId: request.requestId,
+        toolCallId: 'search-2',
+        output: 'Search failed',
+        success: false,
+      });
+      callbacks.onEvent?.({
+        type: 'tool_result',
+        requestId: request.requestId,
+        toolCallId: 'fetch',
+        output: 'Page text',
+        success: true,
+      });
+      callbacks.onDelta('Answer.');
+    });
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Research this', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const saved = get(controller.messages).at(-1)!;
+    expect(saved.content).toBe('Searching 🌐.\n\nReading.\n\nAnswer.');
+    expect(saved.tools).toMatchObject([
+      { contentOffset: 'Searching 🌐.\n\n'.length, output: 'Found pages', status: 'complete' },
+      { contentOffset: 'Searching 🌐.\n\n'.length, status: 'error' },
+      { contentOffset: 'Searching 🌐.\n\nReading.\n\n'.length, output: 'Page text' },
+    ]);
+    const sessionId = get(controller.activeSessionId);
+    controller.destroy();
+    const restored = createChatController(mockClient());
+    await restored.openSession(sessionId);
+    expect(get(restored.messages).at(-1)).toMatchObject({ tools: saved.tools, historical: true });
+    restored.destroy();
+  });
+
   it('persists an endpoint override and uses it for discovery and chat', async () => {
     const client = mockClient();
     const controller = createChatController(client);
@@ -399,6 +462,7 @@ describe('chat controller', () => {
         sources: ['AGENTS.md'],
         warnings: [],
       });
+      callbacks.onDelta('Inspecting.\n\n');
       callbacks.onEvent?.({
         type: 'instructions_loaded',
         requestId: request.requestId,
@@ -420,9 +484,17 @@ describe('chat controller', () => {
     await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
     const tools = get(controller.messages).at(-1)?.tools;
     expect(tools).toHaveLength(2);
-    expect(tools?.[1]).toMatchObject({ id: 'instructions_child', status: 'complete' });
+    expect(tools?.[1]).toMatchObject({
+      id: 'instructions_child',
+      status: 'complete',
+      contentOffset: 'Inspecting.\n\n'.length,
+    });
     expect(tools?.[1].output).toContain('nested/AGENTS.md');
-    expect(tools?.[0]).toMatchObject({ name: 'project_instructions', status: 'error' });
+    expect(tools?.[0]).toMatchObject({
+      name: 'project_instructions',
+      status: 'error',
+      contentOffset: 0,
+    });
     expect(tools?.[0].output).toContain('AGENTS.md, src/AGENTS.override.md');
     expect(tools?.[0].output).toContain('Warning: Skipped oversized guidance.');
     controller.destroy();
