@@ -7,6 +7,7 @@ use blackwall_core::share::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
+    net::SocketAddr,
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -85,8 +86,8 @@ impl Drop for RelayProcess {
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-async fn register(relay: &RelayProcess, registration: RelayRegistration) -> (Socket, RelayToHost) {
-    let (mut socket, _) = connect_async(format!("ws://{}/v1/host/connect", relay.address))
+async fn register(address: SocketAddr, registration: RelayRegistration) -> (Socket, RelayToHost) {
+    let (mut socket, _) = connect_async(format!("ws://{address}/v1/host/connect"))
         .await
         .unwrap();
     socket
@@ -97,16 +98,54 @@ async fn register(relay: &RelayProcess, registration: RelayRegistration) -> (Soc
         ))
         .await
         .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+    // Match the desktop client's registration reply budget. Acknowledgement waits for a
+    // durable ownership claim, which can exceed five seconds on busy Windows runners.
+    let reply = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+            if let Message::Text(text) = socket
+                .next()
+                .await
+                .expect("relay closed before replying to registration")
+                .expect("relay registration reply could not be read")
+            {
                 break serde_json::from_str(&text).unwrap();
             }
         }
     })
     .await
-    .unwrap();
+    .expect("relay must reply to host registration within ten seconds");
     (socket, reply)
+}
+
+#[tokio::test]
+async fn registration_waits_for_a_delayed_acknowledgement() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+            panic!("the first host message must be a registration");
+        };
+        assert!(matches!(
+            serde_json::from_str::<HostToRelay>(&text).unwrap(),
+            HostToRelay::Register { .. }
+        ));
+        // Reproduce a reply arriving after the old five-second test deadline, while still
+        // inside the ten-second deadline used by the desktop client.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&RelayToHost::Registered)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    });
+    let (_host, reply) = register(address, registration()).await;
+    assert_eq!(reply, RelayToHost::Registered);
+    server.await.unwrap();
 }
 fn registration() -> RelayRegistration {
     RelayRegistration {
@@ -130,7 +169,7 @@ async fn offline_address_cannot_be_taken_over_before_or_after_process_restart() 
     let mut relay = RelayProcess::new();
     relay.start().await;
     let owner = registration();
-    let (mut host, reply) = register(&relay, owner.clone()).await;
+    let (mut host, reply) = register(relay.address, owner.clone()).await;
     assert_eq!(reply, RelayToHost::Registered);
     host.close(None).await.unwrap();
     // Wait until the host connection is actually gone before trying the stolen public identifier.
@@ -154,16 +193,16 @@ async fn offline_address_cannot_be_taken_over_before_or_after_process_restart() 
     let mut impostor = owner.clone();
     impostor.host_key = format!("bwh_{}", URL_SAFE_NO_PAD.encode([4; 32]));
     assert!(matches!(
-        register(&relay, impostor.clone()).await.1,
+        register(relay.address, impostor.clone()).await.1,
         RelayToHost::Error { .. }
     ));
     relay.stop();
     relay.start().await;
     assert!(matches!(
-        register(&relay, impostor).await.1,
+        register(relay.address, impostor).await.1,
         RelayToHost::Error { .. }
     ));
-    let (_host, reply) = register(&relay, owner).await;
+    let (_host, reply) = register(relay.address, owner).await;
     assert_eq!(reply, RelayToHost::Registered);
     assert_eq!(
         client
@@ -308,7 +347,7 @@ async fn expiry_ends_an_in_flight_request_and_rejects_the_old_invitation() {
         .unwrap()
         .as_millis() as u64
         + INVITE_LIFETIME.as_millis() as u64;
-    let (mut host, reply) = register(&relay, owner.clone()).await;
+    let (mut host, reply) = register(relay.address, owner.clone()).await;
     assert_eq!(reply, RelayToHost::Registered);
     let response = tokio::spawn(async move { request.send().await.unwrap() });
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -342,7 +381,7 @@ async fn expiry_ends_an_in_flight_request_and_rejects_the_old_invitation() {
         .status()
         .is_success());
     assert!(matches!(
-        register(&relay, owner).await.1,
+        register(relay.address, owner).await.1,
         RelayToHost::Error { .. }
     ));
 }
@@ -353,7 +392,7 @@ async fn a_silent_host_is_disconnected_and_its_owner_can_reconnect() {
     relay.start().await;
     let mut owner = registration();
     owner.expires_at_ms += 60_000;
-    let (_silent_host, reply) = register(&relay, owner.clone()).await;
+    let (_silent_host, reply) = register(relay.address, owner.clone()).await;
     assert_eq!(reply, RelayToHost::Registered);
     // Retain the TCP socket without polling it, simulating a sleeping host that sends no pong.
     let client = reqwest::Client::builder()
@@ -381,7 +420,7 @@ async fn a_silent_host_is_disconnected_and_its_owner_can_reconnect() {
     .await
     .expect("silent TCP connections must not stay online forever");
     assert!(started.elapsed() >= blackwall_core::share::relay_protocol::PEER_IDLE_TIMEOUT);
-    let (_reconnected, reply) = register(&relay, owner).await;
+    let (_reconnected, reply) = register(relay.address, owner).await;
     assert_eq!(reply, RelayToHost::Registered);
     assert_eq!(
         client
