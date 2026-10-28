@@ -9,8 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Record usage metrics with OpenTelemetry: token usage and duration for every model call, tool
-  calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
+- Record usage metrics with OpenTelemetry: token usage and duration for every model call
+  (compaction summaries included), tool calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
   in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,
   or paths. See [Telemetry](docs/TELEMETRY.md).
 

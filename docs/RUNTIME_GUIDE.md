@@ -457,8 +457,8 @@ still include private file contents, so turn it on only while investigating a ru
 In the desktop app, **Settings → Workflows → Runs** lists the 50 newest runs and opens one as a tree
 of model and tool steps, with failures, approval requests, and any captured content. **Record agent
 runs** and **Include content** in that panel set the desktop's `tracesEnabled` and `traceContent`
-preferences, which apply to Chat runs too. Compaction requests are recorded as runs without model
-spans.
+preferences, which apply to Chat runs too. `/compact` requests are not recorded as runs; their
+summary calls count only toward usage metrics.
 
 ## App lock
 

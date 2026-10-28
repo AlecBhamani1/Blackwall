@@ -32,17 +32,32 @@ detectors.
 
 `blackwall.*` is our namespace for what the conventions do not define yet.
 
+**Compaction.** Summarizing history is a `chat` operation, as the conventions define it, so its
+calls use `gen_ai.operation.name=chat` with the run's usual `blackwall.mode`, plus
+`blackwall.compaction=true` on the metrics and the span. Their tokens and durations count in
+`gen_ai.client.token.usage` and `gen_ai.client.operation.duration`. Automatic compaction inside a
+run adds a `chat {model}` span to that run; the summary text is never recorded, even with content
+capture on. An explicit compaction request (`/compact`) is not a run: it writes no trace file and
+no `blackwall.run.outcomes` point, only its model-call metrics.
+
+**Unknown tools.** When a model calls a tool it was not offered, the call is denied and recorded
+as `execute_tool unknown` with `gen_ai.tool.name=unknown` and `blackwall.tool.outcome=denied`. The
+made-up name is model-written text, so it never reaches a trace or a metric.
+
 ## Attributes
 
 **Resource:** `service.name=blackwall`, `service.version`, `blackwall.surface=desktop|cli`.
 
 **Model-call metrics:** `gen_ai.operation.name=chat`, `gen_ai.request.model`,
-`gen_ai.provider.name`, `server.address` (host only), `blackwall.mode=chat|agent|subagent`.
-Token usage adds `gen_ai.token.type=input|output`. Duration adds `error.type` on failure, an error
-class such as `network`, `http`, or `invalid_response`. `gen_ai.provider.name` is `ollama` for an
+`gen_ai.provider.name`, `server.address` (host only; left out when the endpoint has no host),
+`blackwall.mode=chat|agent|subagent`, and `blackwall.compaction=true` on compaction calls. Token
+usage adds `gen_ai.token.type=input|output`. Duration adds `error.type` on failure, one of
+`network`, `http`, `invalid_response`, `limit`, or `_OTHER`, the same in every Chat and Agent
+path. `gen_ai.provider.name` is `ollama` for an
 endpoint on port 11434 and `openai_compatible` otherwise.
 
-**Tool metric:** `gen_ai.tool.name` (MCP tools as `server__tool`) and
+**Tool metric:** `gen_ai.tool.name` (MCP tools as `server__tool`; `unknown` for a tool that was not
+offered) and
 `blackwall.tool.outcome=ok|error|denied|timeout`.
 
 **Run metric:** `blackwall.mode` and
@@ -51,7 +66,8 @@ endpoint on port 11434 and `openai_compatible` otherwise.
 **Spans:** `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.agent.id` (subagents),
 `gen_ai.request.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`,
 `gen_ai.usage.output_tokens`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`,
-`error.type`, `blackwall.request_id`, `blackwall.mode`, and `approval_requested` events with
+`error.type`, `blackwall.request_id`, `blackwall.mode`, `blackwall.compaction`, and
+`approval_requested` events with
 `blackwall.approval.kind`. With content capture on, spans may also carry
 `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, and `gen_ai.tool.call.result`.
 
@@ -73,8 +89,11 @@ endpoint on port 11434 and `openai_compatible` otherwise.
 
 The tracer provider has one span processor, `RunBufferProcessor`, and no exporter of its own. It
 holds every span of a run until the run's root span ends. It then applies the content filter or
-the redaction scrub to the whole run and checks the 4 MiB limit, and only then hands the finished
-run to the file exporter. A run that would pass 4 MiB with content is written without its content
+the redaction scrub to the whole run and checks the 4 MiB limit, and only then the finished run is
+written. Ending a run does no file work itself: the run is queued for a dedicated writer thread,
+which serializes, writes, and prunes. The queue holds 64 finished runs; if it is ever full, the
+run is dropped and counted rather than blocking the agent. The queue is drained when the app or
+`bw` exits. A run that would pass 4 MiB with content is written without its content
 attributes and marked `blackwall.trace.content_removed`. A run is limited to 1,000 spans; spans
 beyond that are counted in `blackwall.trace.dropped_spans`. Spans still open when a run is stopped
 are written as `Cancelled.` with `error.type=cancelled`.
@@ -88,8 +107,8 @@ kept. Files written by earlier versions use the same format and still list and o
 
 **Metrics:** `metrics/YYYY-MM-DD.jsonl` (UTC day), one OTLP/JSON `ExportMetricsServiceRequest`
 per line with delta temporality, so each line holds only what happened since the previous line.
-A line is appended when a run finishes, every 60 seconds while measurements are pending, and when
-the app or `bw` exits. This is the shape the OpenTelemetry Collector's `file` exporter writes and
+A line is appended every 60 seconds while measurements are pending, and when the app or `bw`
+exits. This is the shape the OpenTelemetry Collector's `file` exporter writes and
 its `otlpjsonfile` receiver reads, for example:
 
 ```yaml
