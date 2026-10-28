@@ -900,6 +900,7 @@ mod tests {
                             prompt_tokens: 100,
                             completion_tokens: 10,
                             total_tokens: 110,
+                            ..Default::default()
                         }),
                     }
                 } else {
@@ -910,6 +911,7 @@ mod tests {
                             prompt_tokens: 120,
                             completion_tokens: 5,
                             total_tokens: 125,
+                            ..Default::default()
                         }),
                     }
                 })
@@ -1091,6 +1093,7 @@ mod tests {
                     prompt_tokens: 50,
                     completion_tokens: 5,
                     total_tokens: 55,
+                    ..Default::default()
                 });
                 Ok(match *step {
                     1 => ModelTurn {

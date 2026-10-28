@@ -60,6 +60,7 @@ fn research(calls: Vec<ToolCall>) -> ModelTurn {
             prompt_tokens: 10,
             completion_tokens: 2,
             total_tokens: 12,
+            ..Default::default()
         }),
     }
 }
@@ -71,6 +72,7 @@ fn answer() -> ModelTurn {
             prompt_tokens: 20,
             completion_tokens: 3,
             total_tokens: 23,
+            ..Default::default()
         }),
         ..Default::default()
     }

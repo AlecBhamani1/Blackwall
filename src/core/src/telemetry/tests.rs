@@ -402,6 +402,7 @@ fn metrics_file_has_token_usage_and_duration_per_call() {
                 prompt_tokens: input,
                 completion_tokens: output,
                 total_tokens: input + output,
+                ..Default::default()
             }),
             0.5,
             None,
@@ -642,6 +643,141 @@ fn a_full_writer_queue_drops_and_counts_runs() {
     writer.submit(run(), vec![], resource);
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(writer.dropped_runs(), 1);
+}
+
+#[test]
+fn a_dropped_run_is_counted_in_metrics() {
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let writer =
+        file_spans::Writer::idle_counted(1, telemetry.inner.instruments.dropped_runs.clone());
+    let run = || Arc::new(RunState::new(PathBuf::from("unused.json"), false));
+    let resource = Resource::builder_empty().build();
+    writer.submit(run(), vec![], resource.clone());
+    writer.submit(run(), vec![], resource);
+    telemetry.shutdown();
+    let dropped: f64 = metric_points(&directory)
+        .iter()
+        .filter(|(name, ..)| name == names::DROPPED_RUNS)
+        .map(|(_, _, point)| number(&point["asInt"]))
+        .sum();
+    assert_eq!(dropped, 1.0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn project_attribute_is_basename_only() {
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let project = Path::new("/Users/owner/code/house-finder");
+    let scope = telemetry
+        .run("labelled", Mode::Agent)
+        .labelled(Some(project), Some("session_abc-1"));
+    scope.record_model_call(
+        "m",
+        "127.0.0.1:11434",
+        Some(&TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        }),
+        0.1,
+        None,
+    );
+    scope.finish(RunOutcome::Complete);
+    // Chat has no project; a session ID with unexpected characters is not recorded.
+    let chat = telemetry
+        .run("chat", Mode::Chat)
+        .labelled(None, Some("../../etc/passwd"));
+    chat.record_model_call(
+        "m",
+        "127.0.0.1:11434",
+        Some(&TokenUsage {
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            total_tokens: 4,
+            ..Default::default()
+        }),
+        0.1,
+        None,
+    );
+    chat.finish(RunOutcome::Complete);
+    telemetry.shutdown();
+    let points = metric_points(&directory);
+    let body = std::fs::read_to_string(
+        std::fs::read_dir(directory.join(METRICS_DIRECTORY))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(!body.contains("/Users/owner"), "{body}");
+    assert!(!body.contains("passwd"), "{body}");
+    for metric in [
+        names::GEN_AI_CLIENT_TOKEN_USAGE,
+        names::GEN_AI_CLIENT_OPERATION_DURATION,
+        names::RUN_OUTCOMES,
+    ] {
+        let agent = points
+            .iter()
+            .find(|(name, attributes, _)| name == metric && attributes["blackwall.mode"] == "agent")
+            .unwrap();
+        assert_eq!(agent.1["blackwall.project"], "house-finder", "{metric}");
+        assert_eq!(agent.1["blackwall.session"], "session_abc-1", "{metric}");
+        let chat = points
+            .iter()
+            .find(|(name, attributes, _)| name == metric && attributes["blackwall.mode"] == "chat")
+            .unwrap();
+        assert!(!chat.1.contains_key("blackwall.project"), "{metric}");
+        assert!(!chat.1.contains_key("blackwall.session"), "{metric}");
+    }
+    assert_eq!(project_label(Path::new("/")), None);
+    assert_eq!(project_label(Path::new("C:/work/api")), Some("api".into()));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cached_and_reasoning_tokens_speed_and_compaction_savings_are_recorded() {
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let scope = telemetry.run("detail", Mode::Agent);
+    scope.record_model_call(
+        "m",
+        "127.0.0.1:11434",
+        Some(&TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            total_tokens: 140,
+            cached_input_tokens: 60,
+            reasoning_tokens: 15,
+        }),
+        2.0,
+        None,
+    );
+    scope.record_compaction_saved(500);
+    scope.finish(RunOutcome::Complete);
+    telemetry.shutdown();
+    let points = metric_points(&directory);
+    let sum = |metric: &str, kind: Option<&str>| -> f64 {
+        points
+            .iter()
+            .filter(|(name, attributes, _)| {
+                name == metric && kind.is_none_or(|kind| attributes["gen_ai.token.type"] == kind)
+            })
+            .map(|(_, _, point)| number(&point["sum"]))
+            .sum()
+    };
+    let tokens = names::GEN_AI_CLIENT_TOKEN_USAGE;
+    assert_eq!(sum(tokens, Some("input")), 100.0);
+    assert_eq!(sum(tokens, Some("cached_input")), 60.0);
+    assert_eq!(sum(tokens, Some("output")), 40.0);
+    assert_eq!(sum(tokens, Some("reasoning")), 15.0);
+    assert_eq!(sum(names::OUTPUT_SPEED, None), 20.0);
+    assert_eq!(sum(names::COMPACTION_SAVED, None), 500.0);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 const CHILD: &str = "BLACKWALL_OTEL_ENV_CHILD";

@@ -472,8 +472,15 @@ impl ContextState {
         effective.extend(candidate.effective());
         budget.check(&effective, tools)?;
         // A valid summary must actually release space.
-        if estimate(&candidate.effective()) >= estimate(&self.effective()) {
+        let (after, before) = (
+            estimate(&candidate.effective()),
+            estimate(&self.effective()),
+        );
+        if after >= before {
             return Err(ContextError::Summary);
+        }
+        if let Some(trace) = trace {
+            trace.record_compaction_saved(before - after);
         }
         Ok(checkpoint)
     }
@@ -824,6 +831,7 @@ mod tests {
                         prompt_tokens: 30,
                         completion_tokens: 7,
                         total_tokens: 37,
+                        ..Default::default()
                     }),
                 })
             })
@@ -997,6 +1005,10 @@ mod tests {
             "input and output points are marked as compaction"
         );
         assert_eq!(input, (30 * calls) as f64);
+        assert!(
+            metrics.contains("blackwall.compaction.tokens_saved"),
+            "the space a compaction released is recorded"
+        );
         // In a run, the summary call is a span marked as compaction, without the summary text.
         let spans =
             crate::trace::read(&directory, &crate::trace::list(&directory, 1)[0].id).unwrap();
@@ -1168,6 +1180,7 @@ mod tests {
                         prompt_tokens: 42,
                         completion_tokens: 3,
                         total_tokens: 45,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 })
@@ -1306,6 +1319,7 @@ mod tests {
             prompt_tokens: 17,
             completion_tokens: 4,
             total_tokens: 21,
+            ..Default::default()
         };
         let report = budget.report(&messages, &[], Some(usage));
         assert_eq!(report.server_usage, Some(usage));

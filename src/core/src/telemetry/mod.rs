@@ -198,11 +198,40 @@ const DURATION_BUCKETS: [f64; 14] = [
     0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
 ];
 
+/// Output-speed buckets, in tokens per second.
+const SPEED_BUCKETS: [f64; 12] = [
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0,
+];
+
 struct Instruments {
     tokens: Histogram<u64>,
     duration: Histogram<f64>,
+    speed: Histogram<f64>,
+    saved: Histogram<u64>,
     tools: Counter<u64>,
     runs: Counter<u64>,
+    dropped_runs: Counter<u64>,
+}
+
+/// The `blackwall.project` value for a workspace: its folder name only, never the path.
+pub fn project_label(workspace: &Path) -> Option<String> {
+    let text = workspace.to_string_lossy();
+    let name = text
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty() && !name.ends_with(':'))?;
+    Some(name.chars().take(128).collect())
+}
+
+/// A conversation ID is recorded only when it is a plain neutral ID.
+fn session_label(session: &str) -> Option<String> {
+    let plain = !session.is_empty()
+        && session.len() <= 128
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    plain.then(|| session.to_owned())
 }
 
 struct Inner {
@@ -248,16 +277,10 @@ impl Telemetry {
             )
             .build();
         let runs = Runs::default();
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_sampler(Sampler::AlwaysOn)
-            .with_span_limits(SpanLimits::default())
-            .with_resource(resource.clone())
-            .with_span_processor(RunBufferProcessor::new(runs.clone()))
-            .build();
-        let tracer = tracer_provider.tracer_with_scope(scope());
         let reader = PeriodicReader::builder(file_metrics::FileMetricExporter::new(data_dir))
             .with_interval(Duration::from_secs(60))
             .build();
+        let meter_resource = resource.clone();
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource)
             .with_reader(reader)
@@ -286,7 +309,34 @@ impl Telemetry {
                 .with_unit("{run}")
                 .with_description("Finished runs by outcome.")
                 .build(),
+            speed: meter
+                .f64_histogram(names::OUTPUT_SPEED)
+                .with_unit("{token}/s")
+                .with_description("Output tokens per second of each model call.")
+                .with_boundaries(SPEED_BUCKETS.to_vec())
+                .build(),
+            saved: meter
+                .u64_histogram(names::COMPACTION_SAVED)
+                .with_unit("{token}")
+                .with_description("Estimated context tokens removed by each compaction.")
+                .with_boundaries(TOKEN_BUCKETS.to_vec())
+                .build(),
+            dropped_runs: meter
+                .u64_counter(names::DROPPED_RUNS)
+                .with_unit("{run}")
+                .with_description("Runs whose trace was dropped by a full writer queue.")
+                .build(),
         };
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_span_limits(SpanLimits::default())
+            .with_resource(meter_resource)
+            .with_span_processor(RunBufferProcessor::new(
+                runs.clone(),
+                instruments.dropped_runs.clone(),
+            ))
+            .build();
+        let tracer = tracer_provider.tracer_with_scope(scope());
         Self {
             inner: Arc::new(Inner {
                 directory: data_dir.to_path_buf(),
@@ -372,6 +422,7 @@ impl Telemetry {
             root_error: Mutex::new(None),
             count: AtomicUsize::new(1),
             finished: false,
+            labels: vec![],
         }
     }
 
@@ -466,6 +517,8 @@ pub struct RunScope {
     root_error: Mutex<Option<String>>,
     count: AtomicUsize,
     finished: bool,
+    /// `blackwall.project` and `blackwall.session`, added to this run's metrics.
+    labels: Vec<KeyValue>,
 }
 
 fn otel_value(value: Value) -> opentelemetry::Value {
@@ -538,6 +591,33 @@ impl RunScope {
             root_error: Mutex::new(None),
             count: AtomicUsize::new(0),
             finished: true,
+            labels: vec![],
+        }
+    }
+
+    /// Label this run's metrics with its project (the workspace folder's name, never its path)
+    /// and its neutral conversation ID. Chat runs pass no workspace.
+    pub fn labelled(mut self, workspace: Option<&Path>, session: Option<&str>) -> Self {
+        self.labels.clear();
+        if let Some(project) = workspace.and_then(project_label) {
+            self.labels.push(KeyValue::new(names::PROJECT, project));
+        }
+        if let Some(session) = session.and_then(session_label) {
+            self.labels.push(KeyValue::new(names::SESSION, session));
+        }
+        self
+    }
+
+    /// Record the estimated tokens one compaction removed from the context.
+    pub fn record_compaction_saved(&self, tokens: u64) {
+        if let Some(telemetry) = &self.telemetry {
+            let mut attributes = vec![KeyValue::new(names::MODE, self.mode.as_str())];
+            attributes.extend(self.labels.iter().cloned());
+            telemetry
+                .inner
+                .instruments
+                .saved
+                .record(tokens, &attributes);
         }
     }
 
@@ -813,15 +893,27 @@ impl RunScope {
         if compaction {
             attributes.push(KeyValue::new(names::COMPACTION, true));
         }
+        attributes.extend(self.labels.iter().cloned());
         let instruments = &telemetry.inner.instruments;
         if let Some(usage) = usage {
-            for (kind, count) in [
-                ("input", usage.prompt_tokens),
-                ("output", usage.completion_tokens),
+            // `cached_input` and `reasoning` are parts of `input` and `output`, recorded only
+            // when the server reports them.
+            for (kind, count, always) in [
+                ("input", usage.prompt_tokens, true),
+                ("output", usage.completion_tokens, true),
+                ("cached_input", usage.cached_input_tokens, false),
+                ("reasoning", usage.reasoning_tokens, false),
             ] {
-                let mut attributes = attributes.clone();
-                attributes.push(KeyValue::new(names::GEN_AI_TOKEN_TYPE, kind));
-                instruments.tokens.record(count, &attributes);
+                if always || count > 0 {
+                    let mut attributes = attributes.clone();
+                    attributes.push(KeyValue::new(names::GEN_AI_TOKEN_TYPE, kind));
+                    instruments.tokens.record(count, &attributes);
+                }
+            }
+            if error.is_none() && usage.completion_tokens > 0 && seconds > 0.0 {
+                instruments
+                    .speed
+                    .record(usage.completion_tokens as f64 / seconds, &attributes);
             }
         }
         if let Some(error) = error {
@@ -890,13 +982,12 @@ impl RunScope {
             close(root, error);
         }
         if let Some(telemetry) = &self.telemetry {
-            telemetry.inner.instruments.runs.add(
-                1,
-                &[
-                    KeyValue::new(names::MODE, self.mode.as_str()),
-                    KeyValue::new(names::RUN_OUTCOME, outcome.as_str()),
-                ],
-            );
+            let mut attributes = vec![
+                KeyValue::new(names::MODE, self.mode.as_str()),
+                KeyValue::new(names::RUN_OUTCOME, outcome.as_str()),
+            ];
+            attributes.extend(self.labels.iter().cloned());
+            telemetry.inner.instruments.runs.add(1, &attributes);
         }
     }
 }

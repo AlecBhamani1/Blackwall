@@ -421,6 +421,7 @@ pub(crate) async fn chat(
         &request.request_id,
         blackwall_core::telemetry::Mode::Chat,
         false,
+        (None, None),
     )
     .await;
     let model = request.model.clone();
@@ -542,6 +543,7 @@ pub(crate) async fn stream_chat(
         retryable: false,
     };
     let options = options.unwrap_or_default();
+    let session_id = options.session_id.clone();
     let stream_result = if options.enabled {
         let mut workspace = options
             .workspace
@@ -611,6 +613,7 @@ pub(crate) async fn stream_chat(
             &request_id,
             blackwall_core::telemetry::Mode::Agent,
             request.compact,
+            (Some(&workspace.path), session_id.as_deref()),
         )
         .await;
         workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
@@ -637,7 +640,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=stream_chat_events(api_key.as_deref(),&state.default_endpoint,&app,request,&source,context,options.web_enabled.then_some(&agent.approvals))=>result,
+            result=stream_chat_events(api_key.as_deref(),&state.default_endpoint,&app,request,&source,context,options.web_enabled.then_some(&agent.approvals),session_id.as_deref())=>result,
         }
     };
     if let Err(error) = stream_result {
@@ -803,6 +806,7 @@ async fn stream_chat_events(
     source: &[serde_json::Value],
     context: blackwall_core::context::ContextState,
     web_approvals: Option<&blackwall_core::approvals::Approvals>,
+    session_id: Option<&str>,
 ) -> Result<(), CommandError> {
     let endpoint = selected_endpoint(&request, default_endpoint).map_err(CommandError::from)?;
     let backend = blackwall_core::model::HttpModel::new(
@@ -828,6 +832,7 @@ async fn stream_chat_events(
             &request.request_id,
             blackwall_core::telemetry::Mode::Chat,
             request.compact,
+            (None, session_id),
         )
         .await,
     };

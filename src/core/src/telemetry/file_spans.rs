@@ -6,6 +6,7 @@
 //! still removed from spans that ended earlier. Only the finished run reaches an exporter.
 use super::{names, redact::Scrubber};
 use opentelemetry::{
+    metrics::Counter,
     trace::{SpanId, Status, TraceId},
     Array, KeyValue, StringValue, Value,
 };
@@ -92,12 +93,14 @@ enum Job {
 pub(super) struct Writer {
     queue: Mutex<Option<mpsc::SyncSender<Job>>>,
     dropped_runs: AtomicUsize,
+    /// `blackwall.trace.dropped_runs`, so the Usage page can report the gap.
+    dropped_counter: Option<Counter<u64>>,
     #[cfg(test)]
     _idle: Mutex<Option<mpsc::Receiver<Job>>>,
 }
 
 impl Writer {
-    fn start() -> Self {
+    fn start(dropped_counter: Counter<u64>) -> Self {
         let (queue, jobs) = mpsc::sync_channel::<Job>(QUEUE);
         let spawned = std::thread::Builder::new()
             .name("blackwall-traces".into())
@@ -118,6 +121,7 @@ impl Writer {
         Self {
             queue: Mutex::new(spawned.ok().map(|_| queue)),
             dropped_runs: AtomicUsize::new(0),
+            dropped_counter: Some(dropped_counter),
             #[cfg(test)]
             _idle: Mutex::new(None),
         }
@@ -130,7 +134,17 @@ impl Writer {
         Self {
             queue: Mutex::new(Some(queue)),
             dropped_runs: AtomicUsize::new(0),
+            dropped_counter: None,
             _idle: Mutex::new(Some(jobs)),
+        }
+    }
+
+    /// An idle writer that also counts drops in a metric.
+    #[cfg(test)]
+    pub(super) fn idle_counted(capacity: usize, counter: Counter<u64>) -> Self {
+        Self {
+            dropped_counter: Some(counter),
+            ..Self::idle(capacity)
         }
     }
 
@@ -145,6 +159,9 @@ impl Writer {
             .is_some_and(|queue| queue.try_send(Job::Run(run, spans, resource)).is_ok());
         if !sent {
             self.dropped_runs.fetch_add(1, Ordering::Relaxed);
+            if let Some(counter) = &self.dropped_counter {
+                counter.add(1, &[]);
+            }
         }
     }
 
@@ -180,11 +197,11 @@ pub(super) struct RunBufferProcessor {
 }
 
 impl RunBufferProcessor {
-    pub(super) fn new(runs: Runs) -> Self {
+    pub(super) fn new(runs: Runs, dropped_runs: Counter<u64>) -> Self {
         Self {
             runs,
             resource: Resource::builder_empty().build(),
-            writer: Writer::start(),
+            writer: Writer::start(dropped_runs),
         }
     }
 }

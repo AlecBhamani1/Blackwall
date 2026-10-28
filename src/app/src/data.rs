@@ -153,12 +153,14 @@ impl TelemetryState {
 
 /// A run's telemetry under the owner's current trace settings. `None` only when the data folder
 /// cannot be found; with traces off the scope records nothing. A compaction request is not a run:
-/// its scope only meters the summary calls.
+/// its scope only meters the summary calls. `labels` are the workspace (Agent only) and the
+/// conversation ID.
 pub(crate) async fn run_scope(
     app: &AppHandle,
     request_id: &str,
     mode: blackwall_core::telemetry::Mode,
     compact: bool,
+    labels: (Option<&std::path::Path>, Option<&str>),
 ) -> Option<blackwall_core::telemetry::RunScope> {
     let directory = crate::identity::data_directory(app).ok()?;
     let options = trace_options(directory.clone()).await;
@@ -173,11 +175,12 @@ pub(crate) async fn run_scope(
         )
     });
     telemetry.set_options(options);
-    Some(if compact {
+    let scope = if compact {
         telemetry.compaction(mode)
     } else {
         telemetry.run(request_id, mode)
-    })
+    };
+    Some(scope.labelled(labels.0, labels.1))
 }
 
 #[tauri::command]
