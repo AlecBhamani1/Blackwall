@@ -2,7 +2,7 @@ import type { ComponentProps } from 'svelte';
 import type Icon from './components/Icon.svelte';
 
 export type SettingsPage = 'connection' | 'security' | 'updates' | 'sharing';
-export type SettingsPanel = 'memory' | 'skills' | 'mcp' | 'runs';
+export type SettingsPanel = 'memory' | 'skills' | 'mcp' | 'runs' | 'usage';
 export const settingsGroups = ['General', 'AI capabilities', 'Workflows'] as const;
 
 type SettingsEntry = {
@@ -88,5 +88,15 @@ export const settingsEntries: readonly SettingsEntry[] = [
     title: 'Runs',
     description: 'Traces of agent runs',
     keywords: 'history logs debug activity',
+  },
+  {
+    id: 'usage',
+    kind: 'dialog',
+    group: 'Workflows',
+    icon: 'chart',
+    desktopOnly: true,
+    title: 'Usage',
+    description: 'Tokens, runs, and tools over time',
+    keywords: 'tokens telemetry metrics statistics models projects cost export opentelemetry',
   },
 ];

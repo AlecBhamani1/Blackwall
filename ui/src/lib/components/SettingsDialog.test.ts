@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { GuestShareClient } from '../ipc';
+import { persistence } from '../persistence';
 import SettingsDialog from './SettingsDialog.svelte';
 import { credentialClient } from '../credentials';
 
@@ -74,6 +75,28 @@ describe('SettingsDialog', () => {
     expect(screen.getByRole('heading', { name: 'App lock' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'All settings' }));
     expect(screen.getByRole('button', { name: 'Security' })).toHaveFocus();
+  });
+
+  it('lists Usage next to Runs on desktop and opens it', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    const usage = vi.spyOn(persistence, 'usage').mockReturnValue(new Promise(() => {}));
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value: function (this: HTMLDialogElement) {
+        this.open = true;
+      },
+    });
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
+    const workflows = within(screen.getByRole('region', { name: 'Workflows' }));
+    const names = workflows
+      .getAllByRole('button')
+      .map((button) => button.querySelector('strong')?.textContent);
+    expect(names.slice(names.indexOf('Runs'))).toEqual(['Runs', 'Usage']);
+    await user.click(workflows.getByRole('button', { name: /Usage/ }));
+    expect(screen.getByRole('heading', { name: 'Usage' })).toBeInTheDocument();
+    expect(usage).toHaveBeenCalledWith(7);
+    usage.mockRestore();
   });
 
   it('filters by related terms and category, and explains an empty result', async () => {
