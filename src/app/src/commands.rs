@@ -798,6 +798,7 @@ async fn complete_chat(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_chat_events(
     api_key: Option<&str>,
     default_endpoint: &str,

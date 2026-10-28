@@ -80,6 +80,70 @@ export interface TraceSpan {
   attributes: Record<string, unknown>;
   events: string[];
 }
+/** Token counts; `cachedInput` is part of `input` and `reasoning` part of `output`. */
+export interface UsageTokens {
+  input: number;
+  cachedInput: number;
+  output: number;
+  reasoning: number;
+}
+export interface UsageSessionRow {
+  id: string;
+  models: string[];
+  modelCalls: number;
+  total: number;
+}
+export interface UsageGroupRow {
+  /** Project folder name or model; `null` is Chat with no project. */
+  name: string | null;
+  tokens: UsageTokens;
+  total: number;
+  share: number;
+  /** Projects only. */
+  runs: number | null;
+  sessions: number;
+  modelCalls: number;
+  failedCalls: number;
+  medianOutputSpeed: number | null;
+  p90Seconds: number | null;
+  modes: { mode: string; total: number }[];
+  sessionRows: UsageSessionRow[];
+}
+export interface UsageSummary {
+  from: string;
+  to: string;
+  totals: {
+    tokens: UsageTokens;
+    total: number;
+    modelCalls: number;
+    failedCalls: number;
+    runs: number;
+    completedRuns: number;
+    runsByOutcome: Record<string, number>;
+    runSuccess: number | null;
+    sessions: number;
+    medianOutputSpeed: number | null;
+    topModel: string | null;
+    tokensSaved: number;
+    compactions: number;
+  };
+  perDay: { day: string; tokens: UsageTokens; recorded: boolean }[];
+  perProject: UsageGroupRow[];
+  perModel: UsageGroupRow[];
+  perMode: { mode: string; total: number; modelCalls: number; runs: number }[];
+  tools: { name: string; calls: number; errors: number; denied: number; timeouts: number }[];
+  gaps: { firstDay: string | null; droppedRuns: number };
+  warnings: string[];
+  telemetryEnabled: boolean;
+  files: number;
+  newestUnixMs: number | null;
+  stale: boolean;
+}
+export interface TelemetryExport {
+  folder: string;
+  metricsFiles: number;
+  traceFiles: number;
+}
 export interface SkillFinding {
   severity: 'medium' | 'high';
   reason: string;
@@ -180,6 +244,9 @@ export const persistence = {
     command<void>('discard_skill_downloads', { sources }),
   traces: () => command<TraceSummary[]>('list_traces'),
   trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
+  usage: (days: number) => command<UsageSummary>('usage_summary', { days }),
+  /** Opens a native folder picker; `null` when it is cancelled. */
+  exportTelemetry: (days: number) => command<TelemetryExport | null>('export_telemetry', { days }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),

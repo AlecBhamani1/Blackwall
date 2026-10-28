@@ -425,6 +425,57 @@ pub async fn read_trace(
         .map_err(|_| "This trace could not be read.")?
 }
 
+/// The Usage page: the last `days` days (1–400) of local usage metrics, ending today (UTC).
+#[tauri::command]
+pub async fn usage_summary(
+    app: AppHandle,
+    days: u16,
+) -> Result<blackwall_core::usage::UsageSummary, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let enabled = trace_options(directory.clone()).await.enabled;
+    let (from, to) =
+        blackwall_core::usage::Day::range(days.clamp(1, 400), blackwall_core::usage::Day::today());
+    let mut summary =
+        tokio::task::spawn_blocking(move || blackwall_core::usage::summary(&directory, from, to))
+            .await
+            .map_err(|_| "Usage could not be read.")?;
+    summary.telemetry_enabled = enabled;
+    Ok(summary)
+}
+/// Export the last `days` days of metrics and traces into a folder the owner picks. The folder
+/// comes from the native picker, never from the webview. `None` when the picker is cancelled.
+#[tauri::command]
+pub async fn export_telemetry(
+    app: AppHandle,
+    days: u16,
+) -> Result<Option<blackwall_core::usage::ExportReport>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let picker = app.clone();
+    let chosen = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title("Export usage telemetry")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| "The picker could not open.")?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let dest = chosen.into_path().map_err(|_| "Choose a local folder.")?;
+    crate::auth::require_unlocked(&app).await?;
+    let (from, to) =
+        blackwall_core::usage::Day::range(days.clamp(1, 400), blackwall_core::usage::Day::today());
+    tokio::task::spawn_blocking(move || blackwall_core::usage::export(&directory, from, to, &dest))
+        .await
+        .map_err(|_| "The export could not finish.")?
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 /// Skills found in other harnesses' folders (Claude Code, Codex, Agent Skills), ready to review.
 #[tauri::command]
 pub async fn find_skill_imports(
