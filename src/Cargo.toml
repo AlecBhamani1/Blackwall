@@ -15,6 +15,10 @@ axum = { version = "0.8.4", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.23.1"
 blackwall-core = { path = "core", version = "0.1.0" }
 futures-util = "0.3.31"
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["with-serde", "gen-tonic-messages", "trace", "metrics"] }
+opentelemetry-semantic-conventions = { version = "=0.33.1", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rand = "0.10.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
