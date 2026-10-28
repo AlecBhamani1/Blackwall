@@ -157,6 +157,16 @@ impl ToolOutcome {
     }
 }
 
+/// The tool name to record: the model's name only when it named a tool it was offered, so made-up
+/// names (model-written text) never reach traces or metrics. Such calls are always denied.
+pub fn tool_label(name: &str, offered: bool) -> &str {
+    if offered {
+        name
+    } else {
+        "unknown"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Complete,
@@ -365,9 +375,27 @@ impl Telemetry {
         }
     }
 
-    /// Write any metrics not yet on disk.
+    /// Wait for queued trace files and write any metrics not yet on disk. Blocking: for exit
+    /// paths and tests, not for the end of a run.
     pub fn flush(&self) {
+        let _ = self.inner.tracer_provider.force_flush();
         let _ = self.inner.meter_provider.force_flush();
+    }
+
+    /// A scope for a compaction request: its model calls count toward token usage and duration,
+    /// but it writes no trace and records no run outcome. With telemetry off it records nothing.
+    pub fn compaction(&self, mode: Mode) -> RunScope {
+        let traces = self
+            .inner
+            .options
+            .lock()
+            .map(|options| options.traces)
+            .unwrap_or_default();
+        let mut scope = RunScope::inert(mode);
+        if traces {
+            scope.telemetry = Some(self.clone());
+        }
+        scope
     }
 
     /// Flush and stop both providers. Runs still open afterwards are not written.
@@ -382,6 +410,7 @@ pub struct ModelCall {
     span: SpanId,
     model: String,
     started: std::time::Instant,
+    compaction: bool,
 }
 
 /// What a finished model call returned.
@@ -476,16 +505,24 @@ fn span_kind(kind: u8) -> SpanKind {
     }
 }
 
-/// The host and port of an endpoint URL or `host:port`.
-fn server_parts(server: &str) -> (String, Option<u16>) {
+/// The host and port of an endpoint URL or a bare `host:port`. Anything else, such as a socket
+/// path, has no host, so no `server.address` is recorded.
+fn server_parts(server: &str) -> (Option<String>, Option<u16>) {
     if let Ok(url) = reqwest::Url::parse(server) {
-        if let Some(host) = url.host_str() {
-            return (host.to_owned(), url.port_or_known_default());
+        if let Some(host) = url.host_str().filter(|host| !host.is_empty()) {
+            return (Some(host.to_owned()), url.port_or_known_default());
         }
     }
-    match server.rsplit_once(':') {
-        Some((host, port)) if port.parse::<u16>().is_ok() => (host.to_owned(), port.parse().ok()),
-        _ => (server.to_owned(), None),
+    let Some((host, port)) = server.rsplit_once(':') else {
+        return (None, None);
+    };
+    let plain = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    match port.parse::<u16>() {
+        Ok(port) if plain => (Some(host.to_owned()), Some(port)),
+        _ => (None, None),
     }
 }
 
@@ -640,7 +677,20 @@ impl RunScope {
             ),
             model: model.to_owned(),
             started: std::time::Instant::now(),
+            compaction: false,
         }
+    }
+
+    /// Start a model call that summarizes history for compaction. It is a `chat` operation, as
+    /// the conventions define it, marked `blackwall.compaction=true`; its summary is not recorded.
+    pub fn begin_compaction_call(&self, model: &str) -> ModelCall {
+        let mut call = self.begin_model_call(&self.root(), model);
+        self.set(
+            &call.span,
+            vec![(names::COMPACTION.into(), Value::from(true))],
+        );
+        call.compaction = true;
+        call
     }
 
     /// End a model call's span and record its metrics for `mode`. A reply's text is kept only
@@ -655,7 +705,15 @@ impl RunScope {
         let seconds = call.started.elapsed().as_secs_f64();
         let usage = result.as_ref().ok().and_then(|reply| reply.usage);
         let kind = result.as_ref().err().map(|failure| failure.kind);
-        self.record_model_call_as(mode, &call.model, server, usage, seconds, kind);
+        self.record_model_metrics(
+            mode,
+            &call.model,
+            server,
+            usage,
+            seconds,
+            kind,
+            call.compaction,
+        );
         match result {
             Ok(reply) => {
                 let mut attributes = vec![(
@@ -676,7 +734,7 @@ impl RunScope {
                         Value::from(usage.completion_tokens),
                     ));
                 }
-                if self.content() && !reply.content.is_empty() {
+                if self.content() && !call.compaction && !reply.content.is_empty() {
                     let parts = serde_json::json!([{"role":"assistant","parts":[{"type":"text","content":self.clip(reply.content)}]}]);
                     attributes.push((
                         names::GEN_AI_OUTPUT_MESSAGES.into(),
@@ -718,6 +776,20 @@ impl RunScope {
         seconds: f64,
         error: Option<&str>,
     ) {
+        self.record_model_metrics(mode, model, server, usage, seconds, error, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_model_metrics(
+        &self,
+        mode: Mode,
+        model: &str,
+        server: &str,
+        usage: Option<&TokenUsage>,
+        seconds: f64,
+        error: Option<&str>,
+        compaction: bool,
+    ) {
         let Some(telemetry) = &self.telemetry else {
             return;
         };
@@ -735,8 +807,11 @@ impl RunScope {
             ),
             KeyValue::new(names::MODE, mode.as_str()),
         ];
-        if !host.is_empty() {
+        if let Some(host) = host {
             attributes.push(KeyValue::new(names::SERVER_ADDRESS, host));
+        }
+        if compaction {
+            attributes.push(KeyValue::new(names::COMPACTION, true));
         }
         let instruments = &telemetry.inner.instruments;
         if let Some(usage) = usage {
@@ -822,7 +897,6 @@ impl RunScope {
                     KeyValue::new(names::RUN_OUTCOME, outcome.as_str()),
                 ],
             );
-            telemetry.flush();
         }
     }
 }

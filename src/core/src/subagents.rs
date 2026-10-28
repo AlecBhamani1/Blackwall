@@ -155,21 +155,23 @@ pub(crate) async fn run_with_instructions(
             for call in turn.calls {
                 let arguments:Value=serde_json::from_str(&call.function.arguments).map_err(|_|"Invalid child tool arguments.")?;
                 let path=arguments.get("path").and_then(Value::as_str).unwrap_or("");
+                let offered = matches!(call.function.name.as_str(), "read_file" | "list_files");
+                let tool_name = crate::telemetry::tool_label(&call.function.name, offered);
                 let tool = traced.as_ref().map(|(trace, parent)| {
                     let mut attributes = vec![
                         ("gen_ai.operation.name".into(), json!("execute_tool")),
-                        ("gen_ai.tool.name".into(), json!(call.function.name)),
+                        ("gen_ai.tool.name".into(), json!(tool_name)),
                         ("gen_ai.tool.call.id".into(), json!(call.id)),
                         ("gen_ai.tool.type".into(), json!("function")),
                     ];
                     if trace.content() {
                         attributes.push(("gen_ai.tool.call.arguments".into(), json!(trace.clip(&call.function.arguments))));
                     }
-                    trace.begin(parent, &format!("execute_tool {}", call.function.name), 1, attributes)
+                    trace.begin(parent, &format!("execute_tool {tool_name}"), 1, attributes)
                 });
                 let result=match call.function.name.as_str(){"read_file"=>workspace.read(path),"list_files"=>workspace.list(path),_=>Err(crate::tools::ToolError::Denied)};
                 if let (Some((trace, _)), Some(span)) = (&traced, &tool) {
-                    trace.record_tool(&call.function.name, crate::telemetry::ToolOutcome::of(&result));
+                    trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                     if let Err(error) = &result {
                         trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
                     }

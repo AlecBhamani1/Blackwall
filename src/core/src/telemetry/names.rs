@@ -39,6 +39,8 @@ pub const REQUEST_ID: &str = "blackwall.request_id";
 pub const TOOL_OUTCOME: &str = "blackwall.tool.outcome";
 pub const RUN_OUTCOME: &str = "blackwall.run.outcome";
 pub const APPROVAL_KIND: &str = "blackwall.approval.kind";
+/// Marks a model call that summarized history for compaction.
+pub const COMPACTION: &str = "blackwall.compaction";
 pub const DROPPED_SPANS: &str = "blackwall.trace.dropped_spans";
 pub const CONTENT_REMOVED: &str = "blackwall.trace.content_removed";
 
@@ -55,7 +57,7 @@ pub const CONTENT_KEYS: [&str; 6] = [
 
 /// With content capture off, only these span and event attributes leave the processor. Anything
 /// else, including any content key above or reasoning text, is dropped.
-pub const METADATA_KEYS: [&str; 16] = [
+pub const METADATA_KEYS: [&str; 17] = [
     GEN_AI_OPERATION_NAME,
     GEN_AI_AGENT_NAME,
     GEN_AI_AGENT_ID,
@@ -72,6 +74,7 @@ pub const METADATA_KEYS: [&str; 16] = [
     REQUEST_ID,
     MODE,
     APPROVAL_KIND,
+    COMPACTION,
 ];
 
 #[cfg(test)]

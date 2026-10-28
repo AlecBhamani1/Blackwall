@@ -387,13 +387,19 @@ fn run_scope(
     directory: &Path,
     trace: blackwall_core::trace::TraceOptions,
     request_id: &str,
+    compact: bool,
 ) -> blackwall_core::telemetry::RunScope {
     use blackwall_core::telemetry::{Mode, Surface, Telemetry, TelemetryOptions};
     let telemetry = TELEMETRY.get_or_init(|| {
         Telemetry::start(directory, TelemetryOptions::from_trace(trace, Surface::Cli))
     });
     telemetry.set_options(trace);
-    telemetry.run(request_id, Mode::Agent)
+    // A compaction request is not a run: it only meters its summary calls.
+    if compact {
+        telemetry.compaction(Mode::Agent)
+    } else {
+        telemetry.run(request_id, Mode::Agent)
+    }
 }
 
 /// Write any buffered metrics before bw exits.
@@ -428,7 +434,7 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    run.trace = Some(run_scope(directory, trace, &request_id));
+    run.trace = Some(run_scope(directory, trace, &request_id, run.compact));
     let work = agent.run_context_with_guidance(&request_id, run, memory, Some(directory));
     tokio::pin!(work);
     let mut answer = String::new();

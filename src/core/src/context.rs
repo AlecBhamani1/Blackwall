@@ -355,6 +355,7 @@ impl ContextState {
         budget: ContextBudget,
         tools: &[Value],
         instructions: &[Value],
+        trace: Option<&crate::telemetry::RunScope>,
     ) -> Result<Checkpoint, ContextError> {
         budget.validate()?;
         self.validate()?;
@@ -431,7 +432,26 @@ impl ContextState {
                 return Err(ContextError::Limit);
             }
             budget.check(&request, &[])?;
-            let turn = backend.generate(&request, &[], &mut |_| {}).await?;
+            // Compaction calls count toward token usage; the summary itself is never recorded.
+            let model = backend.model_name().unwrap_or("model");
+            let call = trace.map(|trace| trace.begin_compaction_call(model));
+            let turn = backend.generate(&request, &[], &mut |_| {}).await;
+            if let (Some(trace), Some(call)) = (trace, call) {
+                let message = turn.as_ref().err().map(ToString::to_string);
+                trace.end_model_call(
+                    call,
+                    trace.mode(),
+                    backend.server_address().unwrap_or_default(),
+                    match (&turn, &message) {
+                        (Ok(turn), _) => Ok(crate::telemetry::ModelReply::of(turn)),
+                        (Err(error), message) => Err(crate::telemetry::ModelFailure::of(
+                            error,
+                            message.as_deref().unwrap_or_default(),
+                        )),
+                    },
+                );
+            }
+            let turn = turn?;
             if !turn.calls.is_empty() {
                 return Err(ContextError::Summary);
             }
@@ -573,7 +593,7 @@ async fn chat_traced(
                 && estimate(&messages) + estimate(&definitions) > budget.prompt_limit() * 9 / 10)
         {
             match state
-                .compact(backend, budget, &definitions, &instructions)
+                .compact(backend, budget, &definitions, &instructions, trace)
                 .await
             {
                 Ok(checkpoint) => {
@@ -652,10 +672,14 @@ async fn chat_traced(
                     arguments: call.function.arguments.clone(),
                 });
                 // Enforce the allowlist even if a model invents a file, shell, MCP, or agent call.
+                let offered = definitions
+                    .iter()
+                    .any(|definition| definition["function"]["name"] == call.function.name);
+                let tool_name = crate::telemetry::tool_label(&call.function.name, offered);
                 let tool = trace.map(|trace| {
                     let mut attributes = vec![
                         ("gen_ai.operation.name".into(), json!("execute_tool")),
-                        ("gen_ai.tool.name".into(), json!(call.function.name)),
+                        ("gen_ai.tool.name".into(), json!(tool_name)),
                         ("gen_ai.tool.call.id".into(), json!(call.id)),
                         ("gen_ai.tool.type".into(), json!("function")),
                     ];
@@ -667,24 +691,18 @@ async fn chat_traced(
                     }
                     trace.begin(
                         &trace.root(),
-                        &format!("execute_tool {}", call.function.name),
+                        &format!("execute_tool {tool_name}"),
                         1,
                         attributes,
                     )
                 });
-                let result = if definitions
-                    .iter()
-                    .any(|definition| definition["function"]["name"] == call.function.name)
-                {
+                let result = if offered {
                     crate::web::execute(call, request_id, approvals, emit).await
                 } else {
                     Err(crate::tools::ToolError::Denied)
                 };
                 if let (Some(trace), Some(span)) = (trace, &tool) {
-                    trace.record_tool(
-                        &call.function.name,
-                        crate::telemetry::ToolOutcome::of(&result),
-                    );
+                    trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                     if let Err(error) = &result {
                         trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
                     }
@@ -802,7 +820,11 @@ mod tests {
                     } else {
                         vec![]
                     },
-                    usage: None,
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 30,
+                        completion_tokens: 7,
+                        total_tokens: 37,
+                    }),
                 })
             })
         }
@@ -873,6 +895,117 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    fn metrics_text(directory: &std::path::Path) -> String {
+        std::fs::read_dir(directory.join(crate::telemetry::METRICS_DIRECTORY))
+            .map(|entries| {
+                entries
+                    .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn compact_request_writes_no_run_outcome() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-compact-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let telemetry = crate::telemetry::Telemetry::start(
+            &directory,
+            crate::telemetry::TelemetryOptions {
+                traces: true,
+                content: true,
+                ..Default::default()
+            },
+        );
+        let source = history();
+        let model = backend(summary());
+        let run = ContextRun {
+            state: ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: model.budget,
+            instructions: vec![],
+            compact: true,
+            trace: Some(telemetry.compaction(crate::telemetry::Mode::Chat)),
+        };
+        assert_eq!(chat(&model, "compact-1", run, &|_| {}).await.unwrap(), "");
+        let calls = model.requests.lock().unwrap().len();
+        assert!(calls > 0);
+        telemetry.shutdown();
+        // Not a run: no trace file and no run outcome.
+        assert!(crate::trace::list(&directory, 10).is_empty());
+        let metrics = metrics_text(&directory);
+        assert!(!metrics.contains("blackwall.run.outcomes"), "{metrics}");
+        assert!(metrics.contains("gen_ai.client.token.usage"), "{metrics}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_tokens_appear_in_token_usage() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-compact-tokens-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let telemetry = crate::telemetry::Telemetry::start(
+            &directory,
+            crate::telemetry::TelemetryOptions {
+                traces: true,
+                ..Default::default()
+            },
+        );
+        let scope = telemetry.run("auto-compact", crate::telemetry::Mode::Agent);
+        let source = history();
+        let state = ContextState::restore(&source, None).unwrap();
+        let model = backend(summary());
+        state
+            .compact(&model, model.budget, &[], &[], Some(&scope))
+            .await
+            .unwrap();
+        let calls = model.requests.lock().unwrap().len() as u64;
+        scope.finish(crate::telemetry::RunOutcome::Complete);
+        telemetry.shutdown();
+        let metrics = metrics_text(&directory);
+        let request: Value = serde_json::from_str(metrics.lines().next().unwrap()).unwrap();
+        let mut input = 0.0;
+        let mut marked = 0;
+        for metric in request["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+        {
+            if metric["name"] != "gen_ai.client.token.usage" {
+                continue;
+            }
+            for point in metric["histogram"]["dataPoints"].as_array().unwrap() {
+                let attributes = point["attributes"].as_array().unwrap();
+                let has = |key: &str, value: Value| {
+                    attributes
+                        .iter()
+                        .any(|pair| pair["key"] == key && pair["value"] == value)
+                };
+                assert!(has("blackwall.mode", json!({"stringValue":"agent"})));
+                if has("blackwall.compaction", json!({"boolValue":true})) {
+                    marked += 1;
+                }
+                if has("gen_ai.token.type", json!({"stringValue":"input"})) {
+                    input += point["sum"].as_f64().unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            marked, 2,
+            "input and output points are marked as compaction"
+        );
+        assert_eq!(input, (30 * calls) as f64);
+        // In a run, the summary call is a span marked as compaction, without the summary text.
+        let spans =
+            crate::trace::read(&directory, &crate::trace::list(&directory, 1)[0].id).unwrap();
+        let call = spans.iter().find(|span| span.parent.is_some()).unwrap();
+        assert_eq!(call.attributes["blackwall.compaction"], true);
+        assert!(!call.attributes.contains_key("gen_ai.output.messages"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn web_chat_compaction_never_exposes_tools_or_replays_historical_calls() {
         let source = history();
@@ -918,7 +1051,7 @@ mod tests {
         ];
         let tools = vec![json!({"function":{"name":"read_file","parameters":{"type":"object"}}})];
         let checkpoint = state
-            .compact(&model, model.budget, &tools, &instructions)
+            .compact(&model, model.budget, &tools, &instructions, None)
             .await
             .unwrap();
         assert_eq!(
@@ -954,13 +1087,13 @@ mod tests {
         let original = state.clone();
         for response in ["invalid".into(), "{}".into(), "[]".into(), json!({"taskRequirements":[],"corrections":[],"decisions":[],"changedFiles":[],"checks":[],"unfinishedWork":[],"relevantContext":[]}).to_string(), summary().replace("Keep the task", &"X".repeat(4000))] {
             let model = backend(response);
-            assert!(state.compact(&model, model.budget, &[], &[]).await.is_err());
+            assert!(state.compact(&model, model.budget, &[], &[], None).await.is_err());
             assert_eq!(state, original);
         }
         let mut model = backend(summary());
         model.calls = true;
         assert!(matches!(
-            state.compact(&model, model.budget, &[], &[]).await,
+            state.compact(&model, model.budget, &[], &[], None).await,
             Err(ContextError::Summary)
         ));
         assert_eq!(state, original);
@@ -973,7 +1106,7 @@ mod tests {
         model.pending = true;
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            state.compact(&model, model.budget, &[], &[])
+            state.compact(&model, model.budget, &[], &[], None)
         )
         .await
         .is_err());
@@ -983,7 +1116,7 @@ mod tests {
         model.pending_after = 1;
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            state.compact(&model, model.budget, &[], &[])
+            state.compact(&model, model.budget, &[], &[], None)
         )
         .await
         .is_err());
@@ -993,7 +1126,7 @@ mod tests {
         let instructions = vec![json!({"role":"system","content":"must retain".repeat(3000)})];
         assert!(matches!(
             state
-                .compact(&model, model.budget, &[], &instructions)
+                .compact(&model, model.budget, &[], &instructions, None)
                 .await,
             Err(ContextError::Limit)
         ));

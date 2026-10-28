@@ -366,7 +366,7 @@ impl Agent<'_> {
         definitions.extend(mcp.definitions());
         if compact {
             let checkpoint = state
-                .compact(self.backend, budget, &definitions, &instructions)
+                .compact(self.backend, budget, &definitions, &instructions, trace)
                 .await?;
             state.checkpoints.push(checkpoint);
             let mut messages = instructions.clone();
@@ -389,7 +389,7 @@ impl Agent<'_> {
                     > budget.prompt_limit() * 9 / 10
             {
                 match state
-                    .compact(self.backend, budget, &definitions, &instructions)
+                    .compact(self.backend, budget, &definitions, &instructions, trace)
                     .await
                 {
                     Ok(checkpoint) => {
@@ -530,10 +530,17 @@ impl Agent<'_> {
                     let proposals = &proposals;
                     let invoked = &invoked;
                     async move {
+                        let permitted = definitions.iter().any(|definition| {
+                            definition["function"]["name"].as_str()
+                                == Some(call.function.name.as_str())
+                        });
+                        // A name the model made up is model-written text, so it is not recorded.
+                        let tool_name =
+                            crate::telemetry::tool_label(&call.function.name, permitted);
                         let tool_span = trace.map(|trace| {
                             let mut attributes = vec![
                                 ("gen_ai.operation.name".into(), json!("execute_tool")),
-                                ("gen_ai.tool.name".into(), json!(call.function.name)),
+                                ("gen_ai.tool.name".into(), json!(tool_name)),
                                 ("gen_ai.tool.call.id".into(), json!(call.id)),
                                 (
                                     "gen_ai.tool.type".into(),
@@ -552,7 +559,7 @@ impl Agent<'_> {
                             }
                             trace.begin(
                                 &trace.root(),
-                                &format!("execute_tool {}", call.function.name),
+                                &format!("execute_tool {tool_name}"),
                                 1,
                                 attributes,
                             )
@@ -579,10 +586,6 @@ impl Agent<'_> {
                             tool_call_id: ui_id.clone(),
                             name: call.function.name.clone(),
                             arguments: call.function.arguments.clone(),
-                        });
-                        let permitted = definitions.iter().any(|definition| {
-                            definition["function"]["name"].as_str()
-                                == Some(call.function.name.as_str())
                         });
                         let result = if !permitted {
                             Err(tools::ToolError::Denied)
@@ -681,10 +684,7 @@ impl Agent<'_> {
                         };
                         let success = result.is_ok();
                         if let Some(trace) = trace {
-                            trace.record_tool(
-                                &call.function.name,
-                                crate::telemetry::ToolOutcome::of(&result),
-                            );
+                            trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                         }
                         if let (Some(trace), Some(span), Err(error)) =
                             (trace, &tool_span, &result)
@@ -983,6 +983,7 @@ mod tests {
                 .run_context_with_guidance(&request, run, None, Some(&directory.join("user")))
                 .await
                 .unwrap();
+            telemetry.flush();
             let summary = crate::trace::list(&directory.join("user"), 10)
                 .into_iter()
                 .find(|summary| summary.id.ends_with(&request))
@@ -1251,6 +1252,104 @@ mod tests {
         ] {
             assert!(!metrics.contains(leak), "{leak} in {metrics}");
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// Calls a tool it was never offered, then finishes.
+    struct MadeUpTool {
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for MadeUpTool {
+        fn generate<'a>(
+            &'a self,
+            _: &'a [Value],
+            _: &'a [Value],
+            _: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                Ok(if *step == 1 {
+                    ModelTurn {
+                        calls: vec![ToolCall {
+                            id: "made-up".into(),
+                            function: ToolFunction {
+                                name: "read_file sk-sentinel-123".into(),
+                                arguments: "{}".into(),
+                            },
+                        }],
+                        ..Default::default()
+                    }
+                } else {
+                    ModelTurn {
+                        content: "Done.".into(),
+                        ..Default::default()
+                    }
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn unknown_tool_names_are_not_recorded() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-unknown-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        std::fs::create_dir_all(directory.join("user")).unwrap();
+        let telemetry = crate::telemetry::Telemetry::start(
+            &directory.join("user"),
+            crate::telemetry::TelemetryOptions {
+                traces: true,
+                ..Default::default()
+            },
+        );
+        let agent = Agent {
+            backend: &MadeUpTool {
+                step: Mutex::new(0),
+            },
+            workspace: Workspace::open(&directory.join("project")).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(|_| {}),
+        };
+        let source = vec![json!({"role":"user","content":"Go."})];
+        let run = crate::context::ContextRun {
+            state: crate::context::ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: Default::default(),
+            instructions: vec![],
+            compact: false,
+            trace: Some(telemetry.run("unknown", crate::telemetry::Mode::Agent)),
+        };
+        agent
+            .run_context_with_guidance("unknown", run, None, Some(&directory.join("user")))
+            .await
+            .unwrap();
+        telemetry.shutdown();
+        let user = directory.join("user");
+        let id = crate::trace::list(&user, 1).remove(0).id;
+        let trace = std::fs::read_to_string(
+            user.join(crate::trace::TRACE_DIRECTORY)
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        let metrics = std::fs::read_dir(user.join("metrics"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        for body in [&trace, &metrics] {
+            assert!(!body.contains("sk-sentinel-123"), "{body}");
+        }
+        let spans = crate::trace::read(&user, &id).unwrap();
+        let tool = spans
+            .iter()
+            .find(|span| span.name == "execute_tool unknown")
+            .unwrap();
+        assert_eq!(tool.attributes["gen_ai.tool.name"], "unknown");
+        assert_eq!(tool.error.as_deref(), Some("denied"));
+        assert!(
+            metrics.contains(r#"{"stringValue":"unknown"}"#),
+            "{metrics}"
+        );
+        assert!(metrics.contains(r#"{"stringValue":"denied"}"#), "{metrics}");
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]

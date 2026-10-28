@@ -106,12 +106,21 @@ fn stopped_run_is_written_as_failed_and_reads_back() {
     trace.set(&child, vec![("gen_ai.usage.input_tokens".into(), json!(7))]);
     trace.end(&child, Some("token=abc123 failed"));
     drop(trace);
+    telemetry.flush();
     let summaries = list(&directory, 10);
     assert_eq!(summaries.len(), 1);
     assert!(summaries[0].id.ends_with("-run1"));
     // With content capture off, a failure carries only its error class (§13 M2).
     assert_eq!(summaries[0].error.as_deref(), Some("cancelled"));
     assert_eq!(summaries[0].input_tokens, 7);
+    // SDK timestamps are carried through: a real start time and a non-negative duration.
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(summaries[0].started_ms > 0);
+    assert!(summaries[0].started_ms <= now_ms && now_ms - summaries[0].started_ms < 60_000);
+    assert!(summaries[0].duration_ms < 60_000);
     let spans = read(&directory, &summaries[0].id).unwrap();
     assert_eq!(spans.len(), 2);
     assert!(spans[0].parent.is_none());
@@ -128,6 +137,7 @@ fn stopped_run_keeps_its_message_with_content_on() {
     let directory = folder();
     let telemetry = start(&directory, true);
     drop(telemetry.run("stopped", Mode::Agent));
+    telemetry.flush();
     let summary = list(&directory, 1).remove(0);
     assert_eq!(summary.error.as_deref(), Some("The run was stopped."));
     std::fs::remove_dir_all(directory).unwrap();
@@ -145,6 +155,7 @@ fn keeps_only_the_newest_traces() {
     telemetry
         .run("new", Mode::Agent)
         .finish(RunOutcome::Complete);
+    telemetry.flush();
     let files = crate::trace::list_files(&traces);
     assert_eq!(files.len(), KEEP);
     assert!(!files.contains(&format!("{:013}-old.json", 5)));
@@ -177,6 +188,7 @@ fn open_spans_are_cancelled_and_oversized_traces_drop_content() {
     );
     trace.set(&open, vec![]);
     trace.finish(RunOutcome::Complete);
+    telemetry.flush();
     let id = list(&directory, 1).remove(0).id;
     let spans = read(&directory, &id).unwrap();
     assert!(spans
@@ -203,6 +215,7 @@ fn spans_over_the_limit_are_counted_not_written() {
         trace.end(&span, None);
     }
     trace.finish(RunOutcome::Complete);
+    telemetry.flush();
     let id = list(&directory, 1).remove(0).id;
     assert_eq!(read(&directory, &id).unwrap().len(), MAX_SPANS);
     assert!(trace_body(&directory).contains("blackwall.trace.dropped_spans"));
@@ -232,6 +245,7 @@ fn secrets_found_anywhere_are_scrubbed_from_the_whole_trace() {
         trace.end(&span, Some("failed near longsecret99"));
     }
     trace.finish(RunOutcome::Complete);
+    telemetry.flush();
     let body = trace_body(&directory);
     assert!(!body.contains("longsecret99"), "{body}");
     assert!(!body.contains("quote"), "{body}");
@@ -272,6 +286,7 @@ fn secret_seen_late_is_scrubbed_from_earlier_exported_spans() {
     );
     trace.end(&late, None);
     trace.finish(RunOutcome::Complete);
+    telemetry.flush();
     let body = trace_body(&directory);
     assert!(!body.contains("latesecret77"), "{body}");
     assert!(body.contains("Use [redacted] here."), "{body}");
@@ -314,6 +329,7 @@ fn content_keys_filtered_in_processor() {
     );
     trace.end(&span, None);
     trace.finish(RunOutcome::Complete);
+    telemetry.flush();
     let body = trace_body(&directory);
     for sentinel in ["PROMPT", "SYSTEM", "OUTPUT", "ARG", "REASONING", "SUBJECT"] {
         assert!(!body.contains(&format!("{sentinel}-SENTINEL")), "{body}");
@@ -340,6 +356,7 @@ fn errors_are_kind_only_when_content_off() {
         trace.set(&root, vec![("error.type".into(), json!("model"))]);
         trace.end(&root, Some("The model at /Users/owner failed."));
         trace.finish(RunOutcome::Error);
+        telemetry.flush();
         let spans = read(&directory, &list(&directory, 1)[0].id).unwrap();
         let error = |name: &str| {
             spans
@@ -553,6 +570,7 @@ fn trace_file_is_otlp_json_with_resource_and_schema() {
     telemetry
         .run("shape", Mode::Agent)
         .finish(RunOutcome::Complete);
+    telemetry.flush();
     let body: Value = serde_json::from_str(&trace_body(&directory)).unwrap();
     let resource = &body["resourceSpans"][0];
     assert_eq!(resource["schemaUrl"], names::SCHEMA_URL);
@@ -567,5 +585,105 @@ fn trace_file_is_otlp_json_with_resource_and_schema() {
     let root = &resource["scopeSpans"][0]["spans"][0];
     assert_eq!(root["traceId"].as_str().unwrap().len(), 32);
     assert_eq!(root["status"]["code"], 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn server_address_needs_a_real_host() {
+    assert_eq!(
+        server_parts("http://localhost:11434/v1"),
+        (Some("localhost".into()), Some(11434))
+    );
+    assert_eq!(
+        server_parts("127.0.0.1:8080"),
+        (Some("127.0.0.1".into()), Some(8080))
+    );
+    for endpoint in ["unix:/Users/x/sock", "/Users/x/sock", "", "file:///Users/x"] {
+        assert_eq!(server_parts(endpoint), (None, None), "{endpoint}");
+    }
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let scope = telemetry.run("socket", Mode::Agent);
+    scope.record_model_call("m", "unix:/Users/x/sock", None, 0.1, None);
+    scope.finish(RunOutcome::Complete);
+    telemetry.shutdown();
+    let points = metric_points(&directory);
+    let duration = points
+        .iter()
+        .find(|(name, ..)| name == names::GEN_AI_CLIENT_OPERATION_DURATION)
+        .unwrap();
+    assert!(!duration.1.contains_key("server.address"));
+    let body = std::fs::read_dir(directory.join(METRICS_DIRECTORY))
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(!body.contains("/Users/x/sock"));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_full_writer_queue_drops_and_counts_runs() {
+    let writer = file_spans::Writer::idle(1);
+    let run = || Arc::new(RunState::new(PathBuf::from("unused.json"), false));
+    let resource = Resource::builder_empty().build();
+    writer.submit(run(), vec![], resource.clone());
+    assert_eq!(writer.dropped_runs(), 0);
+    // The queue is full, so the next run is dropped at once instead of blocking.
+    let started = std::time::Instant::now();
+    writer.submit(run(), vec![], resource);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(writer.dropped_runs(), 1);
+}
+
+const CHILD: &str = "BLACKWALL_OTEL_ENV_CHILD";
+
+/// Runs in a child process with hostile `OTEL_*` variables set, so the parent's environment is
+/// never mutated while other tests run.
+#[test]
+fn otel_env_vars_child() {
+    let Some(directory) = std::env::var_os(CHILD) else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let telemetry = start(&directory, false);
+    telemetry
+        .run("env", Mode::Agent)
+        .finish(RunOutcome::Complete);
+    telemetry.shutdown();
+    let body: Value = serde_json::from_str(&trace_body(&directory)).unwrap();
+    let attributes = body["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let service: Vec<_> = attributes
+        .iter()
+        .filter(|pair| pair["key"] == "service.name")
+        .collect();
+    assert_eq!(service.len(), 1);
+    assert_eq!(service[0]["value"]["stringValue"], "blackwall");
+    assert!(!attributes.iter().any(|pair| pair["key"] == "evil.key"));
+}
+
+#[test]
+fn otel_env_vars_are_ignored() {
+    let directory = folder();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telemetry::tests::otel_env_vars_child",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &directory)
+        .env("OTEL_TRACES_SAMPLER", "always_off")
+        .env("OTEL_RESOURCE_ATTRIBUTES", "service.name=evil,evil.key=1")
+        .env("OTEL_SERVICE_NAME", "evil")
+        .env("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "0")
+        .env("OTEL_METRIC_EXPORT_INTERVAL", "1")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // The child wrote a trace despite the sampler variable.
+    assert_eq!(list(&directory, 10).len(), 1);
     std::fs::remove_dir_all(directory).unwrap();
 }

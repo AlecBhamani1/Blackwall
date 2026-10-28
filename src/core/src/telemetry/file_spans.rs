@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     time::Duration,
 };
@@ -78,11 +78,105 @@ impl Runs {
     }
 }
 
+/// Finished runs waiting for the writer thread; more than this are dropped and counted.
+pub(super) const QUEUE: usize = 64;
+
+enum Job {
+    Run(Arc<RunState>, Vec<SpanData>, Resource),
+    Flush(mpsc::SyncSender<()>),
+}
+
+/// The trace writer: a dedicated thread fed by a bounded queue, so ending a run never does file
+/// IO or blocks the caller. Serialization, the write, and pruning all happen on that thread.
+#[derive(Debug)]
+pub(super) struct Writer {
+    queue: Mutex<Option<mpsc::SyncSender<Job>>>,
+    dropped_runs: AtomicUsize,
+    #[cfg(test)]
+    _idle: Mutex<Option<mpsc::Receiver<Job>>>,
+}
+
+impl Writer {
+    fn start() -> Self {
+        let (queue, jobs) = mpsc::sync_channel::<Job>(QUEUE);
+        let spawned = std::thread::Builder::new()
+            .name("blackwall-traces".into())
+            .spawn(move || {
+                for job in jobs {
+                    match job {
+                        Job::Run(run, spans, resource) => {
+                            if let Some(body) = finish_run(&run, spans, &resource) {
+                                FileSpanExporter.export(&run.path, body);
+                            }
+                        }
+                        Job::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            });
+        Self {
+            queue: Mutex::new(spawned.ok().map(|_| queue)),
+            dropped_runs: AtomicUsize::new(0),
+            #[cfg(test)]
+            _idle: Mutex::new(None),
+        }
+    }
+
+    /// A writer whose queue is never drained, to fill it in tests.
+    #[cfg(test)]
+    pub(super) fn idle(capacity: usize) -> Self {
+        let (queue, jobs) = mpsc::sync_channel::<Job>(capacity);
+        Self {
+            queue: Mutex::new(Some(queue)),
+            dropped_runs: AtomicUsize::new(0),
+            _idle: Mutex::new(Some(jobs)),
+        }
+    }
+
+    fn sender(&self) -> Option<mpsc::SyncSender<Job>> {
+        self.queue.lock().ok()?.clone()
+    }
+
+    /// Queue a finished run without blocking; a full queue drops it.
+    pub(super) fn submit(&self, run: Arc<RunState>, spans: Vec<SpanData>, resource: Resource) {
+        let sent = self
+            .sender()
+            .is_some_and(|queue| queue.try_send(Job::Run(run, spans, resource)).is_ok());
+        if !sent {
+            self.dropped_runs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_runs(&self) -> usize {
+        self.dropped_runs.load(Ordering::Relaxed)
+    }
+
+    /// Wait up to `timeout` for every queued run to be written.
+    fn flush(&self, timeout: Duration) {
+        let Some(queue) = self.sender() else {
+            return;
+        };
+        let (done, finished) = mpsc::sync_channel(1);
+        if queue.send(Job::Flush(done)).is_ok() {
+            let _ = finished.recv_timeout(timeout);
+        }
+    }
+
+    fn stop(&self, timeout: Duration) {
+        self.flush(timeout);
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.take();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct RunBufferProcessor {
     runs: Runs,
     resource: Resource,
-    files: FileSpanExporter,
+    writer: Writer,
 }
 
 impl RunBufferProcessor {
@@ -90,7 +184,7 @@ impl RunBufferProcessor {
         Self {
             runs,
             resource: Resource::builder_empty().build(),
-            files: FileSpanExporter,
+            writer: Writer::start(),
         }
     }
 }
@@ -118,16 +212,16 @@ impl SpanProcessor for RunBufferProcessor {
             .map(|mut spans| std::mem::take(&mut *spans))
             .unwrap_or_default();
         spans.push(span);
-        if let Some(body) = finish_run(&run, spans, &self.resource) {
-            self.files.export(&run.path, body);
-        }
+        self.writer.submit(run, spans, self.resource.clone());
     }
 
     fn force_flush(&self) -> OTelSdkResult {
+        self.writer.flush(Duration::from_secs(5));
         Ok(())
     }
 
-    fn shutdown_with_timeout(&self, _: Duration) -> OTelSdkResult {
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.writer.stop(timeout);
         Ok(())
     }
 
