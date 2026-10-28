@@ -47,6 +47,8 @@ a SmartScreen or Gatekeeper warning.
 - Owner-defined command tools and local MCP servers behind the same approvals, with MCP secrets
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
+- Local OpenTelemetry traces and usage metrics (tokens, durations, tool and run outcomes) for Chat,
+  Agent, and subagent runs, kept in the data folder and never sent anywhere ([Telemetry](docs/TELEMETRY.md))
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
   demand, run directly with `/name`, and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime

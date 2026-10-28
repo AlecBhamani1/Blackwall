@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Record usage metrics with OpenTelemetry: token usage and duration for every model call, tool
+  calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
+  in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,
+  or paths. See [Telemetry](docs/TELEMETRY.md).
+
+- Trace desktop Chat runs and subagent runs. A `spawn_agent` child appears in **Runs** and
+  `bw traces show` nested under the tool call that started it.
+
 - Enable Web access in desktop Chat to search the public web and read pages without selecting a
   project. Chat uses the same request approvals and network protections as Agent, and retains web
   results in conversation context.
@@ -36,6 +44,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
 ### Changed
+
+- Write traces through the OpenTelemetry SDK. A run's spans are held until it ends, then filtered
+  or scrubbed as a whole before they are written, so a secret seen late in a run is removed from
+  earlier spans too. With content capture off, failures show only their error class, and only
+  metadata attributes are kept. Existing trace files still list and open.
 
 - Show tool calls where they occur in the response, grouped into collapsible sections with
   individual arguments and results available on expansion.

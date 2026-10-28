@@ -177,6 +177,15 @@ proxies and automatic redirects, validates all resolved IPs, pins DNS results, r
 reserved ranges, and bounds response time and body size. Retrieved content is labeled untrusted.
 The current search implementation uses DuckDuckGo's HTML endpoint and can be unavailable or blocked.
 
+## Telemetry
+
+`core::telemetry` owns one OpenTelemetry `SdkTracerProvider` and `SdkMeterProvider` per process.
+Adapters start a `RunScope` for each Chat or Agent run and the core loops record spans and GenAI
+metrics through it. The provider's only span processor buffers a whole run, applies the content
+allowlist or the redaction scrub, and writes one OTLP/JSON file under `traces/`; a periodic reader
+appends delta metrics to `metrics/YYYY-MM-DD.jsonl`. `core::trace` only reads trace files back.
+Nothing leaves the data folder. See [Telemetry](TELEMETRY.md).
+
 ## Local data and app lock
 
 `~/.blackwall/blackwall.sqlite3` stores versioned sessions, preferences, and FTS5 memory. Native history
