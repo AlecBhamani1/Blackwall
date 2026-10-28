@@ -786,7 +786,10 @@ impl Agent<'_> {
         if self.workspace.original("AGENTS.override.md")?.is_some() {
             return Err(tools::ToolError::Changed.into());
         }
-        self.workspace.write_reviewed("AGENTS.md", None, content)?;
+        let (writer, body) = (self.workspace.clone(), content.to_owned());
+        tokio::task::spawn_blocking(move || writer.write_reviewed("AGENTS.md", None, &body))
+            .await
+            .map_err(|_| tools::ToolError::File)??;
         Ok("Created AGENTS.md from the reviewed proposal. Customize its commands and conventions for this project; it will be loaded on the next turn.".into())
     }
 }

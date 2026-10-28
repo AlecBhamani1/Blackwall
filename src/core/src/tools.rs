@@ -7,6 +7,7 @@ use crate::{
 use cap_std::fs::{Dir, OpenOptions};
 use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -199,6 +200,8 @@ impl Workspace {
         if content.len() > MAX_FILE {
             return Err(ToolError::Limit);
         }
+        // The comparison and replacement are one cross-process transaction for this workspace.
+        let _writing = workspace_write_lock(&self.path)?;
         if self.original(path)?.as_deref() != expected {
             return Err(ToolError::Changed);
         }
@@ -257,6 +260,34 @@ impl Workspace {
         names.sort();
         Ok(names.join("\n"))
     }
+}
+
+fn workspace_write_lock(path: &Path) -> Result<std::fs::File, ToolError> {
+    // Per user: a shared temporary folder would let another account block writes by owning it.
+    let directory = std::env::home_dir()
+        .map(|home| {
+            home.join(".cache")
+                .join("blackwall")
+                .join("workspace-locks")
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("blackwall-workspace-locks"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|_| ToolError::File)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&directory).map_err(|_| ToolError::File)?;
+    let digest: String = Sha256::digest(path.to_string_lossy().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    crate::policy::lock_owner_file(&directory, &format!("{digest}.lock"))
+        .map_err(|_| ToolError::File)
 }
 
 const SHELL_DESCRIPTION: &str = "Propose a shell command in the project directory. Requires approval and runs under the owner's execution profile. Approval does not bypass filesystem or network restrictions.";
@@ -326,7 +357,13 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            workspace.write_reviewed(path, original.as_deref(), content)?;
+            // The write may wait on another process's lock, so keep it off the async workers.
+            let (writer, target, body) = (workspace.clone(), path.to_owned(), content.to_owned());
+            tokio::task::spawn_blocking(move || {
+                writer.write_reviewed(&target, original.as_deref(), &body)
+            })
+            .await
+            .map_err(|_| ToolError::File)??;
             Ok(format!("Saved {path}"))
         }
         "shell" => {
@@ -705,6 +742,38 @@ mod tests {
                 .is_err());
         }
         // Close the directory handle first; Windows cannot delete an open directory.
+        drop(workspace);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn reviewed_write_rechecks_after_the_workspace_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "blackwall-tools-lock-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("file.txt"), "before").unwrap();
+        let workspace = Workspace::open(&path).unwrap();
+        let lock = workspace_write_lock(&workspace.path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let writer = workspace.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(writer.write_reviewed("file.txt", Some("before"), "agent"))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(result_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        std::fs::write(path.join("file.txt"), "concurrent").unwrap();
+        drop(lock);
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(ToolError::Changed)
+        ));
+        handle.join().unwrap();
+        assert_eq!(workspace.read("file.txt").unwrap(), "concurrent");
         drop(workspace);
         std::fs::remove_dir_all(path).unwrap();
     }
