@@ -67,18 +67,22 @@ fn percent(share: f64) -> String {
     format!("{:.1}%", share * 100.0)
 }
 
+fn count(value: u64, word: &str) -> String {
+    format!("{value} {word}{}", if value == 1 { "" } else { "s" })
+}
+
 fn group_line(row: &GroupRow, fallback: &str) -> String {
     let name = row.name.as_deref().unwrap_or(fallback);
     let runs = row
         .runs
-        .map(|runs| format!(", {runs} runs"))
+        .map(|runs| format!(", {}", count(runs, "run")))
         .unwrap_or_default();
     format!(
-        "  {name:<24} {:>8}  {:>6}{runs}, {} sessions, {} calls\n",
+        "  {name:<24} {:>8}  {:>6}{runs}, {}, {}\n",
         compact(row.total),
         percent(row.share),
-        row.sessions,
-        row.model_calls
+        count(row.sessions, "session"),
+        count(row.model_calls, "call")
     )
 }
 
@@ -173,11 +177,11 @@ pub fn text(summary: &UsageSummary, days: u16) -> String {
     out += "\nModes:\n";
     for row in &summary.per_mode {
         out += &format!(
-            "  {:<24} {:>8}  {} runs, {} calls\n",
+            "  {:<24} {:>8}  {}, {}\n",
             row.mode,
             compact(row.total),
-            row.runs,
-            row.model_calls
+            count(row.runs, "run"),
+            count(row.model_calls, "call")
         );
     }
     if !summary.tools.is_empty() {
