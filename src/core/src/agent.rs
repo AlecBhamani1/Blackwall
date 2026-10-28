@@ -1350,6 +1350,8 @@ mod tests {
             "{metrics}"
         );
         assert!(metrics.contains(r#"{"stringValue":"denied"}"#), "{metrics}");
+        // Windows keeps the project folder open while the agent's workspace handle lives.
+        drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]
