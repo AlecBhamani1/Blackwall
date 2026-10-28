@@ -217,8 +217,9 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: true,
-                trace: settings.trace,
+                trace: None,
             },
+            settings.trace,
             Some(input),
             memory.as_ref(),
             directory,
@@ -289,8 +290,9 @@ impl Conversation {
                 budget,
                 instructions,
                 compact: false,
-                trace: settings.trace,
+                trace: None,
             },
+            settings.trace,
             input,
             memory.as_ref(),
             directory,
@@ -377,11 +379,37 @@ fn scoped_key(endpoint: &str, configured: &str, key: Option<String>) -> Option<S
         .and(key)
 }
 
+/// The process's telemetry, started on the first run and flushed when bw exits.
+static TELEMETRY: std::sync::OnceLock<blackwall_core::telemetry::Telemetry> =
+    std::sync::OnceLock::new();
+
+fn run_scope(
+    directory: &Path,
+    trace: blackwall_core::trace::TraceOptions,
+    request_id: &str,
+) -> blackwall_core::telemetry::RunScope {
+    use blackwall_core::telemetry::{Mode, Surface, Telemetry, TelemetryOptions};
+    let telemetry = TELEMETRY.get_or_init(|| {
+        Telemetry::start(directory, TelemetryOptions::from_trace(trace, Surface::Cli))
+    });
+    telemetry.set_options(trace);
+    telemetry.run(request_id, Mode::Agent)
+}
+
+/// Write any buffered metrics before bw exits.
+pub fn shutdown_telemetry() {
+    if let Some(telemetry) = TELEMETRY.get() {
+        telemetry.clone().shutdown();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     backend: &HttpModel,
     workspace: Workspace,
     web_enabled: bool,
-    run: ContextRun,
+    mut run: ContextRun,
+    trace: blackwall_core::trace::TraceOptions,
     mut input: Option<&mut Input>,
     memory: Option<&MemoryTools>,
     directory: &Path,
@@ -400,6 +428,7 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    run.trace = Some(run_scope(directory, trace, &request_id));
     let work = agent.run_context_with_guidance(&request_id, run, memory, Some(directory));
     tokio::pin!(work);
     let mut answer = String::new();

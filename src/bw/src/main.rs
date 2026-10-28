@@ -90,6 +90,7 @@ fn main() -> ExitCode {
         }
     };
     let result = runtime.block_on(run());
+    session::shutdown_telemetry();
     runtime.shutdown_background();
     match result {
         Ok(()) => ExitCode::SUCCESS,

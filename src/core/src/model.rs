@@ -62,6 +62,10 @@ pub trait ModelBackend: Send + Sync {
     fn model_name(&self) -> Option<&str> {
         None
     }
+    /// The model server's endpoint, recorded as `server.address` in usage metrics.
+    fn server_address(&self) -> Option<&str> {
+        None
+    }
     fn generate<'a>(
         &'a self,
         messages: &'a [Value],
@@ -116,6 +120,9 @@ impl ModelBackend for HttpModel {
     }
     fn model_name(&self) -> Option<&str> {
         Some(&self.model)
+    }
+    fn server_address(&self) -> Option<&str> {
+        Some(&self.endpoint)
     }
     fn generate<'a>(
         &'a self,

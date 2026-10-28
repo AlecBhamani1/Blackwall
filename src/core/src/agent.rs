@@ -27,6 +27,28 @@ pub enum AgentError {
     #[error(transparent)]
     Tool(#[from] tools::ToolError),
 }
+impl AgentError {
+    /// A stable error class for traces and metrics, without any message text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Budget(error) => error.kind(),
+            Self::Model(error) => error.kind(),
+            Self::Review(_) => "review",
+            Self::Iterations => "iterations",
+            Self::Context => "context",
+            Self::Instructions => "instructions",
+            Self::Tool(error) => error.kind(),
+        }
+    }
+
+    fn outcome(&self) -> crate::telemetry::RunOutcome {
+        match self {
+            Self::Iterations => crate::telemetry::RunOutcome::Iterations,
+            Self::Tool(tools::ToolError::Denied) => crate::telemetry::RunOutcome::Denied,
+            _ => crate::telemetry::RunOutcome::Error,
+        }
+    }
+}
 struct RunGuard {
     approvals: Approvals,
     request_id: String,
@@ -103,25 +125,28 @@ impl Agent<'_> {
         memory: Option<&crate::memory::MemoryTools>,
         user_directory: Option<&std::path::Path>,
     ) -> Result<String, AgentError> {
-        // The guard writes the trace when the run ends, fails, or is cancelled.
-        let mut tracing = user_directory
-            .and_then(|directory| crate::trace::Trace::start(directory, request_id, run.trace))
-            .map(|trace| crate::trace::TraceGuard {
-                trace,
-                outcome: None,
-            });
-        if let (Some(guard), Some(model)) = (&tracing, self.backend.model_name()) {
-            let root = guard.trace.root();
-            guard
-                .trace
-                .set(&root, vec![("gen_ai.request.model".into(), json!(model))]);
+        // A scope dropped with the cancelled future is written as stopped.
+        let mut run = run;
+        let scope = run.trace.take();
+        if let (Some(scope), Some(model)) = (&scope, self.backend.model_name()) {
+            scope.set(
+                &scope.root(),
+                vec![("gen_ai.request.model".into(), json!(model))],
+            );
         }
-        let trace = tracing.as_ref().map(|guard| &guard.trace);
         let result = self
-            .run_traced(request_id, run, memory, user_directory, trace)
+            .run_traced(request_id, run, memory, user_directory, scope.as_ref())
             .await;
-        if let Some(guard) = &mut tracing {
-            guard.outcome = Some(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        if let Some(scope) = scope {
+            match &result {
+                Ok(_) => scope.finish(crate::telemetry::RunOutcome::Complete),
+                Err(error) => {
+                    let root = scope.root();
+                    scope.set(&root, vec![("error.type".into(), json!(error.kind()))]);
+                    scope.end(&root, Some(&error.to_string()));
+                    scope.finish(error.outcome());
+                }
+            }
         }
         result
     }
@@ -132,7 +157,7 @@ impl Agent<'_> {
         run: crate::context::ContextRun,
         memory: Option<&crate::memory::MemoryTools>,
         user_directory: Option<&std::path::Path>,
-        trace: Option<&crate::trace::Trace>,
+        trace: Option<&crate::telemetry::RunScope>,
     ) -> Result<String, AgentError> {
         let crate::context::ContextRun {
             source,
@@ -393,17 +418,7 @@ impl Agent<'_> {
                 answer.push_str("\n\n");
             }
             let model = self.backend.model_name().unwrap_or("model");
-            let model_span = trace.map(|trace| {
-                trace.begin(
-                    &trace.root(),
-                    &format!("chat {model}"),
-                    3,
-                    vec![
-                        ("gen_ai.operation.name".into(), json!("chat")),
-                        ("gen_ai.request.model".into(), json!(model)),
-                    ],
-                )
-            });
+            let model_call = trace.map(|trace| trace.begin_model_call(&trace.root(), model));
             let turn = self
                 .backend
                 .generate(&messages, &definitions, &mut |delta| {
@@ -413,41 +428,20 @@ impl Agent<'_> {
                     });
                 })
                 .await;
-            if let (Some(trace), Some(span)) = (trace, &model_span) {
-                match &turn {
-                    Ok(turn) => {
-                        let mut attributes = vec![(
-                            "gen_ai.response.finish_reasons".into(),
-                            json!([if turn.calls.is_empty() {
-                                "stop"
-                            } else {
-                                "tool_calls"
-                            }]),
-                        )];
-                        if let Some(usage) = turn.usage {
-                            attributes.push((
-                                "gen_ai.usage.input_tokens".into(),
-                                json!(usage.prompt_tokens),
-                            ));
-                            attributes.push((
-                                "gen_ai.usage.output_tokens".into(),
-                                json!(usage.completion_tokens),
-                            ));
-                        }
-                        if trace.content && !turn.content.is_empty() {
-                            attributes.push((
-                                "gen_ai.output.messages".into(),
-                                json!(json!([{"role":"assistant","parts":[{"type":"text","content":trace.clip(&turn.content)}]}]).to_string()),
-                            ));
-                        }
-                        trace.set(span, attributes);
-                        trace.end(span, None);
-                    }
-                    Err(error) => {
-                        trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
-                        trace.end(span, Some(&error.to_string()));
-                    }
-                }
+            if let (Some(trace), Some(call)) = (trace, model_call) {
+                let message = turn.as_ref().err().map(ToString::to_string);
+                trace.end_model_call(
+                    call,
+                    trace.mode(),
+                    self.backend.server_address().unwrap_or_default(),
+                    match (&turn, &message) {
+                        (Ok(turn), _) => Ok(crate::telemetry::ModelReply::of(turn)),
+                        (Err(error), message) => Err(crate::telemetry::ModelFailure::of(
+                            error,
+                            message.as_deref().unwrap_or_default(),
+                        )),
+                    },
+                );
             }
             let turn = turn?;
             answer.push_str(&turn.content);
@@ -550,7 +544,7 @@ impl Agent<'_> {
                                     }),
                                 ),
                             ];
-                            if trace.content {
+                            if trace.content() {
                                 attributes.push((
                                     "gen_ai.tool.call.arguments".into(),
                                     json!(trace.clip(&call.function.arguments)),
@@ -650,6 +644,7 @@ impl Agent<'_> {
                                 args["context"].as_str().unwrap_or(""),
                                 self.emit.clone(),
                                 guidance.clone(),
+                                trace.zip(tool_span.as_ref()),
                             )
                             .await
                             .map_err(tools::ToolError::Execution)
@@ -685,6 +680,12 @@ impl Agent<'_> {
                             .await
                         };
                         let success = result.is_ok();
+                        if let Some(trace) = trace {
+                            trace.record_tool(
+                                &call.function.name,
+                                crate::telemetry::ToolOutcome::of(&result),
+                            );
+                        }
                         if let (Some(trace), Some(span), Err(error)) =
                             (trace, &tool_span, &result)
                         {
@@ -697,7 +698,7 @@ impl Agent<'_> {
                         let quiet_error = matches!(&result, Err(tools::ToolError::Execution(_)));
                         let output = result.unwrap_or_else(|error| error.to_string());
                         if let (Some(trace), Some(span)) = (trace, &tool_span) {
-                            if trace.content {
+                            if trace.content() {
                                 trace.set(
                                     span,
                                     vec![(
@@ -706,7 +707,7 @@ impl Agent<'_> {
                                     )],
                                 );
                             }
-                            let error = if quiet_error && !trace.content {
+                            let error = if quiet_error && !trace.content() {
                                 "The tool reported an error."
                             } else {
                                 output.as_str()
@@ -961,18 +962,23 @@ mod tests {
                 }),
             };
             let source = vec![json!({"role":"user","content":"Read the notes."})];
+            let request = format!("traced-{content}");
+            let telemetry = crate::telemetry::Telemetry::start(
+                &directory.join("user"),
+                crate::telemetry::TelemetryOptions {
+                    traces: true,
+                    content,
+                    ..Default::default()
+                },
+            );
             let run = crate::context::ContextRun {
                 state: crate::context::ContextState::restore(&source, None).unwrap(),
                 source,
                 budget: Default::default(),
                 instructions: vec![],
                 compact: false,
-                trace: crate::trace::TraceOptions {
-                    enabled: true,
-                    content,
-                },
+                trace: Some(telemetry.run(&request, crate::telemetry::Mode::Agent)),
             };
-            let request = format!("traced-{content}");
             agent
                 .run_context_with_guidance(&request, run, None, Some(&directory.join("user")))
                 .await
@@ -1058,6 +1064,193 @@ mod tests {
             before
         );
         drop(agent);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// Calls `spawn_agent`, answers the child, then finishes; the parent and child share it.
+    struct Delegating {
+        step: Mutex<usize>,
+    }
+    impl ModelBackend for Delegating {
+        fn model_name(&self) -> Option<&str> {
+            Some("fixture-model")
+        }
+        fn server_address(&self) -> Option<&str> {
+            Some("http://127.0.0.1:11434/v1")
+        }
+        fn generate<'a>(
+            &'a self,
+            _: &'a [Value],
+            _: &'a [Value],
+            _: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                let usage = Some(TokenUsage {
+                    prompt_tokens: 50,
+                    completion_tokens: 5,
+                    total_tokens: 55,
+                });
+                Ok(match *step {
+                    1 => ModelTurn {
+                        content: String::new(),
+                        calls: vec![
+                            ToolCall {
+                                id: "child".into(),
+                                function: ToolFunction {
+                                    name: "spawn_agent".into(),
+                                    arguments: r#"{"goal":"Find ARG-SENTINEL","context":""}"#
+                                        .into(),
+                                },
+                            },
+                            ToolCall {
+                                id: "list".into(),
+                                function: ToolFunction {
+                                    name: "spawn_agent".into(),
+                                    arguments: r#"{"goal":"","context":""}"#.into(),
+                                },
+                            },
+                        ],
+                        usage,
+                    },
+                    2 => ModelTurn {
+                        content: "Child found notes.txt with api_key=supersecret1.".into(),
+                        calls: vec![],
+                        usage,
+                    },
+                    _ => ModelTurn {
+                        content: "Done.".into(),
+                        calls: vec![],
+                        usage,
+                    },
+                })
+            })
+        }
+    }
+    async fn delegated_run(directory: &std::path::Path, content: bool) -> String {
+        std::fs::create_dir_all(directory.join("project")).unwrap();
+        std::fs::create_dir_all(directory.join("user")).unwrap();
+        let telemetry = crate::telemetry::Telemetry::start(
+            &directory.join("user"),
+            crate::telemetry::TelemetryOptions {
+                traces: true,
+                content,
+                ..Default::default()
+            },
+        );
+        let agent = Agent {
+            backend: &Delegating {
+                step: Mutex::new(0),
+            },
+            workspace: Workspace::open(&directory.join("project")).unwrap(),
+            web_enabled: false,
+            approvals: Approvals::default(),
+            emit: Arc::new(|_| {}),
+        };
+        let source =
+            vec![json!({"role":"user","content":"PROMPT-SENTINEL token=supersecret1, delegate."})];
+        let run = crate::context::ContextRun {
+            state: crate::context::ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: Default::default(),
+            instructions: vec![],
+            compact: false,
+            trace: Some(telemetry.run("delegated", crate::telemetry::Mode::Agent)),
+        };
+        agent
+            .run_context_with_guidance("delegated", run, None, Some(&directory.join("user")))
+            .await
+            .unwrap();
+        telemetry.shutdown();
+        crate::trace::list(&directory.join("user"), 1).remove(0).id
+    }
+    #[tokio::test]
+    async fn subagent_spans_are_children_of_spawn_agent() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-subagent-{}", rand::random::<u64>()));
+        let id = delegated_run(&directory, false).await;
+        let spans = crate::trace::read(&directory.join("user"), &id).unwrap();
+        let spawns: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "execute_tool spawn_agent")
+            .collect();
+        assert_eq!(spawns.len(), 2);
+        let children: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "invoke_agent subagent")
+            .collect();
+        // The empty goal is rejected before a child starts.
+        assert_eq!(children.len(), 1);
+        let child = children[0];
+        let parent = spawns
+            .iter()
+            .find(|spawn| child.parent.as_deref() == Some(spawn.id.as_str()))
+            .expect("the child sits under its spawn_agent span");
+        assert!(parent.error.is_none());
+        assert_eq!(child.attributes["gen_ai.operation.name"], "invoke_agent");
+        assert!(child.attributes["gen_ai.agent.id"]
+            .as_str()
+            .unwrap()
+            .starts_with("child_"));
+        let child_chat: Vec<_> = spans
+            .iter()
+            .filter(|span| span.parent.as_deref() == Some(child.id.as_str()))
+            .collect();
+        assert_eq!(child_chat.len(), 1);
+        assert_eq!(child_chat[0].name, "chat fixture-model");
+        assert_eq!(child_chat[0].attributes["gen_ai.usage.input_tokens"], 50);
+        // Parent chat spans stay under the root.
+        let root = spans.iter().find(|span| span.parent.is_none()).unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "chat fixture-model"
+                    && span.parent.as_deref() == Some(root.id.as_str()))
+                .count(),
+            2
+        );
+        let metrics = std::fs::read_dir(directory.join("user/metrics"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(
+            metrics.contains(r#"{"stringValue":"subagent"}"#),
+            "{metrics}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[tokio::test]
+    async fn metrics_never_contain_prompt_or_arguments() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-metrics-{}", rand::random::<u64>()));
+        // Content capture on: the trace may hold redacted content, the metrics never do.
+        let id = delegated_run(&directory, true).await;
+        let trace = std::fs::read_to_string(
+            directory
+                .join("user")
+                .join(crate::trace::TRACE_DIRECTORY)
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        assert!(
+            trace.contains("ARG-SENTINEL"),
+            "content capture records arguments"
+        );
+        assert!(!trace.contains("supersecret1"), "{trace}");
+        let metrics = std::fs::read_dir(directory.join("user/metrics"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(metrics.contains("gen_ai.client.token.usage"));
+        for leak in [
+            "PROMPT-SENTINEL",
+            "ARG-SENTINEL",
+            "supersecret1",
+            "notes.txt",
+            &directory.to_string_lossy(),
+        ] {
+            assert!(!metrics.contains(leak), "{leak} in {metrics}");
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]

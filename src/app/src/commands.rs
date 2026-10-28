@@ -396,11 +396,52 @@ pub(crate) async fn chat(
     let selected =
         selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
     let api_key = scoped_api_key(&state, &selected).await?;
-    tokio::select! {
+    // Dropped with a stopped request, the scope is written as cancelled.
+    let scope = crate::data::run_scope(
+        &app,
+        &request.request_id,
+        blackwall_core::telemetry::Mode::Chat,
+    )
+    .await;
+    let model = request.model.clone();
+    let call = scope.as_ref().map(|scope| {
+        let root = scope.root();
+        scope.rename(&root, &format!("chat {model}"));
+        scope.begin_model_call(&root, &model)
+    });
+    let result = tokio::select! {
         biased;
         _ = job.cancelled() => Err(CommandError { code: "request_stopped", message: "Response stopped.".into(), retryable: false }),
         response = complete_chat(&state.client, api_key.as_deref(), &state.default_endpoint, request) => response.map_err(CommandError::from),
+    };
+    if let (Some(scope), Some(call)) = (&scope, call) {
+        scope.end_model_call(
+            call,
+            blackwall_core::telemetry::Mode::Chat,
+            &selected,
+            match &result {
+                Ok(response) => Ok(blackwall_core::telemetry::ModelReply {
+                    usage: response.usage.as_ref(),
+                    tool_calls: false,
+                    content: &response.message.content,
+                }),
+                Err(error) => Err(blackwall_core::telemetry::ModelFailure {
+                    kind: error.code,
+                    message: &error.message,
+                }),
+            },
+        );
     }
+    if let Some(scope) = scope {
+        scope.finish(match &result {
+            Ok(_) => blackwall_core::telemetry::RunOutcome::Complete,
+            Err(error) if error.code == "request_stopped" => {
+                blackwall_core::telemetry::RunOutcome::Cancelled
+            }
+            Err(_) => blackwall_core::telemetry::RunOutcome::Error,
+        });
+    }
+    result
 }
 
 #[derive(Default, Deserialize)]
@@ -538,7 +579,8 @@ pub(crate) async fn stream_chat(
             })?;
         #[cfg(target_os = "macos")]
         crate::lifecycle::login_path_settled().await;
-        let trace = crate::data::trace_options(instruction_directory.clone()).await;
+        let trace =
+            crate::data::run_scope(&app, &request_id, blackwall_core::telemetry::Mode::Agent).await;
         workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
             profile: options.execution_profile,
             network: options.command_network,
@@ -749,7 +791,12 @@ async fn stream_chat_events(
         budget: request.context_budget,
         instructions,
         compact: request.compact,
-        trace: Default::default(),
+        trace: crate::data::run_scope(
+            app,
+            &request.request_id,
+            blackwall_core::telemetry::Mode::Chat,
+        )
+        .await,
     };
     let emit = |event| {
         let _ = emit_event(app, &event);

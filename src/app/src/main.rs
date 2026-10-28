@@ -38,7 +38,8 @@ fn run() -> Result<(), StartupError> {
         .manage(setup::SetupState::default())
         .manage(agent_commands::AgentState::default())
         .manage(auth::AuthState::default())
-        .manage(pairing::PairingState::default());
+        .manage(pairing::PairingState::default())
+        .manage(data::TelemetryState::default());
     #[cfg(target_os = "macos")]
     let builder = builder.on_window_event(lifecycle::on_window_event);
     let app = builder
@@ -116,10 +117,13 @@ fn run() -> Result<(), StartupError> {
             commands::stop_share,
         ])
         .build(context)?;
-    #[cfg(target_os = "macos")]
-    app.run(lifecycle::on_run_event);
-    #[cfg(not(target_os = "macos"))]
-    app.run(|_, _| {});
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            tauri::Manager::state::<data::TelemetryState>(handle).shutdown();
+        }
+        #[cfg(target_os = "macos")]
+        lifecycle::on_run_event(handle, event);
+    });
     Ok(())
 }
 

@@ -192,6 +192,22 @@ pub enum ContextError {
     Model(#[from] ModelError),
 }
 
+impl ContextError {
+    /// A stable error class for traces and metrics, without any message text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::Limit => "context_limit",
+            Self::History => "history",
+            Self::Summary => "summary",
+            Self::Nothing => "nothing_to_compact",
+            Self::Iterations => "iterations",
+            Self::Approval(_) => "approval",
+            Self::Model(error) => error.kind(),
+        }
+    }
+}
+
 /// Reject orphan results, incomplete pairs, duplicate pending call IDs, and invalid roles.
 pub fn validate_history(messages: &[Value]) -> Result<(), ContextError> {
     let mut pending = std::collections::HashSet::new();
@@ -450,8 +466,8 @@ pub struct ContextRun {
     pub budget: ContextBudget,
     pub instructions: Vec<Value>,
     pub compact: bool,
-    /// Owner trace settings; recorded only when the adapter also supplies the data folder.
-    pub trace: crate::trace::TraceOptions,
+    /// This run's telemetry, from the adapter's `Telemetry::run`; `None` records nothing.
+    pub trace: Option<crate::telemetry::RunScope>,
 }
 
 /// Shared tool-free chat/compaction path. Unexpected calls are rejected entirely.
@@ -492,9 +508,43 @@ pub async fn chat_with_web(
 async fn chat_inner(
     backend: &dyn ModelBackend,
     request_id: &str,
+    mut run: ContextRun,
+    approvals: Option<&crate::approvals::Approvals>,
+    emit: &(dyn Fn(crate::protocol::AgentEvent) + Send + Sync),
+) -> Result<String, ContextError> {
+    // A scope dropped with the cancelled future is written as stopped.
+    let scope = run.trace.take();
+    if let Some(scope) = &scope {
+        let model = backend.model_name().unwrap_or("model");
+        let root = scope.root();
+        scope.rename(&root, &format!("chat {model}"));
+        scope.set(&root, vec![("gen_ai.request.model".into(), json!(model))]);
+    }
+    let result = chat_traced(backend, request_id, run, approvals, emit, scope.as_ref()).await;
+    if let Some(scope) = scope {
+        match &result {
+            Ok(_) => scope.finish(crate::telemetry::RunOutcome::Complete),
+            Err(error) => {
+                let root = scope.root();
+                scope.set(&root, vec![("error.type".into(), json!(error.kind()))]);
+                scope.end(&root, Some(&error.to_string()));
+                scope.finish(match error {
+                    ContextError::Iterations => crate::telemetry::RunOutcome::Iterations,
+                    _ => crate::telemetry::RunOutcome::Error,
+                });
+            }
+        }
+    }
+    result
+}
+
+async fn chat_traced(
+    backend: &dyn ModelBackend,
+    request_id: &str,
     run: ContextRun,
     approvals: Option<&crate::approvals::Approvals>,
     emit: &(dyn Fn(crate::protocol::AgentEvent) + Send + Sync),
+    trace: Option<&crate::telemetry::RunScope>,
 ) -> Result<String, ContextError> {
     let ContextRun {
         source,
@@ -554,6 +604,8 @@ async fn chat_inner(
                 delta: "\n\n".into(),
             });
         }
+        let model = backend.model_name().unwrap_or("model");
+        let model_call = trace.map(|trace| trace.begin_model_call(&trace.root(), model));
         let turn = backend
             .generate(&messages, &definitions, &mut |delta| {
                 emit(AgentEvent::AssistantDelta {
@@ -561,7 +613,23 @@ async fn chat_inner(
                     delta,
                 })
             })
-            .await?;
+            .await;
+        if let (Some(trace), Some(call)) = (trace, model_call) {
+            let message = turn.as_ref().err().map(ToString::to_string);
+            trace.end_model_call(
+                call,
+                trace.mode(),
+                backend.server_address().unwrap_or_default(),
+                match (&turn, &message) {
+                    (Ok(turn), _) => Ok(crate::telemetry::ModelReply::of(turn)),
+                    (Err(error), message) => Err(crate::telemetry::ModelFailure::of(
+                        error,
+                        message.as_deref().unwrap_or_default(),
+                    )),
+                },
+            );
+        }
+        let turn = turn?;
         state.server_usage = turn.usage;
         if let Some(count) = turn.usage {
             let total = usage.get_or_insert_with(TokenUsage::default);
@@ -584,6 +652,26 @@ async fn chat_inner(
                     arguments: call.function.arguments.clone(),
                 });
                 // Enforce the allowlist even if a model invents a file, shell, MCP, or agent call.
+                let tool = trace.map(|trace| {
+                    let mut attributes = vec![
+                        ("gen_ai.operation.name".into(), json!("execute_tool")),
+                        ("gen_ai.tool.name".into(), json!(call.function.name)),
+                        ("gen_ai.tool.call.id".into(), json!(call.id)),
+                        ("gen_ai.tool.type".into(), json!("function")),
+                    ];
+                    if trace.content() {
+                        attributes.push((
+                            "gen_ai.tool.call.arguments".into(),
+                            json!(trace.clip(&call.function.arguments)),
+                        ));
+                    }
+                    trace.begin(
+                        &trace.root(),
+                        &format!("execute_tool {}", call.function.name),
+                        1,
+                        attributes,
+                    )
+                });
                 let result = if definitions
                     .iter()
                     .any(|definition| definition["function"]["name"] == call.function.name)
@@ -592,6 +680,26 @@ async fn chat_inner(
                 } else {
                     Err(crate::tools::ToolError::Denied)
                 };
+                if let (Some(trace), Some(span)) = (trace, &tool) {
+                    trace.record_tool(
+                        &call.function.name,
+                        crate::telemetry::ToolOutcome::of(&result),
+                    );
+                    if let Err(error) = &result {
+                        trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
+                    }
+                    let text = match &result {
+                        Ok(text) => text.clone(),
+                        Err(error) => error.to_string(),
+                    };
+                    if trace.content() {
+                        trace.set(
+                            span,
+                            vec![("gen_ai.tool.call.result".into(), json!(trace.clip(&text)))],
+                        );
+                    }
+                    trace.end(span, result.is_err().then_some(text.as_str()));
+                }
                 let success = result.is_ok();
                 let output = result.unwrap_or_else(|error| error.to_string());
                 emit(AgentEvent::ToolResult {
@@ -712,6 +820,59 @@ mod tests {
             json!({"role":"user","content":"Finish the unfinished task"}),
         ]
     }
+    #[tokio::test]
+    async fn chat_mode_writes_a_trace() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-chat-trace-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let telemetry = crate::telemetry::Telemetry::start(
+            &directory,
+            crate::telemetry::TelemetryOptions {
+                traces: true,
+                ..Default::default()
+            },
+        );
+        let source = vec![json!({"role":"user","content":"Hello PROMPT-SENTINEL"})];
+        let model = backend("Hi there.".into());
+        let run = ContextRun {
+            state: ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: model.budget,
+            instructions: vec![],
+            compact: false,
+            trace: Some(telemetry.run("chat-1", crate::telemetry::Mode::Chat)),
+        };
+        assert_eq!(
+            chat(&model, "chat-1", run, &|_| {}).await.unwrap(),
+            "Hi there."
+        );
+        telemetry.shutdown();
+        let summaries = crate::trace::list(&directory, 10);
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].id.ends_with("-chat-1"));
+        assert_eq!(summaries[0].model_calls, 1);
+        assert!(summaries[0].error.is_none());
+        let spans = crate::trace::read(&directory, &summaries[0].id).unwrap();
+        let root = spans.iter().find(|span| span.parent.is_none()).unwrap();
+        assert_eq!(root.name, "chat model");
+        assert_eq!(root.attributes["blackwall.mode"], "chat");
+        let call = spans.iter().find(|span| span.parent.is_some()).unwrap();
+        assert_eq!(call.attributes["gen_ai.operation.name"], "chat");
+        assert_eq!(
+            call.attributes["gen_ai.response.finish_reasons"],
+            json!(["stop"])
+        );
+        let metrics = std::fs::read_dir(directory.join(crate::telemetry::METRICS_DIRECTORY))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(metrics.contains("gen_ai.client.operation.duration"));
+        assert!(metrics.contains(r#"{"stringValue":"chat"}"#));
+        assert!(metrics.contains(r#""blackwall.run.outcome","value":{"stringValue":"complete"}"#));
+        assert!(!metrics.contains("PROMPT-SENTINEL"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn web_chat_compaction_never_exposes_tools_or_replays_historical_calls() {
         let source = history();

@@ -2,6 +2,7 @@
 use crate::{
     model::ModelBackend,
     protocol::{AgentEvent, SubagentState},
+    telemetry::{Mode, RunScope, SpanId},
     tools::Workspace,
 };
 use serde_json::{json, Value};
@@ -48,10 +49,12 @@ pub async fn run(
         context,
         emit,
         instructions,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_instructions(
     backend: &dyn ModelBackend,
     workspace: &Workspace,
@@ -60,11 +63,26 @@ pub(crate) async fn run_with_instructions(
     context: &str,
     emit: Arc<dyn Fn(AgentEvent) + Send + Sync>,
     mut instructions: crate::instructions::Instructions,
+    trace: Option<(&RunScope, &SpanId)>,
 ) -> Result<String, String> {
     if goal.trim().is_empty() || goal.len() > 8000 || context.len() > 16000 {
         return Err("The child task is empty or too large.".into());
     }
     let id = format!("child_{:016x}", rand::random::<u64>());
+    // The child's own spans sit under `invoke_agent subagent`, under the parent's tool span.
+    let traced = trace.map(|(trace, parent)| {
+        let span = trace.begin(
+            parent,
+            "invoke_agent subagent",
+            1,
+            vec![
+                ("gen_ai.operation.name".into(), json!("invoke_agent")),
+                ("gen_ai.agent.name".into(), json!("subagent")),
+                ("gen_ai.agent.id".into(), json!(id)),
+            ],
+        );
+        (trace, span)
+    });
     let mut guard = ChildGuard {
         emit: emit.clone(),
         parent: parent.into(),
@@ -97,7 +115,25 @@ pub(crate) async fn run_with_instructions(
         for _ in 0..8 {
             if serde_json::to_vec(&messages).map_err(|_| "Invalid child context.")?.len() > 8 * 1024 * 1024 { return Err("The child task reached its context size limit.".into()); }
             backend.context_budget().check(&messages, &definitions).map_err(|error|error.to_string())?;
-            let turn=backend.generate(&messages,&definitions,&mut |_|{}).await.map_err(|error|error.to_string())?;
+            let model = backend.model_name().unwrap_or("model");
+            let model_call = traced.as_ref().map(|(trace, parent)| trace.begin_model_call(parent, model));
+            let turn = backend.generate(&messages, &definitions, &mut |_| {}).await;
+            if let (Some((trace, _)), Some(call)) = (&traced, model_call) {
+                let message = turn.as_ref().err().map(ToString::to_string);
+                trace.end_model_call(
+                    call,
+                    Mode::Subagent,
+                    backend.server_address().unwrap_or_default(),
+                    match (&turn, &message) {
+                        (Ok(turn), _) => Ok(crate::telemetry::ModelReply::of(turn)),
+                        (Err(error), message) => Err(crate::telemetry::ModelFailure::of(
+                            error,
+                            message.as_deref().unwrap_or_default(),
+                        )),
+                    },
+                );
+            }
+            let turn = turn.map_err(|error| error.to_string())?;
             if turn.calls.is_empty(){return Ok(turn.content.chars().take(32000).collect());}
             messages.push(json!({"role":"assistant","content":turn.content,"tool_calls":turn.calls.iter().map(|call|call.as_json()).collect::<Vec<_>>()}));
             let project = workspace.clone();
@@ -119,12 +155,44 @@ pub(crate) async fn run_with_instructions(
             for call in turn.calls {
                 let arguments:Value=serde_json::from_str(&call.function.arguments).map_err(|_|"Invalid child tool arguments.")?;
                 let path=arguments.get("path").and_then(Value::as_str).unwrap_or("");
-                let output=match call.function.name.as_str(){"read_file"=>workspace.read(path),"list_files"=>workspace.list(path),_=>Err(crate::tools::ToolError::Denied)}.unwrap_or_else(|error|error.to_string());
+                let tool = traced.as_ref().map(|(trace, parent)| {
+                    let mut attributes = vec![
+                        ("gen_ai.operation.name".into(), json!("execute_tool")),
+                        ("gen_ai.tool.name".into(), json!(call.function.name)),
+                        ("gen_ai.tool.call.id".into(), json!(call.id)),
+                        ("gen_ai.tool.type".into(), json!("function")),
+                    ];
+                    if trace.content() {
+                        attributes.push(("gen_ai.tool.call.arguments".into(), json!(trace.clip(&call.function.arguments))));
+                    }
+                    trace.begin(parent, &format!("execute_tool {}", call.function.name), 1, attributes)
+                });
+                let result=match call.function.name.as_str(){"read_file"=>workspace.read(path),"list_files"=>workspace.list(path),_=>Err(crate::tools::ToolError::Denied)};
+                if let (Some((trace, _)), Some(span)) = (&traced, &tool) {
+                    trace.record_tool(&call.function.name, crate::telemetry::ToolOutcome::of(&result));
+                    if let Err(error) = &result {
+                        trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
+                    }
+                    if trace.content() {
+                        let text = match &result { Ok(text) => text.clone(), Err(error) => error.to_string() };
+                        trace.set(span, vec![("gen_ai.tool.call.result".into(), json!(trace.clip(&text)))]);
+                    }
+                    trace.end(span, result.as_ref().err().map(ToString::to_string).as_deref());
+                }
+                let output=result.unwrap_or_else(|error|error.to_string());
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":output}));
             }
         }Err("The child reached its eight-step limit.".into())
     }.await;
     guard.finished = true;
+    if let Some((trace, span)) = &traced {
+        if let Err(error) = &result {
+            trace.set(span, vec![("error.type".into(), json!("_OTHER"))]);
+            trace.end(span, Some(error));
+        } else {
+            trace.end(span, None);
+        }
+    }
     let (state, summary) = match &result {
         Ok(text) => (SubagentState::Completed, text.chars().take(4000).collect()),
         Err(error) => (SubagentState::Failed, error.clone()),
