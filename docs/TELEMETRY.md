@@ -65,11 +65,12 @@ offered) and
 
 **Spans:** `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.agent.id` (subagents),
 `gen_ai.request.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`,
-`gen_ai.usage.output_tokens`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.type`,
+`gen_ai.usage.output_tokens`, `gen_ai.tool.name`, `gen_ai.tool.type`,
 `error.type`, `blackwall.request_id`, `blackwall.mode`, `blackwall.compaction`, and
 `approval_requested` events with
 `blackwall.approval.kind`. With content capture on, spans may also carry
-`gen_ai.output.messages`, `gen_ai.tool.call.arguments`, and `gen_ai.tool.call.result`.
+`gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and
+`gen_ai.tool.call.id`, which the model writes and so is treated as content.
 
 ## What is never recorded
 

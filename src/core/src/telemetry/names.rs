@@ -56,8 +56,9 @@ pub const CONTENT_KEYS: [&str; 6] = [
 ];
 
 /// With content capture off, only these span and event attributes leave the processor. Anything
-/// else, including any content key above or reasoning text, is dropped.
-pub const METADATA_KEYS: [&str; 17] = [
+/// else, including any content key above, reasoning text, and the model-written
+/// `gen_ai.tool.call.id`, is dropped.
+pub const METADATA_KEYS: [&str; 16] = [
     GEN_AI_OPERATION_NAME,
     GEN_AI_AGENT_NAME,
     GEN_AI_AGENT_ID,
@@ -67,7 +68,6 @@ pub const METADATA_KEYS: [&str; 17] = [
     GEN_AI_USAGE_INPUT_TOKENS,
     GEN_AI_USAGE_OUTPUT_TOKENS,
     GEN_AI_TOOL_NAME,
-    GEN_AI_TOOL_CALL_ID,
     GEN_AI_TOOL_TYPE,
     SERVER_ADDRESS,
     ERROR_TYPE,

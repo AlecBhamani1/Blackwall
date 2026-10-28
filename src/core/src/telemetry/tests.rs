@@ -313,6 +313,7 @@ fn content_keys_filtered_in_processor() {
             ),
             ("gen_ai.output.messages".into(), json!("OUTPUT-SENTINEL")),
             ("gen_ai.tool.call.arguments".into(), json!("ARG-SENTINEL")),
+            ("gen_ai.tool.call.id".into(), json!("CALLID-SENTINEL")),
             ("blackwall.reasoning".into(), json!("REASONING-SENTINEL")),
         ],
     );
@@ -331,7 +332,15 @@ fn content_keys_filtered_in_processor() {
     trace.finish(RunOutcome::Complete);
     telemetry.flush();
     let body = trace_body(&directory);
-    for sentinel in ["PROMPT", "SYSTEM", "OUTPUT", "ARG", "REASONING", "SUBJECT"] {
+    for sentinel in [
+        "PROMPT",
+        "SYSTEM",
+        "OUTPUT",
+        "ARG",
+        "CALLID",
+        "REASONING",
+        "SUBJECT",
+    ] {
         assert!(!body.contains(&format!("{sentinel}-SENTINEL")), "{body}");
     }
     let spans = read(&directory, &list(&directory, 1)[0].id).unwrap();
