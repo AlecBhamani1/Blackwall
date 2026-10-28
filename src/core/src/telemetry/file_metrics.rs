@@ -55,7 +55,7 @@ pub(crate) fn file_name(day: i64) -> String {
 }
 
 /// The day a metrics file holds, or `None` for any other name.
-fn parse_name(name: &str) -> Option<i64> {
+pub(crate) fn parse_name(name: &str) -> Option<i64> {
     let stem = name.strip_suffix(".jsonl")?;
     let bytes = stem.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {

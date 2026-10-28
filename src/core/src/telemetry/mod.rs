@@ -7,7 +7,7 @@
 //! outputs only when the owner turns on content capture. Metrics never carry prompt text, tool
 //! arguments, or paths. No `OTEL_*` environment variable changes this behaviour: every setting
 //! the SDK would read from the environment is given explicitly.
-mod file_metrics;
+pub(crate) mod file_metrics;
 mod file_spans;
 pub mod names;
 mod redact;
