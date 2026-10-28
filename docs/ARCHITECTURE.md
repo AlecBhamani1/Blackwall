@@ -184,6 +184,9 @@ Adapters start a `RunScope` for each Chat or Agent run and the core loops record
 metrics through it. The provider's only span processor buffers a whole run, applies the content
 allowlist or the redaction scrub, and writes one OTLP/JSON file under `traces/`; a periodic reader
 appends delta metrics to `metrics/YYYY-MM-DD.jsonl`. `core::trace` only reads trace files back.
+`core::usage` reads the metrics files for a range of UTC days and returns totals already
+aggregated (`summary`), or copies the range's files to a folder (`export`); the desktop
+`usage_summary` and `export_telemetry` commands and `bw usage` call it.
 Nothing leaves the data folder. See [Telemetry](TELEMETRY.md).
 
 ## Local data and app lock

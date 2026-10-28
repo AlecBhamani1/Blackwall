@@ -29,6 +29,9 @@ detectors.
 | Metric | `gen_ai.client.operation.duration` | histogram, `s` | Once per model call |
 | Metric | `blackwall.tool.invocations` | counter, `{call}` | Once per tool call |
 | Metric | `blackwall.run.outcomes` | counter, `{run}` | Once per finished, failed, or stopped run |
+| Metric | `blackwall.client.output_speed` | histogram, `{token}/s` | Once per successful model call that produced output |
+| Metric | `blackwall.compaction.tokens_saved` | histogram, `{token}` | Once per compaction, the estimated context it released |
+| Metric | `blackwall.trace.dropped_runs` | counter, `{run}` | Once per run whose trace the writer queue dropped |
 
 `blackwall.*` is our namespace for what the conventions do not define yet.
 
@@ -51,7 +54,15 @@ made-up name is model-written text, so it never reaches a trace or a metric.
 **Model-call metrics:** `gen_ai.operation.name=chat`, `gen_ai.request.model`,
 `gen_ai.provider.name`, `server.address` (host only; left out when the endpoint has no host),
 `blackwall.mode=chat|agent|subagent`, and `blackwall.compaction=true` on compaction calls. Token
-usage adds `gen_ai.token.type=input|output`. Duration adds `error.type` on failure, one of
+usage adds `gen_ai.token.type=input|output`, plus `cached_input` (from the server's
+`prompt_tokens_details.cached_tokens`) and `reasoning` (from
+`completion_tokens_details.reasoning_tokens`) when the server reports them. These two are parts of
+`input` and `output`, not extra tokens: sum only `input` and `output` for a total.
+
+**Project and session:** model-call metrics, output speed, compaction savings, and run outcomes
+also carry `blackwall.project`, the workspace folder's name (never its path, and absent for Chat,
+which has no project), and `blackwall.session`, the conversation's neutral ID (absent when the ID
+is not plain letters, digits, `-`, or `_`). Titles and prompts are never recorded. Duration adds `error.type` on failure, one of
 `network`, `http`, `invalid_response`, `limit`, or `_OTHER`, the same in every Chat and Agent
 path. `gen_ai.provider.name` is `ollama` for an
 endpoint on port 11434 and `openai_compatible` otherwise.
@@ -118,9 +129,20 @@ receivers:
     include: ["/Users/you/.blackwall/metrics/*.jsonl", "/Users/you/.blackwall/traces/*.json"]
 ```
 
+## Usage page
+
+`core::usage::summary(data_dir, from, to)` reads `metrics/` for a range of UTC days and returns the
+totals the desktop **Usage** page and `bw usage` show: tokens per day and by type, rows per
+project and per model (tokens, runs for projects, sessions, model calls, median output speed, p90
+duration, and the busiest sessions), the Chat/Agent/Subagent split, the top 10 tools with error and
+denied counts, run success, compaction savings, and gaps. Medians and p90s are read from histogram
+buckets, so they are estimates within a bucket. Lines that cannot be parsed are skipped with one
+warning per file. `core::usage::export` copies the range's `metrics/` and `traces/` files into a
+new folder. See [Usage](RUNTIME_GUIDE.md#usage).
+
 ## Retention
 
 Trace files: the newest 200. Metrics files: 400 days by default. Files older than the retention
 window are deleted when telemetry starts. In core, `Retention::Days(n)` (clamped to 30–3,650) or
-`Retention::Forever` sets the window; the Settings and `bw config` controls arrive with the Usage
-page.
+`Retention::Forever` sets the window; Settings and `bw config` controls for it are not exposed yet,
+so every client keeps the 400-day default.
