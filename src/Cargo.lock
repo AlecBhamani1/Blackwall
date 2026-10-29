@@ -403,6 +403,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "process-wrap",
+ "prost",
  "qrcode",
  "rand 0.10.3",
  "reqwest 0.12.28",

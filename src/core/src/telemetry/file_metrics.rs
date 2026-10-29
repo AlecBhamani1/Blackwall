@@ -1,7 +1,7 @@
 //! Usage metrics as OTLP/JSON lines: one `ExportMetricsServiceRequest` per line in
 //! `metrics/YYYY-MM-DD.jsonl` (UTC), the shape the OpenTelemetry Collector's file exporter writes
 //! and its `otlpjsonfile` receiver reads. Delta temporality, so each line holds only new data.
-use super::Retention;
+use super::{export::Exporter, Retention};
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric::Data,
 };
@@ -97,16 +97,19 @@ pub(crate) fn prune(data_dir: &Path, retention: Retention, today: i64) {
 #[derive(Debug)]
 pub(crate) struct FileMetricExporter {
     directory: PathBuf,
+    exporter: Exporter,
 }
 
 impl FileMetricExporter {
-    pub(crate) fn new(data_dir: &Path) -> Self {
+    pub(super) fn new(data_dir: &Path, exporter: Exporter) -> Self {
         Self {
             directory: data_dir.join(METRICS_DIRECTORY),
+            exporter,
         }
     }
 
-    /// Append one request line. Metrics failures never affect a run.
+    /// Append one request line, and hand the same request to OTLP export. Metrics failures never
+    /// affect a run.
     fn append(&self, mut request: ExportMetricsServiceRequest) {
         for resource in &mut request.resource_metrics {
             for scope in &mut resource.scope_metrics {
@@ -128,6 +131,7 @@ impl FileMetricExporter {
         if request.resource_metrics.is_empty() {
             return;
         }
+        self.exporter.submit_metrics(&request);
         let Ok(mut line) = serde_json::to_vec(&request) else {
             return;
         };
