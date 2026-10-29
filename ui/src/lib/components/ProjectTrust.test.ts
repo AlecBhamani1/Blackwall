@@ -19,7 +19,7 @@ function status(overrides: Partial<ProjectStatus> = {}): ProjectStatus {
       { decision: 'deny', kind: 'file', subject: '.', badges: ['matches every file'] },
     ],
     mode: 'strictest',
-    applies: ["1 deny/ask rules from this project's settings apply"],
+    applies: ["1 deny/ask rule from this project's settings applies"],
     waiting: ['1 allow rules'],
     error: null,
     ...overrides,

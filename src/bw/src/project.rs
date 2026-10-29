@@ -185,7 +185,7 @@ mod tests {
             }],
             mode: blackwall_core::policy::RuleMode::Ordered,
             applies: vec!["1 deny and 0 ask rules".into()],
-            waiting: vec!["1 allow rules".into()],
+            waiting: vec!["1 allow rule".into()],
             error: None,
         }
     }
@@ -198,7 +198,7 @@ mod tests {
             text.contains("Applies now: 1 deny and 0 ask rules"),
             "{text}"
         );
-        assert!(text.contains("Waiting for trust: 1 allow rules"), "{text}");
+        assert!(text.contains("Waiting for trust: 1 allow rule"), "{text}");
         let text = describe(&status(Trust::Changed {
             diff: "+  \"x\"\n".into(),
         }));

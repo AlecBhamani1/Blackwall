@@ -363,10 +363,12 @@ pub(crate) fn try_load(workspace: &Path, data_dir: &Path) -> Result<Loaded, Proj
 /// "N deny/ask rules from this project's settings apply", when there are any.
 fn restricting_line(config: &ProjectConfig) -> Option<String> {
     let (_, ask, deny) = config.policy.as_ref()?.counts();
-    (ask + deny > 0).then(|| {
+    let count = ask + deny;
+    (count > 0).then(|| {
         format!(
-            "{} deny/ask rules from this project's settings apply",
-            ask + deny
+            "{count} deny/ask {} from this project's settings {}",
+            if count == 1 { "rule" } else { "rules" },
+            if count == 1 { "applies" } else { "apply" }
         )
     })
 }
@@ -483,13 +485,18 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
     if let Some(rules) = &config.policy {
         let (allow, ask, deny) = rules.counts();
         if ask + deny > 0 {
+            let count = ask + deny;
             applies.push(format!(
-                "{} deny/ask rules from this project's settings apply",
-                ask + deny
+                "{count} deny/ask {} from this project's settings {}",
+                if count == 1 { "rule" } else { "rules" },
+                if count == 1 { "applies" } else { "apply" }
             ));
         }
         if allow > 0 {
-            let line = format!("{allow} allow rules");
+            let line = format!(
+                "{allow} allow {}",
+                if allow == 1 { "rule" } else { "rules" }
+            );
             if trusted {
                 applies.push(line);
             } else {
