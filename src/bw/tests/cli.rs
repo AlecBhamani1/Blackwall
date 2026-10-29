@@ -120,7 +120,7 @@ impl Drop for Fixture {
     }
 }
 
-/// A rejecting HTTP fixture proves settings commands never contact a model.
+/// A rejecting HTTP fixture proves settings commands never call a model.
 struct OfflineGuard {
     endpoint: String,
     stopped: Arc<AtomicBool>,
@@ -139,6 +139,10 @@ impl OfflineGuard {
             while !worker_stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Server-kind probes read metadata only; they are not model calls.
+                        if answered_probe(&mut stream) {
+                            continue;
+                        }
                         calls += 1;
                         let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     }
@@ -201,7 +205,11 @@ impl ModelServer {
                         return requests;
                     }
                     match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                        Ok((mut stream, _)) => {
+                            if !answered_probe(&mut stream) {
+                                break stream;
+                            }
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -259,6 +267,29 @@ impl Drop for ModelServer {
             let _ = worker.join();
         }
     }
+}
+
+/// Answer the CLI's credential-free server probes (`GET`) with 404, so only chat requests
+/// reach the scripted responses. Returns whether `stream` was a probe.
+fn answered_probe(stream: &mut TcpStream) -> bool {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut start = [0_u8; 4];
+    let mut seen = 0;
+    while seen < start.len() {
+        match stream.peek(&mut start) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => seen = n,
+        }
+    }
+    if &start != b"GET " {
+        return false;
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    true
 }
 
 fn read_request(stream: &mut TcpStream) -> Value {

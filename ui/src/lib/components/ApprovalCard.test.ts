@@ -10,6 +10,22 @@ const approval = {
   detail: 'Update src/main.ts\n-old\n+new',
 };
 describe('action approval', () => {
+  it('offers no run-wide allow for a call the model wrote as text', () => {
+    render(ApprovalCard, {
+      props: { approval: { ...approval, remember: false }, onResolve: vi.fn() },
+    });
+    expect(screen.getByText('Review this file change')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Allow identical action this run' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
+  });
+  it('still offers a run-wide allow for ordinary prompts', () => {
+    render(ApprovalCard, { props: { approval, onResolve: vi.fn() } });
+    expect(
+      screen.getByRole('button', { name: 'Allow identical action this run' }),
+    ).toBeInTheDocument();
+  });
   it('shows the exact proposed action and sends only one decision while pending', async () => {
     const user = userEvent.setup();
     const onResolve = vi.fn(() => new Promise<void>(() => {}));

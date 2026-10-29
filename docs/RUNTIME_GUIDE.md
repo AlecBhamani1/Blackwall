@@ -54,6 +54,52 @@ separately. Environment-variable credentials are managed outside this screen. Ne
 save the invite secret or add a permanent computer. An expired or revoked invitation needs replacement
 by the sender. Guest sharing requires a configured relay; see [sharing](SHARING.md).
 
+## Local models
+
+**Context window.** Before each request, Blackwall asks the service which server it is and what
+context window the selected model is loaded with. The probes send no access key and take at most
+3 seconds; the first server that answers is used, in this order:
+
+| Server | Route | Reported window |
+| --- | --- | --- |
+| Ollama (any port) | `/api/version`, then `/api/ps` | the loaded model's `context_length` |
+| llama.cpp `llama-server` | `/props` | `default_generation_settings.n_ctx` |
+| vLLM | `/v1/models` | the model's `max_model_len` |
+| LM Studio | `/api/v0/models/{id}` (or the `/api/v0/models` list) | `loaded_context_length` |
+
+A reported window replaces the configured limit (capped at 1,000,000 tokens), and a quarter of it
+(up to 32,768 tokens) is reserved for output. The server sets the window itself, for example with
+Ollama's `OLLAMA_CONTEXT_LENGTH` or llama.cpp's `--ctx-size`; requests cannot change it. A model that
+is not loaded, an unknown server, or an unreachable one keeps your configured limit. The detected
+server kind, including "unknown", is remembered for the rest of the session, so later requests ask
+only that server's route, or nothing; a known server that misses one answer keeps its kind. HTTPS
+services on other computers, such as cloud APIs, are never probed by requests and keep your
+configured limit. Opening **Settings → Model connection** or running `bw status` detects again,
+cloud services included. **Settings → Model connection** shows it,
+for example "Detected llama.cpp · 131,072-token context"; in the CLI, `bw status` and `/context`
+print it.
+
+**Reasoning.** Text a model writes inside `<think>…</think>`, or sends in the `reasoning` or
+`reasoning_content` fields, is kept apart from the answer, including a tag split across stream
+chunks. Reasoning that never closes is not shown as answer text. Reasoning is never sent back to
+the model. The desktop shows it collapsed above the answer as **Thought for Ns**; the CLI prints
+`[Thought for Ns]`, and `bw run --json` includes `reasoning` and `reasoningMs` on `turn_complete`.
+Traces record it only when prompt and output capture is on, as a `reasoning` part of
+`gen_ai.output.messages`. Each reply's reasoning is limited to the same 8 MiB as the rest of the
+reply, and a run keeps at most 256 KiB of it, ending with "[Reasoning truncated]" when cut.
+
+**Tool calls written as text.** Some models reply with `<tool_call>{"name":…,"arguments":{…}}</tool_call>`
+blocks instead of structured tool calls. Blackwall reads them only when you turn on **This model
+writes tool calls as text** for that connection in **Settings → Model connection**, or run
+`bw config set text-tool-calls on`. It is off by default. When on, and a reply has no structured
+calls, each block outside a code fence that names an offered tool with object arguments becomes a
+call (at most 8 per reply) and is removed from the answer; anything else stays text. Text from the
+first block onward is shown when the reply ends. **A call read from text always asks for approval**,
+even when a saved rule would allow it. The prompt names what the tool does (a file change, a web
+request, or a command), shows the arguments (cut to 4 KiB), and offers only **Allow once** or
+**Deny**; the answer is never remembered for later calls. The tool's own approvals still apply
+after that, except that an approved web read or search does not ask a second time for its request. Child investigations never run calls written as text.
+
 ## Attach and reference files
 
 Drop screenshots or files anywhere in the conversation, choose files with the paperclip button,
@@ -82,10 +128,8 @@ Open **Memory → Advanced · Context window** to set the context limit configur
 model service and the output reserve. Settings apply to the selected connection's future requests;
 check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
 tokens, and automatic compaction off. The browser development UI also saves these controls locally.
-When an Ollama service on its default port (11434) has the model loaded, CLI and desktop requests
-use the context window it reports instead, reserving a quarter of it (up to 32,768 tokens) for
-output. Ollama sets that window itself (for example with `OLLAMA_CONTEXT_LENGTH`); requests cannot
-change it. The same section sets the Agent iteration limit (1–100, default
+When the model service reports the window it loaded the model with, CLI and desktop requests use
+that window instead (see [Local models](#local-models)). The same section sets the Agent iteration limit (1–100, default
 20) and the command time limit (10–3,600 seconds, default 120). The browser development UI also saves
 these controls locally.
 
@@ -539,7 +583,8 @@ Setup does not test connectivity or launch/download a model. `npm run cli -- set
 
 Type `//` to begin a literal message with `/`. Use `bw commands` to see the catalog outside chat.
 `bw config show` reviews settings, and `bw config set <name> <value>` changes them without entering
-chat. Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
+chat. `bw status` also asks the configured service which server it is and its context window.
+`bw config set text-tool-calls on|off` controls [tool calls written as text](#local-models). Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), then the initial `llama3.2` and local Ollama defaults.
 CLI settings are separate from desktop preferences. They are stored in the same local SQLite
 database; `BLACKWALL_DATA_DIR` selects a different data folder, including its memory and skills.

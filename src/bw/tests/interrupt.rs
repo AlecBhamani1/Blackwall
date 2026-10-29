@@ -100,6 +100,29 @@ fn wait_for_line(lines: &Receiver<String>, expected: &str) {
     }
 }
 
+/// Answer the CLI's credential-free server probes (`GET`) with 404, so only chat requests
+/// reach the scripted responses. Returns whether `stream` was a probe.
+fn answered_probe(stream: &mut TcpStream) -> bool {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut start = [0_u8; 4];
+    let mut seen = 0;
+    while seen < start.len() {
+        match stream.peek(&mut start) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => seen = n,
+        }
+    }
+    if &start != b"GET " {
+        return false;
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    true
+}
+
 fn read_request(stream: &mut TcpStream) -> Value {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -162,7 +185,11 @@ fn interrupted_approval_preserves_partial_answer_and_later_slash_commands() {
         let deadline = Instant::now() + WAIT_LIMIT;
         let mut stream = loop {
             match listener.accept() {
-                Ok((stream, _)) => break stream,
+                Ok((mut stream, _)) => {
+                    if !answered_probe(&mut stream) {
+                        break stream;
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
                         Instant::now() < deadline,
@@ -345,7 +372,11 @@ fn interrupting_git_review_cancels_the_request_without_changes() {
     let deadline = Instant::now() + request_limit;
     let mut stream = loop {
         match listener.accept() {
-            Ok((stream, _)) => break stream,
+            Ok((mut stream, _)) => {
+                if !answered_probe(&mut stream) {
+                    break stream;
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("Fixture accept failed: {error}"),
         }

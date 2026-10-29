@@ -14,7 +14,7 @@
   import { connectionProfiles } from '../connections';
   import PairingPanel from './PairingPanel.svelte';
   import { isPairedEndpoint } from '../pairing';
-  import { isDesktop } from '../setup';
+  import { detectedServerLabel, isDesktop, normalizeEndpoint, setupClient } from '../setup';
   import { platform } from '../platform';
   import Icon from './Icon.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
@@ -52,6 +52,7 @@
   export let onClose: () => void;
   export let client: GuestShareClient = guestShareClient;
   export let invites = multiShareClient;
+  export let detectServer = setupClient.detectServer;
 
   const expiryOptions: Array<{ value: ShareExpiryMinutes; label: string }> = [
     { value: 15, label: '15 min' },
@@ -136,6 +137,44 @@
   let endpointFeedback = '';
   let endpointInputError = '';
   let keyEndpoint = '';
+  $: activeProfile = (contextPreferences.connections ?? []).find(
+    (profile) => profile.endpoint === normalizedOrEmpty(endpoint),
+  );
+  function normalizedOrEmpty(address: string): string {
+    try {
+      return address ? normalizeEndpoint(address) : '';
+    } catch {
+      return '';
+    }
+  }
+  function setTextToolCalls(enabled: boolean): void {
+    onPreferences({
+      connections: (contextPreferences.connections ?? []).map((profile) => {
+        if (profile.endpoint !== activeProfile?.endpoint) return profile;
+        const { textToolCalls: _, ...rest } = profile;
+        return enabled ? { ...rest, textToolCalls: true } : rest;
+      }),
+    });
+  }
+  let detectedServer = '';
+  let detectedFor = '';
+  $: detectKey =
+    open && selectedSetting === 'connection' && connectionState === 'ready' && endpoint && model
+      ? `${endpoint}\n${model}`
+      : '';
+  $: if (detectKey !== detectedFor) {
+    detectedFor = detectKey;
+    detectedServer = '';
+    if (detectKey) void showDetectedServer(detectKey, endpoint, model);
+  }
+  async function showDetectedServer(key: string, address: string, id: string): Promise<void> {
+    try {
+      const server = await detectServer(address, id);
+      if (server && key === detectedFor) detectedServer = detectedServerLabel(server);
+    } catch {
+      // Detection is informational; the connection itself already succeeded.
+    }
+  }
   $: modelKeyConnections = connectionProfiles([
     ...(endpoint ? [{ endpoint, name: 'Current model service' }] : []),
     ...(contextPreferences.connections ?? []),
@@ -514,6 +553,25 @@
                   ),
                 })}
             />
+            {#if detectedServer}
+              <p class="detected-server" role="status">{detectedServer}</p>
+            {/if}
+            {#if activeProfile}
+              <label class="text-tool-calls">
+                <input
+                  type="checkbox"
+                  checked={activeProfile.textToolCalls === true}
+                  onchange={(event) => setTextToolCalls(event.currentTarget.checked)}
+                />
+                <span>
+                  <strong>This model writes tool calls as text</strong>
+                  <small
+                    >For models that reply with &lt;tool_call&gt; blocks instead of structured
+                    calls. Blackwall always asks before running one.</small
+                  >
+                </span>
+              </label>
+            {/if}
             {#if endpointInputError}
               <p class="connection-error" role="alert">{endpointInputError}</p>
             {:else if endpointFeedback}
@@ -1344,6 +1402,37 @@
 
   .endpoint-hint {
     color: var(--text-faint);
+  }
+
+  .text-tool-calls {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin: 4px 0;
+    cursor: pointer;
+  }
+  .text-tool-calls input {
+    margin-top: 3px;
+  }
+  .text-tool-calls span {
+    display: grid;
+    gap: 2px;
+  }
+  .text-tool-calls strong {
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .text-tool-calls small {
+    color: var(--text-muted);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+
+  .detected-server {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    line-height: 1.5;
   }
 
   .relay-form {

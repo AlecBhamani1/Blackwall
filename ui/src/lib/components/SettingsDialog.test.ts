@@ -289,6 +289,75 @@ describe('SettingsDialog', () => {
     expect(onPreferences).toHaveBeenCalledWith({ connections: [connections[0]] });
   });
 
+  it('shows the detected server kind and its context window for the active connection', async () => {
+    const user = userEvent.setup();
+    const detectServer = vi.fn().mockResolvedValue({ kind: 'llama.cpp', contextWindow: 131072 });
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'http://127.0.0.1:18040/v1',
+        model: 'qwen',
+        connectionState: 'ready',
+        detectServer,
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    expect(await screen.findByText(/Detected llama\.cpp/)).toHaveTextContent(
+      'Detected llama.cpp · 131,072-token context',
+    );
+    expect(detectServer).toHaveBeenCalledWith('http://127.0.0.1:18040/v1', 'qwen');
+  });
+
+  it('says when the server kind is unknown', async () => {
+    const user = userEvent.setup();
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'https://api.example/v1',
+        model: 'm',
+        connectionState: 'ready',
+        detectServer: vi.fn().mockResolvedValue({ kind: 'unknown' }),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    expect(
+      await screen.findByText('Server type not detected · using your context setting'),
+    ).toBeInTheDocument();
+  });
+
+  it('turns on text tool calls for the active connection only, off by default', async () => {
+    const user = userEvent.setup();
+    const connections = [
+      { endpoint: 'http://127.0.0.1:18040/v1', name: 'Strata' },
+      { endpoint: 'https://other.example/v1', name: 'Other', textToolCalls: true },
+    ];
+    const onPreferences = vi.fn();
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'http://127.0.0.1:18040/v1',
+        connectionState: 'ready',
+        contextPreferences: { connections },
+        onPreferences,
+        detectServer: vi.fn().mockResolvedValue(null),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    const toggle = screen.getByRole('checkbox', { name: /This model writes tool calls as text/ });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText(/always asks before running one/)).toBeInTheDocument();
+    await user.click(toggle);
+    expect(onPreferences).toHaveBeenCalledWith({
+      connections: [{ ...connections[0], textToolCalls: true }, connections[1]],
+    });
+  });
+
   it('manages a saved service key without changing the active connection', async () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});

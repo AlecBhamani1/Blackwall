@@ -34,6 +34,9 @@ a SmartScreen or Gatekeeper warning.
 
 - Guided setup for local models, another computer, or a browser invitation
 - Detection of local Ollama and LM Studio; explicit starter-model downloads through Ollama
+- Context-window detection for Ollama (any port), llama.cpp, vLLM, and LM Studio; model reasoning
+  kept out of answers and shown collapsed; opt-in reading of tool calls a model writes as text,
+  which always ask first ([Local models](docs/RUNTIME_GUIDE.md#local-models))
 - Named saved connections with remembered models, tested replacements, and managed access keys in
   the platform credential store (Keychain, Windows Credential Manager, or Secret Service)
 - Host-approved persistent computer pairing between any mix of macOS, Windows, and Linux, with
@@ -103,6 +106,8 @@ proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` d
 and `bw skills get <name>` downloads a suggested one; each is scanned for hidden instructions and
 data leaks first. Type `/name` to run a saved skill directly, as in `/pdf fill form.pdf`.
 Use `/settings` to review them. Changes apply to the next turn and future CLI launches.
+`bw status` shows the detected model server and its context window. For models that write tool
+calls as text, `bw config set text-tool-calls on` reads them; each such call always asks first.
 `bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
 one as a tree; the desktop **Settings → Workflows → Runs** panel shows the same traces. See
 [Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).

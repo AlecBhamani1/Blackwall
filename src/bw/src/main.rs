@@ -33,7 +33,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings recall on|off   Enable or disable the agent recall tool (default off)
   /learn                    Propose a reusable skill from this conversation for review
   /<skill> [request]        Run a saved skill now, including one that runs only when typed
-  /context                  Show estimated budget and last server token usage
+  /context                  Show the detected server, estimated budget, and last token usage
   /compact                  Summarize older context; retain the original transcript
   /settings context <n>     Configure model context limit in tokens
   /settings output <n>      Reserve generated output tokens
@@ -42,6 +42,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings profile <read-only|workspace-write|unsandboxed>  Set command access (default read-only)
   /settings command-network on|off  Command network access (default off; unsandboxed always on)
   /settings timeout <n>     Limit each shell command in seconds
+  /settings text-tool-calls on|off  Read tool calls the model writes as text (default off; always asks)
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -59,6 +60,7 @@ USAGE:
   bw setup                   Configure endpoint, model, web, and memory
   bw config [show]           Show effective settings
   bw config set <name> <value>
+  bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
   bw run [--json] <prompt>   Run one task; --json prints JSON lines and denies prompts
@@ -122,8 +124,8 @@ async fn run() -> Result<(), String> {
             println!("bw {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        "chat" | "setup" | "config" | "run" | "resume" | "sessions" | "request" | "memory"
-        | "mcp" | "review" | "skills" | "traces" | "usage" => {}
+        "chat" | "setup" | "config" | "status" | "run" | "resume" | "sessions" | "request"
+        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -158,6 +160,15 @@ async fn run() -> Result<(), String> {
     }
     if command == "config" {
         return configure(&store, &mut settings, &arguments);
+    }
+    if command == "status" {
+        require_no_arguments(&arguments)?;
+        println!(
+            "{}\n{}",
+            session::server_status(&settings, true).await,
+            settings.describe()
+        );
+        return Ok(());
     }
     if command == "request" {
         let prompt = required_prompt(&arguments)?;
@@ -257,7 +268,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.".into(),
             )
         }
     }
@@ -399,7 +410,9 @@ async fn chat(
                             .await
                     }
                     "context" if value.is_empty() => {
-                        conversation.context_report(store, directory, settings)
+                        conversation
+                            .context_report(store, directory, settings)
+                            .await
                     }
                     // A saved skill's name runs it; the agent loads the skill for this turn.
                     _ if saved_skill(directory, name) => {
@@ -448,7 +461,7 @@ fn slash(
         ),
         "settings" => {
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
-                "Use /settings <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.",
+                "Use /settings <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.",
             )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());

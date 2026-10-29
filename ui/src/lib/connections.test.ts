@@ -2,6 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { connectionName, connectionProfiles } from './connections';
 
 describe('saved connection profiles', () => {
+  it('keeps the text tool call setting only when it is on, so older profiles load unchanged', () => {
+    expect(
+      connectionProfiles([
+        { endpoint: 'http://a.example/v1', name: 'A', textToolCalls: true },
+        { endpoint: 'http://b.example/v1', name: 'B', textToolCalls: 'yes' },
+        { endpoint: 'http://c.example/v1', name: 'C' },
+      ]),
+    ).toEqual([
+      { endpoint: 'http://a.example/v1', name: 'A', textToolCalls: true },
+      { endpoint: 'http://b.example/v1', name: 'B' },
+      { endpoint: 'http://c.example/v1', name: 'C' },
+    ]);
+  });
+
   it('normalizes addresses, deduplicates aliases and strips secrets and invalid addresses', () => {
     expect(
       connectionProfiles([

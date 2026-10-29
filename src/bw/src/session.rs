@@ -138,7 +138,7 @@ impl Conversation {
             })
             .transpose()
     }
-    pub fn context_report(
+    pub async fn context_report(
         &self,
         store: &LocalStore,
         directory: &Path,
@@ -182,6 +182,7 @@ impl Conversation {
         let report = settings
             .budget
             .report(&messages, &definitions, state.server_usage);
+        println!("{}", server_status(settings, false).await);
         println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
         Ok(())
     }
@@ -200,6 +201,7 @@ impl Conversation {
             environment_key(&settings.endpoint),
         )
         .and_then(|m| m.with_budget(budget))
+        .map(|m| m.with_text_tool_calls(settings.text_tool_calls))
         .map_err(|e| e.to_string())?;
         let messages = context(store, directory, settings, &self.session)?;
         let (instructions, source): (Vec<_>, Vec<_>) =
@@ -257,6 +259,7 @@ impl Conversation {
             environment_key(&settings.endpoint),
         )
         .and_then(|backend| backend.with_budget(budget))
+        .map(|backend| backend.with_text_tool_calls(settings.text_tool_calls))
         .map_err(|error| error.to_string())?;
         let workspace = execution_workspace(&self.workspace, directory, settings)?;
         let timestamp = now()?;
@@ -502,6 +505,29 @@ async fn execute(
     (answer, snapshot, result)
 }
 
+/// The server kind found at the configured endpoint and the context window it reports.
+/// `detect` asks afresh, including a cloud HTTPS service that requests never probe.
+pub async fn server_status(settings: &Settings, detect: bool) -> String {
+    let (kind, window) = if detect {
+        blackwall_core::connection::detect_endpoint(&settings.endpoint, &settings.model).await
+    } else {
+        blackwall_core::connection::probe_endpoint(&settings.endpoint, &settings.model).await
+    };
+    format!(
+        "server: {}\ndetected context: {}",
+        kind.name(),
+        window.map_or_else(
+            || "not reported (using the configured limit)".into(),
+            |window| format!("{} tokens", window.min(1_000_000))
+        )
+    )
+}
+
+/// "Thought for 3s", rounded to whole seconds and never below one.
+fn thought_for(ms: u64) -> String {
+    format!("Thought for {}s", (ms.saturating_add(500) / 1000).max(1))
+}
+
 fn render_event(
     event: AgentEvent,
     answer: &mut String,
@@ -585,6 +611,12 @@ fn render_event(
         AgentEvent::SubagentStatus { state, summary, .. } => {
             eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default())
         }
+        // Reasoning stays collapsed: only how long it took is shown.
+        AgentEvent::TurnComplete {
+            reasoning: Some(_),
+            reasoning_ms,
+            ..
+        } => eprintln!("\n[{}]", thought_for(reasoning_ms.unwrap_or(0))),
         _ => {}
     }
 }
@@ -606,6 +638,12 @@ fn execution_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_is_shown_only_as_its_duration() {
+        assert_eq!(thought_for(0), "Thought for 1s");
+        assert_eq!(thought_for(2_600), "Thought for 3s");
+    }
 
     #[test]
     fn environment_credentials_stay_at_their_origin() {

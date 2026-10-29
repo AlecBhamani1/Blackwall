@@ -6,6 +6,7 @@ import { persistence } from '../persistence';
 import type { SetupClient } from '../setup';
 function client(): SetupClient {
   return {
+    detectServer: vi.fn().mockResolvedValue(null),
     discover: vi.fn().mockResolvedValue([
       {
         name: 'Ollama',

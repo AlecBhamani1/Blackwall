@@ -5,6 +5,8 @@ export interface ConnectionProfile {
   endpoint: string;
   name: string;
   model?: string;
+  /** "This model writes tool calls as text". Off when absent; such calls always ask. */
+  textToolCalls?: boolean;
 }
 export interface Preferences {
   connections?: ConnectionProfile[];

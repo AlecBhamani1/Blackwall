@@ -17,6 +17,31 @@ function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe('MessageCell', () => {
+  it('keeps reasoning collapsed under its duration, apart from the answer', async () => {
+    const user = userEvent.setup();
+    const { container } = render(MessageCell, {
+      props: {
+        message: message({
+          content: 'The answer.',
+          reasoning: 'First I checked the plan.',
+          reasoningMs: 2600,
+        }),
+      },
+    });
+    const thought = container.querySelector<HTMLDetailsElement>('details.reasoning')!;
+    expect(thought.open).toBe(false);
+    expect(screen.getByText('Thought for 3s')).toBeInTheDocument();
+    expect(container.querySelector('.markdown')?.textContent).not.toContain('checked the plan');
+    await user.click(screen.getByText('Thought for 3s'));
+    expect(thought.open).toBe(true);
+    expect(thought).toHaveTextContent('First I checked the plan.');
+  });
+
+  it('shows no reasoning section when the model did not reason', () => {
+    const { container } = render(MessageCell, { props: { message: message() } });
+    expect(container.querySelector('details.reasoning')).toBeNull();
+  });
+
   it('interleaves tool groups with streamed text and preserves expansion as results arrive', async () => {
     const user = userEvent.setup();
     const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();

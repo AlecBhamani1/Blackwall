@@ -28,6 +28,7 @@ export function connectionProfiles(value: unknown): ConnectionProfile[] {
         ...(typeof item.model === 'string' && item.model.length <= 2048
           ? { model: item.model }
           : {}),
+        ...(item.textToolCalls === true ? { textToolCalls: true } : {}),
       });
       if (profiles.length === MAX_CONNECTIONS) break;
     } catch {

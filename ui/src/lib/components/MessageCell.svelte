@@ -10,6 +10,7 @@
   export let message: ChatMessage;
   let copied = false;
   $: parts = messageTimeline(message);
+  $: thoughtSeconds = Math.max(1, Math.round((message.reasoningMs ?? 0) / 1000));
 
   async function copyMessage() {
     if (!message.content || !navigator.clipboard) return;
@@ -34,6 +35,12 @@
     {#if message.role === 'user'}
       {#if message.content}<div class="user-content">{message.content}</div>{/if}
     {:else}
+      {#if message.reasoning}
+        <details class="reasoning">
+          <summary>Thought for {thoughtSeconds}s</summary>
+          <p>{message.reasoning}</p>
+        </details>
+      {/if}
       {#each parts as part (part.id)}
         {#if part.type === 'text'}
           <div class="markdown" use:copyableMarkdown={part.content}></div>
@@ -86,6 +93,22 @@
 </article>
 
 <style>
+  .reasoning {
+    margin: 0 0 10px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .reasoning summary {
+    cursor: pointer;
+    width: fit-content;
+  }
+  .reasoning p {
+    margin: 8px 0 0;
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
+    white-space: pre-wrap;
+    line-height: 1.6;
+  }
   .children {
     padding: 12px;
     border: 1px solid var(--border);

@@ -133,6 +133,10 @@ pub struct ChatRequest {
     /// Request summary-only compaction, without executing tools.
     #[serde(default)]
     pub compact: bool,
+    /// The connection's "This model writes tool calls as text" setting. Off by default; calls
+    /// read from text always ask for approval.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_tool_calls: bool,
 }
 
 impl ChatRequest {
@@ -153,6 +157,7 @@ impl ChatRequest {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         }
     }
 
@@ -476,6 +481,10 @@ pub enum AgentEvent {
         /// The MCP tool, for approvals that can be saved as an owner rule.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<ApprovalTool>,
+        /// Whether "allow identical action this run" is offered. False for a tool call the
+        /// model wrote as text, which always asks.
+        #[serde(default = "offered", skip_serializing_if = "is_offered")]
+        remember: bool,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -507,6 +516,17 @@ pub enum AgentEvent {
         /// Token usage when supplied by the endpoint.
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        /// The model's reasoning for this turn, shown apart from the answer and never sent back
+        /// to the model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        /// How long the model reasoned, in milliseconds.
+        #[serde(
+            rename = "reasoningMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        reasoning_ms: Option<u64>,
     },
     /// Recoverable or terminal failure associated with a request.
     Error {
@@ -541,6 +561,13 @@ pub enum AgentEvent {
         /// `created`, `updated`, or `deleted`.
         action: String,
     },
+}
+
+fn offered() -> bool {
+    true
+}
+fn is_offered(value: &bool) -> bool {
+    *value
 }
 
 impl AgentEvent {
@@ -646,7 +673,25 @@ mod tests {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         }
+    }
+
+    #[test]
+    fn text_tool_calls_are_off_unless_a_request_asks() {
+        let request: ChatRequest =
+            serde_json::from_value(serde_json::json!({"requestId":"r","model":"m","messages":[]}))
+                .unwrap();
+        assert!(!request.text_tool_calls);
+        assert!(serde_json::to_value(&request)
+            .unwrap()
+            .get("textToolCalls")
+            .is_none());
+        let on: ChatRequest = serde_json::from_value(
+            serde_json::json!({"requestId":"r","model":"m","messages":[],"textToolCalls":true}),
+        )
+        .unwrap();
+        assert!(on.text_tool_calls);
     }
 
     #[test]
@@ -732,6 +777,15 @@ mod tests {
                 kind: ApprovalKind::Exec,
                 detail: "cargo test".to_owned(),
                 tool: None,
+                remember: true,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "a3".to_owned(),
+                kind: ApprovalKind::File,
+                detail: "write_file written as text".to_owned(),
+                tool: None,
+                remember: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -742,6 +796,7 @@ mod tests {
                     server: "docs".to_owned(),
                     tool: "docs__search".to_owned(),
                 }),
+                remember: true,
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),
@@ -760,6 +815,8 @@ mod tests {
                     total_tokens: 6,
                     ..Default::default()
                 }),
+                reasoning: Some("Checked the plan.".to_owned()),
+                reasoning_ms: Some(1500),
             },
             AgentEvent::Error {
                 request_id: "r1".to_owned(),

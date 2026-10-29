@@ -447,6 +447,7 @@ pub(crate) async fn chat(
                     usage: response.usage.as_ref(),
                     tool_calls: false,
                     content: &response.message.content,
+                    reasoning: "",
                 }),
                 (Err(error), message) => Err(blackwall_core::telemetry::ModelFailure {
                     kind: error.kind(),
@@ -598,6 +599,7 @@ pub(crate) async fn stream_chat(
         let backend = blackwall_core::model::HttpModel::new(&selected, &request.model, api_key)
             .and_then(|model| model.with_budget(request.context_budget))
             .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+            .map(|model| model.with_text_tool_calls(request.text_tool_calls))
             .map_err(CommandError::from)?;
         let event_app = app.clone();
         let instruction_directory =
@@ -791,11 +793,19 @@ async fn complete_chat(
         model: payload.model.unwrap_or(request.model),
         message: ChatMessage::new(
             choice.message.role.unwrap_or(MessageRole::Assistant),
-            choice.message.content.unwrap_or_default(),
+            answer_only(&choice.message.content.unwrap_or_default()),
         ),
         finish_reason: choice.finish_reason,
         usage: payload.usage,
     })
+}
+
+/// A complete reply without its `<think>` reasoning.
+fn answer_only(content: &str) -> String {
+    let mut filter = blackwall_core::model::ThinkFilter::default();
+    let (mut answer, _) = filter.push(content);
+    answer.push_str(&filter.finish().0);
+    answer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -817,6 +827,7 @@ async fn stream_chat_events(
     )
     .and_then(|model| model.with_budget(request.context_budget))
     .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+    .map(|model| model.with_text_tool_calls(request.text_tool_calls))
     .map_err(CommandError::from)?;
     let instructions: Vec<_> = blackwall_core::model::messages(&request)
         .into_iter()
@@ -1201,6 +1212,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_replies_drop_think_blocks() {
+        assert_eq!(answer_only("<think>plan</think>\n\nHi"), "Hi");
+        assert_eq!(answer_only("<think>never closed"), "");
+        assert_eq!(answer_only("plain <b>"), "plain <b>");
+    }
+
+    #[test]
     fn one_shot_chat_errors_use_the_model_error_vocabulary() {
         let model_kinds = ["network", "http", "invalid_response", "limit"];
         let errors = [
@@ -1301,6 +1319,7 @@ mod tests {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         };
 
         let messages = build_api_messages(&request).unwrap();

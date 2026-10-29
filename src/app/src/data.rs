@@ -294,10 +294,12 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
             .ok_or("Save at most 20 connections.")?;
         for profile in profiles {
             let profile = profile.as_object().ok_or("Invalid saved connection.")?;
-            if profile
-                .keys()
-                .any(|key| !matches!(key.as_str(), "endpoint" | "name" | "model"))
-            {
+            if profile.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "endpoint" | "name" | "model" | "textToolCalls"
+                )
+            }) {
                 return Err("Invalid saved connection field.".into());
             }
             let endpoint = profile
@@ -318,6 +320,12 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 .is_some_and(|model| !model.as_str().is_some_and(|model| model.len() <= 2048))
             {
                 return Err("Invalid saved model.".into());
+            }
+            if profile
+                .get("textToolCalls")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err("Invalid text tool call setting.".into());
             }
         }
     }

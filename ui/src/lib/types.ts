@@ -31,6 +31,9 @@ export interface ChatMessage {
   children?: ChildEntry[];
   /** Restored tool activity is inert history, never live approval state. */
   historical?: boolean;
+  /** The model's reasoning, shown collapsed; never sent back to the model. */
+  reasoning?: string;
+  reasoningMs?: number;
 }
 
 export interface ModelInfo {
@@ -112,6 +115,8 @@ export interface ChatRequest {
   contextBudget?: ContextBudget;
   contextState?: ContextState;
   compact?: boolean;
+  /** The active connection reads tool calls the model writes as text. */
+  textToolCalls?: boolean;
 }
 
 export type AgentEvent =
@@ -125,7 +130,14 @@ export type AgentEvent =
   | { type: 'context_report'; requestId: string; report: ContextReport }
   | { type: 'context_updated'; requestId: string; state: ContextState }
   | { type: 'assistant_delta'; requestId: string; delta: string }
-  | { type: 'turn_complete'; requestId: string; finishReason?: string; usage?: TokenUsage }
+  | {
+      type: 'turn_complete';
+      requestId: string;
+      finishReason?: string;
+      usage?: TokenUsage;
+      reasoning?: string;
+      reasoningMs?: number;
+    }
   | { type: 'error'; requestId: string; message: string; code?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
@@ -137,6 +149,7 @@ export type AgentEvent =
       kind: string;
       detail: string;
       tool?: ApprovalTool;
+      remember?: boolean;
     };
 
 export interface ChildEntry {
@@ -174,6 +187,8 @@ export interface PendingApproval {
   kind: string;
   detail: string;
   tool?: ApprovalTool;
+  /** False for a tool call the model wrote as text: it can only be allowed once. */
+  remember?: boolean;
 }
 
 export interface StreamCallbacks {

@@ -101,7 +101,33 @@ export function connectionHelp(cause: unknown): string {
   return 'Blackwall could not reach your model. Make sure the model service is open and the computer is awake, then try again.';
 }
 
+export type ServerKind = 'ollama' | 'llama.cpp' | 'vllm' | 'lm-studio' | 'unknown';
+export interface DetectedServer {
+  kind: ServerKind;
+  contextWindow?: number;
+}
+const SERVER_NAMES: Record<ServerKind, string> = {
+  ollama: 'Ollama',
+  'llama.cpp': 'llama.cpp',
+  vllm: 'vLLM',
+  'lm-studio': 'LM Studio',
+  unknown: '',
+};
+/** One line for the connection screen, such as "Detected Ollama · 102,400-token context". */
+export function detectedServerLabel(server: DetectedServer): string {
+  const name = SERVER_NAMES[server.kind] ?? '';
+  if (!name) return 'Server type not detected · using your context setting';
+  return server.contextWindow
+    ? `Detected ${name} · ${server.contextWindow.toLocaleString('en-US')}-token context`
+    : `Detected ${name} · no loaded context reported`;
+}
+
 export const setupClient = {
+  /** Which server answers at `endpoint`; the probe sends no credentials. */
+  async detectServer(endpoint: string, model: string): Promise<DetectedServer | null> {
+    if (!isDesktop()) return null;
+    return invoke<DetectedServer>('detect_server', { endpoint, model });
+  },
   async discover(): Promise<LocalService[]> {
     if (!isDesktop()) return [];
     return invoke<LocalService[]>('discover_local_services');
