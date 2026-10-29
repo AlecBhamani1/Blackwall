@@ -127,8 +127,9 @@ impl SkillProposal {
     }
 }
 const PROPOSALS: &str = ".proposals";
-static APPROVALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// Saving, installing, replacing, and removing skills run one at a time in a process.
+const STORE_LOCK: &str = ".skill-store.lock";
+/// Saving, installing, replacing, removing, and approving skills run one at a time: in a process
+/// through this mutex, and across the desktop app and `bw` through a lock file in the store.
 static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A hidden folder name for staged or replaced skills, with the time it was made, so a sweep can
 /// tell its age even when a moved folder keeps an older modification time.
@@ -138,10 +139,10 @@ fn leftover(prefix: &str) -> String {
         .map_or(0, |elapsed| elapsed.as_secs());
     format!("{prefix}{now}-{:016x}", rand::random::<u64>())
 }
-fn writing() -> std::sync::MutexGuard<'static, ()> {
-    WRITES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Held while the store changes. Fields drop in order, so the file lock is released first.
+struct Writing {
+    _file: std::fs::File,
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 const MAX_PROPOSALS: usize = 20;
 /// A proposal holds up to two skills; JSON escaping can grow each body several times.
@@ -464,7 +465,7 @@ impl SkillStore {
     /// Save a new skill, refusing to replace any existing file with that name, even one written
     /// at the same moment.
     pub fn create(&self, skill: &Skill) -> Result<(), SkillError> {
-        let _writing = writing();
+        let _writing = self.writing()?;
         let document = validate(skill)?;
         if self.contains(&skill.name) {
             return Err(SkillError::Exists);
@@ -497,8 +498,23 @@ impl SkillStore {
         }
         result.map(|()| temporary)
     }
+    fn writing(&self) -> Result<Writing, SkillError> {
+        let guard = WRITES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file =
+            crate::policy::lock_owner_file(&self.path, STORE_LOCK).map_err(|_| SkillError::File)?;
+        Ok(Writing {
+            _file: file,
+            _guard: guard,
+        })
+    }
     pub fn save(&self, skill: &Skill) -> Result<(), SkillError> {
-        let _writing = writing();
+        let _writing = self.writing()?;
+        self.save_held(skill)
+    }
+    /// `save` for a caller that already holds `writing`.
+    fn save_held(&self, skill: &Skill) -> Result<(), SkillError> {
         let document = validate(skill)?;
         // A folder skill keeps its bundled files; only its SKILL.md changes.
         if self.folder(&skill.name).is_some() {
@@ -652,10 +668,9 @@ impl SkillStore {
         id: &str,
         edited: Option<(String, String)>,
     ) -> Result<Skill, SkillError> {
-        // Approvals in this process run one at a time, so two cannot both pass the stale check.
-        let _approving = APPROVALS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The stale check, save, and archive run under the store lock, so neither another
+        // approval nor an owner's save in any process can slip in between.
+        let _writing = self.writing()?;
         let directory = self.proposal_directory()?;
         let proposal = self.proposal(&directory, id)?;
         if self.current(&proposal.skill.name)? != proposal.before {
@@ -675,7 +690,7 @@ impl SkillStore {
             None => proposal.skill,
         };
         skill.user_only |= keep;
-        self.save(&skill)?;
+        self.save_held(&skill)?;
         // The skill is saved; if its record cannot be kept, the proposal is still removed so it
         // does not stay pending and later look stale.
         let archived = directory
@@ -697,7 +712,7 @@ impl SkillStore {
             .map_err(|_| SkillError::Missing)
     }
     pub fn remove(&self, name: &str) -> Result<(), SkillError> {
-        let _writing = writing();
+        let _writing = self.writing()?;
         validate_name(name)?;
         if self.folder(name).is_some() {
             return self
@@ -721,7 +736,7 @@ impl SkillStore {
     /// Replace any saved skill of this name, file or folder, with a single-file skill. The old one
     /// is moved aside first and put back if the new one cannot be saved.
     pub fn replace_with_file(&self, skill: &Skill) -> Result<(), SkillError> {
-        let _writing = writing();
+        let _writing = self.writing()?;
         let document = validate(skill)?;
         let temporary = self.write_temporary(&document)?;
         let old = if self.folder(&skill.name).is_some() {
@@ -768,7 +783,7 @@ impl SkillStore {
     /// Move a staged folder skill into place. A skill with this name is kept unless `replace`;
     /// a replaced one is moved aside first and removed once the new one is in place.
     pub fn install(&self, staged: &str, skill: &Skill, replace: bool) -> Result<(), SkillError> {
-        let _writing = writing();
+        let _writing = self.writing()?;
         let document = validate(skill)?;
         let result = (|| {
             // Scoped so the handle is closed before the rename: Windows cannot rename an open folder.
@@ -1100,6 +1115,67 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, [format!(".import-{now}-c"), ".import-legacy".into()]);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn approval_rechecks_staleness_after_the_store_lock() {
+        let path = std::env::temp_dir().join(format!("blackwall-skills-{}", rand::random::<u64>()));
+        let store = SkillStore::open(&path).unwrap();
+        let original = Skill {
+            name: "diff-notes".into(),
+            description: "Summarize changes.".into(),
+            body: "Read the diff.".into(),
+            enabled: true,
+            user_only: false,
+        };
+        store.save(&original).unwrap();
+        let proposal = store
+            .propose(
+                Skill {
+                    body: "Read the diff twice.".into(),
+                    ..original.clone()
+                },
+                crate::storage::MemorySource {
+                    session_id: "session".into(),
+                    message_id: "message".into(),
+                },
+            )
+            .unwrap();
+        let lock = crate::policy::lock_owner_file(&path, STORE_LOCK).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let approve_path = path.clone();
+        let proposal_id = proposal.id.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(
+                    SkillStore::open(&approve_path)
+                        .unwrap()
+                        .approve(&proposal_id),
+                )
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(result_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        // Another process's save lands while this one waits for the lock.
+        let owner_edit = validate(&Skill {
+            body: "Owner edit.".into(),
+            ..original
+        })
+        .unwrap();
+        std::fs::write(path.join("diff-notes.md"), owner_edit).unwrap();
+        drop(lock);
+        assert!(matches!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Err(SkillError::Stale)
+        ));
+        handle.join().unwrap();
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]

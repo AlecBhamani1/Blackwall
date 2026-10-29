@@ -24,6 +24,7 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SECRET_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
+const EDIT_LOCK: &str = ".mcp.lock";
 
 /// One server entry in `mcp.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -101,6 +102,8 @@ fn edit(
     name: &str,
     change: impl FnOnce(&mut Vec<ServerConfig>, usize) -> Result<(), String>,
 ) -> Result<(), String> {
+    let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
+        .map_err(|_| "The MCP file could not be saved.")?;
     let mut servers = read_config(directory)?;
     let index = servers
         .iter()
@@ -132,6 +135,8 @@ fn saved_name(name: &str) -> String {
 pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
     let name = saved_name(name);
     let name = name.as_str();
+    let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
+        .map_err(|_| "The MCP file could not be saved.")?;
     let mut servers = read_config(directory)?;
     if servers.iter().any(|server| server.name == name) {
         return Err(format!("An MCP server named {name:?} already exists."));
@@ -156,18 +161,25 @@ pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), St
     })
 }
 
-/// Secrets and owner rules are deleted first, so a failure leaves the entry in place to retry.
+/// Commit the server removal before deleting credentials and rules, so a failed configuration
+/// write cannot leave a configured server without its credentials.
 pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
     let name = &saved_name(name);
-    edit(directory, name, |servers, index| {
-        for key in &servers[index].secrets {
-            crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}"))
-                .map_err(store_error)?;
-        }
-        crate::policy::remove_server_rules(directory, name)?;
-        servers.remove(index);
-        Ok(())
-    })
+    let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
+        .map_err(|_| "The MCP file could not be saved.")?;
+    let mut servers = read_config(directory)?;
+    let index = servers
+        .iter()
+        .position(|server| server.name == name.as_str())
+        .ok_or_else(|| format!("No MCP server is named {name:?}."))?;
+    let removed = servers.remove(index);
+    write_config(directory, servers)?;
+    // The removal is saved; a keychain prompt below must not hold up other processes' edits.
+    drop(_editing);
+    for key in &removed.secrets {
+        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
+    }
+    crate::policy::remove_server_rules(directory, name)
 }
 
 /// The value is saved first, so the file never names a secret that failed to save. Blocking.
@@ -996,6 +1008,47 @@ mod tests {
         ] {
             assert!(validate(vec![server(invalid)]).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn simultaneous_server_adds_keep_every_change() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-race-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let directory = &directory;
+                scope.spawn(move || {
+                    add_server(directory, &format!("server-{index}"), vec!["server".into()])
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(read_config(&directory).unwrap().len(), 8);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_server_removal_keeps_rules_for_the_configured_server() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-remove-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        add_server(&directory, "docs", vec!["server".into()]).unwrap();
+        crate::policy::allow_tool(&directory, "docs", None).unwrap();
+        let config = std::fs::read(directory.join(MCP_FILE)).unwrap();
+        let source = directory.join("source.json");
+        std::fs::write(&source, config).unwrap();
+        std::fs::remove_file(directory.join(MCP_FILE)).unwrap();
+        std::os::unix::fs::symlink(&source, directory.join(MCP_FILE)).unwrap();
+
+        assert!(remove_server(&directory, "docs").is_err());
+        assert_eq!(read_config(&directory).unwrap().len(), 1);
+        assert_eq!(
+            crate::policy::tool_rules(&directory).unwrap()[0].tool,
+            "docs"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

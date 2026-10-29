@@ -411,6 +411,23 @@ pub(crate) fn replace_owner_file(
     result
 }
 
+/// Open and exclusively lock a private owner-data lock file. The returned handle holds the
+/// cross-process lock until it is dropped.
+pub(crate) fn lock_owner_file(directory: &Path, name: &str) -> std::io::Result<std::fs::File> {
+    let path = directory.join(name);
+    // Like every other owner file, never follow a planted link to somewhere else.
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.is_file()) {
+        return Err(std::io::Error::other("lock file is not a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
 fn matches(rule: &Rule, subject: &str) -> bool {
     match rule.kind {
         ApprovalKind::Exec => rule.command.as_deref().is_some_and(|command| {
@@ -481,16 +498,59 @@ pub(crate) fn redact_text(text: &str) -> String {
 
 fn redact(subject: &str) -> String {
     let mut hide_next = false;
+    let mut quoted_header = None;
     subject
         .split_whitespace()
         .map(|word| {
             let lower = word.to_ascii_lowercase();
+            if let Some(quote) = quoted_header {
+                hide_next = false;
+                if word.ends_with(quote) {
+                    quoted_header = None;
+                }
+                return "[redacted]".to_owned();
+            }
             let secret = hide_next;
             hide_next = lower.ends_with("bearer")
-                || lower.ends_with("authorization:")
                 || ["-u", "--user", "--password", "--token", "--api-key"].contains(&lower.as_str());
+            // A header name may follow `--header=` and may open a quote: `'X-Api-Key: v`,
+            // `--header='Authorization: Bearer v'`, `Authorization:'Bearer v'`.
+            let header = word.split_once(':').filter(|(name, _)| {
+                let name = name
+                    .rsplit('=')
+                    .next()
+                    .unwrap_or(name)
+                    .trim_start_matches(['\'', '"'])
+                    .to_ascii_lowercase();
+                name == "authorization"
+                    || name == "proxy-authorization"
+                    || name == "cookie"
+                    || name == "set-cookie"
+                    || name.contains("api-key")
+                    || name.contains("apikey")
+                    || name.contains("token")
+                    || name.contains("secret")
+            });
             if secret {
                 "[redacted]".to_owned()
+            } else if let Some((name, value)) = header {
+                // A quote opened anywhere in this word and not closed by its end means the value
+                // continues into the following words.
+                quoted_header = word
+                    .find(['\'', '"'])
+                    .and_then(|at| word[at..].chars().next())
+                    .filter(|quote| word.matches(*quote).count() % 2 == 1);
+                let value = value.trim_matches(['\'', '"']);
+                if value.is_empty() {
+                    hide_next = quoted_header.is_none();
+                    word.to_owned()
+                } else {
+                    if ["bearer", "basic", "digest"].contains(&value.to_ascii_lowercase().as_str())
+                    {
+                        hide_next = quoted_header.is_none();
+                    }
+                    format!("{name}:[redacted]")
+                }
             } else if let Some((name, _)) = word.split_once('=').filter(|(name, _)| {
                 ["key", "token", "secret", "password"]
                     .iter()
@@ -687,7 +747,19 @@ mod tests {
         assert!(audit.contains("curl -H Authorization: [redacted]"));
         assert!(audit.contains("API_TOKEN=[redacted]"));
         assert!(audit.contains("https://[redacted]@host"));
-        for secret in ["hunter2", "abc123", "xyz789", "pw4"] {
+        for secret in [
+            "hunter2",
+            "abc123",
+            "xyz789",
+            "pw4",
+            "header-key",
+            "attached-key",
+            "cookie-value",
+            "theme-value",
+            "custom-value",
+            "wget-key",
+            "httpie-key",
+        ] {
             assert!(!audit.contains(secret), "{secret}");
         }
         tokio::fs::remove_dir_all(&directory).await.unwrap();
@@ -830,6 +902,10 @@ mod tests {
             .record(
                 ApprovalKind::Exec,
                 "curl -H Authorization: abc123 -H Authorization:Bearer xyz789 -u me:pw4 \
+                 -H 'X-Api-Key: header-key' -H Authorization:attached-key \
+                 -H \"Cookie: session=cookie-value; theme=theme-value\" \
+                 -H X-Custom-Token:custom-value --header='X-Api-Key: wget-key' \
+                 Authorization:'Bearer httpie-key' \
                  https://me:hunter2@host API_TOKEN=hunter2",
                 Decision::Ask,
                 false,

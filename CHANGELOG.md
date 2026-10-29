@@ -15,6 +15,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Keep credentials out of the approval audit log when a command passes them as headers such as
+  `X-Api-Key: …`, `Authorization:…`, cookies, or custom token headers.
+
+- Stop simultaneous saves from silently overwriting each other. Reviewed file edits, MCP server
+  changes, and skill proposal approvals now hold a lock shared by the desktop app and `bw`, so a
+  conflicting change is reported instead of lost.
+
+- Keep an MCP server's saved credentials when removing it fails; they are deleted only after the
+  server is removed from the configuration.
+
 - Let readers scroll up during a streamed response without being pulled back down. Resume
   automatic scrolling when they return to the bottom of the conversation.
 
