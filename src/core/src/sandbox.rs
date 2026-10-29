@@ -472,6 +472,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn native_stdin_json_reaches_a_sandboxed_command_tool() {
+            use crate::{
+                approvals::Approvals,
+                protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+            };
+            let project = Project::new(ExecutionProfile::WorkspaceWrite);
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let allow = move |event| {
+                if let AgentEvent::ApprovalRequest {
+                    request_id,
+                    approval_id,
+                    ..
+                } = event
+                {
+                    decisions
+                        .resolve(ResolveApprovalRequest {
+                            request_id,
+                            approval_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .unwrap();
+                }
+            };
+            let tool: crate::command_tools::CommandTool = serde_json::from_value(serde_json::json!({"name":"echo_input", "description":"Native fixture", "command":["/bin/cat"], "stdin":"json", "parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}})).unwrap();
+            let output = tool
+                .run(
+                    &project.workspace,
+                    r#"{"text":"sandboxed"}"#,
+                    "run",
+                    &approvals,
+                    &allow,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output, "Exit: 0\n{\"arguments\":{\"text\":\"sandboxed\"}}");
+        }
+
+        #[tokio::test]
         async fn native_path_quoting_and_explicit_unsandboxed_selection() {
             let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
             let renamed = project.root.join("project \"quoted\" \\ path");

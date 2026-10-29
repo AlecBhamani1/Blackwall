@@ -1,21 +1,33 @@
-//! Owner-defined tools that run a fixed program with model-supplied arguments, without a shell.
+//! Owner-defined tools that run a fixed program with model-supplied arguments, without a shell,
+//! or send one HTTP request to a fixed origin.
 use crate::{
     approvals::Approvals,
     protocol::{AgentEvent, ApprovalKind},
     tools::ToolError,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+mod http;
+pub use http::{delete_secret, save_secret, SECRET_SERVICE};
 
 pub const COMMAND_TOOLS_FILE: &str = "tools.json";
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_TOOLS: usize = 20;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_VALUE_BYTES: usize = 8000;
+/// The JSON written to a `stdin: "json"` tool, so a long prompt is not limited by argv.
+const MAX_INPUT_BYTES: usize = 256 * 1024;
+const MAX_PROPERTIES: usize = 64;
+const MAX_CHOICES: usize = 64;
+/// How much of standard input or a request body the approval prompt shows.
+const MAX_SHOWN_INPUT: usize = 2000;
 const BUILT_IN: [&str; 13] = [
     "read_file",
     "list_files",
@@ -32,18 +44,138 @@ const BUILT_IN: [&str; 13] = [
     "skill_propose",
 ];
 
+/// What a tool does when called: run a program (the default) or send an HTTP request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolKind {
+    #[default]
+    Command,
+    Http,
+}
+
+/// What a command tool's standard input holds: nothing (the default) or `{"arguments":{…}}`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StdinMode {
+    #[default]
+    None,
+    Json,
+}
+
+/// An HTTP tool's request body: none (the default) or the arguments as a JSON object.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyMode {
+    #[default]
+    None,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Method {
+    #[default]
+    Get,
+    Post,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTool {
     name: String,
     description: String,
+    #[serde(default)]
+    kind: ToolKind,
+    #[serde(default)]
     command: Vec<String>,
+    #[serde(default)]
+    stdin: StdinMode,
+    /// The owner's argument schema. Without one, every placeholder is a required string.
+    #[serde(default)]
+    parameters: Option<Schema>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    method: Option<Method>,
+    /// Header names and `{secret:NAME}` references; values are in the credential store.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: BodyMode,
+}
+
+/// The JSON Schema subset owners can declare: an object of typed, optionally enumerated values.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Schema {
+    #[serde(rename = "type")]
+    kind: ObjectType,
+    #[serde(default)]
+    properties: BTreeMap<String, Property>,
+    #[serde(default)]
+    required: Vec<String>,
+    /// Only `false` is accepted; arguments the schema does not name are always refused.
+    #[serde(default)]
+    additional_properties: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+enum ObjectType {
+    #[serde(rename = "object")]
+    Object,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Property {
+    #[serde(rename = "type")]
+    kind: ValueType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "enum", default, skip_serializing_if = "Option::is_none")]
+    choices: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ValueType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+}
+
+impl ValueType {
+    fn accepts(self, value: &Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+            // JSON has one number type, so a whole-number float such as `3.0` is an integer.
+            Self::Integer => {
+                value.is_i64()
+                    || value.is_u64()
+                    || value
+                        .as_f64()
+                        .is_some_and(|n| n.is_finite() && n.fract() == 0.0)
+            }
+            Self::Boolean => value.is_boolean(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandToolFile {
     tools: Vec<CommandTool>,
+}
+
+fn parse_file(body: &[u8]) -> Result<Vec<CommandTool>, &'static str> {
+    if body.len() > MAX_FILE_BYTES {
+        return Err("The tools file is too large.");
+    }
+    serde_json::from_slice::<CommandToolFile>(body)
+        .map_err(|_| "The tools file is not valid.")
+        .and_then(|file| validate(file.tools))
 }
 
 /// Tools loaded for one run. A missing file has no tools; an invalid file has no tools and a
@@ -64,10 +196,7 @@ impl CommandTools {
         {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(_) => Err("The tools file could not be read."),
-            Ok(body) if body.len() > MAX_FILE_BYTES => Err("The tools file is too large."),
-            Ok(body) => serde_json::from_slice::<CommandToolFile>(&body)
-                .map_err(|_| "The tools file is not valid.")
-                .and_then(|file| validate(file.tools)),
+            Ok(body) => parse_file(&body),
         };
         match parsed {
             Ok(tools) => Self { tools, error: None },
@@ -82,19 +211,7 @@ impl CommandTools {
         self.tools
             .iter()
             .map(|tool| {
-                // A placeholder may repeat; the schema lists each name once.
-                let mut seen = std::collections::HashSet::new();
-                let parameters: Vec<_> = tool
-                    .command
-                    .iter()
-                    .filter_map(|arg| placeholder(arg))
-                    .filter(|name| seen.insert(*name))
-                    .collect();
-                let properties: serde_json::Map<_, _> = parameters
-                    .iter()
-                    .map(|name| ((*name).to_owned(), json!({"type":"string"})))
-                    .collect();
-                json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":{"type":"object","properties":properties,"required":parameters,"additionalProperties":false}}})
+                json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters_json()}})
             })
             .collect()
     }
@@ -104,8 +221,107 @@ impl CommandTools {
     }
 }
 
+/// Check `args` against an owner schema: an object with only declared names, every required
+/// name present, and each value of its declared type and, when listed, one of its choices.
+pub fn validate_arguments(schema: &Schema, args: &Value) -> Result<(), ToolError> {
+    let object = args.as_object().ok_or(ToolError::Arguments)?;
+    if schema
+        .required
+        .iter()
+        .any(|name| !object.contains_key(name))
+    {
+        return Err(ToolError::Arguments);
+    }
+    for (name, value) in object {
+        let property = schema.properties.get(name).ok_or(ToolError::Arguments)?;
+        if !property.kind.accepts(value)
+            || property
+                .choices
+                .as_ref()
+                .is_some_and(|choices| !choices.contains(value))
+        {
+            return Err(ToolError::Arguments);
+        }
+    }
+    Ok(())
+}
+
 impl CommandTool {
-    /// Rules match the configured command template, so `claude -p` can allow every prompt.
+    /// The approval kind a call asks with: Network for HTTP tools, Exec for programs.
+    pub fn approval_kind(&self) -> ApprovalKind {
+        match self.kind {
+            ToolKind::Command => ApprovalKind::Exec,
+            ToolKind::Http => ApprovalKind::Network,
+        }
+    }
+
+    /// Placeholder names in first-use order, each once: argv placeholders, or URL placeholders.
+    fn placeholders(&self) -> Vec<&str> {
+        let names: Vec<&str> = match self.kind {
+            ToolKind::Command => self
+                .command
+                .iter()
+                .filter_map(|arg| placeholder(arg))
+                .collect(),
+            ToolKind::Http => self
+                .url
+                .as_deref()
+                .and_then(|url| http::Template::parse(url).ok())
+                .map(|template| template.names)
+                .unwrap_or_default(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        names
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .collect()
+    }
+
+    fn parameters_json(&self) -> Value {
+        match &self.parameters {
+            Some(schema) => {
+                json!({"type":"object","properties":schema.properties,"required":schema.required,"additionalProperties":false})
+            }
+            None => {
+                // A placeholder may repeat; the schema lists each name once.
+                let parameters = self.placeholders();
+                let properties: Map<_, _> = parameters
+                    .iter()
+                    .map(|name| ((*name).to_owned(), json!({"type":"string"})))
+                    .collect();
+                json!({"type":"object","properties":properties,"required":parameters,"additionalProperties":false})
+            }
+        }
+    }
+
+    /// The text a placeholder becomes. Without an owner schema only strings are accepted, as
+    /// before schemas existed; with one, numbers and booleans are written as JSON writes them.
+    fn value_text(&self, values: &Value, name: &str) -> Result<String, ToolError> {
+        let integer = self.parameters.as_ref().is_some_and(|schema| {
+            schema
+                .properties
+                .get(name)
+                .is_some_and(|property| property.kind == ValueType::Integer)
+        });
+        let text = match values.get(name) {
+            Some(Value::String(text)) => text.clone(),
+            // `3.0` for an integer is written `3`, as the owner's program or service expects.
+            Some(Value::Number(number)) if integer && !number.is_i64() && !number.is_u64() => {
+                format!("{:.0}", number.as_f64().ok_or(ToolError::Arguments)?)
+            }
+            Some(value @ (Value::Number(_) | Value::Bool(_))) if self.parameters.is_some() => {
+                value.to_string()
+            }
+            _ => return Err(ToolError::Arguments),
+        };
+        if text.len() > MAX_VALUE_BYTES {
+            return Err(ToolError::Arguments);
+        }
+        Ok(text)
+    }
+
+    /// Command rules match the configured command template, so `claude -p` can allow every
+    /// prompt. HTTP tools ask with kind Network, and rules match the request's host.
     pub async fn run(
         &self,
         workspace: &crate::tools::Workspace,
@@ -115,19 +331,70 @@ impl CommandTool {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         timeout: Duration,
     ) -> Result<String, ToolError> {
+        let keychain: http::Lookup =
+            std::sync::Arc::new(|account: &str| crate::secrets::get(SECRET_SERVICE, account));
+        self.run_with(
+            workspace, arguments, request_id, approvals, emit, timeout, keychain,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_with(
+        &self,
+        workspace: &crate::tools::Workspace,
+        arguments: &str,
+        request_id: &str,
+        approvals: &Approvals,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        timeout: Duration,
+        secrets: http::Lookup,
+    ) -> Result<String, ToolError> {
         let values: Value = serde_json::from_str(arguments).map_err(|_| ToolError::Arguments)?;
+        match &self.parameters {
+            Some(schema) => validate_arguments(schema, &values)?,
+            // Arguments sent whole, on stdin or as a body, follow the placeholder schema exactly;
+            // argv-only tools still ignore names they do not use, as before schemas existed.
+            None if self.stdin == StdinMode::Json || self.body == BodyMode::Json => {
+                let names = self.placeholders();
+                let object = values.as_object().ok_or(ToolError::Arguments)?;
+                if names.iter().any(|name| !object.contains_key(*name))
+                    || object
+                        .iter()
+                        .any(|(name, value)| !value.is_string() || !names.contains(&name.as_str()))
+                {
+                    return Err(ToolError::Arguments);
+                }
+            }
+            None => {}
+        }
+        if self.kind == ToolKind::Http {
+            return http::run(self, &values, request_id, approvals, emit, timeout, secrets).await;
+        }
         let args = self.command[1..]
             .iter()
             .map(|arg| match placeholder(arg) {
-                Some(name) => values
-                    .get(name)
-                    .and_then(Value::as_str)
-                    .filter(|value| value.len() <= MAX_VALUE_BYTES && !is_option(value))
-                    .map(str::to_owned)
-                    .ok_or(ToolError::Arguments),
+                Some(name) => {
+                    self.value_text(&values, name)
+                        .and_then(|value| match is_option(&value) {
+                            true => Err(ToolError::Arguments),
+                            false => Ok(value),
+                        })
+                }
                 None => Ok(arg.clone()),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let input = match self.stdin {
+            StdinMode::None => None,
+            StdinMode::Json => {
+                let input = serde_json::to_vec(&json!({ "arguments": values }))
+                    .map_err(|_| ToolError::Arguments)?;
+                if input.len() > MAX_INPUT_BYTES {
+                    return Err(ToolError::Arguments);
+                }
+                Some(input)
+            }
+        };
         let program = resolve_program(&self.command[0]).ok_or_else(|| {
             ToolError::Execution(format!(
                 "{} was not found on this computer.",
@@ -135,14 +402,17 @@ impl CommandTool {
             ))
         })?;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
-        let detail = format!(
-            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}\n\n{}",
+        let mut detail = format!(
+            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
             workspace.path.display(),
             self.name,
             program.display(),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
-            workspace.execution.description(),
         );
+        if let Some(input) = &input {
+            detail.push_str(&format!("\nStandard input: JSON, {}", shown_bytes(input)));
+        }
+        detail.push_str(&format!("\n\n{}", workspace.execution.description()));
         if !approvals
             .request(
                 request_id,
@@ -156,8 +426,23 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
-        crate::tools::program_with_timeout(workspace, &program, &args, timeout).await
+        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout).await
     }
+}
+
+/// Size, digest, and the start of a payload for an approval prompt. The digest keeps a
+/// remembered approval exact when the shown text is clipped.
+fn shown_bytes(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut shown: String = text.chars().take(MAX_SHOWN_INPUT).collect();
+    if shown.len() < text.len() {
+        shown.push('…');
+    }
+    let digest: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{} bytes, sha256 {digest}\n{shown}", bytes.len())
 }
 
 /// A value that could be read as an option the owner did not configure.
@@ -197,7 +482,7 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .bytes()
@@ -238,14 +523,70 @@ fn validate(tools: Vec<CommandTool>) -> Result<Vec<CommandTool>, &'static str> {
             || tools[..index].iter().any(|other| other.name == tool.name)
             || tool.description.trim().is_empty()
             || tool.description.len() > 1024
-            || tool.command.is_empty()
-            || tool.command.len() > MAX_ARGUMENTS
-            || !valid_program(&tool.command[0])
         {
             return Err("A tool has an invalid name, description, or command.");
         }
+        match tool.kind {
+            ToolKind::Command => {
+                if tool.command.is_empty()
+                    || tool.command.len() > MAX_ARGUMENTS
+                    || !valid_program(&tool.command[0])
+                {
+                    return Err("A tool has an invalid name, description, or command.");
+                }
+                if tool.url.is_some()
+                    || tool.method.is_some()
+                    || !tool.headers.is_empty()
+                    || tool.body != BodyMode::None
+                {
+                    return Err("Only HTTP tools take a url, method, headers, or body.");
+                }
+            }
+            ToolKind::Http => http::validate(tool)?,
+        }
+        if let Some(schema) = &tool.parameters {
+            validate_schema(schema)?;
+            // Every placeholder needs a value, so each must be a required parameter.
+            if tool
+                .placeholders()
+                .iter()
+                .any(|name| !schema.required.iter().any(|required| required == name))
+            {
+                return Err("Every placeholder must be a required parameter.");
+            }
+        }
     }
     Ok(tools)
+}
+
+fn validate_schema(schema: &Schema) -> Result<(), &'static str> {
+    const INVALID: &str = "A tool has invalid parameters.";
+    let ObjectType::Object = schema.kind;
+    if schema.additional_properties == Some(true)
+        || schema.properties.len() > MAX_PROPERTIES
+        || schema.required.iter().enumerate().any(|(index, name)| {
+            !schema.properties.contains_key(name) || schema.required[..index].contains(name)
+        })
+    {
+        return Err(INVALID);
+    }
+    for (name, property) in &schema.properties {
+        let choices_valid = property.choices.as_ref().is_none_or(|choices| {
+            !choices.is_empty()
+                && choices.len() <= MAX_CHOICES
+                && choices.iter().all(|choice| property.kind.accepts(choice))
+        });
+        if !valid_name(name)
+            || property
+                .description
+                .as_ref()
+                .is_some_and(|description| description.len() > 1024)
+            || !choices_valid
+        {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -363,6 +704,273 @@ mod tests {
             .await,
             Err(ToolError::Arguments)
         ));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    fn schema(value: Value) -> Schema {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_json_loads_unchanged() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"ask_claude","description":"Ask Claude","command":["claude","-p","{prompt}","--model","{model}","{prompt}"]},{"name":"status","description":"Git status","command":["git","status"]}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none());
+        assert_eq!(
+            tools.definitions(),
+            vec![
+                json!({"type":"function","function":{"name":"ask_claude","description":"Ask Claude","parameters":{"type":"object","properties":{"prompt":{"type":"string"},"model":{"type":"string"}},"required":["prompt","model"],"additionalProperties":false}}}),
+                json!({"type":"function","function":{"name":"status","description":"Git status","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}),
+            ]
+        );
+        let tool = tools.get("ask_claude").unwrap();
+        assert_eq!(tool.kind, ToolKind::Command);
+        assert_eq!(tool.stdin, StdinMode::None);
+        assert!(tool.parameters.is_none());
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        // HTTP-only fields are refused on a command tool.
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"x","description":"x","command":["ls"],"url":"https://example.com/"}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_some());
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[test]
+    fn schema_types_enforced() {
+        let schema = schema(json!({"type":"object","properties":{
+            "name":{"type":"string","description":"Who"},
+            "count":{"type":"integer"},
+            "ratio":{"type":"number"},
+            "dry_run":{"type":"boolean"}
+        },"required":["name"],"additionalProperties":false}));
+        validate_schema(&schema).unwrap();
+        assert!(validate_arguments(
+            &schema,
+            &json!({"name":"a","count":3,"ratio":0.5,"dry_run":true})
+        )
+        .is_ok());
+        for arguments in [
+            json!({"name":1}),
+            json!({"name":"a","count":"3"}),
+            json!({"name":"a","count":1.5}),
+            json!({"name":"a","ratio":"0.5"}),
+            json!({"name":"a","dry_run":"true"}),
+            json!({"name":"a","extra":1}),
+            json!(["a"]),
+            json!(null),
+        ] {
+            assert!(
+                matches!(
+                    validate_arguments(&schema, &arguments),
+                    Err(ToolError::Arguments)
+                ),
+                "{arguments}"
+            );
+        }
+        // Only the subset is accepted.
+        for parameters in [
+            json!({"type":"object","properties":{"list":{"type":"array"}}}),
+            json!({"type":"object","properties":{"a":{"type":"string","minLength":1}}}),
+            json!({"type":"string"}),
+            json!({"type":"object","properties":{},"additionalProperties":true}),
+            json!({"type":"object","properties":{},"required":["missing"]}),
+            json!({"type":"object","properties":{"Bad Name":{"type":"string"}}}),
+        ] {
+            let parsed = serde_json::from_value::<Schema>(parameters.clone());
+            assert!(
+                parsed.is_err() || validate_schema(&parsed.unwrap()).is_err(),
+                "{parameters}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_enum_enforced() {
+        let schema = schema(json!({"type":"object","properties":{
+            "level":{"type":"string","enum":["low","high"]},
+            "size":{"type":"integer","enum":[1,2]}
+        },"required":["level"]}));
+        validate_schema(&schema).unwrap();
+        assert!(validate_arguments(&schema, &json!({"level":"low","size":2})).is_ok());
+        assert!(validate_arguments(&schema, &json!({"level":"mid"})).is_err());
+        assert!(validate_arguments(&schema, &json!({"level":"low","size":3})).is_err());
+        // Choices must match the declared type and the list cannot be empty.
+        for property in [
+            json!({"type":"string","enum":[1]}),
+            json!({"type":"string","enum":[]}),
+        ] {
+            let bad = schema_from_property(property.clone());
+            assert!(validate_schema(&bad).is_err(), "{property}");
+        }
+        // The definition the model sees carries the owner's schema.
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"deploy","description":"Deploy","command":["deploy","{level}"],"parameters":{"type":"object","properties":{"level":{"type":"string","enum":["low","high"],"description":"How far"}},"required":["level"]}}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none(), "{:?}", tools.error);
+        assert_eq!(
+            tools.definitions()[0]["function"]["parameters"],
+            json!({"type":"object","properties":{"level":{"type":"string","description":"How far","enum":["low","high"]}},"required":["level"],"additionalProperties":false})
+        );
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        // A placeholder that is not a required parameter is refused.
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"deploy","description":"Deploy","command":["deploy","{level}"],"parameters":{"type":"object","properties":{"level":{"type":"string"}}}}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_some());
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    fn schema_from_property(property: Value) -> Schema {
+        schema(json!({"type":"object","properties":{"a":property}}))
+    }
+
+    #[tokio::test]
+    async fn required_missing_is_arguments_error() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"ask","description":"Ask","command":["cat"],"stdin":"json","parameters":{"type":"object","properties":{"prompt":{"type":"string"},"model":{"type":"string"}},"required":["prompt"]}}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none(), "{:?}", tools.error);
+        let workspace = crate::tools::Workspace::open(&directory).unwrap();
+        let approvals = Approvals::default();
+        let never = |_: AgentEvent| panic!("invalid arguments never ask for approval");
+        for arguments in [r#"{"model":"x"}"#, r#"{}"#, "not json"] {
+            assert!(matches!(
+                tools
+                    .get("ask")
+                    .unwrap()
+                    .run(
+                        &workspace,
+                        arguments,
+                        "run",
+                        &approvals,
+                        &never,
+                        Duration::from_secs(10)
+                    )
+                    .await,
+                Err(ToolError::Arguments)
+            ));
+        }
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_json_receives_arguments() {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"ask","description":"Ask","command":["cat"],"stdin":"json","parameters":{"type":"object","properties":{"prompt":{"type":"string"},"max":{"type":"integer"}},"required":["prompt"]}}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none(), "{:?}", tools.error);
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let details = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let captured = details.clone();
+        let allow = move |event| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                detail,
+                ..
+            } = event
+            {
+                captured.lock().unwrap().push(detail);
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        // A value longer than the argv limit and starting with `-` is fine on stdin.
+        let prompt = format!("-{}", "p".repeat(MAX_VALUE_BYTES + 10));
+        let arguments = json!({"prompt":prompt,"max":3}).to_string();
+        let output = tools
+            .get("ask")
+            .unwrap()
+            .run(
+                &workspace,
+                &arguments,
+                "run",
+                &approvals,
+                &allow,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let echoed: Value =
+            serde_json::from_str(output.strip_prefix("Exit: 0\n").unwrap()).unwrap();
+        assert_eq!(echoed, json!({"arguments":{"prompt":prompt,"max":3}}));
+        let detail = details.lock().unwrap()[0].clone();
+        assert!(detail.contains("Standard input: JSON,"), "{detail}");
+        assert!(detail.contains("sha256 "), "{detail}");
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdin_json_without_parameters_takes_only_placeholders() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"ask","description":"Ask","command":["ask","{prompt}"],"stdin":"json"}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none(), "{:?}", tools.error);
+        let workspace = crate::tools::Workspace::open(&directory).unwrap();
+        let approvals = Approvals::default();
+        let never = |_: AgentEvent| panic!("invalid arguments never ask for approval");
+        for arguments in [
+            r#"{"prompt":"a","extra":"b"}"#,
+            r#"{"prompt":{"nested":"a"}}"#,
+            r#"{"prompt":"a","more":{"nested":1}}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                matches!(
+                    tools
+                        .get("ask")
+                        .unwrap()
+                        .run(
+                            &workspace,
+                            arguments,
+                            "run",
+                            &approvals,
+                            &never,
+                            Duration::from_secs(10)
+                        )
+                        .await,
+                    Err(ToolError::Arguments)
+                ),
+                "{arguments}"
+            );
+        }
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn integer_accepts_whole_number_floats() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"issue","description":"Issue","command":["issue","{n}"],"parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}]}"#,
+        )
+        .await;
+        let tool = tools.get("issue").unwrap();
+        let schema = tool.parameters.as_ref().unwrap();
+        assert!(validate_arguments(schema, &json!({"n":3.0})).is_ok());
+        assert!(validate_arguments(schema, &json!({"n":3.5})).is_err());
+        assert_eq!(tool.value_text(&json!({"n":3.0}), "n").unwrap(), "3");
+        assert_eq!(tool.value_text(&json!({"n":-4}), "n").unwrap(), "-4");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 }

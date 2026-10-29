@@ -419,6 +419,21 @@ impl Policy {
         })
     }
 
+    /// An owner HTTP command tool's request. Rules naming the tool always apply, and so do the
+    /// host's deny and ask rules; a host allow applies only to a request without credentials or
+    /// a body, so a credentialed request needs an allow rule that names the tool.
+    pub fn evaluate_http_tool(&self, tool: &str, host: &str, credentialed: bool) -> Verdict {
+        self.verdict(&|rule| {
+            rule.kind == ApprovalKind::Network
+                && match rule.tool.as_deref() {
+                    Some(name) => name == tool,
+                    None => {
+                        (!credentialed || rule.decision != Decision::Allow) && matches(rule, host)
+                    }
+                }
+        })
+    }
+
     pub fn decide_tool(&self, exposed: &str) -> Decision {
         self.evaluate_tool(exposed).decision
     }
@@ -510,7 +525,15 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
                     .as_deref()
                     .filter(|t| crate::mcp::valid_tool_rule(t))),
             ApprovalKind::File => rule.path.as_deref().filter(|p| normalize(p).is_some()),
-            ApprovalKind::Network => rule.host.as_deref().filter(|h| !h.trim().is_empty()),
+            // A `tool` network rule names one owner HTTP command tool.
+            ApprovalKind::Network => rule
+                .host
+                .as_deref()
+                .filter(|h| !h.trim().is_empty())
+                .or(rule
+                    .tool
+                    .as_deref()
+                    .filter(|t| crate::command_tools::valid_name(t))),
             ApprovalKind::Subagent => None,
         };
         let fields = [&rule.command, &rule.path, &rule.host, &rule.tool]
@@ -557,7 +580,7 @@ pub fn allow_tool(directory: &Path, tool: &str, project: Option<&Path>) -> Resul
 pub fn tool_rules(directory: &Path) -> Result<Vec<ToolRule>, String> {
     Ok(read_rules(directory)?
         .into_iter()
-        .filter(|rule| rule.decision == Decision::Allow)
+        .filter(|rule| rule.decision == Decision::Allow && rule.kind == ApprovalKind::Exec)
         .filter_map(|rule| {
             Some(ToolRule {
                 tool: rule.tool?,
@@ -573,9 +596,11 @@ pub fn remove_server_rules(directory: &Path, server: &str) -> Result<(), String>
     let prefix = format!("{server}__");
     edit_rules(directory, |file| {
         file.rules.retain(|rule| {
-            rule.tool
-                .as_deref()
-                .is_none_or(|tool| tool != server && !tool.starts_with(&prefix))
+            rule.kind != ApprovalKind::Exec
+                || rule
+                    .tool
+                    .as_deref()
+                    .is_none_or(|tool| tool != server && !tool.starts_with(&prefix))
         });
     })
 }
@@ -585,6 +610,7 @@ pub fn remove_tool_rule(directory: &Path, rule: &ToolRule) -> Result<(), String>
     edit_rules(directory, |file| {
         file.rules.retain(|saved| {
             saved.decision != Decision::Allow
+                || saved.kind != ApprovalKind::Exec
                 || saved.tool.as_deref() != Some(rule.tool.as_str())
                 || saved.project != rule.project
         });

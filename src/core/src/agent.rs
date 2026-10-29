@@ -663,13 +663,19 @@ impl Agent<'_> {
                             name: call.function.name.clone(),
                             arguments: call.function.arguments.clone(),
                         });
+                        let owner_tool = command_tools.get(&call.function.name);
                         let confirmed = !text_calls
                             || !permitted
                             || self
                                 .approvals
                                 .confirm_text_call(
                                     request_id,
-                                    crate::approvals::text_call_kind(&call.function.name),
+                                    owner_tool.map_or_else(
+                                        || crate::approvals::text_call_kind(&call.function.name),
+                                        |tool| tool.approval_kind(),
+                                    ),
+                                    // An owner tool asks again with its own resolved request.
+                                    owner_tool.is_none(),
                                     &call.function.name,
                                     &call.function.arguments,
                                     &emit,
