@@ -829,7 +829,7 @@ call, and each tool call, using the OpenTelemetry generative AI names (`invoke_a
 `execute_tool`). A `spawn_agent` child appears as `invoke_agent subagent` under its tool call,
 with its own model and tool calls nested beneath it. Spans keep timings, the model, token counts
 the server reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the
-newest 200 traces and never sends them anywhere.
+newest 200 traces. They stay on this computer unless you turn on [OTLP export](#telemetry-export).
 
 The same switch records usage metrics in `~/.blackwall/metrics/YYYY-MM-DD.jsonl`: token usage and
 duration per model call, tool calls by outcome, and runs by outcome, kept for 400 days by default
