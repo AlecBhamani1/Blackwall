@@ -1,0 +1,32 @@
+' Blackwall colours (ui/src/theme.css) for the C4-PlantUML templates.
+skinparam backgroundColor #0e0f13
+skinparam defaultFontColor #e8eaed
+skinparam ArrowColor #8b90a0
+skinparam ArrowFontColor #8b90a0
+skinparam TitleFontColor #39c5a8
+skinparam legendBackgroundColor #14161c
+skinparam legendBorderColor #343946
+skinparam legendFontColor #e8eaed
+<style>
+legend {
+  LineColor #343946
+}
+</style>
+UpdateElementStyle("person", $bgColor="#183a34", $fontColor="#e8eaed", $borderColor="#39c5a8")
+UpdateElementStyle("external_person", $bgColor="#14161c", $fontColor="#8b90a0", $borderColor="#565b6b")
+UpdateElementStyle("system", $bgColor="#183a34", $fontColor="#e8eaed", $borderColor="#39c5a8")
+UpdateElementStyle("external_system", $bgColor="#14161c", $fontColor="#8b90a0", $borderColor="#565b6b")
+UpdateElementStyle("container", $bgColor="#1a1d25", $fontColor="#e8eaed", $borderColor="#39c5a8")
+UpdateElementStyle("external_container", $bgColor="#14161c", $fontColor="#8b90a0", $borderColor="#565b6b")
+UpdateElementStyle("component", $bgColor="#1a1d25", $fontColor="#e8eaed", $borderColor="#39c5a8")
+UpdateBoundaryStyle($bgColor="#0e0f13", $fontColor="#39c5a8", $borderColor="#39c5a8")
+UpdateRelStyle($textColor="#8b90a0", $lineColor="#8b90a0")
+' A plain legend: the template's legend shows missing-glyph boxes in SVG and PNG.
+!procedure $BwLegend()
+HIDE_STEREOTYPE()
+legend right
+|<#183a34> <color:#e8eaed>Blackwall, its users</color> |
+|<#1a1d25> <color:#e8eaed>Part of Blackwall</color> |
+|<#14161c> <color:#8b90a0>Outside Blackwall</color> |
+endlegend
+!endprocedure

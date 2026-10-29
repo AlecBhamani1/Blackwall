@@ -93,6 +93,10 @@ suite (`cargo test … fuzz`). When you add a parser like these, add one in the 
 For a local coverage report, install `cargo-llvm-cov` and run
 `cargo llvm-cov --manifest-path src/Cargo.toml --workspace --html`. Coverage is not enforced in CI.
 
+Architecture diagrams are C4-PlantUML sources in `docs/diagrams/`. After changing one, regenerate
+the SVGs with `plantuml -tsvg docs/diagrams/{context,container,component}.puml` (PlantUML 1.2024
+or newer, which bundles the C4 library) and commit both.
+
 Lefthook runs formatting and static analysis before commits, test suites before pushes, and
 commitlint on commit messages. Hooks supplement CI; they do not replace it.
 

@@ -134,6 +134,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A run now reads `.blackwall/project.json` once, so its rules and its limits always come from the same version of the file, even if the file changes while the run starts.
 - Usage no longer reads an oversized line in a local OTLP metrics file into memory. A line over
   4 MiB is counted as unreadable and skipped, and the next line is still read.
 - Keep credentials out of the approval audit log when a command passes them as headers such as
