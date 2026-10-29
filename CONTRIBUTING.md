@@ -2,7 +2,9 @@
 
 Thank you for helping make Blackwall a dependable local-first agent harness. This guide
 describes the baseline expected of every change. The architecture and security invariants are
-documented in `docs/PLAN.md` while the initial implementation is being built.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), current behaviour in
+[docs/RUNTIME_GUIDE.md](docs/RUNTIME_GUIDE.md), and agent instructions in
+[docs/PROJECT_INSTRUCTIONS.md](docs/PROJECT_INSTRUCTIONS.md).
 
 Start feature branches from `origin/partial` and target `partial` with development PRs.
 `main` is production and accepts release promotions from `partial` only. Follow the

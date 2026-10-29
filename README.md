@@ -6,7 +6,7 @@ on this computer or on another machine you control through any OpenAI-compatible
 
 > **Development status:** guided setup, durable local conversations, project tools with approvals,
 > memory, skills, and an interruptible agent runtime are implemented in this checkout. These changes
-> are available in the 0.1.3 development build. Release acceptance remains incomplete.
+> are available in the current beta builds. Release acceptance remains incomplete.
 > Persistent pairing is implemented with a configured relay;
 > native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in [the delivery plan](docs/DELIVERY_PLAN.md).
 > Linux and Windows builds are new and still need physical-device acceptance.
@@ -33,8 +33,9 @@ a SmartScreen or Gatekeeper warning.
 ## What works now
 
 - Guided setup for local models, another computer, or a browser invitation
-- Detection of every model server on this computer, such as Ollama, LM Studio, llama.cpp and vLLM on
-  any loopback port, chosen in setup rather than connected automatically; explicit starter-model
+- Detection of model servers on this computer, such as Ollama, LM Studio, llama.cpp and vLLM, on
+  their usual ports and on other listening loopback ports (1024 and up, at most 64 checked),
+  chosen in setup rather than connected automatically; explicit starter-model
   downloads through Ollama; the server's own explanation when a request fails
 - Context-window detection for Ollama (any port), llama.cpp, vLLM, and LM Studio; model reasoning
   kept out of answers and shown collapsed; opt-in reading of tool calls a model writes as text,

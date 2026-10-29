@@ -9,7 +9,7 @@ flowchart LR
   F --> C[Pull request and CI]
   C --> P[partial]
   P --> R[Release notes, version, acceptance, milestone]
-  R --> G[partial to main PR and both macOS builds]
+  R --> G[partial to main PR and all five desktop builds]
   G --> M[main merge commit]
   M --> V[Passing production CI]
   V --> B[Signed builds and artifact verification]
@@ -103,8 +103,9 @@ they do not need continuous updates. The queue updates open PRs, not local workt
 
 ## Test integration builds
 
-Successful `partial` push CI automatically publishes a signed beta prerelease for both macOS
-architectures. In Blackwall, choose **Settings → App updates → Beta** to try integration features
+Successful `partial` push CI automatically publishes a signed beta prerelease for all five
+desktop targets (macOS Apple Silicon and Intel, Windows x64, Linux x64 and ARM64). In Blackwall,
+choose **Settings → App updates → Beta** to try integration features
 before promotion. Stable remains the default and its feed changes only through the production
 process. See [UPDATES.md](UPDATES.md) for beta downloads, versions, and recovery.
 
@@ -130,7 +131,8 @@ process. See [UPDATES.md](UPDATES.md) for beta downloads, versions, and recovery
    template. Checking the publication item and merging authorizes automatic publication.
 4. The production gate requires this repository's `partial` branch, a newer stable version,
    complete notes, the matching milestone, explicit checked acceptance, and the latest `main`
-   commit in `partial`'s history. Both Apple Silicon and Intel desktop builds must also pass.
+   commit in `partial`'s history. All five desktop builds (macOS Apple Silicon and Intel,
+   Windows x64, Linux x64 and ARM64) must also pass.
    Merge this PR with a **merge commit**. Production rules prohibit squash/rebase promotions,
    which would sever shared history and make the next batch difficult to compare.
 5. The main push runs CI. Its successful completion automatically starts the signed release
