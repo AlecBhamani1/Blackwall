@@ -1,6 +1,6 @@
 # Using the current Blackwall development build
 
-Updated 2026-10-06. This guide describes the code in this checkout. It does not imply that a
+Updated 2026-10-28. This guide describes the code in this checkout. It does not imply that a
 published installer contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
 
 Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
@@ -831,7 +831,8 @@ the server reports, finish reasons, tool names, errors, and approval requests. B
 newest 200 traces and never sends them anywhere.
 
 The same switch records usage metrics in `~/.blackwall/metrics/YYYY-MM-DD.jsonl`: token usage and
-duration per model call, tool calls by outcome, and runs by outcome, kept for 400 days. Metrics
+duration per model call, tool calls by outcome, and runs by outcome, kept for 400 days by default
+(see [Usage](#usage)). Metrics
 never include prompts, answers, tool arguments, or paths. See [Telemetry](TELEMETRY.md) for every
 signal, attribute, and file format.
 
@@ -876,15 +877,15 @@ command tools such as `claude` or `codex` are billed by their own services.
 - **Tokens per day** as stacked input and output bars, with a table view; **What the tokens
   contain**: input, cached input, output, and reasoning, where the model server reports the last
   two; and **Top tools** with error and denied rates.
+- **Export:** the OTLP endpoint, when it last sent, its last error (class and HTTP status only),
+  spans and metric batches sent and dropped, and **Send test span** (see
+  [Telemetry export](#telemetry-export)).
 
 The page re-reads the files every 2 minutes while it is open and visible, and marks the data
 *stale* when the newest point is more than 4 minutes old. A damaged or truncated line is skipped
 with one warning per file; the rest of the range still shows. **Export…** copies the range's
 metrics and trace files into a new `blackwall-telemetry-<from>-to-<to>` folder you choose, as plain
 OTLP JSON any OpenTelemetry Collector can import.
-
-- **Export:** the OTLP endpoint, when it last sent, its last error (class and HTTP status only),
-  spans and metric batches sent and dropped, and **Send test span**.
 
 ```sh
 bw usage                 # last 7 local days as text
@@ -910,7 +911,8 @@ op read "op://Private/otel/api-key" | bw telemetry header x-api-key   # value st
 bw telemetry test
 ```
 
-`https` is required except for `127.0.0.1`, `::1`, and `localhost`; proxies and redirects are not
+By default the endpoint is off, the protocol is protobuf, both signals are sent, and project names
+and session IDs stay local. `https` is required except for `127.0.0.1`, `::1`, and `localhost`; proxies and redirects are not
 followed and each request has a 10 s limit. Header values live only in the credential store, bound
 to the endpoint origin they were entered for; set the endpoint first, and enter headers again after
 moving to another origin. Prompts and outputs
