@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import {
     persistence,
+    instructionFileValid,
+    MAX_INSTRUCTION_FILES,
     SUBAGENT_TOOLS,
     type SubagentTool,
     type MemoryEntry,
@@ -72,6 +74,38 @@
         subagentMaxSteps: Number(subagentMaxSteps),
         subagentTools,
         subagentRunsOn: subagentRunsOn === 'local' ? 'local' : { tool: subagentTool },
+      });
+    } catch (cause) {
+      error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
+    } finally {
+      busy = false;
+    }
+  }
+  let instructionMaxFileKib = 8;
+  let instructionMaxTotalKib = 32;
+  let instructionFiles = '';
+  $: instructionFileList = instructionFiles
+    .split('\n')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+  $: instructionsValid =
+    Number.isInteger(Number(instructionMaxFileKib)) &&
+    instructionMaxFileKib >= 1 &&
+    instructionMaxFileKib <= 64 &&
+    Number.isInteger(Number(instructionMaxTotalKib)) &&
+    instructionMaxTotalKib >= 8 &&
+    instructionMaxTotalKib <= 256 &&
+    instructionFileList.length <= MAX_INSTRUCTION_FILES &&
+    new Set(instructionFileList).size === instructionFileList.length &&
+    instructionFileList.every(instructionFileValid);
+  async function saveInstructions() {
+    busy = true;
+    error = '';
+    try {
+      await persistence.savePreferences({
+        instructionMaxFileKib: Number(instructionMaxFileKib),
+        instructionMaxTotalKib: Number(instructionMaxTotalKib),
+        instructionExtraFiles: instructionFileList,
       });
     } catch (cause) {
       error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
@@ -226,6 +260,9 @@
         const runsOn = savedPreferences.subagentRunsOn ?? 'local';
         subagentRunsOn = runsOn === 'local' ? 'local' : 'tool';
         subagentTool = runsOn === 'local' ? '' : runsOn.tool;
+        instructionMaxFileKib = savedPreferences.instructionMaxFileKib ?? 8;
+        instructionMaxTotalKib = savedPreferences.instructionMaxTotalKib ?? 32;
+        instructionFiles = (savedPreferences.instructionExtraFiles ?? []).join('\n');
         await refresh();
         loaded = true;
       } catch {
@@ -528,6 +565,46 @@
           class="secondary"
           disabled={busy || !loaded || !subagentsValid}
           onclick={saveSubagents}>Save subagent settings</button
+        >
+      </details>
+      <details>
+        <summary>Advanced · Instructions</summary>
+        <label for="instruction-file-kib">Instruction file limit (KiB)</label>
+        <input
+          id="instruction-file-kib"
+          type="number"
+          min="1"
+          max="64"
+          bind:value={instructionMaxFileKib}
+          disabled={busy || !loaded}
+        />
+        <label for="instruction-total-kib">Total instruction limit (KiB)</label>
+        <input
+          id="instruction-total-kib"
+          type="number"
+          min="8"
+          max="256"
+          bind:value={instructionMaxTotalKib}
+          disabled={busy || !loaded}
+        />
+        <label for="instruction-files">Extra instruction files, one per line</label>
+        <textarea
+          id="instruction-files"
+          rows="3"
+          bind:value={instructionFiles}
+          placeholder="CLAUDE.md"
+          autocomplete="off"
+          spellcheck="false"
+          disabled={busy || !loaded}></textarea>
+        <p class="hint">
+          Read after AGENTS.md in each folder, up to 8 paths inside the project, such as CLAUDE.md
+          or .github/copilot-instructions.md. A longer file is cut at the limit with a warning.
+          Projects can lower these limits but never add files.
+        </p>
+        <button
+          class="secondary"
+          disabled={busy || !loaded || !instructionsValid}
+          onclick={saveInstructions}>Save instruction limits</button
         >
       </details>
     {/if}

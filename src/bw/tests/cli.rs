@@ -805,6 +805,25 @@ fn agent_request_loads_user_and_project_guidance_and_reports_sources() {
     assert!(!system.contains("Shadowed guidance"));
 }
 
+#[test]
+fn run_reads_configured_extra_instruction_files() {
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    fixture.success(&["config", "set", "instruction-files", "CLAUDE.md"], "");
+    fs::write(
+        fixture.project.join("CLAUDE.md"),
+        "Extra fixture conventions",
+    )
+    .unwrap();
+    let model = ModelServer::start(vec![answer("guided answer")]);
+    fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
+    let output = fixture.run(&["run", "inspect conventions"], "");
+    assert!(output.status.success());
+    let requests = model.finish();
+    let system = message_contents(&requests[0], "system").join("\n");
+    assert!(system.contains("Extra fixture conventions"), "{system}");
+}
+
 fn proposed_memory(content: &str) -> Vec<Value> {
     vec![
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fixture-memory","type":"function","function":{"name":"memory_propose","arguments":json!({"scope":"project","key":"test-command","content":content}).to_string()}}]},"finish_reason":"tool_calls"}]}),

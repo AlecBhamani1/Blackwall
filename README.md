@@ -167,7 +167,9 @@ See [Conversation recall](docs/CONVERSATION_RECALL.md) for limits, migration, an
 
 CLI and desktop Agent tasks discover `AGENTS.md` guidance, with `AGENTS.override.md` taking
 precedence in each directory. Source lists and discovery warnings are visible in both clients.
-Use `/init` to review a starter instruction file before writing it. See
+Extra files such as `CLAUDE.md` can be read after `AGENTS.md`, and the per-file and total limits
+(8 and 32 KiB by default) can be changed. Use `/init` to review a starter instruction file before
+writing it. See
 [Project instructions](docs/PROJECT_INSTRUCTIONS.md) for ordering, nested scopes, bounds,
 and approval behavior.
 

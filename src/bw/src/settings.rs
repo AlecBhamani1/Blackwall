@@ -1,3 +1,4 @@
+use blackwall_core::instructions::InstructionSettings;
 use blackwall_core::subagents::{RunsOn, SubagentSettings};
 use blackwall_core::{
     connection::normalize_endpoint,
@@ -30,6 +31,8 @@ pub struct Settings {
     pub retention: Retention,
     /// Child agents' steps, tools, and where they run.
     pub subagents: SubagentSettings,
+    /// Guidance caps and the extra files read after `AGENTS.md`.
+    pub instructions: InstructionSettings,
 }
 
 /// The export and retention settings saved under `telemetryExport` and `usageRetention`.
@@ -81,6 +84,7 @@ impl Settings {
         let model = validated_model(&self.model)?;
         let export = self.export.validated().map_err(|error| error.to_string())?;
         self.subagents.validate()?;
+        self.instructions.validate()?;
         self.endpoint = endpoint;
         self.model = model;
         self.export = export;
@@ -105,6 +109,7 @@ impl Settings {
             "telemetryExport": validated.export,
             "usageRetention": validated.retention,
             "subagents": validated.subagents,
+            "instructions": validated.instructions,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -196,6 +201,26 @@ impl Settings {
                     tool => RunsOn::Tool(tool.strip_prefix("tool:").unwrap_or(tool).to_owned()),
                 }
             }
+            "instruction-file-kib" => {
+                updated.instructions.max_file_kib = value
+                    .parse()
+                    .ok()
+                    .filter(|n| blackwall_core::instructions::FILE_KIB_RANGE.contains(n))
+                    .ok_or("Enter an instruction file limit between 1 and 64 KiB.")?
+            }
+            "instruction-total-kib" => {
+                updated.instructions.max_total_kib = value
+                    .parse()
+                    .ok()
+                    .filter(|n| blackwall_core::instructions::TOTAL_KIB_RANGE.contains(n))
+                    .ok_or("Enter a total instruction limit between 8 and 256 KiB.")?
+            }
+            "instruction-files" => {
+                updated.instructions.extra_files = match value.trim() {
+                    "none" => vec![],
+                    list => list.split(',').map(|name| name.trim().to_owned()).collect(),
+                }
+            }
             "iterations" => {
                 updated.budget.max_iterations = value
                     .parse()
@@ -211,7 +236,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, instruction-file-kib, instruction-total-kib, instruction-files, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
                     .into(),
             ),
         }
@@ -228,7 +253,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\ninstructions: {}\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -240,12 +265,26 @@ impl Settings {
             self.budget.max_iterations, self.budget.command_timeout_seconds,
             self.budget.max_output_bytes,
             describe_subagents(&self.subagents),
+            describe_instructions(&self.instructions),
             self.execution_profile.name(),
             if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
             describe_export(&self.export),
             self.retention,
         )
     }
+}
+
+/// One line for the instruction settings.
+fn describe_instructions(instructions: &InstructionSettings) -> String {
+    let files = if instructions.extra_files.is_empty() {
+        "none".to_owned()
+    } else {
+        instructions.extra_files.join(",")
+    };
+    format!(
+        "{} KiB per file, {} KiB total; extra files: {files}",
+        instructions.max_file_kib, instructions.max_total_kib
+    )
 }
 
 /// One line for the subagent settings.
@@ -379,6 +418,8 @@ fn load_with_environment(
             .1,
         subagents: SubagentSettings::from_preferences(object)
             .map_err(|_| "The saved desktop subagent settings are invalid.")?,
+        instructions: InstructionSettings::from_preferences(object)
+            .map_err(|_| "The saved desktop instruction settings are invalid.")?,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -456,6 +497,7 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
                 | "telemetryExport"
                 | "usageRetention"
                 | "subagents"
+                | "instructions"
         )
     }) {
         return Err(invalid.into());
@@ -510,6 +552,11 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
         retention,
         subagents: object
             .get("subagents")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
+        instructions: object
+            .get("instructions")
             .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
             .transpose()?
             .unwrap_or_default(),
@@ -616,6 +663,7 @@ mod tests {
                 export: Default::default(),
                 retention: Default::default(),
                 subagents: Default::default(),
+                instructions: Default::default(),
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -735,7 +783,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 14);
+        assert_eq!(saved.as_object().unwrap().len(), 15);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -890,6 +938,7 @@ mod tests {
             export: Default::default(),
             retention: Default::default(),
             subagents: Default::default(),
+            instructions: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());
@@ -926,9 +975,10 @@ mod tests {
         for settings in [&from_desktop, &loaded] {
             assert_eq!(settings.budget.max_output_bytes, 65536);
             assert_eq!(settings.subagents, SubagentSettings::default());
+            assert_eq!(settings.instructions, InstructionSettings::default());
         }
         assert!(loaded.describe().contains(
-            "command output cap: 65536 bytes\nsubagents: 8 steps; tools: read_file,list_files; runs on: local model"
+            "command output cap: 65536 bytes\nsubagents: 8 steps; tools: read_file,list_files; runs on: local model\ninstructions: 8 KiB per file, 32 KiB total; extra files: none"
         ));
         // A CLI file whose contextBudget predates maxOutputBytes loads with the default cap.
         let budget = r#"{"endpoint":"http://localhost:11434/v1","model":"fixture","webEnabled":false,"memoryEnabled":false,"contextBudget":{"contextWindow":32000,"outputTokens":4096,"autoCompact":false,"maxIterations":20,"commandTimeoutSeconds":120}}"#;
@@ -975,6 +1025,81 @@ mod tests {
         settings.set(&store, "subagent-runs-on", "local").unwrap();
         assert!(defaults(&store).subagents.tools.is_empty());
         assert_eq!(defaults(&store).subagents.runs_on, RunsOn::Local);
+    }
+
+    #[test]
+    fn instruction_settings_validate_and_persist() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        for (key, value) in [
+            ("instruction-file-kib", "1"),
+            ("instruction-file-kib", "64"),
+            ("instruction-total-kib", "8"),
+            ("instruction-total-kib", "256"),
+        ] {
+            settings.set(&store, key, value).unwrap();
+        }
+        settings
+            .set(
+                &store,
+                "instruction-files",
+                "CLAUDE.md, .github/copilot-instructions.md",
+            )
+            .unwrap();
+        let reopened = defaults(&store);
+        assert_eq!(
+            reopened.instructions,
+            InstructionSettings {
+                max_file_kib: 64,
+                max_total_kib: 256,
+                extra_files: vec!["CLAUDE.md".into(), ".github/copilot-instructions.md".into()],
+            }
+        );
+        assert!(reopened.describe().contains(
+            "instructions: 64 KiB per file, 256 KiB total; extra files: CLAUDE.md,.github/copilot-instructions.md"
+        ));
+        let saved: Value =
+            serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["instructions"]["maxFileKib"], 64);
+        for (key, value) in [
+            ("instruction-file-kib", "0"),
+            ("instruction-file-kib", "65"),
+            ("instruction-total-kib", "7"),
+            ("instruction-total-kib", "257"),
+            ("instruction-files", "../CLAUDE.md"),
+            ("instruction-files", "/etc/passwd"),
+            ("instruction-files", "AGENTS.md"),
+            ("instruction-files", "a.md,a.md"),
+            ("instruction-files", "a,b,c,d,e,f,g,h,i"),
+        ] {
+            assert!(settings.set(&store, key, value).is_err(), "{key} {value}");
+        }
+        assert_eq!(defaults(&store), reopened);
+        settings.set(&store, "instruction-files", "none").unwrap();
+        assert!(defaults(&store).instructions.extra_files.is_empty());
+        // A saved file edited by hand is checked again when it loads.
+        let mut edited = saved.clone();
+        edited["instructions"]["extraFiles"] = json!(["../outside.md"]);
+        store
+            .save_setting(SETTINGS_KEY, &edited.to_string())
+            .unwrap();
+        assert!(Settings::load(&store).is_err());
+        // Without a CLI file, the desktop's saved preferences are used and checked the same way.
+        let desktop = TestDirectory::new();
+        let store = LocalStore::open(&desktop.0).unwrap();
+        let preferences = json!({"instructionMaxFileKib":4,"instructionExtraFiles":["CLAUDE.md"]});
+        store
+            .save_setting("preferences", &preferences.to_string())
+            .unwrap();
+        let loaded = defaults(&store).instructions;
+        assert_eq!((loaded.max_file_kib, loaded.max_total_kib), (4, 32));
+        assert_eq!(loaded.extra_files, ["CLAUDE.md"]);
+        let preferences = json!({"instructionMaxTotalKib":512});
+        store
+            .save_setting("preferences", &preferences.to_string())
+            .unwrap();
+        assert!(Settings::load(&store).is_err());
     }
 
     #[test]

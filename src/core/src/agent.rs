@@ -150,6 +150,7 @@ impl Agent<'_> {
                 compact: false,
                 trace: Default::default(),
                 subagents: Default::default(),
+                instruction_settings: Default::default(),
             },
             None,
             user_directory,
@@ -223,8 +224,12 @@ impl Agent<'_> {
             compact,
             trace: _,
             subagents,
+            instruction_settings,
         } = run;
         subagents
+            .validate()
+            .map_err(|error| tools::ToolError::Execution(error.into()))?;
+        instruction_settings
             .validate()
             .map_err(|error| tools::ToolError::Execution(error.into()))?;
         state.validate()?;
@@ -286,13 +291,15 @@ impl Agent<'_> {
             Some(directory) => crate::command_tools::CommandTools::load(directory).await,
             None => Default::default(),
         };
-        // A trusted project can lower the output cap and narrow subagents, never raise them.
-        let limits = match user_directory {
+        // A trusted project can lower the output cap, narrow subagents, and lower instruction
+        // caps or drop extra files, never raise or add them.
+        let (limits, project_instructions) = match user_directory {
             Some(directory) => {
                 crate::project::trusted_limits(directory, &self.workspace.path).await
             }
-            None => None,
+            None => (None, None),
         };
+        let instruction_settings = instruction_settings.within(project_instructions.as_ref());
         if let Some(limits) = &limits {
             budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
         }
@@ -318,7 +325,11 @@ impl Agent<'_> {
         let workspace = self.workspace.clone();
         let user_directory = user_directory.map(std::path::Path::to_path_buf);
         let mut guidance = instruction_task(move || {
-            crate::instructions::Instructions::discover(&workspace, user_directory.as_deref())
+            crate::instructions::Instructions::discover(
+                &workspace,
+                user_directory.as_deref(),
+                &instruction_settings,
+            )
         })
         .await?;
         guidance.warnings.extend(command_tools.error.clone());
@@ -1164,6 +1175,7 @@ mod tests {
                 compact: false,
                 trace: Some(telemetry.run(&request, crate::telemetry::Mode::Agent)),
                 subagents: Default::default(),
+                instruction_settings: Default::default(),
             };
             agent
                 .run_context_with_guidance(&request, run, None, Some(&directory.join("user")))
@@ -1242,6 +1254,7 @@ mod tests {
             compact: false,
             trace: Default::default(),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         agent
             .run_context_with_guidance("untraced", run, None, Some(&directory.join("user")))
@@ -1349,6 +1362,7 @@ mod tests {
             compact: false,
             trace: Some(telemetry.run("delegated", crate::telemetry::Mode::Agent)),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         agent
             .run_context_with_guidance("delegated", run, None, Some(&directory.join("user")))
@@ -1511,6 +1525,7 @@ mod tests {
             compact: false,
             trace: Some(telemetry.run("unknown", crate::telemetry::Mode::Agent)),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         agent
             .run_context_with_guidance("unknown", run, None, Some(&directory.join("user")))
@@ -1702,6 +1717,7 @@ mod tests {
                 compact: false,
                 trace: None,
                 subagents: Default::default(),
+                instruction_settings: Default::default(),
             };
             agent
                 .run_context_with_guidance("limits", run, None, Some(&user))
@@ -1717,6 +1733,94 @@ mod tests {
                     assert_eq!(head.len(), cap * 2 / 5);
                 }
             }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    struct Answers;
+    impl ModelBackend for Answers {
+        fn generate<'a>(
+            &'a self,
+            _: &'a [Value],
+            _: &'a [Value],
+            _: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                Ok(ModelTurn {
+                    content: "Done.".into(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn project_instructions_can_only_lower_caps_and_drop_extra_files() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-guidance-{}", rand::random::<u64>()));
+        let (project, user) = (directory.join("project"), directory.join("user"));
+        std::fs::create_dir_all(project.join(crate::project::PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "a".repeat(3000)).unwrap();
+        for name in ["CLAUDE.md", "GEMINI.md", "COPILOT.md"] {
+            std::fs::write(project.join(name), name).unwrap();
+        }
+        let file = project
+            .join(crate::project::PROJECT_DIRECTORY)
+            .join(crate::project::PROJECT_FILE);
+        let body = json!({"instructions":{"max_file_kib":1,"max_total_kib":64,"extra_files":["CLAUDE.md","COPILOT.md"]}});
+        std::fs::write(&file, body.to_string()).unwrap();
+        let owner = crate::instructions::InstructionSettings {
+            max_file_kib: 2,
+            max_total_kib: 32,
+            extra_files: vec!["CLAUDE.md".into(), "GEMINI.md".into()],
+        };
+        // Untrusted first, then trusted: (sources, cap named in the truncation warning).
+        for (trusted, sources, cap) in [
+            (false, vec!["AGENTS.md", "CLAUDE.md", "GEMINI.md"], 2),
+            (true, vec!["AGENTS.md", "CLAUDE.md"], 1),
+        ] {
+            if trusted {
+                let sha = crate::project::status(&project, &user).sha256.unwrap();
+                crate::project::trust(&project, &user, &sha).unwrap();
+            }
+            let loaded = Arc::new(Mutex::new(vec![]));
+            let seen = loaded.clone();
+            let agent = Agent {
+                backend: &Answers,
+                workspace: Workspace::open(&project).unwrap(),
+                web_enabled: false,
+                approvals: Approvals::default(),
+                emit: Arc::new(move |event| {
+                    if let AgentEvent::InstructionsLoaded {
+                        sources, warnings, ..
+                    } = event
+                    {
+                        seen.lock().unwrap().push((sources, warnings));
+                    }
+                }),
+            };
+            let source = vec![json!({"role":"user","content":"Hello"})];
+            let run = crate::context::ContextRun {
+                state: crate::context::ContextState::restore(&source, None).unwrap(),
+                source,
+                budget: Default::default(),
+                instructions: vec![],
+                compact: false,
+                trace: None,
+                subagents: Default::default(),
+                instruction_settings: owner.clone(),
+            };
+            agent
+                .run_context_with_guidance("guidance", run, None, Some(&user))
+                .await
+                .unwrap();
+            let loaded = loaded.lock().unwrap();
+            let (found, warnings) = &loaded[0];
+            assert_eq!(found, &sources, "trusted: {trusted}");
+            assert!(warnings.iter().any(|warning| warning
+                == &format!("AGENTS.md: truncated to the {cap} KiB instruction file limit.")));
+            // Windows keeps the project folder open while the agent's workspace handle lives.
+            drop(agent);
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1802,6 +1906,7 @@ mod tests {
             compact: false,
             trace: Default::default(),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert!(matches!(
             agent.run_context("limited", run).await,
@@ -2518,6 +2623,7 @@ mod tests {
             compact: false,
             trace: Default::default(),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert_eq!(
             agent
@@ -2626,6 +2732,7 @@ mod tests {
                     compact: false,
                     trace: Default::default(),
                     subagents: Default::default(),
+                    instruction_settings: Default::default(),
                 },
             )
             .await;
@@ -2707,6 +2814,7 @@ mod context_tests {
                     compact: false,
                     trace: Default::default(),
                     subagents: Default::default(),
+                    instruction_settings: Default::default(),
                 },
             )
             .await
@@ -2847,6 +2955,7 @@ mod recall_tests {
                         compact: false,
                         trace: Default::default(),
                         subagents: Default::default(),
+                        instruction_settings: Default::default(),
                     },
                     Some(&memory),
                 )

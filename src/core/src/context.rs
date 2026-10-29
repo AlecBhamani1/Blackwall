@@ -505,6 +505,8 @@ pub struct ContextRun {
     pub trace: Option<crate::telemetry::RunScope>,
     /// The owner's subagent settings; a trusted project can only lower them.
     pub subagents: crate::subagents::SubagentSettings,
+    /// The owner's instruction caps and extra files; a trusted project can only lower them.
+    pub instruction_settings: crate::instructions::InstructionSettings,
 }
 
 /// Shared tool-free chat/compaction path. Unexpected calls are rejected entirely.
@@ -591,6 +593,7 @@ async fn chat_traced(
         compact,
         trace: _,
         subagents: _,
+        instruction_settings: _,
     } = run;
     use crate::protocol::AgentEvent;
     state.validate()?;
@@ -906,6 +909,7 @@ mod tests {
             compact: false,
             trace: Some(telemetry.run("chat-1", crate::telemetry::Mode::Chat)),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert_eq!(
             chat(&model, "chat-1", run, &|_| {}).await.unwrap(),
@@ -971,6 +975,7 @@ mod tests {
             compact: true,
             trace: Some(telemetry.compaction(crate::telemetry::Mode::Chat)),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert_eq!(chat(&model, "compact-1", run, &|_| {}).await.unwrap(), "");
         let calls = model.requests.lock().unwrap().len();
@@ -1067,6 +1072,7 @@ mod tests {
             compact: true,
             trace: Default::default(),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert_eq!(
             chat_with_web(
@@ -1243,6 +1249,7 @@ mod tests {
             compact: false,
             trace: Default::default(),
             subagents: Default::default(),
+            instruction_settings: Default::default(),
         };
         assert_eq!(
             chat(&Automatic, "auto", run, &|event| events

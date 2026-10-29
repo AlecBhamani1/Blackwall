@@ -71,8 +71,10 @@ USAGE:
                              otlp-signals <traces,metrics>, otlp-include-project <on|off>,
                              and usage-retention-days <30-3650|forever> (default 400);
                              output-bytes <4096-1048576> (default 65536), subagent-steps <1-50>,
-                             subagent-tools <read_file,list_files,...|none>, and
-                             subagent-runs-on <local|TOOL> (a stdin JSON command tool; always asks)
+                             subagent-tools <read_file,list_files,...|none>,
+                             subagent-runs-on <local|TOOL> (a stdin JSON command tool; always asks),
+                             instruction-file-kib <1-64> (default 8), instruction-total-kib
+                             <8-256> (default 32), and instruction-files <CLAUDE.md,...|none>
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
@@ -394,7 +396,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
             )
         }
     }
