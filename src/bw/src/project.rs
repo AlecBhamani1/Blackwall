@@ -1,5 +1,5 @@
 //! `bw project status|trust|untrust`: review and trust the current project's settings file.
-use blackwall_core::project::{self, ProjectStatus, Trust};
+use blackwall_core::project::{self, ProjectStatus, RuleView, Trust};
 use std::{
     io::{BufRead, IsTerminal, Write},
     path::Path,
@@ -32,12 +32,12 @@ pub fn run(directory: &Path, workspace: &Path, arguments: &[String]) -> Result<(
 fn trust(directory: &Path, workspace: &Path, yes: bool) -> Result<(), String> {
     let status = project::status(workspace, directory);
     if let Some(error) = &status.error {
-        return Err(error.clone());
+        return Err(safe(error));
     }
     let (Some(content), Some(sha256)) = (&status.content, &status.sha256) else {
         return Err(format!(
             "There is no project settings file at {}.",
-            status.path
+            safe(&status.path)
         ));
     };
     if status.trust == Trust::Trusted {
@@ -50,10 +50,13 @@ fn trust(directory: &Path, workspace: &Path, yes: bool) -> Result<(), String> {
                 .into(),
         );
     }
-    println!("{}\n", status.path);
-    match &status.trust {
-        Trust::Changed { diff } => println!("Changes since you trusted it:\n{diff}"),
-        _ => println!("{}", crate::memory::visible(content)),
+    println!("{}\n", safe(&status.path));
+    print!("{}", rules(&status));
+    if let Trust::Changed { diff } = &status.trust {
+        println!("\nChanges since you trusted it:\n{}", safe(diff));
+    }
+    if !matches!(&status.trust, Trust::Changed { diff } if diff != project::DIFF_TOO_LARGE) {
+        println!("\nFile:\n{}", safe(content));
     }
     if !yes {
         print!(
@@ -79,12 +82,18 @@ fn trust(directory: &Path, workspace: &Path, yes: bool) -> Result<(), String> {
 }
 
 fn describe(status: &ProjectStatus) -> String {
-    let mut text = format!("Project: {}\n", status.project);
+    let mut text = format!(
+        "Project: {}\n",
+        safe(&project::display_path(&status.project))
+    );
     if !status.exists {
-        text.push_str(&format!("No project settings file ({}).\n", status.path));
+        text.push_str(&format!(
+            "No project settings file ({}).\n",
+            safe(&status.path)
+        ));
         return text;
     }
-    text.push_str(&format!("Settings file: {}\n", status.path));
+    text.push_str(&format!("Settings file: {}\n", safe(&status.path)));
     let trust = match &status.trust {
         Trust::None => "not trusted",
         Trust::Trusted => "trusted",
@@ -92,13 +101,14 @@ fn describe(status: &ProjectStatus) -> String {
     };
     text.push_str(&format!("Trust: {trust}\n"));
     if let Some(error) = &status.error {
-        text.push_str(&format!("Problem: {error}\n"));
+        text.push_str(&format!("Problem: {}\n", safe(error)));
     }
+    text.push_str(&rules(status));
     let list = |lines: &[String]| {
         if lines.is_empty() {
             "nothing".to_owned()
         } else {
-            lines.join("; ")
+            safe(&lines.join("; "))
         }
     };
     text.push_str(&format!("Applies now: {}\n", list(&status.applies)));
@@ -109,7 +119,48 @@ fn describe(status: &ProjectStatus) -> String {
         ));
     }
     if let Trust::Changed { diff } = &status.trust {
-        text.push_str(&format!("Changes since you trusted it:\n{diff}"));
+        text.push_str(&format!("Changes since you trusted it:\n{}", safe(diff)));
+    }
+    text
+}
+
+/// Repository text for the terminal: control characters dropped, so no escape sequences reach
+/// it, and invisible format characters such as bidi controls shown as `\u{XXXX}`.
+fn safe(text: &str) -> String {
+    crate::memory::visible(&project::escape_invisible(text))
+}
+
+/// The file's rules as a table, in file order, with badges for broad rules.
+fn rules(status: &ProjectStatus) -> String {
+    if status.rules.is_empty() {
+        return String::new();
+    }
+    let name = |value: serde_json::Result<serde_json::Value>| {
+        value
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let mode = name(serde_json::to_value(status.mode));
+    let mut text = format!("Rules ({mode}):\n  #  decision  kind     subject\n");
+    for (index, rule) in status.rules.iter().enumerate() {
+        let RuleView {
+            decision,
+            kind,
+            subject,
+            badges,
+        } = rule;
+        let badges = if badges.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", badges.join(", "))
+        };
+        text.push_str(&format!(
+            "  {index:<2} {:<9} {:<8} {}{badges}\n",
+            name(serde_json::to_value(decision)),
+            name(serde_json::to_value(kind)),
+            safe(subject)
+        ));
     }
     text
 }
@@ -126,6 +177,13 @@ mod tests {
             trust,
             sha256: Some("abc".into()),
             content: Some("{}".into()),
+            rules: vec![RuleView {
+                decision: blackwall_core::policy::Decision::Allow,
+                kind: blackwall_core::ApprovalKind::File,
+                subject: ".".into(),
+                badges: vec!["matches every file".into()],
+            }],
+            mode: blackwall_core::policy::RuleMode::Ordered,
             applies: vec!["1 deny and 0 ask rules".into()],
             waiting: vec!["1 allow rules".into()],
             error: None,
@@ -146,8 +204,31 @@ mod tests {
         }));
         assert!(text.contains("changed since you trusted it"), "{text}");
         assert!(text.ends_with("+  \"x\"\n"), "{text}");
+        let text = describe(&status(Trust::None));
+        assert!(text.contains("Rules (ordered):"), "{text}");
+        assert!(
+            text.contains("  0  allow     file     .  [matches every file]"),
+            "{text}"
+        );
         let mut missing = status(Trust::None);
         missing.exists = false;
         assert!(describe(&missing).contains("No project settings file"));
+    }
+
+    #[test]
+    fn terminal_escapes_and_bidi_are_neutralised() {
+        let mut shown = status(Trust::Changed {
+            diff: "+ \u{1b}[2J\u{202E}evil\n".into(),
+        });
+        shown.project = r"\\?\C:\work".into();
+        shown.rules[0].subject = "rm\u{200B}x".into();
+        let text = describe(&shown);
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202E}'),
+            "{text}"
+        );
+        assert!(text.contains("\\u{202E}evil"), "{text}");
+        assert!(text.contains("rm\\u{200B}x"), "{text}");
+        assert!(text.contains(r"Project: C:\work"), "{text}");
     }
 }

@@ -289,9 +289,21 @@ impl Policy {
             )
             .await;
             match loaded {
-                Ok(Ok(Ok((config, _, notes)))) => {
-                    warnings = notes;
-                    layers.extend(config.policy.map(|rules| rules.layer(Source::Project)));
+                Ok(Ok(Ok(loaded))) => {
+                    if loaded.ask_all {
+                        // Behave as the warning says: nothing is allowed without asking.
+                        ask_all = true;
+                        if let Some(message) = loaded.warnings.first() {
+                            error.get_or_insert(message.clone());
+                        }
+                    }
+                    warnings = loaded.warnings;
+                    layers.extend(
+                        loaded
+                            .config
+                            .policy
+                            .map(|rules| rules.layer(Source::Project)),
+                    );
                 }
                 Ok(Ok(Err(problem))) => {
                     ask_all = true;
@@ -360,10 +372,19 @@ impl Policy {
     /// its own rules.
     pub fn evaluate(&self, kind: ApprovalKind, subject: &str) -> Verdict {
         let verdict = self.verdict(&|rule| rule.kind == kind && matches(rule, subject));
+        // Writes to the data folder or to the project's own `.blackwall` settings folder always ask,
+        // so the agent cannot change rules or settings without the owner seeing it.
         let protected = kind == ApprovalKind::File
-            && self.protected.as_ref().is_some_and(|data| {
-                normalize(&subject.to_lowercase()).is_none_or(|path| path.starts_with(data))
-            });
+            && match normalize(&subject.to_lowercase()) {
+                None => self.protected.is_some(),
+                Some(path) => {
+                    path.starts_with(crate::project::PROJECT_DIRECTORY)
+                        || self
+                            .protected
+                            .as_ref()
+                            .is_some_and(|data| path.starts_with(data))
+                }
+            };
         if protected {
             floor_at_ask(verdict)
         } else {
@@ -513,9 +534,13 @@ pub fn allow_tool(directory: &Path, tool: &str, project: Option<&Path>) -> Resul
         tool: Some(tool.into()),
         project: project.map(|project| project.to_string_lossy().into_owned()),
     };
-    edit_rules(directory, |rules| {
-        if !rules.contains(&rule) {
-            rules.push(rule);
+    edit_rules(directory, |file| {
+        if file.mode == RuleMode::Ordered {
+            // The first match decides, so the owner's choice goes first to take effect.
+            file.rules.retain(|saved| saved != &rule);
+            file.rules.insert(0, rule);
+        } else if !file.rules.contains(&rule) {
+            file.rules.push(rule);
         }
     })
 }
@@ -538,8 +563,8 @@ pub fn tool_rules(directory: &Path) -> Result<Vec<ToolRule>, String> {
 /// name does not inherit them. Blocking.
 pub fn remove_server_rules(directory: &Path, server: &str) -> Result<(), String> {
     let prefix = format!("{server}__");
-    edit_rules(directory, |rules| {
-        rules.retain(|rule| {
+    edit_rules(directory, |file| {
+        file.rules.retain(|rule| {
             rule.tool
                 .as_deref()
                 .is_none_or(|tool| tool != server && !tool.starts_with(&prefix))
@@ -549,8 +574,8 @@ pub fn remove_server_rules(directory: &Path, server: &str) -> Result<(), String>
 
 /// Remove saved allow rules for exactly this MCP server or tool and project. Blocking.
 pub fn remove_tool_rule(directory: &Path, rule: &ToolRule) -> Result<(), String> {
-    edit_rules(directory, |rules| {
-        rules.retain(|saved| {
+    edit_rules(directory, |file| {
+        file.rules.retain(|saved| {
             saved.decision != Decision::Allow
                 || saved.tool.as_deref() != Some(rule.tool.as_str())
                 || saved.project != rule.project
@@ -588,13 +613,13 @@ fn read_file(directory: &Path) -> Result<RulesFile, String> {
 /// Serializes rule edits in this process, so two saves cannot both read the old file.
 static EDITS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn edit_rules(directory: &Path, change: impl FnOnce(&mut Vec<Rule>)) -> Result<(), String> {
+fn edit_rules(directory: &Path, change: impl FnOnce(&mut RulesFile)) -> Result<(), String> {
     let _edit = EDITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut file = read_file(directory)?;
     let before = file.rules.len();
-    change(&mut file.rules);
+    change(&mut file);
     if file.rules.len() == before && !directory.join(POLICY_FILE).exists() {
         // Nothing to save, so a missing file stays missing.
         return Ok(());
@@ -700,7 +725,7 @@ fn has_control_syntax(command: &str) -> bool {
 }
 
 /// Workspace-relative path with `..` resolved lexically; escapes and absolute paths are `None`.
-fn normalize(path: &str) -> Option<PathBuf> {
+pub(crate) fn normalize(path: &str) -> Option<PathBuf> {
     let mut normal = PathBuf::new();
     for component in Path::new(path).components() {
         match component {
@@ -1237,6 +1262,66 @@ mod tests {
                 Decision::Allow
             );
         }
+    }
+
+    #[test]
+    fn project_settings_writes_floor_at_ask() {
+        let mut rules =
+            policy(r#"{"mode":"ordered","rules":[{"decision":"allow","kind":"file","path":"."}]}"#);
+        // Even when the data folder is elsewhere.
+        rules.protected = None;
+        for path in [
+            ".blackwall/project.json",
+            ".BlackWall/Project.json",
+            "src/../.blackwall/new.json",
+            ".blackwall",
+        ] {
+            assert_eq!(
+                rules.decide(ApprovalKind::File, path),
+                Decision::Ask,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            rules.decide(ApprovalKind::File, ".blackwallet/notes.md"),
+            Decision::Allow
+        );
+        assert_eq!(
+            rules.decide(ApprovalKind::File, "src/main.rs"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn saved_tool_rule_wins_in_ordered_mode() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-ordered-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(POLICY_FILE),
+            r#"{"mode":"ordered","rules":[
+                {"decision":"ask","kind":"exec","tool":"docs"},
+                {"decision":"allow","kind":"exec","tool":"docs"}
+            ]}"#,
+        )
+        .unwrap();
+        allow_tool(&directory, "docs", None).unwrap();
+        let file = read_file(&directory).unwrap();
+        assert_eq!(file.mode, RuleMode::Ordered);
+        // Moved to the front, not duplicated, so the owner's click takes effect.
+        assert_eq!(file.counts(), (1, 1, 0));
+        assert_eq!(file.rules[0].decision, Decision::Allow);
+        let rules = Layer {
+            source: Source::User,
+            mode: file.mode,
+            rules: file.rules.into_iter().enumerate().collect(),
+        };
+        let policy = Policy {
+            layers: vec![rules],
+            ..policy(r#"{"rules":[]}"#)
+        };
+        assert_eq!(policy.decide_tool("docs__search"), Decision::Allow);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[tokio::test]

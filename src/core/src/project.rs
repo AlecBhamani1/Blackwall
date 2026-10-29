@@ -12,13 +12,15 @@
 //! The `mcp`, `limits` and `instructions` sections are parsed and validated now so the file format
 //! is fixed, but nothing applies them yet. Whoever consumes them must treat the owner's own value
 //! as a ceiling: a project can only lower limits, narrow tools, and lower instruction caps.
-use crate::policy::RulesFile;
+use crate::policy::{Decision, RuleMode, RulesFile};
+use crate::protocol::ApprovalKind;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 pub const PROJECT_DIRECTORY: &str = ".blackwall";
@@ -31,6 +33,11 @@ const MAX_TRUST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SERVERS: usize = 16;
 const MAX_EXTRA_FILES: usize = 8;
 const MAX_MESSAGE_CHARS: usize = 200;
+/// A diff longer than this is not shown; the whole file is shown instead.
+const MAX_DIFF_LINES: usize = 5000;
+const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
+pub const DIFF_TOO_LARGE: &str =
+    "The change is too large to show as a diff. Review the whole file below.";
 /// The built-in tools a subagent can use today. A project can only narrow this list.
 const SUBAGENT_TOOLS: [&str; 2] = ["read_file", "list_files"];
 
@@ -54,6 +61,8 @@ pub enum ProjectError {
     TrustFile,
     #[error("Too many projects are trusted. Untrust one first.")]
     TooMany,
+    #[error("The trusted projects list is too large. Untrust some projects first.")]
+    TrustListTooLarge,
 }
 
 impl ProjectError {
@@ -68,6 +77,7 @@ impl ProjectError {
             Self::Changed => "changed",
             Self::TrustFile => "trust_file",
             Self::TooMany => "too_many",
+            Self::TrustListTooLarge => "trust_list_too_large",
         }
     }
 }
@@ -210,7 +220,10 @@ pub enum Trust {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustedProject {
+    /// The canonical folder, as [`untrust`] takes it.
     pub path: String,
+    /// The folder for display, without a Windows `\\?\` prefix.
+    pub label: String,
     pub sha256: String,
 }
 
@@ -230,19 +243,35 @@ struct TrustList {
     projects: Vec<TrustRecord>,
 }
 
+/// One project rule as shown for review. `subject` has invisible characters escaped.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleView {
+    pub decision: Decision,
+    pub kind: ApprovalKind,
+    pub subject: String,
+    /// Warnings about how much the rule covers: "matches every file", "any host",
+    /// "any subdomain", or "your MCP server".
+    pub badges: Vec<String>,
+}
+
 /// What the owner sees before deciding: the file, its trust, and what applies now.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStatus {
     /// The canonical project folder, as trust records name it.
     pub project: String,
-    /// The settings file's path.
+    /// The settings file's path, for display.
     pub path: String,
     pub exists: bool,
     pub trust: Trust,
     /// The hash of the file shown in `content`; pass it to [`trust`].
     pub sha256: Option<String>,
+    /// The file for display: invisible characters escaped and long blank runs collapsed.
     pub content: Option<String>,
+    /// The file's rules, parsed, in file order.
+    pub rules: Vec<RuleView>,
+    pub mode: RuleMode,
     /// What applies to runs now.
     pub applies: Vec<String>,
     /// What waits until the owner trusts this file.
@@ -255,47 +284,91 @@ pub struct ProjectStatus {
 /// deny and ask rules. A file that cannot be used comes back empty with a warning; the run's
 /// policy treats that case strictly (see [`crate::policy::Policy::load`]).
 pub fn load(workspace: &Path, data_dir: &Path) -> (ProjectConfig, Trust, Vec<String>) {
-    try_load(workspace, data_dir).unwrap_or_else(|error| {
-        (
+    match try_load(workspace, data_dir) {
+        Ok(loaded) => (loaded.config, loaded.trust, loaded.warnings),
+        Err(error) => (
             ProjectConfig::default(),
             Trust::None,
             vec![error.to_string()],
-        )
-    })
+        ),
+    }
 }
 
-pub(crate) fn try_load(
-    workspace: &Path,
-    data_dir: &Path,
-) -> Result<(ProjectConfig, Trust, Vec<String>), ProjectError> {
+/// A run's project settings. `ask_all` asks the policy to make every action ask, because trust
+/// could not be checked. A `Changed` trust carries no diff here; only [`status`] computes one.
+#[derive(Debug)]
+pub(crate) struct Loaded {
+    pub config: ProjectConfig,
+    pub trust: Trust,
+    pub warnings: Vec<String>,
+    pub ask_all: bool,
+}
+
+pub(crate) fn try_load(workspace: &Path, data_dir: &Path) -> Result<Loaded, ProjectError> {
+    let none = || Loaded {
+        config: ProjectConfig::default(),
+        trust: Trust::None,
+        warnings: vec![],
+        ask_all: false,
+    };
     let Some(workspace) = canonical(workspace) else {
-        return Ok((ProjectConfig::default(), Trust::None, vec![]));
+        return Ok(none());
     };
     let Some(file) = read(&workspace)? else {
-        return Ok((ProjectConfig::default(), Trust::None, vec![]));
+        return Ok(none());
     };
     let mut warnings = vec![];
-    let trust = trust_state(&workspace, data_dir, &file).unwrap_or_else(|error| {
-        warnings.push(format!(
-            "{error} The project's settings are treated as untrusted."
-        ));
+    let mut ask_all = false;
+    let trust = trust_state(&workspace, data_dir, &file, false).unwrap_or_else(|_| {
+        // The list is written only by Blackwall; an unreadable one may have been tampered with.
+        ask_all = true;
+        warnings.push("The trusted projects list could not be read, so it may have been changed outside Blackwall. Every action will ask for approval until it is fixed or removed.".into());
         Trust::None
     });
     if trust == Trust::Trusted {
-        return Ok((file.config, trust, warnings));
+        return Ok(Loaded {
+            config: file.config,
+            trust,
+            warnings,
+            ask_all,
+        });
     }
     let (_, waiting) = summary(&file.config, false);
+    let config = restricted(file.config);
+    let mut parts = vec![];
+    if let Some(line) = restricting_line(&config) {
+        parts.push(format!("{line}."));
+    }
     match &trust {
-        Trust::Changed { .. } => warnings.push(
+        Trust::Changed { .. } => parts.push(
             "This project's .blackwall/project.json changed after you trusted it, so only its deny and ask rules apply. Review the change and trust it again to apply the rest.".into(),
         ),
-        _ if !waiting.is_empty() => warnings.push(format!(
+        _ if !waiting.is_empty() => parts.push(format!(
             "This project's .blackwall/project.json is not trusted, so only its deny and ask rules apply. Waiting for trust: {}. Review it with bw project status or in the desktop app.",
             waiting.join("; ")
         )),
         _ => {}
     }
-    Ok((restricted(file.config), trust, warnings))
+    if !parts.is_empty() {
+        warnings.push(parts.join(" "));
+    }
+    Ok(Loaded {
+        config,
+        trust,
+        warnings,
+        ask_all,
+    })
+}
+
+/// "N deny/ask rules from this project's settings apply", when there are any.
+fn restricting_line(config: &ProjectConfig) -> Option<String> {
+    let (_, ask, deny) = config.policy.as_ref()?.counts();
+    (ask + deny > 0).then(|| {
+        format!(
+            "{} deny/ask rules from this project's settings apply",
+            ask + deny
+        )
+    })
 }
 
 /// Only what can tighten: deny and ask rules.
@@ -314,15 +387,18 @@ pub fn status(workspace: &Path, data_dir: &Path) -> ProjectStatus {
     let folder = canonical(workspace).unwrap_or_else(|| workspace.to_path_buf());
     let mut status = ProjectStatus {
         project: folder.to_string_lossy().into_owned(),
-        path: folder
-            .join(PROJECT_DIRECTORY)
-            .join(PROJECT_FILE)
-            .to_string_lossy()
-            .into_owned(),
+        path: display_path(
+            &folder
+                .join(PROJECT_DIRECTORY)
+                .join(PROJECT_FILE)
+                .to_string_lossy(),
+        ),
         exists: false,
         trust: Trust::None,
         sha256: None,
         content: None,
+        rules: vec![],
+        mode: RuleMode::Strictest,
         applies: vec![],
         waiting: vec![],
         error: None,
@@ -338,8 +414,12 @@ pub fn status(workspace: &Path, data_dir: &Path) -> ProjectStatus {
     };
     status.exists = true;
     status.sha256 = Some(file.sha256.clone());
-    status.content = Some(String::from_utf8_lossy(&file.bytes).into_owned());
-    match trust_state(&folder, data_dir, &file) {
+    status.content = Some(display_text(&String::from_utf8_lossy(&file.bytes)));
+    if let Some(rules) = &file.config.policy {
+        status.mode = rules.mode;
+        status.rules = rules.rules.iter().map(view).collect();
+    }
+    match trust_state(&folder, data_dir, &file, true) {
         Ok(trust) => status.trust = trust,
         Err(error) => status.error = Some(error.to_string()),
     }
@@ -389,6 +469,7 @@ pub fn trusted(data_dir: &Path) -> Result<Vec<TrustedProject>, ProjectError> {
         .projects
         .into_iter()
         .map(|record| TrustedProject {
+            label: display_path(&record.path),
             path: record.path,
             sha256: record.sha256,
         })
@@ -402,7 +483,10 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
     if let Some(rules) = &config.policy {
         let (allow, ask, deny) = rules.counts();
         if ask + deny > 0 {
-            applies.push(format!("{deny} deny and {ask} ask rules"));
+            applies.push(format!(
+                "{} deny/ask rules from this project's settings apply",
+                ask + deny
+            ));
         }
         if allow > 0 {
             let line = format!("{allow} allow rules");
@@ -522,6 +606,22 @@ fn parse(bytes: &[u8]) -> Result<ProjectConfig, ProjectError> {
         if rules.rules.iter().any(|rule| rule.project.is_some()) {
             return Err(invalid("project rules cannot name a project"));
         }
+        for rule in rules.rules.iter().filter(|r| r.decision == Decision::Allow) {
+            if rule.tool.as_deref().is_some_and(|tool| !own_server(tool)) {
+                return Err(invalid(
+                    "project allow rules can only name the project's own p- MCP servers",
+                ));
+            }
+            if rule.kind == ApprovalKind::File
+                && rule
+                    .path
+                    .as_deref()
+                    .and_then(crate::policy::normalize)
+                    .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(invalid("project allow rules cannot match every file"));
+            }
+        }
         config.policy = Some(rules.validate().map_err(invalid)?);
     }
     if let Some(mcp) = &config.mcp {
@@ -638,6 +738,7 @@ fn trust_state(
     workspace: &Path,
     data_dir: &Path,
     file: &ProjectFile,
+    with_diff: bool,
 ) -> Result<Trust, ProjectError> {
     let path = workspace.to_string_lossy();
     let list = read_trust(data_dir)?;
@@ -646,13 +747,11 @@ fn trust_state(
             None => Trust::None,
             Some(record) if record.sha256 == file.sha256 => Trust::Trusted,
             Some(record) => Trust::Changed {
-                diff: similar::TextDiff::from_lines(
-                    &record.content,
-                    String::from_utf8_lossy(&file.bytes),
-                )
-                .unified_diff()
-                .header("trusted", "current")
-                .to_string(),
+                diff: if with_diff {
+                    diff(&record.content, &String::from_utf8_lossy(&file.bytes))
+                } else {
+                    String::new()
+                },
             },
         },
     )
@@ -690,10 +789,128 @@ fn edit_trust(
     let mut body = serde_json::to_vec_pretty(&list).map_err(|_| ProjectError::TrustFile)?;
     body.push(b'\n');
     if body.len() > MAX_TRUST_BYTES {
-        return Err(ProjectError::TooMany);
+        return Err(ProjectError::TrustListTooLarge);
     }
     crate::policy::replace_owner_file(data_dir, &data_dir.join(TRUST_FILE), &body)
         .map_err(|_| ProjectError::TrustFile)
+}
+
+/// Whether an MCP `tool` rule names a project server (`p-` prefix) rather than the owner's.
+fn own_server(tool: &str) -> bool {
+    tool.split_once("__")
+        .map_or(tool, |(server, _)| server)
+        .starts_with("p-")
+}
+
+fn view(rule: &crate::policy::Rule) -> RuleView {
+    let mut badges = vec![];
+    let subject = if let Some(tool) = &rule.tool {
+        if !own_server(tool) {
+            badges.push("your MCP server".to_owned());
+        }
+        format!("MCP {tool}")
+    } else if let Some(path) = &rule.path {
+        if crate::policy::normalize(&path.to_lowercase())
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            badges.push("matches every file".to_owned());
+        }
+        path.clone()
+    } else if let Some(host) = &rule.host {
+        if let Some(domain) = host.trim_end_matches('.').strip_prefix("*.") {
+            badges.push(
+                if domain.contains('.') {
+                    "any subdomain"
+                } else {
+                    "any host"
+                }
+                .to_owned(),
+            );
+        }
+        host.clone()
+    } else {
+        rule.command.clone().unwrap_or_default()
+    };
+    RuleView {
+        decision: rule.decision,
+        kind: rule.kind,
+        subject: escape_invisible(&subject),
+        badges,
+    }
+}
+
+/// From the trusted file to the current one, bounded in time and length.
+fn diff(old: &str, new: &str) -> String {
+    let text = similar::TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(old, new)
+        .unified_diff()
+        .header("trusted", "current")
+        .to_string();
+    if text.lines().count() > MAX_DIFF_LINES {
+        DIFF_TOO_LARGE.to_owned()
+    } else {
+        escape_invisible(&text)
+    }
+}
+
+/// Unicode format characters (category Cf): bidi controls, zero-width characters, the byte order
+/// mark, and others that change how text looks without being visible.
+fn is_format(character: char) -> bool {
+    matches!(character as u32,
+        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+        | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Show invisible format characters as `\u{XXXX}`, so text cannot hide or reorder what it says.
+pub fn escape_invisible(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if is_format(character) {
+                format!("\\u{{{:04X}}}", character as u32)
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// The file as shown for review: invisible characters escaped, and runs of more than two blank
+/// lines collapsed with a note saying how many were hidden.
+pub fn display_text(text: &str) -> String {
+    let text = escape_invisible(text);
+    let mut lines: Vec<String> = vec![];
+    let mut blank = 0;
+    let flush = |lines: &mut Vec<String>, blank: &mut usize| {
+        if *blank > 2 {
+            lines.push(format!("[{} more blank lines not shown]", *blank - 2));
+        }
+        *blank = 0;
+    };
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank <= 2 {
+                lines.push(line.to_owned());
+            }
+            continue;
+        }
+        flush(&mut lines, &mut blank);
+        lines.push(line.to_owned());
+    }
+    flush(&mut lines, &mut blank);
+    lines.join("\n")
+}
+
+/// A path for display, without the Windows `\\?\` verbatim prefix that canonical paths carry.
+pub fn display_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1316,194 @@ mod tests {
         assert!(
             warnings[0].contains("trusted projects list"),
             "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_are_shown_with_badges_and_risky_project_allows_rejected() {
+        let folders = Folders::new();
+        folders.write(json!({"policy":{"mode":"ordered","rules":[
+            {"decision":"deny","kind":"file","path":"."},
+            {"decision":"ask","kind":"network","host":"*.com"},
+            {"decision":"ask","kind":"network","host":"*.docs.rs"},
+            {"decision":"deny","kind":"exec","tool":"github"},
+            {"decision":"allow","kind":"exec","tool":"p-docs__search"},
+            {"decision":"allow","kind":"exec","command":"cargo\u{202E}test"}
+        ]}}));
+        let shown = status(&folders.workspace, &folders.data);
+        assert_eq!(shown.mode, RuleMode::Ordered);
+        let row = |index: usize| {
+            let rule = &shown.rules[index];
+            (rule.subject.as_str(), rule.badges.join(","))
+        };
+        assert_eq!(row(0), (".", "matches every file".into()));
+        assert_eq!(row(1), ("*.com", "any host".into()));
+        assert_eq!(row(2), ("*.docs.rs", "any subdomain".into()));
+        assert_eq!(row(3), ("MCP github", "your MCP server".into()));
+        assert_eq!(row(4), ("MCP p-docs__search", String::new()));
+        assert_eq!(row(5), ("cargo\\u{202E}test", String::new()));
+        assert_eq!(shown.rules[0].decision, Decision::Deny);
+        assert_eq!(shown.rules[1].kind, ApprovalKind::Network);
+        // Allow rules for the owner's MCP servers or for every file are refused outright.
+        for (rule, reason) in [
+            (
+                json!({"decision":"allow","kind":"exec","tool":"github"}),
+                "p- MCP servers",
+            ),
+            (
+                json!({"decision":"allow","kind":"exec","tool":"github__push"}),
+                "p- MCP servers",
+            ),
+            (
+                json!({"decision":"allow","kind":"file","path":"."}),
+                "every file",
+            ),
+            (
+                json!({"decision":"allow","kind":"file","path":"src/.."}),
+                "every file",
+            ),
+        ] {
+            folders.write(json!({"policy":{"rules":[rule]}}));
+            let error = try_load(&folders.workspace, &folders.data).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn invisible_characters_escaped_and_blank_runs_collapsed() {
+        for hidden in [
+            '\u{200B}',
+            '\u{200F}',
+            '\u{202A}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{AD}',
+            '\u{E0041}',
+        ] {
+            let shown = escape_invisible(&format!("a{hidden}b"));
+            assert_eq!(shown, format!("a\\u{{{:04X}}}b", hidden as u32));
+        }
+        assert_eq!(escape_invisible("plain é 中"), "plain é 中");
+        assert_eq!(display_text("a\n\n\nb"), "a\n\n\nb");
+        assert_eq!(
+            display_text("a\n\n\n\n  \n\nb\n"),
+            "a\n\n\n[3 more blank lines not shown]\nb\n"
+        );
+        let folders = Folders::new();
+        // A byte order mark hidden in a rule, and a long run of blank lines in the whitespace.
+        std::fs::write(
+            folders.file(),
+            format!(
+                "{{{}\"policy\":{{\"rules\":[{{\"decision\":\"deny\",\"kind\":\"exec\",\"command\":\"rm\u{FEFF}x\"}}]}}}}\n",
+                "\n".repeat(40)
+            ),
+        )
+        .unwrap();
+        let content = status(&folders.workspace, &folders.data).content.unwrap();
+        assert!(content.contains("\\u{FEFF}"), "{content}");
+        assert!(
+            content.contains("[37 more blank lines not shown]"),
+            "{content}"
+        );
+        assert!(!content.contains('\u{FEFF}'));
+    }
+
+    #[tokio::test]
+    async fn diff_is_only_computed_for_status_and_bounded() {
+        let folders = Folders::new();
+        folders.write(rm_and_cat());
+        folders.trust_current();
+        let rules: Vec<_> = (0..6000)
+            .map(|index| json!({"decision":"deny","kind":"exec","command":format!("tool{index}")}))
+            .collect();
+        let body = serde_json::to_vec(&json!({"policy":{"rules":rules[..150]}})).unwrap();
+        std::fs::write(folders.file(), &body).unwrap();
+        // A run never builds the diff.
+        let loaded = try_load(&folders.workspace, &folders.data).unwrap();
+        assert_eq!(
+            loaded.trust,
+            Trust::Changed {
+                diff: String::new()
+            }
+        );
+        let Trust::Changed { diff } = status(&folders.workspace, &folders.data).trust else {
+            panic!()
+        };
+        assert!(diff.starts_with("--- trusted"), "{diff}");
+        // A diff over 5000 lines is replaced by a note; the whole file is still shown.
+        let long = "x\n".repeat(6000);
+        assert_eq!(super::diff("", &long), DIFF_TOO_LARGE);
+        assert!(super::diff("a\n", "b\n").contains("+b"));
+    }
+
+    #[tokio::test]
+    async fn unreadable_trust_list_makes_every_action_ask() {
+        let folders = Folders::new();
+        folders.owner_rules(json!({"rules":[{"decision":"allow","kind":"exec","command":"ls"}]}));
+        folders.write(rm_and_cat());
+        std::fs::write(folders.data.join(TRUST_FILE), "{").unwrap();
+        let policy = folders.policy().await;
+        assert_eq!(policy.decide(ApprovalKind::Exec, "ls"), Decision::Ask);
+        assert_eq!(
+            policy.decide(ApprovalKind::Exec, "cat secret.txt"),
+            Decision::Deny
+        );
+        let error = policy.error.unwrap();
+        assert!(
+            error.contains("trusted projects list could not be read"),
+            "{error}"
+        );
+        assert!(error.contains("Every action will ask"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn deny_and_ask_only_project_says_its_rules_apply() {
+        let folders = Folders::new();
+        folders.write(json!({"policy":{"rules":[
+            {"decision":"deny","kind":"exec","command":"rm"},
+            {"decision":"ask","kind":"exec","command":"git push"}
+        ]}}));
+        let policy = folders.policy().await;
+        assert_eq!(
+            policy.warnings,
+            vec!["2 deny/ask rules from this project's settings apply."]
+        );
+        let shown = status(&folders.workspace, &folders.data);
+        assert_eq!(
+            shown.applies,
+            vec!["2 deny/ask rules from this project's settings apply"]
+        );
+        assert!(shown.waiting.is_empty());
+    }
+
+    #[test]
+    fn windows_verbatim_prefix_is_hidden_for_display() {
+        assert_eq!(display_path(r"\\?\C:\work\app"), r"C:\work\app");
+        assert_eq!(
+            display_path(r"\\?\UNC\server\share\app"),
+            r"\\server\share\app"
+        );
+        assert_eq!(display_path("/work/app"), "/work/app");
+    }
+
+    #[test]
+    fn oversized_trust_list_is_reported_as_too_large() {
+        let folders = Folders::new();
+        let filler = "x".repeat(MAX_TRUST_BYTES - 1024);
+        std::fs::write(
+            folders.data.join(TRUST_FILE),
+            json!({"projects":[{"path":"/elsewhere","sha256":"0","content":filler}]}).to_string(),
+        )
+        .unwrap();
+        let mut body = rm_and_cat().to_string();
+        body.push_str(&" ".repeat(4096));
+        std::fs::write(folders.file(), body).unwrap();
+        let sha = status(&folders.workspace, &folders.data).sha256.unwrap();
+        assert_eq!(
+            trust(&folders.workspace, &folders.data, &sha).unwrap_err(),
+            ProjectError::TrustListTooLarge
         );
     }
 }
