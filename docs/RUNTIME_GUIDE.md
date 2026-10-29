@@ -514,8 +514,9 @@ command tools such as `claude` or `codex` are billed by their own services.
 - **Tiles:** tokens recorded, with runs, sessions, and model calls; run success and how other runs
   ended; median output speed; tokens kept out of context by compaction.
 - **Missing from this picture:** history before the first day with metrics, runs whose trace the
-  writer queue dropped, and whether recording is off now. Past periods with recording off cannot
-  be told apart from days without use, so days with no data are marked "no data" in the chart.
+  writer queue dropped, whether recording is off now, and the periods in the range when recording
+  was off (desktop and `bw` separately). Turning recording off before this version was not written
+  down, so days with no data are marked "no data" in the chart, not "off".
 - **Where it went:** tokens by project (the workspace folder's name, never its path; Chat has no
   project) or by model. Selecting a row shows its share of the range, its split across Agent,
   Subagent, and Chat, and its busiest sessions by their neutral IDs. Titles and prompts are never
@@ -532,11 +533,39 @@ with one warning per file; the rest of the range still shows. **Export…** copi
 metrics and trace files into a new `blackwall-telemetry-<from>-to-<to>` folder you choose, as plain
 OTLP JSON any OpenTelemetry Collector can import.
 
+- **Export:** the OTLP endpoint, when it last sent, its last error (class and HTTP status only),
+  spans and metric batches sent and dropped, and **Send test span**.
+
 ```sh
 bw usage                 # last 7 local days as text
 bw usage --days 14 --json
 bw usage --days 1 --utc  # today in UTC
 ```
+
+Usage metrics are kept for 400 days by default. Choose 30 to 3,650 days or forever in **Settings →
+Security → Telemetry**, or with `bw config set usage-retention-days 90` (or `forever`); older files
+are deleted at the next start.
+
+## Telemetry export
+
+Send the same traces and usage metrics to an OpenTelemetry collector over OTLP/HTTP. Off by default.
+Set it in **Settings → Security → Telemetry**, or:
+
+```sh
+bw config set otlp-endpoint https://otel.example.com     # or http://127.0.0.1:4318; off to stop
+bw config set otlp-protocol protobuf                    # or json
+bw config set otlp-signals traces,metrics               # or just one
+bw config set otlp-include-project off                  # project names and session IDs stay local
+op read "op://Private/otel/api-key" | bw telemetry header x-api-key   # value stays in the keychain
+bw telemetry test
+```
+
+`https` is required except for `127.0.0.1`, `::1`, and `localhost`; redirects are not followed and
+each request has a 10 s limit. Header values live only in the credential store. Prompts and outputs
+leave only when content capture is on, and project names and session IDs only when you allow them.
+Export never slows or fails a run: a full queue drops data and counts it, and failures appear only
+in the export status. See [Export](TELEMETRY.md#export) for Collector, Grafana Alloy, Jaeger, and
+Langfuse setups.
 
 ## App lock
 

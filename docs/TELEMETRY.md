@@ -4,17 +4,18 @@ Blackwall records local traces and usage metrics with the OpenTelemetry SDK
 (`opentelemetry_sdk` 0.33.1), using the OpenTelemetry generative AI semantic conventions. Every
 resource and instrumentation scope carries the conventions' schema URL
 (`https://opentelemetry.io/schemas/1.42.0`, from `opentelemetry-semantic-conventions` 0.33.1).
-Everything stays in the data folder (`~/.blackwall`, or `BLACKWALL_DATA_DIR`); nothing is sent
-anywhere.
+Everything stays in the data folder (`~/.blackwall`, or `BLACKWALL_DATA_DIR`). Nothing is sent
+anywhere unless you set an OTLP endpoint; [Export](#export) then sends the same data the files
+hold.
 
 Telemetry follows the existing traces switch: **Settings → Workflows → Runs → Record agent runs**
 on the desktop (`tracesEnabled`), `bw config set traces on|off` in the CLI. It is on by default.
 Turning it off stops both traces and usage metrics. Content capture (`traceContent`,
 `bw config set trace-content on|off`) is off by default and only affects traces.
 
-No `OTEL_*` environment variable changes this behaviour. Blackwall gives the SDK its sampler, span
-limits, resource, and export interval explicitly and does not use the SDK's environment resource
-detectors.
+No `OTEL_*` environment variable changes this behaviour, including export: Blackwall gives the
+SDK its sampler, span limits, resource, and export interval explicitly, does not use the SDK's
+environment resource detectors, and ignores `OTEL_EXPORTER_OTLP_*`.
 
 ## Signals
 
@@ -150,15 +151,159 @@ the range are read. A line covers up to the 60 seconds before it was exported, s
 minute before local midnight can count on the next day. Points are bucketed with the offset in use
 when the page is read, so after a daylight-saving change older days shift by that hour.
 
-**What the gaps line cannot know.** It reports history before the first metrics point, runs whose
-trace the writer queue dropped, and whether recording is off now. It cannot tell past periods when
-recording was off from periods with no use, because nothing is written while recording is off; days
-with no data are shown as "no data", not as off. Planned with OTLP export (PR 3): recording on/off
-changes are written down, so past off periods can be listed.
+**The gaps line.** It reports history before the first metrics point, runs whose trace the writer
+queue dropped, whether recording is off now, and the periods in the range when recording was off.
+Turning recording on or off (the desktop's **Record agent runs**, or `bw config set traces`)
+appends one line to `metrics/recording.jsonl`, such as
+`{"unixMs":1793208600000,"recording":false,"surface":"desktop"}`; the desktop and `bw` have
+separate switches, so their periods are listed separately. Changes made before this file existed
+are unknown, and days with no data and no off period are shown as "no data", not as off.
 
 ## Retention
 
-Trace files: the newest 200. Metrics files: 400 days by default. Files older than the retention
-window are deleted when telemetry starts. In core, `Retention::Days(n)` (clamped to 30–3,650) or
-`Retention::Forever` sets the window; Settings and `bw config` controls for it are not exposed yet,
-so every client keeps the 400-day default.
+Trace files: the newest 200. Metrics files: 400 days by default; set 30 to 3,650 days or forever
+in **Settings → Security → Telemetry** (`usageRetention` in the preferences) or with
+`bw config set usage-retention-days N|forever`. Files older than the window are deleted when
+telemetry starts, so a shorter window takes effect at the next start. `metrics/recording.jsonl` is
+not a metrics file and is kept.
+
+## Export
+
+Optional, and off until you set an endpoint. Blackwall then sends traces and usage metrics to any
+OTLP/HTTP receiver: an OpenTelemetry Collector, Grafana Alloy, Jaeger, Langfuse, or a vendor
+endpoint.
+
+**Settings:** **Settings → Security → Telemetry** on the desktop (saved as `telemetryExport` in
+the preferences), or `bw config set` for the CLI (saved in the CLI settings; `bw` uses the
+desktop's until you set one of its own):
+
+| Setting | Desktop | CLI | Default |
+|---|---|---|---|
+| Endpoint | Endpoint | `otlp-endpoint <url>` / `off` | off |
+| Protocol | Protocol | `otlp-protocol json\|protobuf` | `http/protobuf` |
+| Signals | Send traces / metrics | `otlp-signals traces,metrics` | both |
+| Project names | Include project names and session IDs | `otlp-include-project on\|off` | off |
+| Headers | Headers (value typed once) | `bw telemetry header <name>` (value on stdin), `--delete` | none |
+| Test | Send test span | `bw telemetry test` | |
+
+**Endpoint.** The base URL, as `OTEL_EXPORTER_OTLP_ENDPOINT` defines it: traces go to
+`{endpoint}/v1/traces` and metrics to `{endpoint}/v1/metrics`. A URL ending in `/v1/traces` or
+`/v1/metrics` is trimmed back to its base. `https` is required; plain `http` is accepted only for
+the literal hosts `127.0.0.1`, `::1`, and `localhost`. A user name, password, query, or fragment is
+refused, so no secret is ever saved with the URL.
+
+**Headers.** Use headers for credentials such as `authorization` or `x-api-key`. Only the header
+names are saved in settings; each value is stored in the credential store (service
+`com.blackwall.telemetry`, account = the lower-case header name) and is never shown again, logged,
+or put in an environment variable. `bw telemetry header` reads the value from piped standard input
+only, so it never lands in shell history:
+
+```sh
+op read "op://Private/Langfuse/otlp-auth" | bw telemetry header authorization
+bw telemetry header authorization --delete
+```
+
+A header whose value is missing turns export off and shows `header value missing` as the last
+error.
+
+**What is sent.** Exactly what the local files hold. The run buffer finishes a run (content
+filter, redaction, the whole-run secret scrub, the 4 MiB rule) once, then the writer thread hands
+the same `ExportTraceServiceRequest` to the trace file and to OTLP; each metrics line is the same
+`ExportMetricsServiceRequest` the file gets. So content attributes leave only when content capture
+is on, and secrets found late in a run are scrubbed from every exported span. Exported metrics drop
+`blackwall.project` and `blackwall.session` (and merge the series that differed only by them)
+unless **Include project names** is on; the local files always keep them.
+
+**How it is sent.** The messages are the official `opentelemetry-proto` types, encoded as OTLP
+JSON or protobuf and POSTed by Blackwall's own small exporters on its reqwest client
+(`opentelemetry-otlp` is not used). Redirects are never followed: a 3xx is an error. Each request
+has a 10 s limit. A dedicated thread sends, fed by a queue of at most 2,048 spans and 64 metric
+batches; when it is full, new data is dropped and counted, never waited for. Failed sends are not
+retried. Export never slows, blocks, or fails a run, and failures are shown only in the export
+status. When the app or `bw` exits, it waits up to 3 s for queued data.
+
+**Export status.** The Usage page's **Export** card and the Telemetry settings show the endpoint,
+the last successful send, the last error as its class and HTTP status (`connect`, `timeout`,
+`redirect`, `http_status`, `missing_header`, …; response bodies are never read or shown), and the
+spans and metric batches sent and dropped since the app started. **Send test span** sends one span
+named `blackwall test span` and reports the HTTP status.
+
+### Examples
+
+**OpenTelemetry Collector** (the `otlp` receiver on HTTP, printing what arrives):
+
+```yaml
+# otel.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318 # inside the container; the port is published on 127.0.0.1 only
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces: { receivers: [otlp], exporters: [debug] }
+    metrics: { receivers: [otlp], exporters: [debug] }
+```
+
+```sh
+docker run --rm -p 127.0.0.1:4318:4318 -v "$PWD/otel.yaml:/etc/otelcol/config.yaml:ro" \
+  otel/opentelemetry-collector:0.116.1
+bw config set otlp-endpoint http://127.0.0.1:4318
+bw telemetry test
+```
+
+For a collector on another machine, put it behind https, or forward it to loopback with
+`ssh -N -L 4318:127.0.0.1:4318 <host>`. (The `0.116.0` image tag ships a binary that does not
+start; use `0.116.1` or later.)
+
+**Grafana Alloy** (receive OTLP/HTTP, forward to Tempo and Prometheus or Grafana Cloud):
+
+```alloy
+otelcol.receiver.otlp "blackwall" {
+  http { endpoint = "127.0.0.1:4318" }
+  output {
+    traces  = [otelcol.exporter.otlp.tempo.input]
+    metrics = [otelcol.exporter.prometheus.local.input]
+  }
+}
+otelcol.exporter.otlp "tempo" {
+  client { endpoint = "tempo:4317" }
+}
+otelcol.exporter.prometheus "local" {
+  forward_to = [prometheus.remote_write.local.receiver]
+}
+prometheus.remote_write "local" {
+  endpoint { url = "http://prometheus:9090/api/v1/write" }
+}
+```
+
+```sh
+bw config set otlp-endpoint http://127.0.0.1:4318
+```
+
+**Jaeger all-in-one** (traces only; Jaeger has no metrics endpoint):
+
+```sh
+docker run --rm -p 127.0.0.1:16686:16686 -p 127.0.0.1:4318:4318 jaegertracing/all-in-one:1.64.0
+bw config set otlp-endpoint http://127.0.0.1:4318
+bw config set otlp-signals traces
+```
+
+Open `http://127.0.0.1:16686` and pick the `blackwall` service.
+
+**Langfuse** (traces only). The OTLP endpoint is `https://cloud.langfuse.com/api/public/otel`
+(EU) or `https://us.cloud.langfuse.com/api/public/otel` (US), or `<your host>/api/public/otel` when
+self-hosted. Authenticate with HTTP Basic auth of your public and secret key: keep
+`Basic <base64 of public-key:secret-key>` in your password manager and pipe it in.
+
+```sh
+bw config set otlp-endpoint https://cloud.langfuse.com/api/public/otel
+bw config set otlp-signals traces
+op read "op://Private/Langfuse/otlp-authorization" | bw telemetry header authorization
+bw telemetry test
+```
+
+Langfuse shows prompts and answers only for runs recorded with content capture on.
