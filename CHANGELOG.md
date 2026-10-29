@@ -16,7 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   approval, matched on the URL's host; values fill only the path or query, percent-encoded; header
   values come only from the credential store as `{secret:NAME}`, saved with
   `bw tools secret <tool> <NAME>` for the URL's origin; responses are capped at 64 KiB with no
-  redirects, proxies or compression. Existing `tools.json` files load unchanged.
+  redirects, proxies or compression. A tool that sends headers or a JSON body is allowed only by
+  a Network rule naming it (`"tool":"<name>"`), not by a host allow. Existing `tools.json` files
+  load unchanged.
 - Project settings in `.blackwall/project.json`. A project's deny and ask rules apply right away;
   its allow rules (and its `mcp`, `limits` and `instructions` sections, validated now; `mcp` is
   used from this release) wait until the owner trusts the file. Trust is saved in `trusted-projects.json`

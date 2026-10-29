@@ -238,9 +238,10 @@ one matching field:
 `command` matches the leading words of a shell command, `path` matches a workspace-relative path and
 everything below it, and `host` matches a host exactly or, with `*.`, its subdomains. For MCP calls,
 an `exec` rule can use `tool` instead: a server name such as `context7` matches all of that server's
-tools, and `server__tool` matches one. `tool` rules never match shell commands. Any rule can add
-`project` with an absolute folder path, and then applies only to runs in that project. Ask and deny
-path rules ignore letter case, as the default macOS and Windows file systems do. By default
+tools, and `server__tool` matches one. `tool` rules never match shell commands. A `network` rule
+can use `tool` instead of `host` to name one HTTP command tool from `tools.json` (see below).
+Any rule can add `project` with an absolute folder path, and then applies only to runs in that
+project. Ask and deny path rules ignore letter case, as the default macOS and Windows file systems do. By default
 (`"mode": "strictest"`), deny outranks ask, and ask outranks allow. With `"mode": "ordered"` next to
 `rules`, the first matching rule in the file decides instead, so an earlier allow can make an
 exception to a later rule; see [ordered rules](#ordered-and-strictest-rules). Actions that no rule
@@ -294,12 +295,15 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 ]}
 ```
 
-**Argument schemas.** Without `parameters`, each placeholder is a required text parameter. With
+**Argument schemas.** Without `parameters`, each placeholder is a required text parameter. A tool
+with `"stdin":"json"` or `"body":"json"` and no `parameters` then takes exactly those names, each a
+string; anything else is refused, since the whole object reaches the program or service. With
 `parameters`, the tool declares its own schema, a subset of JSON Schema: `"type":"object"` with up
 to 64 `properties`, each of `type` `string`, `number`, `integer` or `boolean`, with an optional
 `description` and `enum` list, plus `required`. `additionalProperties` may only be `false`, which is
 also the default. Arguments that are not an object, miss a required name, add a name the schema does
-not list, or have the wrong type or a value outside `enum` are refused before any approval. Every
+not list, or have the wrong type or a value outside `enum` are refused before any approval. An
+`integer` also accepts a whole-number float such as `3.0`, written as `3`. Every
 placeholder must be a required parameter; numbers and booleans fill a placeholder as JSON writes
 them.
 
@@ -321,19 +325,24 @@ them.
 - `url` must be `https`, or plain `http` only to the literal `127.0.0.1` or `[::1]`, with no
   sign-in part or `#fragment`. Placeholders may appear only in path segments and query values,
   never in the scheme, host, port or a query name, and each value is percent-encoded; a whole
-  segment of `.` or `..` is refused.
+  segment of `.` or `..` is refused, and so is a resolved URL over 8 KiB.
 - `method` is `GET` (the default) or `POST`. `"body":"json"` (POST only) sends the arguments as a
   JSON object.
-- `headers` values may only be `{secret:NAME}`. Save the value, piped so it is never shown, with
+- `headers` values may only be `{secret:NAME}`, and a name may appear only once, ignoring case. Save the value, piped so it is never shown, with
   `op read "op://Private/GitLab/token" | bw tools secret gitlab_issue GITLAB_TOKEN` (`--delete`
   removes it). It is stored in the credential store under `com.blackwall.tools` for the URL's origin
   (`scheme://host:port`), so pointing the tool at another host never sends it; save it again for
   the new origin. Put any scheme in the value itself, such as `Bearer …` or `Basic …`. Saved values
   are replaced with `[redacted]` in responses.
 - Every call asks for Network approval. The prompt shows the method and resolved URL, with
-  secret-looking query values hidden, the header names, any body, and a SHA-256 of the request;
-  Network rules match the URL's host, so
-  `{"decision":"allow","kind":"network","host":"gitlab.example.com"}` allows it without a prompt.
+  secret-looking query values hidden (names such as `token`, `key` or `sig`, or ending in `_key` or
+  `_token`), the header names, any body, and a SHA-256 of the request. A call the model wrote as
+  text asks first as Network and then still shows this prompt.
+- Network rules match the URL's host, so
+  `{"decision":"allow","kind":"network","host":"api.github.com"}` allows a tool without `headers`
+  or a body without a prompt. A tool that sends `headers` or a JSON body is allowed only by a rule
+  that names it, `{"decision":"allow","kind":"network","tool":"gitlab_issue"}`; with only a host
+  allow it still asks. Deny and ask rules for the host apply to every tool, and beat a tool allow.
 - Proxy variables are ignored, redirects are not followed, and compressed responses are refused
   (Blackwall asks for `identity`). The response is capped at 64 KiB, counted as it streams, and
   must be UTF-8. A response that is not 2xx is an error with the status and at most 200 characters
