@@ -630,9 +630,12 @@ Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol prev
 and CI. Each agent event except context snapshots is printed to standard output as one JSON object
 per line, ending with a `result` line that has the session ID, `status`, the answer, any error,
 `reason`, `denied` (how many approvals were denied) and `usage` (`input` and `output` tokens the
-server reported for the run's completed turns). Standard input is not read: actions that owner
-rules allow run, and anything that would show an approval prompt is denied. Add `--timeout SECS`
-(10–86400) to stop the whole run after that many seconds.
+server reported for every model call in the run, including calls before a failure, timeout or
+interrupt). A `model_usage` event carries each call's tokens as it returns. Standard input is not
+read: actions that owner rules allow run, and anything that would show an approval prompt is
+denied. Add `--timeout SECS` or `--timeout=SECS` (10–86400) to stop the whole run after that many
+seconds. Flags come before the prompt, each at most once; an unknown `--option` is a usage error,
+and `--` ends the flags so a prompt can start with `--`.
 
 The exit code says why the run ended, with or without `--json`:
 
@@ -643,11 +646,13 @@ The exit code says why the run ended, with or without `--json`:
 | 2 | Usage error, such as a missing prompt or a `--timeout` outside 10–86400 | `usage` |
 | 3 | Completed, but at least one approval was denied | `denied` |
 | 4 | Step limit (`iterations`) reached | `iterations` |
-| 5 | Model or network error | `model` |
+| 5 | Model or network error, including a request or response over Blackwall's size limit | `model` |
 | 6 | Context budget exceeded | `budget` |
 | 7 | Whole-run time limit (`--timeout`) reached | `timeout` |
 | 130 | Interrupted (Ctrl+C), on every platform | `interrupted` |
 
+`denied` counts denials whatever the `reason`. Exit 3 means the run completed after at least one
+denial; when a denial is followed by an error, the error's reason and exit code win.
 A usage error with `--json` still prints a `result` line, with a null session ID. Other errors
 before the run starts, such as invalid settings, exit 1 and are reported only on standard error.
 

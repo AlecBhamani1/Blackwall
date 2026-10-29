@@ -68,7 +68,7 @@ USAGE:
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
-  bw run [--json] <prompt>   Run one task; --json prints JSON lines and denies prompts
+  bw run [--json] [--timeout SECS] <prompt>  Run one task; --json prints JSON lines and denies prompts
   bw resume <id> [--json] [prompt]
                              Continue a saved Agent conversation
   bw sessions                List saved conversations
