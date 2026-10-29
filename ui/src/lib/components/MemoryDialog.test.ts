@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { persistence, type MemoryProposal } from '../persistence';
+import { instructionFileValid, persistence, type MemoryProposal } from '../persistence';
 import MemoryDialog from './MemoryDialog.svelte';
 
 describe('memory management', () => {
@@ -116,6 +116,82 @@ describe('memory management', () => {
     expect(name).toHaveValue('review');
     expect(screen.getByLabelText('Subagent step limit')).toHaveValue(3);
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
+  });
+  it('saves instruction limits and extra files only within their ranges', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const file = await screen.findByLabelText('Instruction file limit (KiB)');
+    await vi.waitFor(() => expect(file).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Instructions'));
+    const total = screen.getByLabelText('Total instruction limit (KiB)');
+    const files = screen.getByLabelText('Extra instruction files, one per line');
+    expect(file).toHaveValue(8);
+    expect(total).toHaveValue(32);
+    expect(files).toHaveValue('');
+    const button = screen.getByRole('button', { name: 'Save instruction limits' });
+    for (const [input, value] of [
+      [file, '0'],
+      [file, '65'],
+      [total, '7'],
+      [total, '257'],
+    ] as const) {
+      await user.clear(input);
+      await user.type(input, value);
+      expect(button).toBeDisabled();
+      await user.clear(input);
+      await user.type(input, input === file ? '4' : '64');
+      expect(button).toBeEnabled();
+    }
+    for (const bad of ['../CLAUDE.md', '/etc/passwd', 'C:\\CLAUDE.md', 'AGENTS.md']) {
+      await user.clear(files);
+      await user.type(files, bad);
+      expect(button).toBeDisabled();
+    }
+    await user.clear(files);
+    await user.type(files, 'CLAUDE.md{Enter}  .github/copilot-instructions.md  {Enter}');
+    await user.click(button);
+    expect(save).toHaveBeenLastCalledWith({
+      instructionMaxFileKib: 4,
+      instructionMaxTotalKib: 64,
+      instructionExtraFiles: ['CLAUDE.md', '.github/copilot-instructions.md'],
+    });
+  });
+  it('loads saved instruction settings', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({
+      instructionMaxFileKib: 2,
+      instructionMaxTotalKib: 128,
+      instructionExtraFiles: ['CLAUDE.md', 'GEMINI.md'],
+    });
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const file = await screen.findByLabelText('Instruction file limit (KiB)');
+    await vi.waitFor(() => expect(file).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Instructions'));
+    expect(file).toHaveValue(2);
+    expect(screen.getByLabelText('Total instruction limit (KiB)')).toHaveValue(128);
+    expect(screen.getByLabelText('Extra instruction files, one per line')).toHaveValue(
+      'CLAUDE.md\nGEMINI.md',
+    );
+  });
+  it('accepts only relative extra instruction file paths inside the project', () => {
+    for (const good of ['CLAUDE.md', '.github/copilot-instructions.md', 'docs/AGENTS.md'])
+      expect(instructionFileValid(good)).toBe(true);
+    for (const bad of [
+      '',
+      '../CLAUDE.md',
+      'a/../b.md',
+      './CLAUDE.md',
+      '/CLAUDE.md',
+      'C:CLAUDE.md',
+      '\\\\server\\share',
+      '.git/CLAUDE.md',
+      'a//b.md',
+      'agents.override.md',
+      'x'.repeat(257),
+      'bad\u0000name',
+    ])
+      expect(instructionFileValid(bad)).toBe(false);
   });
   it('keeps the draft available when saving fails', async () => {
     const user = userEvent.setup();

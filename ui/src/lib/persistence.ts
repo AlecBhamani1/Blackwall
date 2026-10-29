@@ -19,6 +19,20 @@ export const SUBAGENT_TOOLS = [
 ] as const;
 export type SubagentTool = (typeof SUBAGENT_TOOLS)[number];
 export type SubagentRunsOn = 'local' | { tool: string };
+/** Up to 8 extra guidance files are read after AGENTS.md in each directory. */
+export const MAX_INSTRUCTION_FILES = 8;
+/** A relative path of plain names with `/`: no `..`, `.`, `.git`, root, drive or backslash. */
+export function instructionFileValid(name: string): boolean {
+  return (
+    name.length > 0 &&
+    new TextEncoder().encode(name).length <= 256 &&
+    !/[\\:\u0000-\u001f\u007f-\u009f]/.test(name) &&
+    name
+      .split('/')
+      .every((part) => part !== '' && part !== '.' && part !== '..' && part !== '.git') &&
+    !['agents.md', 'agents.override.md'].includes(name.toLowerCase())
+  );
+}
 export interface Preferences {
   connections?: ConnectionProfile[];
   endpoint?: string;
@@ -38,6 +52,12 @@ export interface Preferences {
   subagentTools?: SubagentTool[];
   /** Where subagents run: the current model, or an owner command tool. */
   subagentRunsOn?: SubagentRunsOn;
+  /** Per-file guidance cap in KiB, 1 to 64; longer files are truncated. */
+  instructionMaxFileKib?: number;
+  /** Cap on all guidance in a turn in KiB, 8 to 256. */
+  instructionMaxTotalKib?: number;
+  /** Extra guidance files read after AGENTS.md, such as CLAUDE.md. */
+  instructionExtraFiles?: string[];
   memoryEnabled?: boolean;
   recallEnabled?: boolean;
   tracesEnabled?: boolean;

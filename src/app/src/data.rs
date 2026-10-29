@@ -129,19 +129,45 @@ pub(crate) async fn subagent_settings(
     directory: std::path::PathBuf,
 ) -> Result<blackwall_core::subagents::SubagentSettings, String> {
     tokio::task::spawn_blocking(move || {
-        let saved = LocalStore::open(&directory)
-            .map_err(|error| error.to_string())?
-            .setting("preferences")
-            .map_err(|error| error.to_string())?;
-        let saved: Value = match saved {
-            Some(text) => serde_json::from_str(&text).map_err(|_| "Invalid settings.")?,
-            None => serde_json::json!({}),
-        };
-        let object = saved.as_object().ok_or("Invalid settings.")?;
-        blackwall_core::subagents::SubagentSettings::from_preferences(object).map_err(str::to_owned)
+        blackwall_core::subagents::SubagentSettings::from_preferences(&saved_preferences(
+            &directory,
+        )?)
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| "Settings could not be read.".to_owned())?
+}
+
+/// The owner's saved instruction caps and extra files for an Agent run, checked again here.
+pub(crate) async fn instruction_settings(
+    directory: std::path::PathBuf,
+) -> Result<blackwall_core::instructions::InstructionSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        blackwall_core::instructions::InstructionSettings::from_preferences(&saved_preferences(
+            &directory,
+        )?)
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "Settings could not be read.".to_owned())?
+}
+
+/// The saved desktop preferences object; empty when none are saved.
+fn saved_preferences(
+    directory: &std::path::Path,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let saved = LocalStore::open(directory)
+        .map_err(|error| error.to_string())?
+        .setting("preferences")
+        .map_err(|error| error.to_string())?;
+    let saved: Value = match saved {
+        Some(text) => serde_json::from_str(&text).map_err(|_| "Invalid settings.")?,
+        None => serde_json::json!({}),
+    };
+    match saved {
+        Value::Object(object) => Ok(object),
+        _ => Err("Invalid settings.".into()),
+    }
 }
 
 /// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
@@ -443,6 +469,9 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "subagentMaxSteps"
                 | "subagentTools"
                 | "subagentRunsOn"
+                | "instructionMaxFileKib"
+                | "instructionMaxTotalKib"
+                | "instructionExtraFiles"
                 | "memoryEnabled"
                 | "recallEnabled"
                 | "tracesEnabled"
@@ -498,6 +527,8 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
     }) {
         return Err("Choose a command output cap between 4,096 and 1,048,576 bytes.".into());
     }
+    // Caps in range; extra files relative, without .. or .git, at most 8.
+    blackwall_core::instructions::InstructionSettings::from_preferences(object)?;
     // A delegate must exist and take its prompt on standard input before it is chosen.
     if let blackwall_core::subagents::RunsOn::Tool(name) =
         blackwall_core::subagents::SubagentSettings::from_preferences(object)?.runs_on
@@ -1108,6 +1139,10 @@ mod telemetry_settings_tests {
             subagent_settings(directory.clone()).await.unwrap(),
             blackwall_core::subagents::SubagentSettings::default()
         );
+        assert_eq!(
+            instruction_settings(directory.clone()).await.unwrap(),
+            blackwall_core::instructions::InstructionSettings::default()
+        );
         assert_eq!(settings.export, ExportConfig::default());
         assert_eq!(settings.retention, Retention::Days(400));
         store
@@ -1133,6 +1168,54 @@ mod telemetry_settings_tests {
             telemetry_settings(directory.clone()).await.export,
             ExportConfig::default()
         );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod instruction_settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saved_instruction_settings_are_range_checked() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-app-instructions-{}-{unique}",
+            std::process::id()
+        ));
+        let store = LocalStore::open(&directory).unwrap();
+        store
+            .save_setting(
+                "preferences",
+                r#"{"instructionMaxFileKib":64,"instructionMaxTotalKib":8,"instructionExtraFiles":["CLAUDE.md",".github/copilot-instructions.md"]}"#,
+            )
+            .unwrap();
+        let settings = instruction_settings(directory.clone()).await.unwrap();
+        assert_eq!((settings.max_file_kib, settings.max_total_kib), (64, 8));
+        assert_eq!(
+            settings.extra_files,
+            ["CLAUDE.md", ".github/copilot-instructions.md"]
+        );
+        for bad in [
+            r#"{"instructionMaxFileKib":0}"#,
+            r#"{"instructionMaxFileKib":65}"#,
+            r#"{"instructionMaxTotalKib":7}"#,
+            r#"{"instructionMaxTotalKib":257}"#,
+            r#"{"instructionExtraFiles":["../CLAUDE.md"]}"#,
+            r#"{"instructionExtraFiles":["/etc/passwd"]}"#,
+            r#"{"instructionExtraFiles":["a","b","c","d","e","f","g","h","i"]}"#,
+        ] {
+            store.save_setting("preferences", bad).unwrap();
+            assert!(
+                instruction_settings(directory.clone()).await.is_err(),
+                "{bad}"
+            );
+        }
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
