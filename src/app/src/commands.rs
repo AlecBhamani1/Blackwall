@@ -670,6 +670,7 @@ pub(crate) async fn stream_chat(
             .map_err(|message| CommandError {
                 code: "settings_error",
                 message,
+                detail: None,
                 retryable: false,
             })?;
         let runner = blackwall_core::agent::Agent {

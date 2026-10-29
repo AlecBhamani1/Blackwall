@@ -810,7 +810,11 @@ fn run_reads_configured_extra_instruction_files() {
     let fixture = Fixture::new();
     fixture.configure_model();
     fixture.success(&["config", "set", "instruction-files", "CLAUDE.md"], "");
-    fs::write(fixture.project.join("CLAUDE.md"), "Extra fixture conventions").unwrap();
+    fs::write(
+        fixture.project.join("CLAUDE.md"),
+        "Extra fixture conventions",
+    )
+    .unwrap();
     let model = ModelServer::start(vec![answer("guided answer")]);
     fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
     let output = fixture.run(&["run", "inspect conventions"], "");
