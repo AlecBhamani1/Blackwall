@@ -357,7 +357,7 @@
     <p class="hint">
       {canAddHeader
         ? `Saved for ${saved?.origin} only.`
-        : 'Save an endpoint first: a header is saved for that endpoint only.'}
+        : 'Save the endpoint first: a header is saved for that endpoint only.'}
     </p>
   </form>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -478,6 +478,11 @@
     margin: 0 0 10px;
     padding: 0;
     list-style: none;
+  }
+  .headers code,
+  .headers button {
+    flex: none;
+    white-space: nowrap;
   }
   .headers li {
     display: flex;

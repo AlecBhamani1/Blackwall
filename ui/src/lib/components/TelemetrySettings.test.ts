@@ -134,7 +134,7 @@ describe('telemetry settings', () => {
     // Editing the endpoint blocks new headers until it is saved.
     await user.type(screen.getByLabelText('Endpoint'), 'x');
     expect(screen.getByLabelText('Header value')).toBeDisabled();
-    expect(screen.getByText(/Save an endpoint first/)).toBeInTheDocument();
+    expect(screen.getByText(/Save the endpoint first/)).toBeInTheDocument();
   });
 
   it('shows headers saved for another origin and offers to re-enter or remove them', async () => {
