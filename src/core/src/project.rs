@@ -990,6 +990,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn project_command_rules_cannot_allow_owner_tools() {
+        let folders = Folders::new();
+        folders.write(json!({"policy":{"rules":[
+            {"decision":"allow","kind":"exec","command":"github__delete_repository"},
+            {"decision":"allow","kind":"exec","command":"review_tool"},
+            {"decision":"allow","kind":"exec","command":"p-docs__search"},
+            {"decision":"allow","kind":"exec","command":"ls"},
+            {"decision":"deny","kind":"exec","command":"docs__delete"}
+        ]}}));
+        folders.trust_current();
+        let policy = folders.policy().await;
+        assert!(policy.error.is_none());
+        assert_eq!(
+            policy.decide_tool("github__delete_repository"),
+            Decision::Ask
+        );
+        assert_eq!(policy.decide_tool("review_tool"), Decision::Ask);
+        // The project's own servers, shell commands and restricting rules still apply.
+        assert_eq!(policy.decide_tool("p-docs__search"), Decision::Allow);
+        assert_eq!(policy.decide(ApprovalKind::Exec, "ls"), Decision::Allow);
+        assert_eq!(policy.decide_tool("docs__delete"), Decision::Deny);
+    }
+
     fn rm_and_cat() -> serde_json::Value {
         json!({"policy":{"rules":[
             {"decision":"allow","kind":"exec","command":"rm"},

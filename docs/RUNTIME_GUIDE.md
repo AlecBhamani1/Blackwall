@@ -642,7 +642,8 @@ lets it add permissions on its own:
 Every section is optional, and unknown fields make the file invalid. `policy` uses the same rule
 format as `policy.json`, except that a project rule cannot name a `project`, and a project allow
 rule can neither name one of your MCP servers (only the project's own `p-` servers) nor match every
-file (a `path` of `.` or anything that resolves to the project root).
+file (a `path` of `.` or anything that resolves to the project root). A project allow rule never
+allows one of your MCP or command tools, even through `command`; only its own `p-` servers.
 
 **Trust.** Until you trust the file, only its `deny` and `ask` rules apply, because they can only
 tighten. Its `allow` rules and every other section wait. To trust it:

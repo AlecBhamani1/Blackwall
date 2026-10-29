@@ -193,6 +193,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- A trusted project's `command` allow rule (for example `"command": "github__delete_repository"`)
+  could allow one of your own MCP or command tools. A project's allow rules now only ever allow
+  its own `p-` servers.
 - Update `ctutils` to 0.4.4 to fix non-constant-time operations reported in
   [RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385.html).
 

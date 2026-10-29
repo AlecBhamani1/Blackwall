@@ -353,10 +353,14 @@ impl Policy {
     /// Each file gives its own answer (see [`RuleMode`]); across files deny outranks ask and ask
     /// outranks allow, and on a tie the owner's rule is the one recorded.
     fn verdict(&self, applies: &dyn Fn(&Rule) -> bool) -> Verdict {
+        self.verdict_by_source(&|_, rule| applies(rule))
+    }
+
+    fn verdict_by_source(&self, applies: &dyn Fn(Source, &Rule) -> bool) -> Verdict {
         let verdict = strictest(
             self.layers
                 .iter()
-                .filter_map(|layer| layer.verdict(applies)),
+                .filter_map(|layer| layer.verdict(&|rule| applies(layer.source, rule))),
             |(decision, _)| *decision,
         )
         .map_or(
@@ -405,13 +409,17 @@ impl Policy {
     }
 
     /// MCP calls match `tool` rules by server or exact name, and `command` rules by the namespaced
-    /// name. `tool` rules never match shell commands, which `decide` handles.
+    /// name. `tool` rules never match shell commands, which `decide` handles. A project's allow
+    /// rules only ever allow its own `p-` servers, however they are written.
     pub fn evaluate_tool(&self, exposed: &str) -> Verdict {
         let server = exposed
             .split_once("__")
             .map_or(exposed, |(server, _)| server);
-        self.verdict(&|rule| {
+        self.verdict_by_source(&|source, rule| {
             rule.kind == ApprovalKind::Exec
+                && (source != Source::Project
+                    || rule.decision != Decision::Allow
+                    || server.starts_with("p-"))
                 && match rule.tool.as_deref() {
                     Some(tool) => tool == exposed || tool == server,
                     None => matches(rule, exposed),
