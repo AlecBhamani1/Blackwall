@@ -24,17 +24,38 @@ use std::{
 pub const REFRESH_SECS: u64 = 120;
 pub const STALE_AFTER_SECS: u64 = 2 * REFRESH_SECS;
 
-/// A UTC day: days since the Unix epoch.
+/// A day number: days since the Unix epoch. Metrics files are named by UTC day; the Usage page
+/// counts local days, the UTC day numbering shifted by the viewer's UTC offset.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Day(pub u32);
 
+/// UTC offsets run from -12:00 to +14:00.
+pub fn clamp_offset(minutes: i32) -> i32 {
+    minutes.clamp(-12 * 60, 14 * 60)
+}
+
+/// The local day number of a Unix time in seconds, at `offset_minutes` east of UTC.
+fn local_day(unix_secs: i64, offset_minutes: i32) -> i64 {
+    (unix_secs + i64::from(clamp_offset(offset_minutes)) * 60).div_euclid(86_400)
+}
+
 impl Day {
-    pub fn today() -> Self {
-        Self::of(SystemTime::now())
+    /// Today in the zone `offset_minutes` east of UTC.
+    pub fn today(offset_minutes: i32) -> Self {
+        Self::local(SystemTime::now(), offset_minutes)
     }
 
+    /// The UTC day of a time.
     pub fn of(time: SystemTime) -> Self {
         Self(u32::try_from(day_of(time)).unwrap_or_default())
+    }
+
+    /// The local day of a time, `offset_minutes` east of UTC.
+    pub fn local(time: SystemTime, offset_minutes: i32) -> Self {
+        let secs = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        Self(u32::try_from(local_day(secs, offset_minutes)).unwrap_or_default())
     }
 
     /// The `days` days ending with `to`, at least one.
@@ -175,7 +196,8 @@ pub struct ToolRow {
     pub timeouts: u64,
 }
 
-/// What the range cannot show.
+/// What the range cannot show. Past periods with recording off are not knowable from the
+/// metrics files; PR 3 records on/off changes so they can be listed here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Gaps {
@@ -208,29 +230,41 @@ pub struct UsageSummary {
     pub stale: bool,
 }
 
-/// Aggregate the metrics files from `from` to `to`, inclusive. Blocking.
-pub fn summary(data_dir: &Path, from: Day, to: Day) -> UsageSummary {
-    summary_at(data_dir, from, to, SystemTime::now())
+/// Aggregate usage for the local days `from` to `to`, inclusive, in the zone `offset_minutes`
+/// east of UTC. Blocking.
+pub fn summary(data_dir: &Path, from: Day, to: Day, offset_minutes: i32) -> UsageSummary {
+    summary_at(data_dir, from, to, offset_minutes, SystemTime::now())
 }
 
 /// [`summary`] as of `now`, for the stale check.
-pub fn summary_at(data_dir: &Path, from: Day, to: Day, now: SystemTime) -> UsageSummary {
+///
+/// Files are named by the UTC day they were written, so a local day can span two of them; files
+/// from the day before `from` to the day after `to` are read, and each point is counted on the
+/// local day of its timestamp.
+pub fn summary_at(
+    data_dir: &Path,
+    from: Day,
+    to: Day,
+    offset_minutes: i32,
+    now: SystemTime,
+) -> UsageSummary {
     let to = to.max(from);
-    let mut usage = Aggregate::new(from, to);
+    let mut usage = Aggregate::new(from, to, offset_minutes);
     let mut warnings = vec![];
     let files = metric_files(data_dir);
-    let first = files.first().map(|(day, _)| *day);
+    let window = Day(from.0.saturating_sub(1))..=Day(to.0.saturating_add(1));
+    // Data before the files read can exist only if an older file does.
+    let older = files.first().is_some_and(|(day, _)| day < window.start());
     let mut read = 0;
-    for (day, path) in files.iter().filter(|(day, _)| (from..=to).contains(day)) {
+    for (day, path) in files.iter().filter(|(day, _)| window.contains(day)) {
         read += 1;
-        usage.recorded[(day.0 - from.0) as usize] = true;
         let name = day.file_name();
         let Ok(file) = std::fs::File::open(path) else {
             warnings.push(format!("{name} could not be read."));
             continue;
         };
         let bad = read_lines(std::io::BufReader::new(file), |request| {
-            usage.add_request(*day, request);
+            usage.add_request(request);
         });
         if bad > 0 {
             let plural = if bad == 1 { "" } else { "s" };
@@ -245,6 +279,14 @@ pub fn summary_at(data_dir: &Path, from: Day, to: Day, now: SystemTime) -> Usage
             .saturating_sub(Duration::from_millis(newest));
         age > Duration::from_secs(STALE_AFTER_SECS)
     });
+    let first = (!older).then_some(usage.earliest).flatten();
+    if usage.mismatched_bounds {
+        warnings.push(
+            "Some histogram points used different bucket bounds and were left out of medians and \
+             p90s."
+                .into(),
+        );
+    }
     let mut summary = usage.finish();
     summary.gaps.first_day = first
         .filter(|first| *first > from)
@@ -309,9 +351,11 @@ struct Buckets {
 }
 
 impl Buckets {
-    fn add(&mut self, point: &HistogramDataPoint) {
+    /// Merge a point's buckets. Returns false when its bounds differ from the ones already
+    /// merged, or its counts do not match its bounds; such a point is left out.
+    fn add(&mut self, point: &HistogramDataPoint) -> bool {
         if point.bucket_counts.len() != point.explicit_bounds.len() + 1 {
-            return;
+            return point.bucket_counts.is_empty();
         }
         if self.counts.is_empty() {
             self.bounds.clone_from(&point.explicit_bounds);
@@ -320,7 +364,10 @@ impl Buckets {
             for (total, count) in self.counts.iter_mut().zip(&point.bucket_counts) {
                 *total += count;
             }
+        } else {
+            return false;
         }
+        true
     }
 
     /// The `q` quantile, interpolated inside its bucket as Prometheus does. The open last
@@ -426,6 +473,10 @@ struct ModeTally {
 
 struct Aggregate {
     from: Day,
+    offset_minutes: i32,
+    /// The local day of the earliest point seen in any file read.
+    earliest: Option<Day>,
+    mismatched_bounds: bool,
     per_day: Vec<Tokens>,
     recorded: Vec<bool>,
     totals: Totals,
@@ -462,10 +513,13 @@ fn number(point: &NumberDataPoint) -> u64 {
 }
 
 impl Aggregate {
-    fn new(from: Day, to: Day) -> Self {
+    fn new(from: Day, to: Day, offset_minutes: i32) -> Self {
         let days = (to.0 - from.0 + 1) as usize;
         Self {
             from,
+            offset_minutes,
+            earliest: None,
+            mismatched_bounds: false,
             per_day: vec![Tokens::default(); days],
             recorded: vec![false; days],
             totals: Totals::default(),
@@ -480,8 +534,16 @@ impl Aggregate {
         }
     }
 
-    fn add_request(&mut self, day: Day, request: ExportMetricsServiceRequest) {
-        let index = (day.0 - self.from.0) as usize;
+    /// The range index of the local day a point was recorded on, or `None` outside the range.
+    fn index(&mut self, time_unix_nano: u64) -> Option<usize> {
+        let day = local_day((time_unix_nano / 1_000_000_000) as i64, self.offset_minutes);
+        let day = Day(u32::try_from(day).ok()?);
+        self.earliest = Some(self.earliest.map_or(day, |earliest| earliest.min(day)));
+        let index = usize::try_from(day.0.checked_sub(self.from.0)?).ok()?;
+        (index < self.per_day.len()).then_some(index)
+    }
+
+    fn add_request(&mut self, request: ExportMetricsServiceRequest) {
         for metric in request
             .resource_metrics
             .into_iter()
@@ -491,12 +553,20 @@ impl Aggregate {
             match metric.data {
                 Some(metric::Data::Histogram(data)) => {
                     for point in &data.data_points {
+                        let Some(index) = self.index(point.time_unix_nano) else {
+                            continue;
+                        };
+                        self.recorded[index] = true;
                         self.newest_nanos = self.newest_nanos.max(point.time_unix_nano);
                         self.add_histogram(index, &metric.name, point);
                     }
                 }
                 Some(metric::Data::Sum(data)) => {
                     for point in &data.data_points {
+                        let Some(index) = self.index(point.time_unix_nano) else {
+                            continue;
+                        };
+                        self.recorded[index] = true;
                         self.newest_nanos = self.newest_nanos.max(point.time_unix_nano);
                         self.add_sum(&metric.name, point);
                     }
@@ -554,27 +624,32 @@ impl Aggregate {
                 self.totals.model_calls += point.count;
                 self.totals.failed_calls += failed;
                 self.modes.entry(mode.to_owned()).or_default().calls += point.count;
+                let mut merged = true;
                 for group in [
                     self.projects.entry(project).or_default(),
                     self.models.entry(model.to_owned()).or_default(),
                 ] {
                     group.calls += point.count;
                     group.failed += failed;
-                    group.duration.add(point);
+                    merged &= group.duration.add(point);
                     if let Some(tally) = group.session(session) {
                         tally.calls += point.count;
                         tally.models.insert(model.to_owned());
                     }
                 }
+                self.mismatched_bounds |= !merged;
             }
             names::OUTPUT_SPEED => {
-                self.speed.add(point);
-                self.projects.entry(project).or_default().speed.add(point);
-                self.models
-                    .entry(model.to_owned())
-                    .or_default()
-                    .speed
-                    .add(point);
+                let merged = [
+                    self.speed.add(point),
+                    self.projects.entry(project).or_default().speed.add(point),
+                    self.models
+                        .entry(model.to_owned())
+                        .or_default()
+                        .speed
+                        .add(point),
+                ];
+                self.mismatched_bounds |= merged.contains(&false);
             }
             names::COMPACTION_SAVED => {
                 self.totals.tokens_saved += sum;
@@ -719,7 +794,7 @@ impl Aggregate {
 pub enum UsageError {
     #[error("Choose an existing folder to export to.")]
     Destination,
-    #[error("That folder already holds an export of this range.")]
+    #[error("A folder or file with this export's name already exists there.")]
     Exists,
     #[error("The export could not be written.")]
     Write,
@@ -743,12 +818,15 @@ pub struct ExportReport {
     pub trace_files: usize,
 }
 
-/// Copy the range's metrics files and trace files into a new folder inside `dest`, as plain
-/// OTLP JSON any collector can import. Symlinks are not followed.
+/// Copy the files for the local days `from` to `to` (`offset_minutes` east of UTC) into a new
+/// folder inside `dest`, as plain OTLP JSON any collector can import: every metrics file whose UTC
+/// day overlaps the range, and every trace started within it. Symlinks are not followed. On any
+/// error the new folder is removed, so a retry starts clean.
 pub fn export(
     data_dir: &Path,
     from: Day,
     to: Day,
+    offset_minutes: i32,
     dest: &Path,
 ) -> Result<ExportReport, UsageError> {
     if !std::fs::metadata(dest).is_ok_and(|meta| meta.is_dir()) {
@@ -762,6 +840,24 @@ pub fn export(
         }
         Err(_) => return Err(UsageError::Write),
     }
+    let result = copy_range(data_dir, from, to, offset_minutes, &folder);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+    result
+}
+
+fn copy_range(
+    data_dir: &Path,
+    from: Day,
+    to: Day,
+    offset_minutes: i32,
+    folder: &Path,
+) -> Result<ExportReport, UsageError> {
+    let offset = i64::from(clamp_offset(offset_minutes)) * 60;
+    // The UTC days the range's first and last instants fall on.
+    let first_utc = (i64::from(from.0) * 86_400 - offset).div_euclid(86_400);
+    let last_utc = ((i64::from(to.0) + 1) * 86_400 - offset - 1).div_euclid(86_400);
     let copy = |source: &Path, folder: &Path| -> Result<bool, UsageError> {
         if !std::fs::symlink_metadata(source).is_ok_and(|meta| meta.is_file()) {
             return Ok(false);
@@ -772,13 +868,13 @@ pub fn export(
         Ok(true)
     };
     let mut report = ExportReport {
-        folder: folder.clone(),
+        folder: folder.to_path_buf(),
         metrics_files: 0,
         trace_files: 0,
     };
     for (_, path) in metric_files(data_dir)
         .into_iter()
-        .filter(|(day, _)| (from..=to).contains(day))
+        .filter(|(day, _)| (first_utc..=last_utc).contains(&i64::from(day.0)))
     {
         report.metrics_files += usize::from(copy(&path, &folder.join(METRICS_DIRECTORY))?);
     }
@@ -793,10 +889,9 @@ pub fn export(
         let day = name
             .strip_suffix(".json")
             .and_then(|stem| stem.split_once('-'))
-            .and_then(|(millis, _)| millis.parse::<u64>().ok())
-            .and_then(|millis| u32::try_from(millis / 86_400_000).ok())
-            .map(Day);
-        if day.is_some_and(|day| (from..=to).contains(&day)) {
+            .and_then(|(millis, _)| millis.parse::<i64>().ok())
+            .map(|millis| local_day(millis / 1000, offset_minutes));
+        if day.is_some_and(|day| (i64::from(from.0)..=i64::from(to.0)).contains(&day)) {
             report.trace_files += usize::from(copy(
                 &entry.path(),
                 &folder.join(crate::trace::TRACE_DIRECTORY),

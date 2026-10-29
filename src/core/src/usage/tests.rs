@@ -20,8 +20,26 @@ fn usage(input: u64, output: u64) -> TokenUsage {
     }
 }
 
-/// Record real metrics with the SDK, then file them under `day` in `directory`.
-fn record(directory: &Path, day: Day, work: impl FnOnce(&Telemetry)) {
+/// Set every data point's timestamps to `nanos`.
+fn retime(value: &mut serde_json::Value, nanos: u64) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if key == "timeUnixNano" || key == "startTimeUnixNano" {
+                    *item = serde_json::Value::String(nanos.to_string());
+                } else {
+                    retime(item, nanos);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|item| retime(item, nanos)),
+        _ => {}
+    }
+}
+
+/// Record real metrics with the SDK, as if at `unix_secs`, filed under that UTC day like the
+/// exporter does.
+fn record_at(directory: &Path, unix_secs: u64, work: impl FnOnce(&Telemetry)) {
     let scratch = folder();
     let telemetry = Telemetry::start(
         &scratch,
@@ -34,16 +52,26 @@ fn record(directory: &Path, day: Day, work: impl FnOnce(&Telemetry)) {
     telemetry.shutdown();
     let metrics = directory.join(METRICS_DIRECTORY);
     std::fs::create_dir_all(&metrics).unwrap();
+    let day = Day((unix_secs / 86_400) as u32);
     for entry in std::fs::read_dir(scratch.join(METRICS_DIRECTORY)).unwrap() {
-        let body = std::fs::read(entry.unwrap().path()).unwrap();
+        let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(metrics.join(day.file_name()))
             .unwrap();
-        std::io::Write::write_all(&mut file, &body).unwrap();
+        for line in body.lines() {
+            let mut request: serde_json::Value = serde_json::from_str(line).unwrap();
+            retime(&mut request, unix_secs * 1_000_000_000);
+            std::io::Write::write_all(&mut file, format!("{request}\n").as_bytes()).unwrap();
+        }
     }
     std::fs::remove_dir_all(scratch).unwrap();
+}
+
+/// [`record_at`] at noon UTC on `day`.
+fn record(directory: &Path, day: Day, work: impl FnOnce(&Telemetry)) {
+    record_at(directory, u64::from(day.0) * 86_400 + 43_200, work);
 }
 
 fn agent_call(
@@ -78,7 +106,7 @@ fn usage_sums_tokens_per_day_and_model() {
     record(&directory, Day(D + 2), |t| {
         agent_call(t, "api", "s2", "qwen", (200, 20));
     });
-    let summary = summary(&directory, Day(D), Day(D + 2));
+    let summary = summary(&directory, Day(D), Day(D + 2), 0);
     assert_eq!(summary.per_day.len(), 3);
     assert_eq!(summary.per_day[0].tokens.input, 150);
     assert_eq!(summary.per_day[0].tokens.output, 15);
@@ -102,7 +130,7 @@ fn usage_sums_tokens_per_day_and_model() {
     assert_eq!(summary.per_model[0].name.as_deref(), Some("qwen"));
     assert_eq!(summary.from, "2024-10-04");
     // Days outside the range are not counted.
-    let one = super::summary(&directory, Day(D + 1), Day(D + 2));
+    let one = super::summary(&directory, Day(D + 1), Day(D + 2), 0);
     assert_eq!(one.totals.tokens.total(), 220);
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -118,7 +146,7 @@ fn usage_median_tokens_per_second() {
         }
         scope.finish(RunOutcome::Complete);
     });
-    let summary = summary(&directory, Day(D), Day(D));
+    let summary = summary(&directory, Day(D), Day(D), 0);
     let median = summary.totals.median_output_speed.unwrap();
     // Read from histogram buckets: the median lies in the 16-32 tok/s bucket.
     assert!((16.0..=32.0).contains(&median), "{median}");
@@ -148,7 +176,7 @@ fn usage_success_rate_from_run_outcomes() {
         scope.record_tool("read_file", ToolOutcome::Ok);
         scope.finish(RunOutcome::Cancelled);
     });
-    let summary = summary(&directory, Day(D), Day(D));
+    let summary = summary(&directory, Day(D), Day(D), 0);
     assert_eq!(summary.totals.runs, 7);
     assert_eq!(summary.totals.completed_runs, 4);
     assert_eq!(summary.totals.runs_by_outcome["iterations"], 1);
@@ -188,7 +216,7 @@ fn usage_skips_corrupt_lines_and_missing_days() {
         [0xff, 0xfe, b'\n'],
     )
     .unwrap();
-    let summary = summary(&directory, Day(D - 3), Day(D + 3));
+    let summary = summary(&directory, Day(D - 3), Day(D + 3), 0);
     assert_eq!(summary.totals.tokens.total(), 44);
     assert_eq!(summary.per_day.len(), 7);
     // One warning per affected file, naming the file, not every line.
@@ -206,7 +234,7 @@ fn usage_skips_corrupt_lines_and_missing_days() {
 #[test]
 fn usage_empty_folder_is_zero_not_error() {
     let directory = folder();
-    let summary = summary(&directory, Day(D), Day(D + 6));
+    let summary = summary(&directory, Day(D), Day(D + 6), 0);
     assert_eq!(summary.totals.tokens.total(), 0);
     assert_eq!(summary.totals.runs, 0);
     assert_eq!(summary.totals.run_success, None);
@@ -232,7 +260,7 @@ fn usage_per_project_and_session_drilldown() {
         chat.record_model_call("qwen", "127.0.0.1:11434", Some(&usage(9, 1)), 1.0, None);
         chat.finish(RunOutcome::Complete);
     });
-    let summary = summary(&directory, Day(D), Day(D));
+    let summary = summary(&directory, Day(D), Day(D), 0);
     let names: Vec<_> = summary
         .per_project
         .iter()
@@ -268,7 +296,9 @@ fn usage_gaps_lists_off_periods_and_drops() {
         scope.record_compaction_saved(700);
         scope.finish(RunOutcome::Complete);
     });
-    // A dropped-run point, as the trace writer records it: a one-run file, renamed.
+    // A dropped-run point, as the trace writer records it: a one-run file, renamed. That the
+    // writer really records this metric is pinned by
+    // `telemetry::tests::a_dropped_run_is_counted_in_metrics`.
     record(&directory, Day(D + 3), |t| {
         t.run("r", Mode::Agent).finish(RunOutcome::Complete)
     });
@@ -280,7 +310,7 @@ fn usage_gaps_lists_off_periods_and_drops() {
         crate::telemetry::names::DROPPED_RUNS,
     );
     std::fs::write(&file, body).unwrap();
-    let summary = summary(&directory, Day(D), Day(D + 4));
+    let summary = summary(&directory, Day(D), Day(D + 4), 0);
     assert_eq!(
         summary.gaps.first_day.as_deref(),
         Some(Day(D + 2).to_string().as_str())
@@ -292,7 +322,7 @@ fn usage_gaps_lists_off_periods_and_drops() {
     assert!(!summary.per_day[4].recorded);
     // A range that starts on or after the first day has no history gap.
     assert_eq!(
-        super::summary(&directory, Day(D + 2), Day(D + 4))
+        super::summary(&directory, Day(D + 2), Day(D + 4), 0)
             .gaps
             .first_day,
         None
@@ -303,20 +333,125 @@ fn usage_gaps_lists_off_periods_and_drops() {
 #[test]
 fn usage_marks_stale_data() {
     let directory = folder();
-    record(&directory, Day::today(), |t| {
+    let now = SystemTime::now();
+    let secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    record_at(&directory, secs, |t| {
         agent_call(t, "api", "s1", "m", (10, 1))
     });
-    let now = SystemTime::now();
-    let fresh = summary_at(&directory, Day::today(), Day::today(), now);
+    let today = Day::today(0);
+    let fresh = summary_at(&directory, today, today, 0, now);
     assert!(fresh.newest_unix_ms.is_some());
     assert!(!fresh.stale);
     let later = summary_at(
         &directory,
-        Day::today(),
-        Day::today(),
+        today,
+        today,
+        0,
         now + Duration::from_secs(STALE_AFTER_SECS + 5),
     );
     assert!(later.stale);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Unix seconds for a civil UTC time.
+fn utc(year: i64, month: u32, day: u32, hour: u64, minute: u64) -> u64 {
+    let days = crate::telemetry::file_metrics::days_from_civil(year, month, day);
+    days as u64 * 86_400 + hour * 3_600 + minute * 60
+}
+
+/// Pacific Daylight Time, 7 hours west of UTC.
+const PDT: i32 = -7 * 60;
+
+#[test]
+fn today_is_the_whole_local_day_for_a_pacific_user_in_the_evening() {
+    let directory = folder();
+    // 2026-10-27 23:00 PDT: yesterday, local, though it is 2026-10-28 in UTC.
+    record_at(&directory, utc(2026, 10, 28, 6, 0), |t| {
+        agent_call(t, "api", "s1", "m", (1, 0))
+    });
+    // 2026-10-28 08:00 PDT, in the 2026-10-28 UTC file.
+    record_at(&directory, utc(2026, 10, 28, 15, 0), |t| {
+        agent_call(t, "api", "s1", "m", (10, 0))
+    });
+    // 2026-10-28 19:30 PDT, already in the 2026-10-29 UTC file.
+    record_at(&directory, utc(2026, 10, 29, 2, 30), |t| {
+        agent_call(t, "api", "s1", "m", (100, 0))
+    });
+    // At 20:00 PDT on 2026-10-28 it is 03:00 UTC the next day.
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(utc(2026, 10, 29, 3, 0));
+    let today = Day::local(now, PDT);
+    assert_eq!(today.to_string(), "2026-10-28");
+    assert_eq!(Day::of(now).to_string(), "2026-10-29");
+    let (from, to) = Day::range(1, today);
+    let summary = summary_at(&directory, from, to, PDT, now);
+    assert_eq!(summary.totals.tokens.input, 110);
+    assert_eq!(summary.from, "2026-10-28");
+    // In UTC the same instant's Today holds only the evening call.
+    let utc_today = Day::of(now);
+    let utc_summary = summary_at(&directory, utc_today, utc_today, 0, now);
+    assert_eq!(utc_summary.totals.tokens.input, 100);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn per_day_edges_sit_at_local_midnight() {
+    let directory = folder();
+    // 23:59 and 00:01 PDT, both in the same UTC file (06:59 and 07:01 UTC).
+    record_at(&directory, utc(2026, 10, 28, 6, 59), |t| {
+        agent_call(t, "api", "s1", "m", (5, 0))
+    });
+    record_at(&directory, utc(2026, 10, 28, 7, 1), |t| {
+        agent_call(t, "api", "s1", "m", (7, 0))
+    });
+    let day = |text: &str| {
+        Day(crate::telemetry::file_metrics::parse_name(&format!("{text}.jsonl")).unwrap() as u32)
+    };
+    let summary = summary(&directory, day("2026-10-27"), day("2026-10-28"), PDT);
+    assert_eq!(summary.per_day[0].day, "2026-10-27");
+    assert_eq!(summary.per_day[0].tokens.input, 5);
+    assert_eq!(summary.per_day[1].tokens.input, 7);
+    assert!(summary.per_day.iter().all(|day| day.recorded));
+    // Offsets are clamped to real zones.
+    assert_eq!(clamp_offset(-100_000), -720);
+    assert_eq!(clamp_offset(100_000), 840);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn mismatched_histogram_bounds_warn_once() {
+    let directory = folder();
+    record(&directory, Day(D), |t| {
+        agent_call(t, "api", "s1", "m", (10, 10))
+    });
+    let file = directory.join(METRICS_DIRECTORY).join(Day(D).file_name());
+    let line = std::fs::read_to_string(&file).unwrap();
+    let mut request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    // A second copy of every histogram point, with different bounds.
+    for metric in request["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array_mut()
+        .unwrap()
+    {
+        if let Some(points) = metric["histogram"]["dataPoints"].as_array_mut() {
+            for point in points.iter_mut() {
+                point["explicitBounds"] = serde_json::json!([1.0, 2.0]);
+                point["bucketCounts"] = serde_json::json!(["0", "0", "1"]);
+            }
+        }
+    }
+    std::fs::write(&file, format!("{}{request}\n{request}\n", line)).unwrap();
+    let summary = summary(&directory, Day(D), Day(D), 0);
+    let warnings: Vec<_> = summary
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains("bucket bounds"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", summary.warnings);
+    // Totals still count every point; only the quantiles leave the odd ones out.
+    assert_eq!(summary.totals.tokens.input, 30);
+    assert!(summary.totals.median_output_speed.is_some());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -345,7 +480,7 @@ fn export_copies_only_range_files() {
     }
     std::fs::write(traces.join("other.json"), "{}").unwrap();
     let dest = folder();
-    let report = export(&directory, Day(D), Day(D + 1), &dest).unwrap();
+    let report = export(&directory, Day(D), Day(D + 1), 0, &dest).unwrap();
     assert_eq!((report.metrics_files, report.trace_files), (2, 2));
     assert!(report.folder.starts_with(&dest));
     let mut copied: Vec<_> = std::fs::read_dir(report.folder.join(METRICS_DIRECTORY))
@@ -362,11 +497,11 @@ fn export_copies_only_range_files() {
     );
     // Exporting the same range again never overwrites the earlier export.
     assert!(matches!(
-        export(&directory, Day(D), Day(D + 1), &dest),
+        export(&directory, Day(D), Day(D + 1), 0, &dest),
         Err(UsageError::Exists)
     ));
     assert!(matches!(
-        export(&directory, Day(D), Day(D), &dest.join("missing")),
+        export(&directory, Day(D), Day(D), 0, &dest.join("missing")),
         Err(UsageError::Destination)
     ));
     #[cfg(unix)]
@@ -377,10 +512,68 @@ fn export_copies_only_range_files() {
         std::fs::remove_file(metrics.join(Day(D + 2).file_name())).unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), metrics.join(Day(D + 2).file_name()))
             .unwrap();
-        let report = export(&directory, Day(D + 2), Day(D + 2), &dest).unwrap();
+        let report = export(&directory, Day(D + 2), Day(D + 2), 0, &dest).unwrap();
         assert_eq!(report.metrics_files, 0);
         std::fs::remove_dir_all(outside).unwrap();
     }
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(dest).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_export_removes_its_folder_so_a_retry_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = folder();
+    let metrics = directory.join(METRICS_DIRECTORY);
+    std::fs::create_dir_all(&metrics).unwrap();
+    let file = metrics.join(Day(D).file_name());
+    std::fs::write(&file, "{}\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let dest = folder();
+    let failed = export(&directory, Day(D), Day(D), 0, &dest);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::fs::read(&file).is_ok() && failed.is_ok() {
+        // Running as a user who can read any file (root): nothing to fail.
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(dest).unwrap();
+        return;
+    }
+    assert!(matches!(failed, Err(UsageError::Write)));
+    assert_eq!(
+        std::fs::read_dir(&dest).unwrap().count(),
+        0,
+        "no half-written folder"
+    );
+    let report = export(&directory, Day(D), Day(D), 0, &dest).unwrap();
+    assert_eq!(report.metrics_files, 1);
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(dest).unwrap();
+}
+
+#[test]
+fn export_uses_local_days() {
+    let directory = folder();
+    let metrics = directory.join(METRICS_DIRECTORY);
+    let traces = directory.join(crate::trace::TRACE_DIRECTORY);
+    std::fs::create_dir_all(&metrics).unwrap();
+    std::fs::create_dir_all(&traces).unwrap();
+    for day in [D - 1, D, D + 1, D + 2] {
+        std::fs::write(metrics.join(Day(day).file_name()), "{}\n").unwrap();
+    }
+    // Local day D at UTC-7 runs from 07:00 UTC on D to 07:00 UTC on D + 1.
+    let ms = |day: u32, hour: u64| (u64::from(day) * 86_400 + hour * 3_600) * 1_000;
+    for (day, hour) in [(D, 6), (D, 8), (D + 1, 6), (D + 1, 8)] {
+        std::fs::write(
+            traces.join(format!("{:013}-run{hour}.json", ms(day, hour))),
+            "{}",
+        )
+        .unwrap();
+    }
+    let dest = folder();
+    let report = export(&directory, Day(D), Day(D), PDT, &dest).unwrap();
+    // The UTC files for D and D + 1 overlap local day D; only traces inside it are copied.
+    assert_eq!((report.metrics_files, report.trace_files), (2, 2));
     std::fs::remove_dir_all(directory).unwrap();
     std::fs::remove_dir_all(dest).unwrap();
 }
