@@ -40,8 +40,12 @@ pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
                 if !server.secrets.is_empty() {
                     println!("Secrets: {}", list(&server.secrets));
                 }
+                for (key, saved) in server.secrets_saved_elsewhere() {
+                    println!("{key} was saved for {saved}; save it again to use it here.");
+                }
             }
         }
+        "add" if name.starts_with("--") => return Err(USAGE.into()),
         "add" if args.get(2).is_some_and(|flag| flag == "--url") => {
             let (url, headers) = url_arguments(&args[3..]).ok_or(USAGE)?;
             let secrets: Vec<String> = headers.iter().map(|(_, secret)| secret.clone()).collect();
@@ -204,6 +208,8 @@ mod tests {
             "add a --url http://mcp.example.com/mcp",
             "add a --url https://mcp.example.com/mcp --header Authorization=lower",
             "add p-docs --url https://mcp.example.com/mcp",
+            "add --url https://mcp.example.com/mcp",
+            "add --url",
         ] {
             assert!(run(&directory, &args(invalid)).is_err(), "{invalid}");
         }

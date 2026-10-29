@@ -1090,7 +1090,12 @@ mod tests {
         let (old, _) = serve_raw(mcp(false)).await;
         let (new, log) = serve_raw(mcp(false)).await;
         let directory = folder("moved");
-        let file = json!({"servers":[secret_server(&format!("{new}/mcp"), Some(&old))]});
+        let moved = secret_server(&format!("{new}/mcp"), Some(&old));
+        assert_eq!(
+            moved.secrets_saved_elsewhere(),
+            [("API_TOKEN", old.as_str())]
+        );
+        let file = json!({ "servers": [moved] });
         std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
         // The secret is refused before the credential store or the new address is contacted.
         let servers = McpServers::start(&directory, &[]).await;

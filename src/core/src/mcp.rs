@@ -70,6 +70,17 @@ impl ServerConfig {
         }
     }
 
+    /// Secrets of a URL server saved for another origin, with that origin. They are not sent
+    /// until saved again.
+    pub fn secrets_saved_elsewhere(&self) -> Vec<(&str, &str)> {
+        let origin = self.endpoint();
+        self.secret_origins
+            .iter()
+            .filter(|(_, saved)| self.url.is_some() && Some(saved.as_str()) != origin.as_deref())
+            .map(|(key, saved)| (key.as_str(), saved.as_str()))
+            .collect()
+    }
+
     /// What a header secret is bound to: the URL's origin, or `None` for a local command.
     fn endpoint(&self) -> Option<String> {
         self.url.as_deref().and_then(http::origin)
