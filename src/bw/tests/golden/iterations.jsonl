@@ -1,0 +1,5 @@
+{"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
+{"report":"<report>","requestId":"<requestId>","type":"context_report"}
+{"arguments":"{\"path\":\"notes.txt\"}","name":"read_file","requestId":"<requestId>","toolCallId":"0_0_fixture-call","type":"tool_call"}
+{"output":"notes\n","requestId":"<requestId>","success":true,"toolCallId":"0_0_fixture-call","type":"tool_result"}
+{"answer":"","denied":0,"error":"The agent reached its iteration limit. Review its progress before continuing.","reason":"iterations","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

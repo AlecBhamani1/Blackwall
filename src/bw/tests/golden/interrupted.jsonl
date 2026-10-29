@@ -1,0 +1,3 @@
+{"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
+{"report":"<report>","requestId":"<requestId>","type":"context_report"}
+{"answer":"","denied":0,"error":"Task stopped. You can continue this conversation.","reason":"interrupted","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

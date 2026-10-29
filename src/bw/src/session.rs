@@ -1,6 +1,6 @@
 use crate::{input::Input, settings::Settings};
 use blackwall_core::{
-    agent::Agent,
+    agent::{Agent, RunReason},
     approvals::Approvals,
     connection::{normalize_endpoint, same_origin, served_budget},
     context::{ContextRun, ContextState},
@@ -11,7 +11,7 @@ use blackwall_core::{
     storage::LocalStore,
     storage::MemorySource,
     tools::Workspace,
-    ChatMessage, ChatRequest,
+    ChatMessage, ChatRequest, TokenUsage,
 };
 use serde_json::{json, Value};
 use std::{
@@ -22,8 +22,57 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// A failed run and why it ended. Plain string errors are `RunReason::Error`.
+#[derive(Debug)]
+pub struct Failure {
+    pub reason: RunReason,
+    pub message: String,
+}
+
+impl Failure {
+    pub fn new(reason: RunReason, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::new(RunReason::Error, message)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::new(RunReason::Error, message)
+    }
+}
+
+/// The headless result line. `usage` counts the run's model tokens as the server reported them.
+pub fn result_line(
+    session: Option<&str>,
+    answer: &str,
+    failure: Option<&Failure>,
+    reason: RunReason,
+    denied: u32,
+    usage: TokenUsage,
+) -> Value {
+    json!({
+        "type": "result",
+        "sessionId": session,
+        "status": if failure.is_none() { "complete" } else { "error" },
+        "answer": answer,
+        "error": failure.map(|failure| &failure.message),
+        "reason": reason,
+        "denied": denied,
+        "usage": {"input": usage.prompt_tokens, "output": usage.completion_tokens},
+    })
+}
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -210,7 +259,9 @@ impl Conversation {
             .map_err(|e| e.to_string())?;
         let memory = self.memory_tools(directory);
         let session = self.id().to_owned();
-        let (_, snapshot, result) = execute(
+        let Executed {
+            snapshot, result, ..
+        } = execute(
             &backend,
             execution_workspace(&self.workspace, directory, settings)?,
             settings.web_enabled,
@@ -227,9 +278,10 @@ impl Conversation {
             memory.as_ref(),
             directory,
             &session,
+            None,
         )
         .await;
-        result?;
+        result.map_err(|failure| failure.message)?;
         if let Some(snapshot) = snapshot {
             let mut candidate = self.session.clone();
             candidate["contextState"] = json!(snapshot);
@@ -249,6 +301,23 @@ impl Conversation {
         prompt: &str,
         input: Option<&mut Input>,
     ) -> Result<(), String> {
+        self.run(store, directory, settings, prompt, input, None)
+            .await
+            .map(|_| ())
+            .map_err(|failure| failure.message)
+    }
+
+    /// Run one turn and say why it ended: `Complete`, or `Denied` when it completed after
+    /// denying an approval. `limit` bounds the whole run.
+    pub async fn run(
+        &mut self,
+        store: &LocalStore,
+        directory: &Path,
+        settings: &Settings,
+        prompt: &str,
+        input: Option<&mut Input>,
+        limit: Option<Duration>,
+    ) -> Result<RunReason, Failure> {
         // Without input, the run is headless: JSON lines, and prompts are denied.
         let json = input.is_none();
         self.flush(store)?;
@@ -286,7 +355,13 @@ impl Conversation {
             messages.into_iter().partition(|m| m["role"] == "system");
         let state = ContextState::restore(&source, saved.as_ref()).map_err(|e| e.to_string())?;
         let session = self.id().to_owned();
-        let (answer, snapshot, result) = execute(
+        let Executed {
+            answer,
+            snapshot,
+            result,
+            denied,
+            usage,
+        } = execute(
             &backend,
             workspace,
             settings.web_enabled,
@@ -303,6 +378,7 @@ impl Conversation {
             memory.as_ref(),
             directory,
             &session,
+            limit,
         )
         .await;
         if let Some(snapshot) = snapshot {
@@ -310,7 +386,11 @@ impl Conversation {
         }
         let status = if result.is_ok() { "complete" } else { "error" };
         let content = if answer.is_empty() {
-            result.as_ref().err().cloned().unwrap_or_default()
+            result
+                .as_ref()
+                .err()
+                .map(|failure| failure.message.clone())
+                .unwrap_or_default()
         } else {
             answer.clone()
         };
@@ -320,13 +400,25 @@ impl Conversation {
         self.session["updatedAt"] = json!(now()?);
         self.dirty = true;
         self.flush(store)?;
+        let reason = match &result {
+            Err(failure) => failure.reason,
+            Ok(()) if denied > 0 => RunReason::Denied,
+            Ok(()) => RunReason::Complete,
+        };
         if json {
-            let result = json!({"type":"result","sessionId":self.id(),"status":status,"answer":answer,"error":result.as_ref().err()});
-            println!("{result}");
+            let line = result_line(
+                Some(self.id()),
+                &answer,
+                result.as_ref().err(),
+                reason,
+                denied,
+                usage,
+            );
+            println!("{line}");
         } else {
             eprintln!("Saved conversation {}", self.id());
         }
-        result
+        result.map(|()| reason)
     }
 }
 
@@ -457,6 +549,17 @@ pub fn shutdown_telemetry() {
     }
 }
 
+/// What one agent run produced.
+struct Executed {
+    answer: String,
+    snapshot: Option<ContextState>,
+    result: Result<(), Failure>,
+    /// Approvals denied during the run, by the user or because the run is headless.
+    denied: u32,
+    /// Tokens the server reported for the run's completed turns.
+    usage: TokenUsage,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     backend: &HttpModel,
@@ -468,7 +571,8 @@ async fn execute(
     memory: Option<&MemoryTools>,
     directory: &Path,
     session: &str,
-) -> (String, Option<ContextState>, Result<(), String>) {
+    limit: Option<Duration>,
+) -> Executed {
     let json = input.is_none();
     let approvals = Approvals::default();
     let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -496,42 +600,62 @@ async fn execute(
     let mut answer = String::new();
     let mut snapshot = None;
     let mut pending: Option<ResolveApprovalRequest> = None;
-    let result = loop {
-        tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => break Err("Task stopped. You can continue this conversation.".into()),
-            line = async {
-                match input.as_deref_mut() {
-                    Some(input) => input.read().await,
-                    None => Ok(None),
-                }
-            }, if pending.is_some() => {
-                match line {
-                    Ok(line) => {
-                        if let Some(mut request) = pending.take() {
-                            request.decision = if line.as_deref().is_some_and(|line| line.trim() == "yes") { ApprovalDecision::Allow } else { ApprovalDecision::Deny };
-                            if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
-                        }
+    let mut denied = 0_u32;
+    let mut usage = TokenUsage::default();
+    let run = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => break Err(Failure::new(RunReason::Interrupted, "Task stopped. You can continue this conversation.")),
+                line = async {
+                    match input.as_deref_mut() {
+                        Some(input) => input.read().await,
+                        None => Ok(None),
                     }
-                    Err(error) => break Err(error),
+                }, if pending.is_some() => {
+                    match line {
+                        Ok(line) => {
+                            if let Some(mut request) = pending.take() {
+                                request.decision = if line.as_deref().is_some_and(|line| line.trim() == "yes") { ApprovalDecision::Allow } else { ApprovalDecision::Deny };
+                                if request.decision == ApprovalDecision::Deny { denied = denied.saturating_add(1); }
+                                if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
+                            }
+                        }
+                        Err(error) => break Err(Failure::from(error)),
+                    }
                 }
+                event = incoming.recv() => if let Some(event) = event {
+                    count_usage(&event, &request_id, &mut usage);
+                    render_event(event, &mut answer, &mut pending, &mut snapshot, json);
+                    // Nobody can answer a prompt in a headless run, so it is denied at once.
+                    if let Some(request) = pending.take_if(|_| json) {
+                        denied = denied.saturating_add(1);
+                        if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
+                    }
+                },
+                result = &mut work => match result {
+                    Ok(complete) => break Ok(complete),
+                    Err(error) => break Err(Failure::new(error.reason(), error.to_string())),
+                },
             }
-            event = incoming.recv() => if let Some(event) = event {
-                render_event(event, &mut answer, &mut pending, &mut snapshot, json);
-                // Nobody can answer a prompt in a headless run, so it is denied at once.
-                if let Some(request) = pending.take_if(|_| json) {
-                    if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
-                }
-            },
-            result = &mut work => match result {
-                Ok(complete) => break Ok(complete),
-                Err(error) => break Err(error.to_string()),
-            },
         }
+    };
+    let result = match limit {
+        Some(limit) => tokio::time::timeout(limit, run).await.unwrap_or_else(|_| {
+            Err(Failure::new(
+                RunReason::Timeout,
+                format!(
+                    "The run reached its {}-second time limit and was stopped. You can continue this conversation.",
+                    limit.as_secs()
+                ),
+            ))
+        }),
+        None => run.await,
     };
     // A ready model future can enqueue events and complete in one poll. Render those
     // events before returning so fast completions retain text and instruction provenance.
     while let Ok(event) = incoming.try_recv() {
+        count_usage(&event, &request_id, &mut usage);
         render_event(event, &mut answer, &mut pending, &mut snapshot, json);
     }
     let _ = io::stdout().flush();
@@ -541,7 +665,27 @@ async fn execute(
     if !json {
         println!();
     }
-    (answer, snapshot, result)
+    Executed {
+        answer,
+        snapshot,
+        result,
+        denied,
+        usage,
+    }
+}
+
+/// The run's final `TurnComplete` carries the token total of all its model calls.
+fn count_usage(event: &AgentEvent, request_id: &str, usage: &mut TokenUsage) {
+    if let AgentEvent::TurnComplete {
+        request_id: id,
+        usage: Some(count),
+        ..
+    } = event
+    {
+        if id == request_id {
+            *usage = *count;
+        }
+    }
 }
 
 /// The server kind found at the configured endpoint and the context window it reports.
