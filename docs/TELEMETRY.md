@@ -25,7 +25,7 @@ environment resource detectors, and ignores `OTEL_EXPORTER_OTLP_*`.
 | Span | `chat {model}` | root | Each Chat run on the desktop (streamed, web, and one-shot) |
 | Span | `chat {model}` | client | Each model call |
 | Span | `execute_tool {name}` | internal | Each tool call, including web tools in Chat |
-| Span | `invoke_agent subagent` | internal | Each `spawn_agent` child, under that call's `execute_tool spawn_agent` span; the child's own `chat` and `execute_tool` spans sit under it |
+| Span | `invoke_agent subagent` | internal | Each `spawn_agent` child, under that call's `execute_tool spawn_agent` span; the child's own `chat` and `execute_tool` spans sit under it. A child that runs on a command tool (`runs_on`) has one `execute_tool {tool}` span instead, which also carries its approval events |
 | Metric | `gen_ai.client.token.usage` | histogram, `{token}` | Once per model call that reports usage, once each for input and output |
 | Metric | `gen_ai.client.operation.duration` | histogram, `s` | Once per model call |
 | Metric | `blackwall.tool.invocations` | counter, `{call}` | Once per tool call |
