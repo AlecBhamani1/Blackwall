@@ -289,6 +289,46 @@ describe('SettingsDialog', () => {
     expect(onPreferences).toHaveBeenCalledWith({ connections: [connections[0]] });
   });
 
+  it('shows the detected server kind and its context window for the active connection', async () => {
+    const user = userEvent.setup();
+    const detectServer = vi.fn().mockResolvedValue({ kind: 'llama.cpp', contextWindow: 131072 });
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'http://127.0.0.1:18040/v1',
+        model: 'qwen',
+        connectionState: 'ready',
+        detectServer,
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    expect(await screen.findByText(/Detected llama\.cpp/)).toHaveTextContent(
+      'Detected llama.cpp · 131,072-token context',
+    );
+    expect(detectServer).toHaveBeenCalledWith('http://127.0.0.1:18040/v1', 'qwen');
+  });
+
+  it('says when the server kind is unknown', async () => {
+    const user = userEvent.setup();
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'https://api.example/v1',
+        model: 'm',
+        connectionState: 'ready',
+        detectServer: vi.fn().mockResolvedValue({ kind: 'unknown' }),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    expect(
+      await screen.findByText('Server type not detected · using your context setting'),
+    ).toBeInTheDocument();
+  });
+
   it('manages a saved service key without changing the active connection', async () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});

@@ -105,6 +105,7 @@ fn run() -> Result<(), StartupError> {
             credentials::has_saved_credential,
             credentials::remove_saved_credential,
             setup::discover_local_services,
+            setup::detect_server,
             setup::download_local_model,
             setup::cancel_request,
             setup::open_setup_link,

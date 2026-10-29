@@ -138,7 +138,7 @@ impl Conversation {
             })
             .transpose()
     }
-    pub fn context_report(
+    pub async fn context_report(
         &self,
         store: &LocalStore,
         directory: &Path,
@@ -182,6 +182,7 @@ impl Conversation {
         let report = settings
             .budget
             .report(&messages, &definitions, state.server_usage);
+        println!("{}", server_status(settings).await);
         println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
         Ok(())
     }
@@ -500,6 +501,20 @@ async fn execute(
         println!();
     }
     (answer, snapshot, result)
+}
+
+/// The server kind found at the configured endpoint and the context window it reports.
+pub async fn server_status(settings: &Settings) -> String {
+    let (kind, window) =
+        blackwall_core::connection::probe_endpoint(&settings.endpoint, &settings.model).await;
+    format!(
+        "server: {}\ndetected context: {}",
+        kind.name(),
+        window.map_or_else(
+            || "not reported (using the configured limit)".into(),
+            |window| format!("{} tokens", window.min(1_000_000))
+        )
+    )
 }
 
 fn render_event(

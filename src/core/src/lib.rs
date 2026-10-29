@@ -46,3 +46,7 @@ pub mod auth;
 pub mod pairing;
 
 pub mod sandbox;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod test_http;

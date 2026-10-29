@@ -25,6 +25,26 @@ pub async fn discover_local_services() -> Vec<LocalService> {
     connection::discover_local_services().await
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedServer {
+    kind: connection::ServerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+}
+
+/// Which server answers at `endpoint`, and the context window it serves `model` with. The probe
+/// sends no credentials.
+#[tauri::command]
+pub async fn detect_server(endpoint: String, model: String) -> Result<DetectedServer, String> {
+    let endpoint = connection::normalize_endpoint(&endpoint).map_err(|e| e.to_string())?;
+    let (kind, context_window) = connection::probe_endpoint(&endpoint, model.trim()).await;
+    Ok(DetectedServer {
+        kind,
+        context_window: context_window.map(|window| window.min(1_000_000)),
+    })
+}
+
 #[tauri::command]
 pub async fn download_local_model(
     model: String,
