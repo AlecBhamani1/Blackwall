@@ -9,6 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Detect the context window of any local server, not only Ollama on port 11434: Ollama on any port,
+  llama.cpp (`/props`), vLLM (`max_model_len`), and LM Studio (`loaded_context_length`). The
+  detected server shows in **Settings → Model connection**, `bw status`, and `/context`.
+- Keep model reasoning out of answers: `<think>` blocks (even split across stream chunks) and the
+  `reasoning` / `reasoning_content` fields go to a separate bounded buffer, are never sent back to
+  the model, and show collapsed as "Thought for Ns". Traces keep reasoning only with content capture.
+- Opt-in reading of `<tool_call>` blocks a model writes as text, per connection ("This model writes
+  tool calls as text", or `bw config set text-tool-calls on`). Off by default; blocks inside code
+  fences and calls for tools that were not offered stay text, and every call read from text asks
+  for approval even when a saved rule allows it.
+
 - Record usage metrics with OpenTelemetry: token usage and duration for every model call
   (compaction summaries included), tool calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
   in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,
