@@ -983,7 +983,8 @@ Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol prev
 `bw run --json "prompt"` and `bw resume SESSION_ID --json "prompt"` run without prompting, for scripts
 and CI. Each agent event except context snapshots is printed to standard output as one JSON object
 per line, ending with a `result` line that has the session ID, `status`, the answer, any error,
-`reason`, `denied` (how many approvals were denied) and `usage` (`input` and `output` tokens the
+`reason`, `denied` (how many actions did not run because a rule, a prompt or the headless run denied
+them; each also has a `tool_result` with `"denied": true`) and `usage` (`input` and `output` tokens the
 server reported for every model call in the run, including calls before a failure, timeout or
 interrupt). A `model_usage` event carries each call's tokens as it returns. Standard input is not
 read: actions that owner rules allow run, and anything that would show an approval prompt is

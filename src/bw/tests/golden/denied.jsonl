@@ -3,7 +3,7 @@
 {"requestId":"<requestId>","type":"model_usage","usage":{"completionTokens":10,"promptTokens":100,"totalTokens":110}}
 {"arguments":"{\"content\":\"changed\\n\",\"path\":\"protected.txt\"}","name":"write_file","requestId":"<requestId>","toolCallId":"0_0_fixture-call","type":"tool_call"}
 {"approvalId":"<approvalId>","detail":"Project: <project>\nFile: protected.txt\n\n--- a/protected.txt\n+++ b/protected.txt\n@@ -1 +1 @@\n-original\n+changed\n","kind":"file","requestId":"<requestId>","type":"approval_request"}
-{"output":"The operation was denied. Do not retry it without new user instructions.","requestId":"<requestId>","success":false,"toolCallId":"0_0_fixture-call","type":"tool_result"}
+{"denied":true,"output":"The operation was denied. Do not retry it without new user instructions.","requestId":"<requestId>","success":false,"toolCallId":"0_0_fixture-call","type":"tool_result"}
 {"report":"<report>","requestId":"<requestId>","type":"context_report"}
 {"delta":"The write was denied.","requestId":"<requestId>","type":"assistant_delta"}
 {"requestId":"<requestId>","type":"model_usage","usage":{"completionTokens":30,"promptTokens":120,"totalTokens":150}}

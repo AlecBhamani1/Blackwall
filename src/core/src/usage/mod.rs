@@ -180,6 +180,8 @@ pub struct GroupRow {
 
 pub const MAX_SESSION_ROWS: usize = 20;
 pub const MAX_TOOL_ROWS: usize = 10;
+/// One OTLP/JSON request line. Corrupt local files must not cause an unbounded allocation.
+const MAX_METRICS_LINE: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -329,19 +331,31 @@ fn metric_files(data_dir: &Path) -> Vec<(Day, PathBuf)> {
     files
 }
 
-/// Call `each` for every parseable line; returns how many lines could not be read.
+/// Call `each` for every parseable line; returns how many lines could not be read. A line over
+/// [`MAX_METRICS_LINE`] is counted as bad and skipped without being held in memory.
 fn read_lines(
     mut reader: impl std::io::BufRead,
     mut each: impl FnMut(ExportMetricsServiceRequest),
 ) -> usize {
+    use std::io::{BufRead, Read};
     let mut bad = 0;
     let mut line = vec![];
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        match (&mut reader)
+            .take(MAX_METRICS_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+        {
             Ok(0) => return bad,
             Ok(_) => {}
             Err(_) => return bad + 1,
+        }
+        if line.len() > MAX_METRICS_LINE {
+            bad += 1;
+            if !line.ends_with(b"\n") && skip_line(&mut reader).is_err() {
+                return bad;
+            }
+            continue;
         }
         if line.trim_ascii().is_empty() {
             continue;
@@ -349,6 +363,26 @@ fn read_lines(
         match serde_json::from_slice::<ExportMetricsServiceRequest>(&line) {
             Ok(request) => each(request),
             Err(_) => bad += 1,
+        }
+    }
+}
+
+/// Discard the rest of the current line.
+fn skip_line(reader: &mut impl std::io::BufRead) -> std::io::Result<()> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(at) => {
+                reader.consume(at + 1);
+                return Ok(());
+            }
+            None => {
+                let read = buffer.len();
+                reader.consume(read);
+            }
         }
     }
 }
