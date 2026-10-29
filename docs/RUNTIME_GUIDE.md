@@ -478,6 +478,18 @@ a real `.blackwall` folder; symbolic links are refused. It is read once, and its
 come from those same bytes. If it cannot be read or is invalid, every action asks for approval
 until it is fixed, and the run's warnings and `bw project status` say why.
 
+**Project MCP servers.** Once the file is trusted, each server in its `mcp` section starts with the
+run as `p-<name>`, so a project's `docs` is `p-docs` and its tools are `p-docs__<tool>`; it can
+never shadow one of your servers, and your own `mcp.json` cannot use the `p-` prefix. A project
+server is reached only by `url` over streamable HTTP, never by a command, and it never gets your
+secrets or headers. Its address must be on the public internet: a URL whose host is, or resolves
+to, a loopback, private, link-local or shared address (`127.0.0.0/8`, `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7`,
+`fe80::/10` and similar) is refused with a warning, and the checked addresses are the ones used to
+connect. Approvals for its tools say the server is "defined by this project", and **Always allow**
+for a `p-` server or tool is always saved for this project only; an owner rule allowing a `p-` tool
+without a `project` is ignored.
+
 The `mcp`, `limits` and `instructions` sections are validated now so the format is fixed, but this
 version does not use them yet. When it does, a project can only remove permissions: limits and
 instruction caps no higher than yours, subagent tools only from those you allow (`read_file` and

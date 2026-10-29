@@ -8,7 +8,11 @@ use reqwest::{
     redirect, StatusCode, Url,
 };
 use serde_json::Value;
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 const MAX_SESSION_BYTES: usize = 128;
 const MAX_URL_BYTES: usize = 2048;
@@ -59,6 +63,75 @@ pub(super) fn valid_url(url: &str) -> bool {
             "http" => ["127.0.0.1", "[::1]"].contains(&host),
             _ => false,
         }
+}
+
+/// A host name and the checked addresses a connection to it must use.
+pub(super) type Pinned = (String, Vec<SocketAddr>);
+
+/// Addresses a project's server may not use: loopback, private, link-local, shared, multicast
+/// and unspecified ranges, including IPv4 addresses written as IPv6.
+fn local_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || first == 0
+                || (first == 100 && (64..128).contains(&second))
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| local_address(IpAddr::V4(ip)))
+        }
+    }
+}
+
+/// Check that a project server's host is public. A name is resolved once, every address must be
+/// public, and the result is pinned so the connection cannot be pointed elsewhere afterwards.
+pub(super) async fn public_addresses(url: &str) -> Result<Option<Pinned>, ToolError> {
+    let refused = || {
+        failed("Its address is on this computer or a private network, which a project cannot use.")
+    };
+    let url = Url::parse(url).map_err(|_| failed("The MCP server URL is not allowed."))?;
+    let host = url.host_str().unwrap_or_default();
+    let port = url.port_or_known_default().unwrap_or(443);
+    if let Ok(ip) = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        return if local_address(ip) {
+            Err(refused())
+        } else {
+            Ok(None)
+        };
+    }
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| failed("Its address could not be looked up in time."))?
+    .map_err(|_| failed("Its address could not be looked up."))?;
+    let addresses: Vec<SocketAddr> = lookup.collect();
+    if addresses.is_empty() {
+        return Err(failed("Its address could not be looked up."));
+    }
+    if addresses.iter().any(|address| local_address(address.ip())) {
+        return Err(refused());
+    }
+    Ok(Some((host.to_owned(), addresses)))
 }
 
 /// `scheme://host[:port]`, which header secrets are bound to.
@@ -217,16 +290,24 @@ pub(super) struct HttpTransport {
 }
 
 impl HttpTransport {
-    pub(super) fn new(url: &str, headers: HeaderMap) -> Result<Self, ToolError> {
+    pub(super) fn new(
+        url: &str,
+        headers: HeaderMap,
+        pinned: Option<Pinned>,
+    ) -> Result<Self, ToolError> {
         let url = Url::parse(url)
             .ok()
             .filter(|_| valid_url(url))
             .ok_or_else(|| failed("The MCP server URL is not allowed."))?;
         // Like the model and web clients, system proxy settings are never used.
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .no_proxy()
             .redirect(redirect::Policy::custom(same_origin))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+        if let Some((host, addresses)) = &pinned {
+            client = client.resolve_to_addrs(host, addresses);
+        }
+        let client = client
             .build()
             .map_err(|_| failed("The MCP connection could not be prepared."))?;
         Ok(Self {
@@ -531,7 +612,7 @@ mod tests {
     }
 
     async fn connect(url: &str) -> Result<Connection, ToolError> {
-        let transport = HttpTransport::new(url, HeaderMap::new())?;
+        let transport = HttpTransport::new(url, HeaderMap::new(), None)?;
         let mut connection = Connection::new(Box::new(transport), vec![]);
         connection.initialize().await?;
         Ok(connection)
@@ -563,7 +644,7 @@ mod tests {
         let directory = folder("http");
         let file = json!({"servers":[url_server("docs", &format!("{origin}/mcp"))]});
         std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
-        let servers = McpServers::start(&directory, &[]).await;
+        let servers = McpServers::start(&directory, None, &[]).await;
         assert!(servers.warnings.is_empty(), "{:?}", servers.warnings);
         let names: Vec<_> = servers
             .definitions()
@@ -775,7 +856,7 @@ mod tests {
         let accounts = header_accounts(&config).unwrap();
         assert_eq!(accounts[0].2, format!("docs/{origin}/API_TOKEN"));
         let environment = vec![("Authorization".to_owned(), token.to_owned())];
-        let connection = super::super::launch(&config, &std::env::temp_dir(), environment)
+        let connection = super::super::launch(&config, &std::env::temp_dir(), environment, None)
             .await
             .unwrap();
         let mut servers = McpServers::default();
@@ -954,7 +1035,7 @@ mod tests {
         ]});
         std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
         assert_eq!(read_config(&directory).unwrap().len(), 2);
-        let servers = McpServers::start(&directory, &[]).await;
+        let servers = McpServers::start(&directory, None, &[]).await;
         assert_eq!(servers.warnings.len(), 1);
         assert!(servers.warnings[0].contains("p-docs") && servers.warnings[0].contains("rename"));
         assert!(servers.handles("docs__search") && !servers.handles("p-docs__search"));
@@ -1098,7 +1179,7 @@ mod tests {
         let file = json!({ "servers": [moved] });
         std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
         // The secret is refused before the credential store or the new address is contacted.
-        let servers = McpServers::start(&directory, &[]).await;
+        let servers = McpServers::start(&directory, None, &[]).await;
         assert!(
             servers.warnings[0].contains(&format!("was saved for {old}, not {new}")),
             "{:?}",
@@ -1165,7 +1246,7 @@ mod tests {
         })
         .await;
         let url = format!("{origin}/mcp");
-        let transport = HttpTransport::new(&url, HeaderMap::new()).unwrap();
+        let transport = HttpTransport::new(&url, HeaderMap::new(), None).unwrap();
         let mut connection = Connection::new(Box::new(transport), vec!["token-123".into()]);
         connection.initialize().await.unwrap();
         let mut servers = McpServers::default();
@@ -1236,7 +1317,8 @@ mod tests {
             Some(open_events(&format!("data: {reply}\n\n")))
         })
         .await;
-        let transport = HttpTransport::new(&format!("{origin}/mcp"), HeaderMap::new()).unwrap();
+        let transport =
+            HttpTransport::new(&format!("{origin}/mcp"), HeaderMap::new(), None).unwrap();
         let mut connection = Connection::new(Box::new(transport), vec![]);
         tokio::time::timeout(Duration::from_secs(5), async {
             connection.initialize().await.unwrap();
@@ -1325,5 +1407,95 @@ mod tests {
         let listed =
             tokio::time::timeout(Duration::from_millis(500), connection.list_tools()).await;
         assert!(listed.is_err(), "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn project_servers_prefixed_and_need_trust() {
+        let (origin, log) = serve_raw(mcp(false)).await;
+        let root = folder("project");
+        let (data, workspace) = (root.join("data"), root.join("work"));
+        std::fs::create_dir_all(workspace.join(".blackwall")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let file = json!({"mcp":{"servers":[{"name":"docs","url":format!("{origin}/mcp")}]}});
+        std::fs::write(workspace.join(".blackwall/project.json"), file.to_string()).unwrap();
+        let untrusted = McpServers::start(&data, Some(&workspace), &[]).await;
+        assert!(untrusted.warnings.is_empty(), "{:?}", untrusted.warnings);
+        assert!(untrusted.definitions().is_empty());
+        let sha = crate::project::status(&workspace, &data).sha256.unwrap();
+        crate::project::trust(&workspace, &data, &sha).unwrap();
+        // Trusted, it is started as p-docs, and refused because its address is this computer.
+        let trusted = McpServers::start(&data, Some(&workspace), &[]).await;
+        assert_eq!(trusted.warnings.len(), 1, "{:?}", trusted.warnings);
+        assert!(trusted.warnings[0].starts_with("Project MCP server p-docs did not start"));
+        assert!(trusted.warnings[0].contains("private network"));
+        assert!(log.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_server_addresses_must_be_public() {
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+            "ff02::1",
+        ] {
+            assert!(local_address(local.parse().unwrap()), "{local}");
+        }
+        for public in ["1.1.1.1", "172.32.0.1", "8.8.8.8", "2606:4700::1111"] {
+            assert!(!local_address(public.parse().unwrap()), "{public}");
+        }
+        assert!(public_addresses("https://10.0.0.1/mcp").await.is_err());
+        assert!(public_addresses("https://[fe80::1]/mcp").await.is_err());
+        // A name is resolved and refused when it points at this computer.
+        assert!(public_addresses("https://localhost/mcp").await.is_err());
+        assert_eq!(public_addresses("https://1.1.1.1/mcp").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn project_server_approvals_say_who_defined_them() {
+        let (origin, _) = serve_raw(mcp(false)).await;
+        let url = format!("{origin}/mcp");
+        let mut servers = McpServers::default();
+        servers
+            .add(
+                url_server("p-docs", &url),
+                connect(&url).await.unwrap(),
+                &mut vec![],
+            )
+            .await;
+        let approvals = Approvals::default();
+        let details = Arc::new(Mutex::new(vec![]));
+        let seen = details.clone();
+        let allow = allow(&approvals);
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { detail, .. } = &event {
+                seen.lock().unwrap().push(detail.clone());
+            }
+            allow(event);
+        };
+        servers
+            .call(
+                "p-docs__search",
+                "{}",
+                "run",
+                &approvals,
+                &emit,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(details.lock().unwrap()[0].contains("p-docs (127.0.0.1), defined by this project"));
     }
 }

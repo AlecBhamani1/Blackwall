@@ -342,6 +342,8 @@ struct Tool {
 
 struct Server {
     name: String,
+    /// Defined by the trusted project rather than the owner.
+    project: bool,
     /// The host of a URL server, shown when asking to call its tools.
     host: Option<String>,
     connection: Mutex<Connection>,
@@ -357,8 +359,10 @@ pub struct McpServers {
 }
 
 impl McpServers {
-    /// Start enabled servers from owner data. Failures become warnings and never stop the run.
-    pub async fn start(directory: &Path, reserved: &[Value]) -> Self {
+    /// Start enabled servers from owner data and, when `workspace` is given and its
+    /// `.blackwall/project.json` is trusted, the project's URL servers as `p-<name>`. Failures
+    /// become warnings and never stop the run.
+    pub async fn start(directory: &Path, workspace: Option<&Path>, reserved: &[Value]) -> Self {
         let mut started = Self::default();
         let path = directory.join(MCP_FILE);
         let read = crate::policy::read_bounded(&path, MAX_FILE_BYTES);
@@ -366,19 +370,17 @@ impl McpServers {
             .await
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return started,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(_) => Err("The MCP file could not be read."),
             Ok(body) => parse(&body),
         };
-        let configs = match configs {
-            Ok(configs) => configs,
-            Err(error) => {
-                started
-                    .warnings
-                    .push(format!("{error} MCP servers are unavailable for this run."));
-                return started;
-            }
-        };
+        // A problem with the owner's file does not hold back the project's servers.
+        let configs = configs.unwrap_or_else(|error| {
+            started
+                .warnings
+                .push(format!("{error} MCP servers are unavailable for this run."));
+            vec![]
+        });
         let mut names: Vec<String> = reserved
             .iter()
             .filter_map(|definition| definition["function"]["name"].as_str())
@@ -387,6 +389,14 @@ impl McpServers {
         started
             .add_servers(configs, Source::Owner, directory, &mut names)
             .await;
+        if let Some(workspace) = workspace {
+            let projects = project_servers(directory, workspace).await;
+            if !projects.is_empty() {
+                started
+                    .add_servers(projects, Source::Project, directory, &mut names)
+                    .await;
+            }
+        }
         started
     }
 
@@ -405,6 +415,10 @@ impl McpServers {
                     .push(format!("{error} MCP servers are unavailable for this run."));
                 return;
             }
+        };
+        let defined = match source {
+            Source::Owner => "",
+            Source::Project => "Project ",
         };
         for config in configs.into_iter().filter(|config| config.enabled) {
             if source == Source::Owner && config.name.starts_with("p-") {
@@ -433,8 +447,28 @@ impl McpServers {
                         continue;
                     }
                 };
-            match tokio::time::timeout(STARTUP_TIMEOUT, launch(&config, directory, environment))
-                .await
+            // A project's server must be on the public internet, and the address checked here is
+            // the one connected to.
+            let pinned = match source {
+                Source::Owner => None,
+                Source::Project => {
+                    match http::public_addresses(config.url.as_deref().unwrap_or_default()).await {
+                        Ok(pinned) => pinned,
+                        Err(error) => {
+                            self.warnings.push(format!(
+                                "{defined}MCP server {} did not start: {error}",
+                                config.name
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
+            match tokio::time::timeout(
+                STARTUP_TIMEOUT,
+                launch(&config, directory, environment, pinned),
+            )
+            .await
             {
                 Ok(Ok(connection)) => {
                     self.add(config, connection, names).await;
@@ -516,6 +550,8 @@ impl McpServers {
             }
         }
         self.servers.push(Server {
+            // Owner servers never have this prefix; those that do are skipped at start.
+            project: config.name.starts_with("p-"),
             host: config
                 .url
                 .as_deref()
@@ -576,8 +612,10 @@ impl McpServers {
                 server.name, tool.name
             ),
             Some(host) => format!(
-                "MCP server: {} ({host})\nTool: {}\nArguments: {arguments}\n\nThe arguments are sent to {host}, which may change data in the services it connects to.",
-                server.name, tool.name
+                "MCP server: {} ({host}){}\nTool: {}\nArguments: {arguments}\n\nThe arguments are sent to {host}, which may change data in the services it connects to.",
+                server.name,
+                if server.project { ", defined by this project" } else { "" },
+                tool.name
             ),
         };
         let approval = ApprovalTool {
@@ -842,13 +880,50 @@ async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, To
 }
 
 /// Servers start in the data folder so a project cannot shadow what a package runner loads.
+/// The trusted project's URL servers, named `p-<name>`. An untrusted, changed or unusable file
+/// adds none; its warnings are reported by the run's policy.
+async fn project_servers(directory: &Path, workspace: &Path) -> Vec<ServerConfig> {
+    let (data, folder) = (directory.to_path_buf(), workspace.to_path_buf());
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || crate::project::try_load(&folder, &data)),
+    )
+    .await;
+    let Ok(Ok(Ok(loaded))) = loaded else {
+        return vec![];
+    };
+    if loaded.trust != crate::project::Trust::Trusted {
+        return vec![];
+    }
+    let servers = loaded.config.mcp.map(|mcp| mcp.servers).unwrap_or_default();
+    servers
+        .into_iter()
+        .map(|server| ServerConfig {
+            name: format!("p-{}", server.name),
+            command: vec![],
+            url: Some(server.url),
+            headers: BTreeMap::new(),
+            enabled: server.enabled,
+            allow_tools: server.allow_tools,
+            deny_tools: server.deny_tools,
+            secrets: vec![],
+            secret_origins: BTreeMap::new(),
+        })
+        .collect()
+}
+
 async fn launch(
     config: &ServerConfig,
     directory: &Path,
     environment: Vec<(String, String)>,
+    pinned: Option<http::Pinned>,
 ) -> Result<Connection, ToolError> {
     let transport: Box<dyn Transport> = match &config.url {
-        Some(url) => Box::new(http::HttpTransport::new(url, http::headers(&environment)?)?),
+        Some(url) => Box::new(http::HttpTransport::new(
+            url,
+            http::headers(&environment)?,
+            pinned,
+        )?),
         None => start_process(config, directory, &environment)?,
     };
     let secrets = environment.into_iter().map(|(_, value)| value).collect();
@@ -937,8 +1012,6 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
     Owner,
-    // Wired up with trusted project settings.
-    #[cfg_attr(not(test), allow(dead_code))]
     Project,
 }
 
@@ -1347,7 +1420,7 @@ mod tests {
             tokio::fs::write(directory.join(MCP_FILE), body)
                 .await
                 .unwrap();
-            let servers = McpServers::start(&directory, &[]).await;
+            let servers = McpServers::start(&directory, None, &[]).await;
             assert_eq!(servers.warnings.len(), 1, "{body}");
             assert!(servers.definitions().is_empty());
         }
@@ -1357,7 +1430,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let disabled = McpServers::start(&directory, &[]).await;
+        let disabled = McpServers::start(&directory, None, &[]).await;
         assert!(disabled.warnings.is_empty() && disabled.definitions().is_empty());
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }

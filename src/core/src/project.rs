@@ -9,8 +9,9 @@
 //! - The file is read once (a regular file, never a symbolic link, at most 64 KiB), and both the
 //!   hash and the parsed settings come from those same bytes.
 //!
-//! The `mcp`, `limits` and `instructions` sections are parsed and validated now so the file format
-//! is fixed, but nothing applies them yet. Whoever consumes them must treat the owner's own value
+//! The `mcp` section is applied by [`crate::mcp`] as `p-` servers. The `limits` and
+//! `instructions` sections are parsed and validated now so the file format is fixed, but nothing
+//! applies them yet. Whoever consumes them must treat the owner's own value
 //! as a ceiling: a project can only lower limits, narrow tools, and lower instruction caps.
 use crate::policy::{Decision, RuleMode, RulesFile};
 use crate::protocol::ApprovalKind;
@@ -100,7 +101,7 @@ pub struct ProjectConfig {
     /// rules cannot name a `project`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<RulesFile>,
-    /// Not applied yet.
+    /// Started by [`crate::mcp::McpServers::start`] as `p-<name>` once the file is trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpFile>,
     /// Not applied yet.
@@ -507,7 +508,10 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
     let later = " (accepted; not used by this version yet)";
     let mut other = vec![];
     if let Some(mcp) = &config.mcp {
-        other.push(format!("{} MCP servers{later}", mcp.servers.len()));
+        other.push(format!(
+            "{} MCP servers, started as p-<name> on public addresses",
+            mcp.servers.len()
+        ));
     }
     if config.limits.is_some() {
         other.push(format!("limits{later}"));
