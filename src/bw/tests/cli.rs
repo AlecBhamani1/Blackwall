@@ -1205,6 +1205,9 @@ fn usage_reports_a_run_by_project_and_as_json() {
     let text = fixture.success(&["usage", "--days", "7"], "");
     assert!(text.contains("Tokens recorded: 150"), "{text}");
     assert!(text.contains("Run success: 100.0%"), "{text}");
-    let rejected = fixture.run(&["usage", "--days", "5"], "");
+    assert!(fixture
+        .success(&["usage", "--days", "5", "--utc"], "")
+        .contains("UTC)"));
+    let rejected = fixture.run(&["usage", "--days", "0"], "");
     assert!(!rejected.status.success());
 }

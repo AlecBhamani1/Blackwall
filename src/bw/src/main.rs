@@ -70,8 +70,9 @@ USAGE:
   bw skills import [<path>]  Import SKILL.md skills from other harnesses (list without a path)
   bw skills suggested        List suggested skills; bw skills get <name> downloads, scans, and imports one
   bw traces [show <id>]      List recent agent-run traces or show one as a tree
-  bw usage [--days 1|7|30|90] [--json]
+  bw usage [--days N] [--utc] [--json]
                              Show tokens, runs, and tools from local usage metrics
+                             for the last N local days (1-400, default 7)
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
                              Review Git changes without agent tools

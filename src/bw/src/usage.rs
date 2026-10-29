@@ -2,29 +2,15 @@
 use blackwall_core::usage::{self, Day, GroupRow, UsageSummary};
 use std::path::Path;
 
-const USAGE: &str = "Use bw usage [--days 1|7|30|90] [--json].";
+const USAGE: &str =
+    "Use bw usage [--days N] [--utc] [--json], with N from 1 to 400 (such as 1, 7, 30, or 90).";
 
 pub fn run(directory: &Path, args: &[String], telemetry_enabled: bool) -> Result<(), String> {
-    let mut days = 7;
-    let mut json = false;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--json" => json = true,
-            "--days" => {
-                days = match args.next().map(String::as_str) {
-                    Some("1") => 1,
-                    Some("7") => 7,
-                    Some("30") => 30,
-                    Some("90") => 90,
-                    _ => return Err(USAGE.into()),
-                }
-            }
-            _ => return Err(USAGE.into()),
-        }
-    }
-    let (from, to) = Day::range(days, Day::today());
-    let mut summary = usage::summary(directory, from, to);
+    let (days, utc, json) = parse(args)?;
+    let offset = if utc { Some(0) } else { local_offset() };
+    let offset_minutes = offset.unwrap_or(0);
+    let (from, to) = Day::range(days, Day::today(offset_minutes));
+    let mut summary = usage::summary(directory, from, to, offset_minutes);
     summary.telemetry_enabled = telemetry_enabled;
     if json {
         println!(
@@ -32,9 +18,69 @@ pub fn run(directory: &Path, args: &[String], telemetry_enabled: bool) -> Result
             serde_json::to_string(&summary).map_err(|error| error.to_string())?
         );
     } else {
-        print!("{}", text(&summary, days));
+        print!("{}", text(&summary, days, offset_minutes));
     }
     Ok(())
+}
+
+/// `--days N` (1–400, default 7), `--utc`, and `--json`.
+fn parse(args: &[String]) -> Result<(u16, bool, bool), String> {
+    let (mut days, mut utc, mut json) = (7, false, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--utc" => utc = true,
+            "--days" => {
+                days = args
+                    .next()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|value| (1..=400).contains(value))
+                    .ok_or(USAGE)?;
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    Ok((days, utc, json))
+}
+
+/// This computer's UTC offset in minutes, from `date +%z` (`-0700`). `None` where that is not
+/// available, such as Windows, and days are then counted in UTC.
+fn local_offset() -> Option<i32> {
+    if cfg!(windows) {
+        return None;
+    }
+    let output = std::process::Command::new("date")
+        .arg("+%z")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_offset(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// `+0530` or `-0700` as minutes east of UTC.
+fn parse_offset(text: &str) -> Option<i32> {
+    let (sign, digits) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = digits[..2].parse().ok()?;
+    let minutes: i32 = digits[2..].parse().ok()?;
+    (hours <= 14 && minutes < 60).then_some(sign * (hours * 60 + minutes))
+}
+
+fn zone(offset_minutes: i32) -> String {
+    if offset_minutes == 0 {
+        return "UTC".into();
+    }
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let minutes = offset_minutes.unsigned_abs();
+    format!("UTC{sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// A compact count: 950, 12.4k, 4.82M.
@@ -86,14 +132,19 @@ fn group_line(row: &GroupRow, fallback: &str) -> String {
     )
 }
 
-pub fn text(summary: &UsageSummary, days: u16) -> String {
+pub fn text(summary: &UsageSummary, days: u16, offset_minutes: i32) -> String {
     let mut out = String::new();
     let span = if days == 1 {
         "today".to_owned()
     } else {
         format!("last {days} days")
     };
-    out += &format!("Usage, {span} ({} to {}, UTC)\n", summary.from, summary.to);
+    out += &format!(
+        "Usage, {span} ({} to {}, {})\n",
+        summary.from,
+        summary.to,
+        zone(offset_minutes)
+    );
     if !summary.telemetry_enabled {
         out += "Telemetry is off, so nothing new is recorded. Turn it on with bw config set traces on.\n";
     }
@@ -221,9 +272,43 @@ mod tests {
     fn empty_range_says_no_usage_yet() {
         let directory =
             std::env::temp_dir().join(format!("bw-usage-missing-{}", std::process::id()));
-        let mut summary = usage::summary(&directory, Day(20_000), Day(20_006));
-        assert!(text(&summary, 7).contains("No usage yet."));
+        let mut summary = usage::summary(&directory, Day(20_000), Day(20_006), 0);
+        assert!(text(&summary, 7, 0).contains("No usage yet."));
+        assert!(text(&summary, 7, -420).contains("2024-10-04 to 2024-10-10, UTC-07:00)"));
         summary.telemetry_enabled = false;
-        assert!(text(&summary, 7).contains("Telemetry is off"));
+        assert!(text(&summary, 7, 0).contains("Telemetry is off"));
+    }
+
+    #[test]
+    fn days_accept_any_count_from_1_to_400() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse(&args(&[])).unwrap(), (7, false, false));
+        assert_eq!(parse(&args(&["--days", "14"])).unwrap().0, 14);
+        assert_eq!(parse(&args(&["--days", "1"])).unwrap().0, 1);
+        assert_eq!(
+            parse(&args(&["--days", "400", "--utc", "--json"])).unwrap(),
+            (400, true, true)
+        );
+        for bad in [
+            &["--days", "0"][..],
+            &["--days", "401"],
+            &["--days"],
+            &["--days", "x"],
+            &["7"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn offsets_parse_from_date_output() {
+        assert_eq!(parse_offset("-0700"), Some(-420));
+        assert_eq!(parse_offset("+0530"), Some(330));
+        assert_eq!(parse_offset("+0000"), Some(0));
+        for bad in ["", "0700", "-07:00", "+9999", "PDT"] {
+            assert_eq!(parse_offset(bad), None, "{bad}");
+        }
+        assert_eq!(zone(330), "UTC+05:30");
+        assert_eq!(zone(0), "UTC");
     }
 }
