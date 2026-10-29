@@ -242,15 +242,18 @@ fn answer(text: &str) -> Reply {
 }
 
 fn tool_call(name: &str, arguments: Value) -> Reply {
-    Reply::Stream(vec![json!({"choices":[{
-        "delta":{"tool_calls":[{
-            "index":0,
-            "id":"fixture-call",
-            "type":"function",
-            "function":{"name":name,"arguments":arguments.to_string()}
-        }]},
-        "finish_reason":"tool_calls"
-    }]})])
+    Reply::Stream(vec![
+        json!({"choices":[{
+            "delta":{"tool_calls":[{
+                "index":0,
+                "id":"fixture-call",
+                "type":"function",
+                "function":{"name":name,"arguments":arguments.to_string()}
+            }]},
+            "finish_reason":"tool_calls"
+        }]}),
+        json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}),
+    ])
 }
 
 /// Replace values that change between runs: identifiers, timings, paths, and size estimates.
@@ -390,6 +393,11 @@ fn exit_4_iterations() {
     fixture.set("iterations", "1");
     let output = fixture.run(&["run", "--json", "read notes.txt"]);
     assert_exit(&output, 4, "iterations");
+    // Tokens spent before the limit are still reported.
+    assert_eq!(
+        result_line(&output)["usage"],
+        json!({"input":100,"output":10})
+    );
     assert_golden("iterations", &output);
     assert_eq!(server.finish(), 1);
 }
@@ -466,7 +474,8 @@ fn result_line_has_reason_denied_and_usage() {
     assert_eq!(result["status"], "complete");
     assert_eq!(result["reason"], "denied");
     assert_eq!(result["denied"], 1);
-    assert_eq!(result["usage"], json!({"input":120,"output":30}));
+    // Both model calls count: the tool call (100 + 10) and the answer (120 + 30).
+    assert_eq!(result["usage"], json!({"input":220,"output":40}));
     assert!(result["sessionId"].as_str().is_some());
     assert_eq!(result["answer"], "The command was denied.");
     assert_eq!(server.finish(), 2);

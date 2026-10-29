@@ -1,6 +1,7 @@
 {"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
 {"report":"<report>","requestId":"<requestId>","type":"context_report"}
 {"delta":"All done.","requestId":"<requestId>","type":"assistant_delta"}
+{"requestId":"<requestId>","type":"model_usage","usage":{"completionTokens":30,"promptTokens":120,"totalTokens":150}}
 {"report":"<report>","requestId":"<requestId>","type":"context_report"}
 {"finishReason":"stop","message":{"content":"All done.","role":"assistant"},"requestId":"<requestId>","type":"turn_complete","usage":{"completionTokens":30,"promptTokens":120,"totalTokens":150}}
 {"answer":"All done.","denied":0,"error":null,"reason":"complete","sessionId":"<sessionId>","status":"complete","type":"result","usage":{"input":120,"output":30}}

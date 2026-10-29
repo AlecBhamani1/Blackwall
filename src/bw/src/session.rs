@@ -556,7 +556,7 @@ struct Executed {
     result: Result<(), Failure>,
     /// Approvals denied during the run, by the user or because the run is headless.
     denied: u32,
-    /// Tokens the server reported for the run's completed turns.
+    /// Tokens the server reported for the run's model calls, including any before a failure.
     usage: TokenUsage,
 }
 
@@ -674,16 +674,20 @@ async fn execute(
     }
 }
 
-/// The run's final `TurnComplete` carries the token total of all its model calls.
+/// Sum each model call's usage as it arrives, so a run that fails or stops still reports the
+/// tokens it spent. `TurnComplete.usage` repeats the same total and is not counted again.
 fn count_usage(event: &AgentEvent, request_id: &str, usage: &mut TokenUsage) {
-    if let AgentEvent::TurnComplete {
+    if let AgentEvent::ModelUsage {
         request_id: id,
-        usage: Some(count),
-        ..
+        usage: count,
     } = event
     {
         if id == request_id {
-            *usage = *count;
+            usage.prompt_tokens = usage.prompt_tokens.saturating_add(count.prompt_tokens);
+            usage.completion_tokens = usage
+                .completion_tokens
+                .saturating_add(count.completion_tokens);
+            usage.total_tokens = usage.total_tokens.saturating_add(count.total_tokens);
         }
     }
 }

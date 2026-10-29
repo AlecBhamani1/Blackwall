@@ -510,6 +510,10 @@ impl Agent<'_> {
             reasoning.add(&turn);
             state.server_usage = turn.usage;
             if let Some(count) = turn.usage {
+                (self.emit)(AgentEvent::ModelUsage {
+                    request_id: request_id.into(),
+                    usage: count,
+                });
                 usage.prompt_tokens = usage.prompt_tokens.saturating_add(count.prompt_tokens);
                 usage.completion_tokens = usage
                     .completion_tokens

@@ -503,6 +503,15 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// Token usage the server reported for one model call, sent as soon as the call returns so
+    /// a run that later fails or stops still accounts for it.
+    ModelUsage {
+        /// Identifier of the request that made the call.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Tokens for this call only.
+        usage: TokenUsage,
+    },
     /// Successful end of a model turn after all deltas.
     TurnComplete {
         /// Identifier of the completed request.
@@ -582,6 +591,7 @@ impl AgentEvent {
             | Self::ToolResult { request_id, .. }
             | Self::ApprovalRequest { request_id, .. }
             | Self::SubagentStatus { request_id, .. }
+            | Self::ModelUsage { request_id, .. }
             | Self::TurnComplete { request_id, .. }
             | Self::Error { request_id, .. }
             | Self::MemoryUpdated { request_id, .. }
