@@ -126,7 +126,7 @@ fn describe(status: &ProjectStatus) -> String {
 
 /// Repository text for the terminal: control characters dropped, so no escape sequences reach
 /// it, and invisible format characters such as bidi controls shown as `\u{XXXX}`.
-fn safe(text: &str) -> String {
+pub(crate) fn safe(text: &str) -> String {
     crate::memory::visible(&project::escape_invisible(text))
 }
 
