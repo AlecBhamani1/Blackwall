@@ -64,14 +64,28 @@ pub fn same_origin(left: &str, right: &str) -> bool {
     }
 }
 
+mod listeners;
+
+/// A model server found on this computer by [`discover_local_services`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalService {
+    /// A display name for the server kind, such as `Ollama` or `llama.cpp`.
     pub name: String,
+    /// The OpenAI-compatible base address, ending in `/v1`.
     pub endpoint: String,
     pub available: bool,
     pub models: Vec<String>,
+    /// Whether Blackwall can download starter models into it (Ollama on its usual port).
     pub supports_download: bool,
+    #[serde(default)]
+    pub kind: ServerKind,
+    /// Models the server has in memory now, when it reports them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded: Vec<String>,
+    /// The context window of the first loaded model, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 fn client() -> Result<Client, ConnectionError> {
@@ -99,39 +113,8 @@ async fn bounded_json(response: reqwest::Response) -> Result<serde_json::Value, 
     serde_json::from_slice(&body).map_err(|_| ConnectionError::InvalidResponse)
 }
 
-async fn probe(name: &str, origin: &str, ollama: bool) -> LocalService {
-    let mut result = LocalService {
-        name: name.into(),
-        endpoint: format!("{origin}/v1"),
-        available: false,
-        models: vec![],
-        supports_download: ollama,
-    };
-    let fetch = async {
-        let response = client()?
-            .get(format!(
-                "{origin}/{}",
-                if ollama { "api/tags" } else { "v1/models" }
-            ))
-            .send()
-            .await
-            .map_err(|_| ConnectionError::Unavailable)?;
-        bounded_json(response).await
-    };
-    if let Ok(Ok(value)) = tokio::time::timeout(Duration::from_secs(3), fetch).await {
-        if let Some(items) = value
-            .get(if ollama { "models" } else { "data" })
-            .and_then(|v| v.as_array())
-        {
-            result.available = true;
-            result.models = model_names(items, ollama);
-        }
-    }
-    result
-}
-
 /// The kind of model server behind an endpoint, as found by [`probe_server`].
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ServerKind {
     #[serde(rename = "ollama")]
     Ollama,
@@ -142,6 +125,7 @@ pub enum ServerKind {
     #[serde(rename = "lm-studio")]
     LmStudio,
     #[serde(rename = "unknown")]
+    #[default]
     Unknown,
 }
 
@@ -157,6 +141,17 @@ impl ServerKind {
             Self::Vllm => "vllm",
             Self::LmStudio => "lm-studio",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// The name people know the server by, for setup screens and `bw setup`.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Ollama => "Ollama",
+            Self::LlamaCpp => "llama.cpp",
+            Self::Vllm => "vLLM",
+            Self::LmStudio => "LM Studio",
+            Self::Unknown => "OpenAI-compatible server",
         }
     }
 }
@@ -179,6 +174,10 @@ async fn fetch_json(url: &str) -> Result<serde_json::Value, ConnectionError> {
     bounded_json(response).await
 }
 
+async fn fetch_owned(url: String) -> Result<serde_json::Value, ConnectionError> {
+    fetch_json(&url).await
+}
+
 /// Ask one kind of server for `model`'s context window. `None` means the endpoint is not that
 /// kind; `Some(None)` means it is, but reported no window for `model`.
 async fn probe_kind(
@@ -191,10 +190,10 @@ async fn probe_kind(
         match kind {
             ServerKind::Ollama => {
                 let origin = origin?;
-                let version = fetch_json(&format!("{origin}/api/version")).await.ok()?;
+                let version = fetch_owned(format!("{origin}/api/version")).await.ok()?;
                 version.get("version")?.as_str()?;
                 Some(
-                    fetch_json(&format!("{origin}/api/ps"))
+                    fetch_owned(format!("{origin}/api/ps"))
                         .await
                         .ok()
                         .and_then(|ps| ollama_window(&ps, model)),
@@ -405,13 +404,166 @@ fn model_names(items: &[serde_json::Value], ollama: bool) -> Vec<String> {
         .collect()
 }
 
-/// Only probes known loopback services. Never scans a network or uses remote credentials.
+/// Ports model servers commonly use: Ollama, LM Studio, llama.cpp, vLLM, text-generation-webui
+/// and koboldcpp, Strata, GPT4All, Jan, and a common llama.cpp alternative.
+const COMMON_PORTS: [u16; 10] = [11434, 1234, 8080, 8000, 5000, 5001, 18040, 4891, 1337, 8081];
+/// The most ports one discovery asks.
+const MAX_CANDIDATES: usize = 64;
+/// How long one server may take to answer discovery, kind detection included.
+const PROBE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Loopback origins to ask: the common ports first, then other ports listening here. A port
+/// bound only to `::1` is asked there; everything else on `127.0.0.1`. Ports below 1024 and
+/// addresses bound to other interfaces are never included.
+fn candidate_origins(listening: &[listeners::Listener]) -> Vec<String> {
+    let mut ports: Vec<u16> = COMMON_PORTS.to_vec();
+    for (_, port) in listening {
+        if !ports.contains(port) {
+            ports.push(*port);
+        }
+    }
+    ports
+        .into_iter()
+        .filter(|port| *port >= 1024)
+        .take(MAX_CANDIDATES)
+        .map(|port| {
+            let mut binds = listening
+                .iter()
+                .filter(|(_, p)| *p == port)
+                .map(|(a, _)| *a);
+            let first = binds.next();
+            let v6_only = first.is_some_and(|a| a == std::net::Ipv6Addr::LOCALHOST)
+                && binds.all(|a| a == std::net::Ipv6Addr::LOCALHOST);
+            if v6_only {
+                format!("http://[::1]:{port}")
+            } else {
+                format!("http://127.0.0.1:{port}")
+            }
+        })
+        .collect()
+}
+
+/// Ask one loopback origin what it serves, within [`PROBE_BUDGET`]. Only credential-free GETs
+/// are sent, and each response is read up to 1 MiB.
+async fn probe_local(origin: String) -> Option<LocalService> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + PROBE_BUDGET;
+    let (version, listed) = tokio::time::timeout_at(deadline, async {
+        tokio::join!(
+            fetch_owned(format!("{origin}/api/version")),
+            fetch_owned(format!("{origin}/v1/models"))
+        )
+    })
+    .await
+    .ok()?;
+    let endpoint = format!("{origin}/v1");
+    let ollama = version
+        .ok()
+        .is_some_and(|v| v.get("version").and_then(|v| v.as_str()).is_some());
+    if ollama {
+        let (tags, ps) = tokio::time::timeout_at(deadline, async {
+            tokio::join!(
+                fetch_owned(format!("{origin}/api/tags")),
+                fetch_owned(format!("{origin}/api/ps"))
+            )
+        })
+        .await
+        .unwrap_or((
+            Err(ConnectionError::Unavailable),
+            Err(ConnectionError::Unavailable),
+        ));
+        let names = |value: &serde_json::Value| {
+            value
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|items| model_names(items, true))
+                .unwrap_or_default()
+        };
+        let models = tags.as_ref().map(names).unwrap_or_default();
+        let loaded = ps.as_ref().map(names).unwrap_or_default();
+        let context_window = match (&ps, loaded.first()) {
+            (Ok(ps), Some(model)) => ollama_window(ps, model),
+            _ => None,
+        };
+        return Some(LocalService {
+            name: ServerKind::Ollama.display_name().into(),
+            supports_download: origin == LOCAL_OLLAMA,
+            endpoint,
+            available: true,
+            models,
+            kind: ServerKind::Ollama,
+            loaded,
+            context_window,
+        });
+    }
+    let listed = listed.ok()?;
+    let models = model_names(listed.get("data")?.as_array()?, false);
+    // Kind detection gets whatever time is left; a slow server is still listed, as unknown.
+    let first = models.first().cloned().unwrap_or_default();
+    let (kind, window) = tokio::time::timeout_at(deadline, identify(&endpoint, &first, None))
+        .await
+        .unwrap_or((ServerKind::Unknown, None));
+    let kind = if kind == ServerKind::Ollama {
+        ServerKind::Unknown
+    } else {
+        kind
+    };
+    let loaded = match kind {
+        // llama.cpp and vLLM serve exactly the models they list.
+        ServerKind::LlamaCpp | ServerKind::Vllm => models.clone(),
+        ServerKind::LmStudio => tokio::time::timeout_at(deadline, lm_studio_loaded(&origin))
+            .await
+            .unwrap_or_default(),
+        _ => vec![],
+    };
+    let context_window = match (kind, loaded.first()) {
+        (ServerKind::LlamaCpp | ServerKind::Vllm, _) => window,
+        (ServerKind::LmStudio, Some(model)) if *model == first => window,
+        _ => None,
+    };
+    Some(LocalService {
+        name: kind.display_name().into(),
+        endpoint,
+        available: true,
+        models,
+        supports_download: false,
+        kind,
+        loaded,
+        context_window,
+    })
+}
+
+/// The models LM Studio reports as loaded.
+async fn lm_studio_loaded(origin: &str) -> Vec<String> {
+    let Ok(list) = fetch_json(&format!("{origin}/api/v0/models")).await else {
+        return vec![];
+    };
+    let loaded: Vec<serde_json::Value> = list
+        .get("data")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("state").and_then(|v| v.as_str()) == Some("loaded"))
+        .cloned()
+        .collect();
+    model_names(&loaded, false)
+}
+
+/// Ask every origin at once and keep those that answered as a model server, in origin order.
+async fn discover_origins(origins: Vec<String>) -> Vec<LocalService> {
+    futures_util::future::join_all(origins.into_iter().map(probe_local))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Find every Ollama or OpenAI-compatible model server on this computer: the common model
+/// server ports plus any port listening on loopback, at most 64, asked at once for 1.5 s each.
+/// Only this computer's loopback addresses are asked, never the network, and no credentials
+/// are sent. Only servers that answered are returned.
 pub async fn discover_local_services() -> Vec<LocalService> {
-    let (ollama, studio) = tokio::join!(
-        probe("Ollama", LOCAL_OLLAMA, true),
-        probe("LM Studio", "http://127.0.0.1:1234", false)
-    );
-    vec![ollama, studio]
+    discover_origins(candidate_origins(&listeners::listening().await)).await
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -840,6 +992,214 @@ mod tests {
             ),
             ["a"]
         );
+    }
+    #[test]
+    fn candidates_are_loopback_common_ports_first_and_bounded() {
+        let v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: std::net::IpAddr = "::1".parse().unwrap();
+        let any: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        let mut listening = vec![
+            (v4, 11434),
+            (v6, 18888),
+            (v6, 19999),
+            (v4, 19999),
+            (any, 22),
+        ];
+        listening.extend((20_000..20_100).map(|port| (any, port)));
+        let origins = candidate_origins(&listening);
+        assert_eq!(origins.len(), MAX_CANDIDATES);
+        assert_eq!(origins[0], "http://127.0.0.1:11434");
+        assert!(origins
+            .iter()
+            .zip(COMMON_PORTS)
+            .all(|(origin, port)| origin.ends_with(&format!(":{port}"))));
+        assert_eq!(origins[COMMON_PORTS.len()], "http://[::1]:18888");
+        assert_eq!(origins[COMMON_PORTS.len() + 1], "http://127.0.0.1:19999");
+        assert!(!origins.iter().any(|origin| origin.ends_with(":22")));
+        let unique: std::collections::HashSet<_> = origins.iter().collect();
+        assert_eq!(unique.len(), origins.len());
+        assert!(origins
+            .iter()
+            .all(|origin| origin.starts_with("http://127.0.0.1:")
+                || origin.starts_with("http://[::1]:")));
+        // Listeners on other interfaces never reach the candidates.
+        let lan =
+            listeners::parse_lsof("server 1 me 4u IPv4 0x1 0t0 TCP 192.168.1.50:9000 (LISTEN)\n");
+        assert!(!candidate_origins(&lan).iter().any(|o| o.ends_with(":9000")));
+    }
+    #[tokio::test]
+    async fn discovery_labels_each_kind_of_server() {
+        let llama = server(&[
+            (
+                "/props",
+                serde_json::json!({"default_generation_settings": {"n_ctx": 32_768}}),
+            ),
+            (
+                "/v1/models",
+                serde_json::json!({"data": [{"id": "qwen3.8-flash"}]}),
+            ),
+        ])
+        .await;
+        let vllm = server(&[(
+            "/v1/models",
+            serde_json::json!({"data": [{"id": "Qwen/Qwen3-8B", "max_model_len": 40_960}]}),
+        )])
+        .await;
+        let studio = server(&[
+            (
+                "/v1/models",
+                serde_json::json!({"data": [{"id": "a"}, {"id": "b"}]}),
+            ),
+            (
+                "/api/v0/models",
+                serde_json::json!({"data": [
+                    {"id": "a", "state": "loaded", "loaded_context_length": 8192},
+                    {"id": "b", "state": "not-loaded"}
+                ]}),
+            ),
+            (
+                "/api/v0/models/a",
+                serde_json::json!({"id": "a", "state": "loaded", "loaded_context_length": 8192}),
+            ),
+        ])
+        .await;
+        let ollama = server(&[
+            ("/api/version", serde_json::json!({"version": "0.40.1"})),
+            (
+                "/api/tags",
+                serde_json::json!({"models": [{"name": "qwen3.6:35b"}, {"name": "llama3.2:1b"}]}),
+            ),
+            (
+                "/api/ps",
+                serde_json::json!({"models": [{"name": "qwen3.6:35b", "context_length": 65_536}]}),
+            ),
+        ])
+        .await;
+        let generic = server(&[("/v1/models", serde_json::json!({"data": [{"id": "m"}]}))]).await;
+        let other = server(&[("/", serde_json::json!({"hello": "world"}))]).await;
+        let found = discover_origins(
+            [&llama, &vllm, &studio, &ollama, &generic, &other]
+                .iter()
+                .map(|fake| fake.origin())
+                .collect(),
+        )
+        .await;
+        let summary: Vec<_> = found
+            .iter()
+            .map(|s| {
+                (
+                    s.kind,
+                    s.name.as_str(),
+                    s.models.clone(),
+                    s.loaded.clone(),
+                    s.context_window,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    ServerKind::LlamaCpp,
+                    "llama.cpp",
+                    vec!["qwen3.8-flash".to_owned()],
+                    vec!["qwen3.8-flash".to_owned()],
+                    Some(32_768)
+                ),
+                (
+                    ServerKind::Vllm,
+                    "vLLM",
+                    vec!["Qwen/Qwen3-8B".to_owned()],
+                    vec!["Qwen/Qwen3-8B".to_owned()],
+                    Some(40_960)
+                ),
+                (
+                    ServerKind::LmStudio,
+                    "LM Studio",
+                    vec!["a".to_owned(), "b".to_owned()],
+                    vec!["a".to_owned()],
+                    Some(8192)
+                ),
+                (
+                    ServerKind::Ollama,
+                    "Ollama",
+                    vec!["qwen3.6:35b".to_owned(), "llama3.2:1b".to_owned()],
+                    vec!["qwen3.6:35b".to_owned()],
+                    Some(65_536)
+                ),
+                (
+                    ServerKind::Unknown,
+                    "OpenAI-compatible server",
+                    vec!["m".to_owned()],
+                    vec![],
+                    None
+                ),
+            ]
+        );
+        assert!(found
+            .iter()
+            .all(|s| s.endpoint.ends_with("/v1") && s.available && !s.supports_download));
+        // Discovery only ever reads.
+        for fake in [&llama, &vllm, &studio, &ollama, &generic, &other] {
+            assert!(fake.requests().iter().all(|r| r.starts_with("GET ")));
+        }
+        // Older callers that know only the original fields still read the result.
+        let value = serde_json::to_value(&found[3]).unwrap();
+        assert_eq!(value["supportsDownload"], false);
+        assert_eq!(value["kind"], "ollama");
+        assert_eq!(value["contextWindow"], 65_536);
+        let old: LocalService = serde_json::from_value(serde_json::json!({
+            "name": "Ollama", "endpoint": "http://127.0.0.1:11434/v1", "available": true,
+            "models": [], "supportsDownload": true
+        }))
+        .unwrap();
+        assert_eq!(old.kind, ServerKind::Unknown);
+    }
+    #[tokio::test]
+    async fn discovery_finds_a_server_on_any_listening_loopback_port() {
+        let fake = server(&[
+            (
+                "/props",
+                serde_json::json!({"default_generation_settings": {"n_ctx": 4096}}),
+            ),
+            ("/v1/models", serde_json::json!({"data": [{"id": "tiny"}]})),
+        ])
+        .await;
+        let port = fake.addr.port();
+        assert!(!COMMON_PORTS.contains(&port));
+        let listening = listeners::listening().await;
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            assert!(
+                listening.iter().any(|(_, p)| *p == port),
+                "port {port} not in {listening:?}"
+            );
+        }
+        // Ask only this fake, so other tests' fake servers see no extra requests.
+        let ours: Vec<_> = listening.into_iter().filter(|(_, p)| *p == port).collect();
+        let origins: Vec<_> = candidate_origins(&ours)
+            .into_iter()
+            .filter(|origin| origin.ends_with(&format!(":{port}")))
+            .collect();
+        let found = discover_origins(origins).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, ServerKind::LlamaCpp);
+        assert_eq!(found[0].endpoint, format!("http://127.0.0.1:{port}/v1"));
+    }
+    #[tokio::test]
+    async fn a_silent_server_does_not_hold_up_discovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        // Accept and never answer.
+        let held = tokio::spawn(async move {
+            let mut sockets = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        let started = std::time::Instant::now();
+        assert!(discover_origins(vec![origin]).await.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(2500));
+        held.abort();
     }
     #[test]
     fn invitations_reject_unsafe_schemes_and_malformed_secrets() {
