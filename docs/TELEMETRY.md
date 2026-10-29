@@ -157,7 +157,8 @@ Turning recording on or off (the desktop's **Record agent runs**, or `bw config 
 appends one line to `metrics/recording.jsonl`, such as
 `{"unixMs":1793208600000,"recording":false,"surface":"desktop"}`; the desktop and `bw` have
 separate switches, so their periods are listed separately. Changes made before this file existed
-are unknown, and days with no data and no off period are shown as "no data", not as off.
+are unknown, and days with no data and no off period are shown as "no data", not as off. Only the
+first 1 MiB of the file is read, and only `desktop` and `cli` markers count.
 
 ## Retention
 
@@ -192,19 +193,26 @@ desktop's until you set one of its own):
 the literal hosts `127.0.0.1`, `::1`, and `localhost`. A user name, password, query, or fragment is
 refused, so no secret is ever saved with the URL.
 
-**Headers.** Use headers for credentials such as `authorization` or `x-api-key`. Only the header
-names are saved in settings; each value is stored in the credential store (service
-`com.blackwall.telemetry`, account = the lower-case header name) and is never shown again, logged,
-or put in an environment variable. `bw telemetry header` reads the value from piped standard input
-only, so it never lands in shell history:
+**Headers.** Use headers for credentials such as `authorization` or `x-api-key`. Settings keep
+only each header's name and the endpoint origin (`scheme://host:port`) it was entered for; the value
+is stored in the credential store (service `com.blackwall.telemetry`, account
+`{origin}|{name}`) and is never shown again, logged, or put in an environment variable. A value is
+only ever read for its own origin, so it cannot follow a changed endpoint: after you point export at
+a different origin, its headers show as "saved for <old origin>" and export pauses until you enter
+them again for the new endpoint or remove them. Save the endpoint before adding a header.
+`bw telemetry header` reads the value from piped standard input only, so it never lands in shell
+history:
 
 ```sh
 op read "op://Private/Langfuse/otlp-auth" | bw telemetry header authorization
 bw telemetry header authorization --delete
 ```
 
-A header whose value is missing turns export off and shows `header value missing` as the last
-error.
+A header whose value is missing, or that was saved for another origin, turns export off and shows
+as the last error (`missing_header`, `header_other_origin`). Saving or removing a header applies at
+once. Settings files never hold a value: a saved `telemetryExport` with a `headerValues` (or any
+value- or secret-named) field is refused, while other unknown fields from newer versions are
+ignored.
 
 **What is sent.** Exactly what the local files hold. The run buffer finishes a run (content
 filter, redaction, the whole-run secret scrub, the 4 MiB rule) once, then the writer thread hands
@@ -214,9 +222,14 @@ is on, and secrets found late in a run are scrubbed from every exported span. Ex
 `blackwall.project` and `blackwall.session` (and merge the series that differed only by them)
 unless **Include project names** is on; the local files always keep them.
 
+**Content.** With content capture on, export sends prompts, outputs, and tool data. Turning export
+on (or moving it to a new endpoint) while **Include content** is on asks first on the desktop, and
+`bw config set` prints a warning.
+
 **How it is sent.** The messages are the official `opentelemetry-proto` types, encoded as OTLP
 JSON or protobuf and POSTed by Blackwall's own small exporters on its reqwest client
-(`opentelemetry-otlp` is not used). Redirects are never followed: a 3xx is an error. Each request
+(`opentelemetry-otlp` is not used). `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are ignored, as
+for model and web requests. Redirects are never followed: a 3xx is an error. Each request
 has a 10 s limit. A dedicated thread sends, fed by a queue of at most 2,048 spans and 64 metric
 batches; when it is full, new data is dropped and counted, never waited for. Failed sends are not
 retried. Export never slows, blocks, or fails a run, and failures are shown only in the export
@@ -226,7 +239,8 @@ status. When the app or `bw` exits, it waits up to 3 s for queued data.
 the last successful send, the last error as its class and HTTP status (`connect`, `timeout`,
 `redirect`, `http_status`, `missing_header`, …; response bodies are never read or shown), and the
 spans and metric batches sent and dropped since the app started. **Send test span** sends one span
-named `blackwall test span` and reports the HTTP status.
+named `blackwall test span` with the saved settings (save changes first) and reports the HTTP
+status.
 
 ### Examples
 
@@ -302,7 +316,7 @@ self-hosted. Authenticate with HTTP Basic auth of your public and secret key: ke
 ```sh
 bw config set otlp-endpoint https://cloud.langfuse.com/api/public/otel
 bw config set otlp-signals traces
-op read "op://Private/Langfuse/otlp-authorization" | bw telemetry header authorization
+op read "op://Private/Langfuse/otlp-authorization" | bw telemetry header authorization  # after the endpoint
 bw telemetry test
 ```
 

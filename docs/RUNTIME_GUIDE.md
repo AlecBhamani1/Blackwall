@@ -560,8 +560,10 @@ op read "op://Private/otel/api-key" | bw telemetry header x-api-key   # value st
 bw telemetry test
 ```
 
-`https` is required except for `127.0.0.1`, `::1`, and `localhost`; redirects are not followed and
-each request has a 10 s limit. Header values live only in the credential store. Prompts and outputs
+`https` is required except for `127.0.0.1`, `::1`, and `localhost`; proxies and redirects are not
+followed and each request has a 10 s limit. Header values live only in the credential store, bound
+to the endpoint origin they were entered for; set the endpoint first, and enter headers again after
+moving to another origin. Prompts and outputs
 leave only when content capture is on, and project names and session IDs only when you allow them.
 Export never slows or fails a run: a full queue drops data and counts it, and failures appear only
 in the export status. See [Export](TELEMETRY.md#export) for Collector, Grafana Alloy, Jaeger, and

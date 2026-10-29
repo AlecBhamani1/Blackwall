@@ -23,7 +23,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Export traces and usage metrics over OTLP/HTTP (JSON or protobuf) from **Settings → Security →
   Telemetry** or `bw config set otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project`.
   Off by default; https is required except for loopback; redirects are not followed; header values
-  are kept only in the credential store (`bw telemetry header <name>` reads one from stdin). Export
+  are kept only in the credential store, bound to the endpoint origin they were entered for
+(`bw telemetry header <name>` reads one from stdin). Export
   sends exactly what the local files hold, after the whole-run scrub, leaves project names and
   session IDs out of metrics unless allowed, and never blocks a run. The Usage page gains an
   **Export** status card, and **Send test span** (`bw telemetry test`) reports the HTTP status.
