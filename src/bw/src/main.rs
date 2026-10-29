@@ -6,6 +6,7 @@ mod review;
 mod session;
 mod settings;
 mod skills;
+mod telemetry;
 mod traces;
 mod usage;
 
@@ -43,6 +44,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings command-network on|off  Command network access (default off; unsandboxed always on)
   /settings timeout <n>     Limit each shell command in seconds
   /settings text-tool-calls on|off  Read tool calls the model writes as text (default off; always asks)
+  /settings otlp-endpoint <url|off>  Export traces and metrics over OTLP/HTTP (default off)
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -60,6 +62,9 @@ USAGE:
   bw setup                   Configure endpoint, model, web, and memory
   bw config [show]           Show effective settings
   bw config set <name> <value>
+                             Includes otlp-endpoint <url|off>, otlp-protocol <json|protobuf>,
+                             otlp-signals <traces,metrics>, otlp-include-project <on|off>,
+                             and usage-retention-days <30-3650|forever> (default 400)
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
@@ -75,6 +80,9 @@ USAGE:
   bw usage [--days N] [--utc] [--json]
                              Show tokens, runs, and tools from local usage metrics
                              for the last N local days (1-400, default 7)
+  bw telemetry test          Send one test span to the OTLP endpoint and show the result
+  bw telemetry header <name> [--delete]
+                             Save an export header (value piped on stdin) in the credential store
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
                              Review Git changes without agent tools
@@ -125,7 +133,7 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "status" | "run" | "resume" | "sessions" | "request"
-        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" => {}
+        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" | "telemetry" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -155,11 +163,15 @@ async fn run() -> Result<(), String> {
         return list_sessions(&store);
     }
     let mut settings = Settings::load(&store)?;
+    session::configure_telemetry(&settings);
+    if command == "telemetry" {
+        return telemetry::run(&store, &mut settings, &arguments).await;
+    }
     if command == "usage" {
         return usage::run(&directory, &arguments, settings.trace.enabled);
     }
     if command == "config" {
-        return configure(&store, &mut settings, &arguments);
+        return configure(&store, &directory, &mut settings, &arguments);
     }
     if command == "status" {
         require_no_arguments(&arguments)?;
@@ -257,6 +269,7 @@ fn required_prompt(arguments: &[String]) -> Result<String, String> {
 
 fn configure(
     store: &LocalStore,
+    directory: &std::path::Path,
     settings: &mut Settings,
     arguments: &[String],
 ) -> Result<(), String> {
@@ -264,15 +277,36 @@ fn configure(
         [] => {}
         [show] if show == "show" => {}
         [set, key, values @ ..] if set == "set" && !values.is_empty() => {
-            settings.set(store, key, &values.join(" "))?;
+            set_setting(store, directory, settings, key, &values.join(" "))?;
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
             )
         }
     }
     println!("{}", settings.describe());
+    Ok(())
+}
+
+/// Change one saved setting. Turning recording on or off is marked for the Usage page's gaps.
+fn set_setting(
+    store: &LocalStore,
+    directory: &std::path::Path,
+    settings: &mut Settings,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let recording = settings.trace.enabled;
+    settings.set(store, key, value)?;
+    if settings.trace.enabled != recording {
+        blackwall_core::usage::mark_recording(
+            directory,
+            settings.trace.enabled,
+            blackwall_core::telemetry::Surface::Cli,
+        );
+    }
+    session::configure_telemetry(settings);
     Ok(())
 }
 
@@ -463,7 +497,7 @@ fn slash(
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
                 "Use /settings <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.",
             )?;
-            settings.set(store, key, value.trim())?;
+            set_setting(store, directory, settings, key, value.trim())?;
             println!("{}", settings.describe());
         }
         "memory" if !matches!(value, "on" | "off") => memory::run(
@@ -474,7 +508,7 @@ fn slash(
                 .collect::<Vec<_>>(),
         )?,
         "model" | "endpoint" | "web" | "memory" => {
-            settings.set(store, name, value)?;
+            set_setting(store, directory, settings, name, value)?;
             println!("{}", settings.describe());
         }
         "new" if value.is_empty() => {

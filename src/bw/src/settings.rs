@@ -1,4 +1,8 @@
-use blackwall_core::{connection::normalize_endpoint, storage::LocalStore};
+use blackwall_core::{
+    connection::normalize_endpoint,
+    storage::LocalStore,
+    telemetry::{ExportConfig, Protocol, Retention},
+};
 use serde_json::{json, Value};
 
 const SETTINGS_KEY: &str = "cli-settings";
@@ -19,6 +23,28 @@ pub struct Settings {
     pub trace: blackwall_core::trace::TraceOptions,
     /// Read `<tool_call>` blocks the model writes as text. Off by default; such calls always ask.
     pub text_tool_calls: bool,
+    /// OTLP export; off until an endpoint is set. Header values are in the credential store.
+    pub export: ExportConfig,
+    /// How long usage metrics are kept; 400 days by default.
+    pub retention: Retention,
+}
+
+/// The export and retention settings saved under `telemetryExport` and `usageRetention`.
+fn telemetry_options(
+    object: &serde_json::Map<String, Value>,
+    invalid: &str,
+) -> Result<(ExportConfig, Retention), String> {
+    let export = object
+        .get("telemetryExport")
+        .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid.to_owned()))
+        .transpose()?
+        .unwrap_or_default();
+    let retention = object
+        .get("usageRetention")
+        .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid.to_owned()))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((export, retention))
 }
 
 /// Traces are on unless the owner turned them off.
@@ -49,8 +75,10 @@ impl Settings {
         self.budget.validate().map_err(|error| error.to_string())?;
         let endpoint = validated_endpoint(&self.endpoint)?;
         let model = validated_model(&self.model)?;
+        let export = self.export.validated().map_err(|error| error.to_string())?;
         self.endpoint = endpoint;
         self.model = model;
+        self.export = export;
         Ok(())
     }
 
@@ -69,6 +97,8 @@ impl Settings {
             "tracesEnabled": validated.trace.enabled,
             "traceContent": validated.trace.content,
             "textToolCalls": validated.text_tool_calls,
+            "telemetryExport": validated.export,
+            "usageRetention": validated.retention,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -97,6 +127,32 @@ impl Settings {
             "traces" => updated.trace.enabled = on_or_off(value)?,
             "trace-content" => updated.trace.content = on_or_off(value)?,
             "text-tool-calls" => updated.text_tool_calls = on_or_off(value)?,
+            "otlp-endpoint" => {
+                updated.export.endpoint = match value.trim() {
+                    "off" => None,
+                    endpoint => Some(endpoint.into()),
+                }
+            }
+            "otlp-protocol" => {
+                updated.export.protocol = match value.trim() {
+                    "json" | "http/json" => Protocol::HttpJson,
+                    "protobuf" | "http/protobuf" => Protocol::HttpProtobuf,
+                    _ => return Err("Choose json or protobuf.".into()),
+                }
+            }
+            "otlp-signals" => {
+                let mut signals = (false, false);
+                for signal in value.split(',').map(str::trim) {
+                    match signal {
+                        "traces" => signals.0 = true,
+                        "metrics" => signals.1 = true,
+                        _ => return Err("Choose traces, metrics, or traces,metrics.".into()),
+                    }
+                }
+                (updated.export.traces, updated.export.metrics) = signals;
+            }
+            "otlp-include-project" => updated.export.include_project = on_or_off(value)?,
+            "usage-retention-days" => updated.retention = value.parse()?,
             "context" => {
                 updated.budget.context_window = value
                     .parse()
@@ -123,7 +179,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, compact, iterations, or timeout."
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, compact, iterations, timeout, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
                     .into(),
             ),
         }
@@ -140,7 +196,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -152,8 +208,36 @@ impl Settings {
             self.budget.max_iterations, self.budget.command_timeout_seconds,
             self.execution_profile.name(),
             if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
+            describe_export(&self.export),
+            self.retention,
         )
     }
+}
+
+/// One line for the export settings; header names only, never values.
+fn describe_export(export: &ExportConfig) -> String {
+    let Some(endpoint) = export
+        .endpoint
+        .as_deref()
+        .and_then(|endpoint| blackwall_core::telemetry::export::normalize_endpoint(endpoint).ok())
+    else {
+        return "off".into();
+    };
+    let signals: Vec<_> = [("traces", export.traces), ("metrics", export.metrics)]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+    let headers = if export.headers.is_empty() {
+        String::new()
+    } else {
+        format!("; headers: {}", export.headers.join(", "))
+    };
+    format!(
+        "{endpoint} ({}; {}{headers}; project names: {})",
+        export.protocol.as_str(),
+        signals.join(", "),
+        if export.include_project { "on" } else { "off" }
+    )
 }
 
 /// An injected environment lookup keeps precedence tests independent of the
@@ -208,6 +292,9 @@ fn load_with_environment(
             .unwrap_or(false),
         trace: trace_options(object, "Invalid trace setting.")?,
         text_tool_calls: false,
+        export: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?.0,
+        retention: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?
+            .1,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -273,10 +360,13 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
                 | "tracesEnabled"
                 | "traceContent"
                 | "textToolCalls"
+                | "telemetryExport"
+                | "usageRetention"
         )
     }) {
         return Err(invalid.into());
     }
+    let (export, retention) = telemetry_options(object, invalid)?;
     let mut settings = Settings {
         execution_profile: object
             .get("executionProfile")
@@ -322,6 +412,8 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .map(|v| v.as_bool().ok_or(invalid))
             .transpose()?
             .unwrap_or(false),
+        export,
+        retention,
     };
     settings
         .validate()
@@ -422,6 +514,8 @@ mod tests {
                     content: false,
                 },
                 text_tool_calls: false,
+                export: Default::default(),
+                retention: Default::default(),
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -541,7 +635,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 11);
+        assert_eq!(saved.as_object().unwrap().len(), 13);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -693,6 +787,8 @@ mod tests {
             budget: Default::default(),
             trace: Default::default(),
             text_tool_calls: false,
+            export: Default::default(),
+            retention: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());
@@ -702,5 +798,109 @@ mod tests {
         assert!(!description.contains("secret"));
         assert!(!description.contains('\u{1b}'));
         assert!(description.contains("web: on\nmemory: off"));
+    }
+
+    #[test]
+    fn legacy_preferences_load_unchanged() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        // Desktop preferences and CLI settings from before export existed.
+        let desktop =
+            r#"{"endpoint":"http://localhost:11434/v1","model":"m","tracesEnabled":false}"#;
+        store.save_setting("preferences", desktop).unwrap();
+        let from_desktop = defaults(&store);
+        assert_eq!(from_desktop.export, ExportConfig::default());
+        assert_eq!(from_desktop.retention, Retention::Days(400));
+        assert!(!from_desktop.trace.enabled);
+        let old = r#"{"endpoint":"http://localhost:11434/v1","model":"fixture","webEnabled":false,"memoryEnabled":false,"tracesEnabled":true,"traceContent":false}"#;
+        store.save_setting(SETTINGS_KEY, old).unwrap();
+        let loaded = defaults(&store);
+        assert_eq!(loaded.export, ExportConfig::default());
+        assert_eq!(loaded.retention, Retention::default());
+        assert!(loaded
+            .describe()
+            .contains("otlp export: off\nusage history: 400 days"));
+        assert_eq!(store.setting(SETTINGS_KEY).unwrap().as_deref(), Some(old));
+    }
+
+    #[test]
+    fn otlp_settings_validate_and_persist_names_only() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        for (key, value) in [
+            ("otlp-endpoint", "http://collector.example:4318"),
+            ("otlp-endpoint", "https://user:secret@collector.example"),
+            ("otlp-endpoint", "https://collector.example/?key=secret"),
+            ("otlp-protocol", "grpc"),
+            ("otlp-signals", "logs"),
+            ("otlp-include-project", "yes"),
+            ("usage-retention-days", "29"),
+            ("usage-retention-days", "3651"),
+        ] {
+            let before = settings.clone();
+            let error = settings.set(&store, key, value).unwrap_err();
+            assert!(!error.contains("secret"), "{error}");
+            assert_eq!(settings, before);
+        }
+        settings
+            .set(
+                &store,
+                "otlp-endpoint",
+                "https://otel.example.com/v1/traces",
+            )
+            .unwrap();
+        settings.set(&store, "otlp-protocol", "json").unwrap();
+        settings.set(&store, "otlp-signals", "metrics").unwrap();
+        settings.set(&store, "otlp-include-project", "on").unwrap();
+        assert_eq!(
+            settings.export.endpoint.as_deref(),
+            Some("https://otel.example.com/")
+        );
+        assert!(settings.describe().contains(
+            "otlp export: https://otel.example.com/ (http/json; metrics; project names: on)"
+        ));
+        let reloaded = defaults(&store);
+        assert_eq!(reloaded, settings);
+        settings.set(&store, "otlp-endpoint", "off").unwrap();
+        settings
+            .set(&store, "otlp-endpoint", "http://127.0.0.1:4318")
+            .unwrap();
+        assert!(defaults(&store).export.is_on());
+        settings.set(&store, "otlp-endpoint", "off").unwrap();
+        assert!(!defaults(&store).export.is_on());
+        // Unknown export fields, such as a smuggled header value, are refused when loading.
+        store
+            .save_setting(
+                SETTINGS_KEY,
+                r#"{"endpoint":"http://localhost:11434/v1","model":"m","webEnabled":false,"memoryEnabled":false,"telemetryExport":{"headerValues":{"x":"secret"}}}"#,
+            )
+            .unwrap();
+        let error = load_with_environment(&store, |_| None).unwrap_err();
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn retention_setting_round_trips() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        settings.set(&store, "usage-retention-days", "90").unwrap();
+        assert_eq!(defaults(&store).retention, Retention::Days(90));
+        settings
+            .set(&store, "usage-retention-days", "forever")
+            .unwrap();
+        assert_eq!(defaults(&store).retention, Retention::Forever);
+        let saved: Value =
+            serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["usageRetention"], json!("forever"));
+        assert!(settings.describe().contains("usage history: forever"));
+        // The desktop's saved value is used until the CLI saves its own.
+        let other = TestDirectory::new();
+        let store = LocalStore::open(&other.0).unwrap();
+        store
+            .save_setting("preferences", r#"{"usageRetention":30}"#)
+            .unwrap();
+        assert_eq!(defaults(&store).retention, Retention::Days(30));
     }
 }
