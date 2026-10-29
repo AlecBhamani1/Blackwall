@@ -186,8 +186,13 @@ allowlist or the redaction scrub, and writes one OTLP/JSON file under `traces/`;
 appends delta metrics to `metrics/YYYY-MM-DD.jsonl`. `core::trace` only reads trace files back.
 `core::usage` reads the metrics files for a range of UTC days and returns totals already
 aggregated (`summary`), or copies the range's files to a folder (`export`); the desktop
-`usage_summary` and `export_telemetry` commands and `bw usage` call it.
-Nothing leaves the data folder. See [Telemetry](TELEMETRY.md).
+`usage_summary` and `export_telemetry` commands and `bw usage` call it. `core::usage` also
+writes and reads `metrics/recording.jsonl`, the recording on/off markers behind the gaps line.
+`core::telemetry::export` is the optional OTLP/HTTP side: the trace writer thread and the metric
+exporter hand it the same finished requests they write to the files, and its own thread POSTs them
+(JSON or protobuf) with no redirects, a 10 s timeout, and a bounded queue that drops instead of
+blocking. Nothing leaves the data folder unless the owner sets an endpoint. See
+[Telemetry](TELEMETRY.md).
 
 ## Local data and app lock
 

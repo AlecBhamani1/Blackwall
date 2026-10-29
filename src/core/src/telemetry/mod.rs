@@ -1,17 +1,20 @@
 //! Local traces and usage metrics through the OpenTelemetry SDK, using the GenAI semantic
-//! conventions. Nothing is sent anywhere: spans go to `traces/` as one OTLP/JSON file per run, and
-//! metrics go to `metrics/YYYY-MM-DD.jsonl` as OTLP/JSON lines.
+//! conventions. Spans go to `traces/` as one OTLP/JSON file per run, and metrics go to
+//! `metrics/YYYY-MM-DD.jsonl` as OTLP/JSON lines. Nothing is sent anywhere unless the owner sets
+//! an OTLP endpoint ([`export`]); export then receives the same scrubbed data as the files.
 //!
 //! One [`Telemetry`] per process owns an `SdkTracerProvider` and an `SdkMeterProvider`. Each run
 //! gets a [`RunScope`]. Timings, token counts, and outcomes are always recorded; prompts and
 //! outputs only when the owner turns on content capture. Metrics never carry prompt text, tool
 //! arguments, or paths. No `OTEL_*` environment variable changes this behaviour: every setting
 //! the SDK would read from the environment is given explicitly.
+pub mod export;
 pub(crate) mod file_metrics;
 mod file_spans;
 pub mod names;
 mod redact;
 
+pub use export::{ExportConfig, ExportError, ExportStatus, Protocol};
 pub use file_metrics::METRICS_DIRECTORY;
 
 use crate::protocol::TokenUsage;
@@ -41,12 +44,64 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// How long usage metrics are kept. Days are clamped to 30–3,650.
+/// How long usage metrics are kept. Days are clamped to 30–3,650. Saved as a number of days or
+/// `"forever"`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "RetentionValue", into = "RetentionValue")]
 pub enum Retention {
     Days(u16),
     Forever,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum RetentionValue {
+    Days(u16),
+    Text(String),
+}
+
+impl From<Retention> for RetentionValue {
+    fn from(retention: Retention) -> Self {
+        match retention {
+            Retention::Days(days) => Self::Days(days),
+            Retention::Forever => Self::Text("forever".into()),
+        }
+    }
+}
+
+impl TryFrom<RetentionValue> for Retention {
+    type Error = String;
+
+    fn try_from(value: RetentionValue) -> Result<Self, Self::Error> {
+        match value {
+            RetentionValue::Days(days) => Self::checked(days),
+            RetentionValue::Text(text) => text.parse(),
+        }
+    }
+}
+
+impl std::str::FromStr for Retention {
+    type Err = String;
+
+    /// `forever` or a whole number of days from 30 to 3,650.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("forever") {
+            return Ok(Self::Forever);
+        }
+        text.parse::<u16>()
+            .map_err(|_| Self::RANGE.to_owned())
+            .and_then(Self::checked)
+    }
+}
+
+impl std::fmt::Display for Retention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Days(days) => write!(f, "{days} days"),
+            Self::Forever => f.write_str("forever"),
+        }
+    }
 }
 
 impl Default for Retention {
@@ -58,6 +113,15 @@ impl Default for Retention {
 impl Retention {
     pub const MIN_DAYS: u16 = 30;
     pub const MAX_DAYS: u16 = 3650;
+    const RANGE: &'static str = "Keep usage history for 30 to 3,650 days, or forever.";
+
+    /// Days within 30–3,650.
+    pub fn checked(days: u16) -> Result<Self, String> {
+        (Self::MIN_DAYS..=Self::MAX_DAYS)
+            .contains(&days)
+            .then_some(Self::Days(days))
+            .ok_or_else(|| Self::RANGE.to_owned())
+    }
 
     /// The kept days, or `None` to keep everything.
     pub fn days(self) -> Option<u16> {
@@ -77,7 +141,7 @@ pub enum Surface {
 }
 
 impl Surface {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Desktop => "desktop",
             Self::Cli => "cli",
@@ -242,6 +306,10 @@ struct Inner {
     meter_provider: SdkMeterProvider,
     instruments: Instruments,
     runs: Runs,
+    exporter: export::Exporter,
+    /// The export settings last applied, so an unchanged setting is not re-read every run.
+    export_requested: Mutex<Option<ExportConfig>>,
+    surface: Surface,
 }
 
 /// The process's telemetry. Cheap to clone; every clone shares the same providers.
@@ -277,9 +345,13 @@ impl Telemetry {
             )
             .build();
         let runs = Runs::default();
-        let reader = PeriodicReader::builder(file_metrics::FileMetricExporter::new(data_dir))
-            .with_interval(Duration::from_secs(60))
-            .build();
+        let exporter = export::Exporter::default();
+        let reader = PeriodicReader::builder(file_metrics::FileMetricExporter::new(
+            data_dir,
+            exporter.clone(),
+        ))
+        .with_interval(Duration::from_secs(60))
+        .build();
         let meter_resource = resource.clone();
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource)
@@ -334,6 +406,7 @@ impl Telemetry {
             .with_span_processor(RunBufferProcessor::new(
                 runs.clone(),
                 instruments.dropped_runs.clone(),
+                exporter.clone(),
             ))
             .build();
         let tracer = tracer_provider.tracer_with_scope(scope());
@@ -346,8 +419,56 @@ impl Telemetry {
                 meter_provider,
                 instruments,
                 runs,
+                exporter,
+                export_requested: Mutex::new(None),
+                surface: options.surface,
             }),
         }
+    }
+
+    /// Apply the owner's export settings, reading header values from the credential store.
+    /// Unchanged settings are kept without a credential-store read. Blocking.
+    pub fn set_export(&self, config: &ExportConfig) {
+        let unchanged = self.inner.export_requested.lock().is_ok_and(|requested| {
+            requested.as_ref() == Some(config) || (requested.is_none() && !config.is_on())
+        });
+        if !unchanged {
+            self.reload_export(config, &export::keychain_header);
+        }
+    }
+
+    /// Apply export settings and read every header value again, such as after one was changed.
+    /// A setting that fails to apply turns export off and is shown in the export status.
+    pub fn reload_export(&self, config: &ExportConfig, lookup: &export::HeaderLookup<'_>) {
+        if let Ok(mut requested) = self.inner.export_requested.lock() {
+            *requested = Some(config.clone());
+        }
+        let applied = config.validated().and_then(|config| {
+            let headers = if config.is_on() {
+                export::resolve_headers(&config, lookup)?
+            } else {
+                Default::default()
+            };
+            Ok((config, headers))
+        });
+        match applied {
+            Ok((config, _)) if !config.is_on() => self.inner.exporter.configure(None),
+            Ok(settings) => self.inner.exporter.configure(Some(settings)),
+            Err(error) => self.inner.exporter.refuse(config, &error),
+        }
+    }
+
+    /// What the export has sent, dropped, and last failed with, since this process started.
+    pub fn export_status(&self) -> ExportStatus {
+        self.inner.exporter.status()
+    }
+
+    /// Send a test span with `config` (header values from the credential store) and record the
+    /// outcome in the export status. Returns the HTTP status.
+    pub async fn send_test_span(&self, config: &ExportConfig) -> Result<u16, ExportError> {
+        let result = export::send_test_span(config, self.inner.surface.as_str()).await;
+        self.inner.exporter.record_test(&result);
+        result
     }
 
     /// Apply the owner's current trace settings to runs started from now on.
@@ -426,11 +547,12 @@ impl Telemetry {
         }
     }
 
-    /// Wait for queued trace files and write any metrics not yet on disk. Blocking: for exit
-    /// paths and tests, not for the end of a run.
+    /// Wait for queued trace files and write any metrics not yet on disk, then up to 3 s for
+    /// export. Blocking: for exit paths and tests, not for the end of a run.
     pub fn flush(&self) {
         let _ = self.inner.tracer_provider.force_flush();
         let _ = self.inner.meter_provider.force_flush();
+        self.inner.exporter.drain(export::DRAIN);
     }
 
     /// A scope for a compaction request: its model calls count toward token usage and duration,
@@ -449,10 +571,12 @@ impl Telemetry {
         scope
     }
 
-    /// Flush and stop both providers. Runs still open afterwards are not written.
+    /// Flush and stop both providers, then wait up to 3 s for export. Runs still open afterwards
+    /// are not written.
     pub fn shutdown(self) {
         let _ = self.inner.tracer_provider.shutdown();
         let _ = self.inner.meter_provider.shutdown();
+        self.inner.exporter.stop(export::DRAIN);
     }
 }
 

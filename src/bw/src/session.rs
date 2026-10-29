@@ -389,6 +389,32 @@ fn scoped_key(endpoint: &str, configured: &str, key: Option<String>) -> Option<S
 /// The process's telemetry, started on the first run and flushed when bw exits.
 static TELEMETRY: std::sync::OnceLock<blackwall_core::telemetry::Telemetry> =
     std::sync::OnceLock::new();
+/// The saved export and retention settings, applied when a run starts.
+static TELEMETRY_SETTINGS: std::sync::Mutex<
+    Option<(
+        blackwall_core::telemetry::ExportConfig,
+        blackwall_core::telemetry::Retention,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// Apply changed export settings, reading every header value again, such as after a header was
+/// saved or removed.
+pub fn reload_telemetry(settings: &crate::settings::Settings) {
+    configure_telemetry(settings);
+    if let Some(telemetry) = TELEMETRY.get() {
+        telemetry.reload_export(
+            &settings.export,
+            &blackwall_core::telemetry::export::keychain_header,
+        );
+    }
+}
+
+/// Use these export and retention settings for runs from now on.
+pub fn configure_telemetry(settings: &crate::settings::Settings) {
+    if let Ok(mut saved) = TELEMETRY_SETTINGS.lock() {
+        *saved = Some((settings.export.clone(), settings.retention));
+    }
+}
 
 fn run_scope(
     directory: &Path,
@@ -398,10 +424,23 @@ fn run_scope(
     labels: (&Path, &str),
 ) -> blackwall_core::telemetry::RunScope {
     use blackwall_core::telemetry::{Mode, Surface, Telemetry, TelemetryOptions};
+    let (export, retention) = TELEMETRY_SETTINGS
+        .lock()
+        .ok()
+        .and_then(|saved| saved.clone())
+        .unwrap_or_default();
     let telemetry = TELEMETRY.get_or_init(|| {
-        Telemetry::start(directory, TelemetryOptions::from_trace(trace, Surface::Cli))
+        Telemetry::start(
+            directory,
+            TelemetryOptions {
+                retention,
+                ..TelemetryOptions::from_trace(trace, Surface::Cli)
+            },
+        )
     });
     telemetry.set_options(trace);
+    // Reads header values from the credential store only when the settings change.
+    telemetry.set_export(&export);
     // A compaction request is not a run: it only meters its summary calls.
     let scope = if compact {
         telemetry.compaction(Mode::Agent)

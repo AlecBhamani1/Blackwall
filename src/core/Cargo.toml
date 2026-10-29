@@ -19,6 +19,7 @@ opentelemetry.workspace = true
 opentelemetry-proto.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry_sdk.workspace = true
+prost.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true

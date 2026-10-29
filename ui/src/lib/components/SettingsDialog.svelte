@@ -10,6 +10,7 @@
   } from '../updates';
   import LockSettings from './LockSettings.svelte';
   import CredentialSettings from './CredentialSettings.svelte';
+  import TelemetrySettings from './TelemetrySettings.svelte';
   import SavedConnections from './SavedConnections.svelte';
   import { connectionProfiles } from '../connections';
   import PairingPanel from './PairingPanel.svelte';
@@ -62,6 +63,7 @@
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let keysOpen = false;
+  let telemetryOpen = false;
   let activePanel: SettingsPanel | null = null;
   let selectedSetting: SettingsPage | null = null;
   let settingsQuery = '';
@@ -872,6 +874,11 @@
             <details class="access-keys">
               <summary>App lock</summary>
               <LockSettings {onLock} />
+            </details>
+            <details class="access-keys" bind:open={telemetryOpen}>
+              <summary>Telemetry</summary>
+              <p>Export traces and usage metrics over OTLP, and choose how long usage is kept.</p>
+              {#if telemetryOpen}<TelemetrySettings />{/if}
             </details>
           {/if}
         {/if}

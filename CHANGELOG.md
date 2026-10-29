@@ -20,6 +20,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fences and calls for tools that were not offered stay text, and every call read from text asks
   for approval even when a saved rule allows it.
 
+- Export traces and usage metrics over OTLP/HTTP (JSON or protobuf) from **Settings → Security →
+  Telemetry** or `bw config set otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project`.
+  Off by default; https is required except for loopback; redirects are not followed; header values
+  are kept only in the credential store, bound to the endpoint origin they were entered for
+(`bw telemetry header <name>` reads one from stdin). Export
+  sends exactly what the local files hold, after the whole-run scrub, leaves project names and
+  session IDs out of metrics unless allowed, and never blocks a run. The Usage page gains an
+  **Export** status card, and **Send test span** (`bw telemetry test`) reports the HTTP status.
+  See [Export](docs/TELEMETRY.md#export).
+
+- Set how long usage metrics are kept: 30 to 3,650 days or forever (default 400), in Settings or
+  with `bw config set usage-retention-days`.
+
+- List the periods when recording was off in the Usage page's gaps line and in `bw usage`.
+
 - Record usage metrics with OpenTelemetry: token usage and duration for every model call
   (compaction summaries included), tool calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
   in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,

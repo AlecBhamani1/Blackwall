@@ -84,6 +84,14 @@ fn zone(offset_minutes: i32) -> String {
 }
 
 /// A compact count: 950, 12.4k, 4.82M.
+/// A Unix time in milliseconds as local `YYYY-MM-DD HH:MM`.
+fn moment(unix_ms: u64, offset_minutes: i32) -> String {
+    let secs = (unix_ms / 1000) as i64 + i64::from(offset_minutes) * 60;
+    let day = Day(u32::try_from(secs.div_euclid(86_400)).unwrap_or_default());
+    let minutes = secs.rem_euclid(86_400) / 60;
+    format!("{day} {:02}:{:02}", minutes / 60, minutes % 60)
+}
+
 pub fn compact(value: u64) -> String {
     match value {
         0..=999 => value.to_string(),
@@ -198,6 +206,25 @@ pub fn text(summary: &UsageSummary, days: u16, offset_minutes: i32) -> String {
         if totals.compactions == 1 { "" } else { "s" }
     );
     let mut missing = vec![];
+    for period in &summary.gaps.off_periods {
+        let who = if period.surface == "cli" {
+            "bw"
+        } else {
+            "desktop"
+        };
+        missing.push(match (period.from_unix_ms, period.to_unix_ms) {
+            (Some(from), Some(to)) => format!(
+                "{who} recording off {} to {}",
+                moment(from, offset_minutes),
+                moment(to, offset_minutes)
+            ),
+            (Some(from), None) => {
+                format!("{who} recording off since {}", moment(from, offset_minutes))
+            }
+            (None, Some(to)) => format!("{who} recording off until {}", moment(to, offset_minutes)),
+            (None, None) => format!("{who} recording off"),
+        });
+    }
     if let Some(first) = &summary.gaps.first_day {
         missing.push(format!(
             "nothing before {first}, when usage tracking started"
@@ -258,6 +285,27 @@ pub fn text(summary: &UsageSummary, days: u16, offset_minutes: i32) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_periods_print_in_local_time() {
+        // 2026-10-28 17:30 UTC is 10:30 at UTC-7.
+        let ms = 1_793_208_600_000;
+        assert_eq!(moment(ms, -420), "2026-10-28 10:30");
+        assert_eq!(moment(ms, 0), "2026-10-28 17:30");
+        let mut summary = blackwall_core::usage::summary(
+            std::path::Path::new("/nonexistent-blackwall-usage"),
+            Day(20_000),
+            Day(20_000),
+            0,
+        );
+        summary.totals.total = 1;
+        summary.gaps.off_periods = vec![blackwall_core::usage::OffPeriod {
+            surface: "cli".into(),
+            from_unix_ms: Some(ms),
+            to_unix_ms: None,
+        }];
+        assert!(text(&summary, 1, 0).contains("bw recording off since 2026-10-28 17:30"));
+    }
 
     #[test]
     fn compact_numbers() {

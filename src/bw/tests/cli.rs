@@ -1242,3 +1242,77 @@ fn usage_reports_a_run_by_project_and_as_json() {
     let rejected = fixture.run(&["usage", "--days", "0"], "");
     assert!(!rejected.status.success());
 }
+
+#[test]
+fn telemetry_test_span_reports_the_collector_status_and_config_round_trips() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let collector = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request_line = line.clone();
+        let mut length = 0;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .unwrap();
+        (request_line, body)
+    });
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let set = fixture.run(&["config", "set", "otlp-endpoint", &endpoint], "");
+    assert!(set.status.success(), "{set:?}");
+    assert!(String::from_utf8_lossy(&set.stdout).contains(&format!(
+        "otlp export: {endpoint}/ (http/protobuf; traces, metrics;"
+    )));
+    let retention = fixture.run(&["config", "set", "usage-retention-days", "forever"], "");
+    assert!(String::from_utf8_lossy(&retention.stdout).contains("usage history: forever"));
+    let test = fixture.run(&["telemetry", "test"], "");
+    assert!(test.status.success(), "{test:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&test.stdout).trim(),
+        "Test span sent: HTTP 202."
+    );
+    let (request_line, body) = collector.join().unwrap();
+    assert!(request_line.starts_with("POST /v1/traces HTTP/1.1"));
+    assert!(String::from_utf8_lossy(&body).contains("blackwall test span"));
+    let insecure = fixture.run(
+        &[
+            "config",
+            "set",
+            "otlp-endpoint",
+            "http://collector.example:4318",
+        ],
+        "",
+    );
+    assert!(!insecure.status.success());
+    assert!(String::from_utf8_lossy(&insecure.stderr).contains("Use https"));
+    // Turning content capture on while export is on warns that prompts will leave.
+    let content = fixture.run(&["config", "set", "trace-content", "on"], "");
+    assert!(String::from_utf8_lossy(&content.stderr)
+        .contains("Warning: trace content is on, so prompts, outputs, and tool data are sent to"));
+    // A header needs a value on standard input (here, empty) and is not saved without one.
+    let header = fixture.run(&["telemetry", "header", "x-api-key"], "");
+    assert!(!header.status.success());
+    // Recording off and on again is marked for the Usage page's gaps.
+    fixture.run(&["config", "set", "traces", "off"], "");
+    fixture.run(&["config", "set", "traces", "on"], "");
+    let markers = fs::read_to_string(fixture.root.join("data/metrics/recording.jsonl")).unwrap();
+    assert_eq!(markers.lines().count(), 2);
+    assert!(markers.contains(r#""recording":false,"surface":"cli""#));
+}

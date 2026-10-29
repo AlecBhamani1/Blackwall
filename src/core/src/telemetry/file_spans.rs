@@ -4,7 +4,7 @@
 //! the provider directly. It holds every span of a run until the run's root span ends, then
 //! filters, redacts, and scrubs the whole run at once, so a secret first seen late in a run is
 //! still removed from spans that ended earlier. Only the finished run reaches an exporter.
-use super::{names, redact::Scrubber};
+use super::{export::Exporter, names, redact::Scrubber};
 use opentelemetry::{
     metrics::Counter,
     trace::{SpanId, Status, TraceId},
@@ -100,7 +100,7 @@ pub(super) struct Writer {
 }
 
 impl Writer {
-    fn start(dropped_counter: Counter<u64>) -> Self {
+    fn start(dropped_counter: Counter<u64>, exporter: Exporter) -> Self {
         let (queue, jobs) = mpsc::sync_channel::<Job>(QUEUE);
         let spawned = std::thread::Builder::new()
             .name("blackwall-traces".into())
@@ -108,8 +108,10 @@ impl Writer {
                 for job in jobs {
                     match job {
                         Job::Run(run, spans, resource) => {
-                            if let Some(body) = finish_run(&run, spans, &resource) {
+                            // The file and OTLP get the same finished, scrubbed run.
+                            if let Some((request, body)) = finish_run(&run, spans, &resource) {
                                 FileSpanExporter.export(&run.path, body);
+                                exporter.submit_spans(&request);
                             }
                         }
                         Job::Flush(done) => {
@@ -197,11 +199,11 @@ pub(super) struct RunBufferProcessor {
 }
 
 impl RunBufferProcessor {
-    pub(super) fn new(runs: Runs, dropped_runs: Counter<u64>) -> Self {
+    pub(super) fn new(runs: Runs, dropped_runs: Counter<u64>, exporter: Exporter) -> Self {
         Self {
             runs,
             resource: Resource::builder_empty().build(),
-            writer: Writer::start(dropped_runs),
+            writer: Writer::start(dropped_runs, exporter),
         }
     }
 }
@@ -259,7 +261,8 @@ fn scrub_value(value: &mut Value, scrubber: &Scrubber) {
     }
 }
 
-/// The run's filtered, scrubbed spans as one OTLP JSON body within the 4 MiB limit, or `None`.
+/// The run's filtered, scrubbed spans as one OTLP request and its JSON body within the 4 MiB
+/// limit, or `None`. The body is the request serialized, so both exporters send the same data.
 ///
 /// Content capture off: only metadata keys survive and failure messages carry only the error
 /// class. Content capture on: every string is scrubbed of the run's secrets, and content keys are
@@ -268,7 +271,7 @@ pub(super) fn finish_run(
     run: &RunState,
     mut spans: Vec<SpanData>,
     resource: &Resource,
-) -> Option<Vec<u8>> {
+) -> Option<(ExportTraceServiceRequest, Vec<u8>)> {
     // The root first, then in start order, as the original writer stored them.
     spans.sort_by_key(|span| (span.parent_span_id != SpanId::INVALID, span.start_time));
     let secrets = run.secrets.lock().map(|s| s.clone()).unwrap_or_default();
@@ -346,7 +349,7 @@ pub(super) fn finish_run(
         }
         body = serde_json::to_vec(&request).ok()?;
     }
-    (body.len() <= MAX_FILE).then_some(body)
+    (body.len() <= MAX_FILE).then_some((request, body))
 }
 
 fn attribute(key: &str, value: any_value::Value) -> ProtoKeyValue {

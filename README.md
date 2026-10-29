@@ -51,7 +51,10 @@ a SmartScreen or Gatekeeper warning.
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Local OpenTelemetry traces and usage metrics (tokens, durations, tool and run outcomes) for Chat,
-  Agent, and subagent runs, kept in the data folder and never sent anywhere ([Telemetry](docs/TELEMETRY.md))
+  Agent, and subagent runs, kept in the data folder ([Telemetry](docs/TELEMETRY.md))
+- Optional OTLP/HTTP export of those traces and metrics to an OpenTelemetry Collector, Grafana
+  Alloy, Jaeger, or Langfuse: off by default, https only (except loopback), header values in the
+  credential store, and never slowing a run ([Export](docs/TELEMETRY.md#export))
 - A Usage page and `bw usage`: tokens by project, model, and day, run success, output speed,
   compaction savings, and top tools, read from those local metrics
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
@@ -115,6 +118,11 @@ one as a tree; the desktop **Settings → Workflows → Runs** panel shows the s
 local days (1–400), by
 project and model; **Settings → Workflows → Usage** shows the same numbers with a chart and a
 per-project session breakdown. See [Usage](docs/RUNTIME_GUIDE.md#usage).
+`bw config set otlp-endpoint <url|off>` (plus `otlp-protocol`, `otlp-signals`, and
+`otlp-include-project`) exports them over OTLP/HTTP; `bw telemetry header <name>` stores a header
+value piped on stdin in the credential store, and `bw telemetry test` sends a test span.
+`bw config set usage-retention-days <30-3650|forever>` sets how long usage metrics are kept
+(400 days by default). See [Telemetry export](docs/RUNTIME_GUIDE.md#telemetry-export).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues

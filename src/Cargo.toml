@@ -19,6 +19,8 @@ opentelemetry = { version = "=0.33.1", default-features = false, features = ["tr
 opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["with-serde", "gen-tonic-messages", "trace", "metrics"] }
 opentelemetry-semantic-conventions = { version = "=0.33.1", features = ["semconv_experimental"] }
 opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
+# The protobuf encoder opentelemetry-proto already uses, for OTLP/HTTP protobuf export.
+prost = { version = "=0.14.4", default-features = false, features = ["std"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rand = "0.10.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }

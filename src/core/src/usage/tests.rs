@@ -577,3 +577,85 @@ fn export_uses_local_days() {
     std::fs::remove_dir_all(directory).unwrap();
     std::fs::remove_dir_all(dest).unwrap();
 }
+
+#[test]
+fn recording_off_periods_listed_in_gaps() {
+    use crate::telemetry::Surface::{Cli as CLI, Desktop as DESKTOP};
+    let directory = folder();
+    let day_ms = |day: u32, hour: u64| u64::from(day) * 86_400_000 + hour * 3_600_000;
+    // Off on day D+1 at 10:00, back on at 15:00; off again on D+3 and still off. The repeated
+    // "off" and an unreadable line change nothing.
+    recording::mark_at(&directory, false, DESKTOP, day_ms(D + 1, 10));
+    recording::mark_at(&directory, false, DESKTOP, day_ms(D + 1, 11));
+    recording::mark_at(&directory, true, DESKTOP, day_ms(D + 1, 15));
+    recording::mark_at(&directory, false, DESKTOP, day_ms(D + 3, 9));
+    let markers = directory.join(METRICS_DIRECTORY).join(RECORDING_FILE);
+    let mut body = std::fs::read_to_string(&markers).unwrap();
+    body.push_str("not json\n");
+    // A marker from an unknown surface is ignored.
+    body.push_str(&format!(
+        "{{\"unixMs\":{},\"recording\":false,\"surface\":\"<b>x</b>\"}}\n",
+        day_ms(D + 2, 1)
+    ));
+    std::fs::write(&markers, body).unwrap();
+    let summary = summary(&directory, Day(D), Day(D + 4), 0);
+    assert_eq!(
+        summary.gaps.off_periods,
+        vec![
+            OffPeriod {
+                surface: "desktop".into(),
+                from_unix_ms: Some(day_ms(D + 1, 10)),
+                to_unix_ms: Some(day_ms(D + 1, 15)),
+            },
+            OffPeriod {
+                surface: "desktop".into(),
+                from_unix_ms: Some(day_ms(D + 3, 9)),
+                to_unix_ms: None,
+            },
+        ]
+    );
+    // Only periods overlapping the range are listed; the marker file is not a metrics file.
+    let late = super::summary(&directory, Day(D + 2), Day(D + 2), 0);
+    assert!(late.gaps.off_periods.is_empty());
+    assert_eq!(late.files, 0);
+    // Local days: at UTC-7, D+1 ends at 07:00 UTC on D+2, after the first period.
+    let pacific = super::summary(&directory, Day(D + 1), Day(D + 1), PDT);
+    assert_eq!(pacific.gaps.off_periods.len(), 1);
+    // A first "on" means recording was off before it, since only changes are marked.
+    let other = folder();
+    recording::mark_at(&other, true, CLI, day_ms(D + 1, 8));
+    assert_eq!(
+        super::summary(&other, Day(D), Day(D + 1), 0)
+            .gaps
+            .off_periods,
+        vec![OffPeriod {
+            surface: "cli".into(),
+            from_unix_ms: None,
+            to_unix_ms: Some(day_ms(D + 1, 8)),
+        }]
+    );
+    // Each surface has its own switch: bw turning on does not end the desktop's off period.
+    recording::mark_at(&directory, true, CLI, day_ms(D + 3, 12));
+    let both = super::summary(&directory, Day(D + 3), Day(D + 3), 0);
+    assert_eq!(both.gaps.off_periods.len(), 2);
+    assert_eq!(both.gaps.off_periods[1].to_unix_ms, None);
+    // Only the first 1 MiB is read: markers past it are ignored.
+    let big = folder();
+    recording::mark_at(&big, false, DESKTOP, day_ms(D + 1, 1));
+    let path = big.join(METRICS_DIRECTORY).join(RECORDING_FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("{}\n", " ".repeat(1024 * 1024)));
+    text.push_str(&format!(
+        "{{\"unixMs\":{},\"recording\":true,\"surface\":\"desktop\"}}\n",
+        day_ms(D + 1, 2)
+    ));
+    std::fs::write(&path, text).unwrap();
+    let capped = super::summary(&big, Day(D), Day(D + 1), 0);
+    assert_eq!(capped.gaps.off_periods.len(), 1);
+    assert_eq!(capped.gaps.off_periods[0].to_unix_ms, None);
+    std::fs::remove_dir_all(big).unwrap();
+    let json = serde_json::to_value(&summary.gaps).unwrap();
+    assert_eq!(json["offPeriods"][1]["toUnixMs"], serde_json::Value::Null);
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(other).unwrap();
+}

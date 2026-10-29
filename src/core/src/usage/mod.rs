@@ -4,6 +4,10 @@
 //! Everything here reads files the owner already has; nothing is sent anywhere. Unreadable lines,
 //! such as one truncated by a crash, are skipped with one warning per file, so a damaged file
 //! never hides the rest of the range.
+mod recording;
+
+pub use recording::{mark_recording, OffPeriod, RECORDING_FILE};
+
 use crate::telemetry::{
     file_metrics::{civil_from_days, day_of, file_name, parse_name},
     names, METRICS_DIRECTORY,
@@ -196,8 +200,7 @@ pub struct ToolRow {
     pub timeouts: u64,
 }
 
-/// What the range cannot show. Past periods with recording off are not knowable from the
-/// metrics files; PR 3 records on/off changes so they can be listed here.
+/// What the range cannot show.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Gaps {
@@ -205,6 +208,9 @@ pub struct Gaps {
     pub first_day: Option<String>,
     /// Runs whose trace was dropped by a full writer queue.
     pub dropped_runs: u64,
+    /// Periods in the range with recording turned off, from `metrics/recording.jsonl`. Changes
+    /// made before recording markers existed are not known.
+    pub off_periods: Vec<OffPeriod>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -291,6 +297,10 @@ pub fn summary_at(
     summary.gaps.first_day = first
         .filter(|first| *first > from)
         .map(|day| day.to_string());
+    let offset_ms = i64::from(clamp_offset(offset_minutes)) * 60_000;
+    let edge = |day: u32| (i64::from(day) * 86_400_000 - offset_ms).max(0) as u64;
+    summary.gaps.off_periods =
+        recording::off_periods(data_dir, edge(from.0), edge(to.0.saturating_add(1)));
     summary.warnings = warnings;
     summary.files = read;
     summary.newest_unix_ms = newest_unix_ms;
@@ -780,6 +790,7 @@ impl Aggregate {
             gaps: Gaps {
                 first_day: None,
                 dropped_runs: self.dropped_runs,
+                off_periods: vec![],
             },
             warnings: vec![],
             telemetry_enabled: true,
