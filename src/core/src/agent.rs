@@ -89,7 +89,7 @@ impl AgentError {
             Self::Budget(ContextError::Limit) | Self::Context => RunReason::Budget,
             Self::Budget(ContextError::Iterations) | Self::Iterations => RunReason::Iterations,
             Self::Budget(ContextError::Model(_)) | Self::Model(_) => RunReason::Model,
-            Self::Tool(tools::ToolError::Denied) => RunReason::Denied,
+            // `Denied` is only a run that completed after a denial; a run that fails is an error.
             Self::Budget(_) | Self::Review(_) | Self::Instructions | Self::Tool(_) => {
                 RunReason::Error
             }
@@ -922,10 +922,8 @@ mod tests {
             ),
             (AgentError::Budget(ContextError::Limit), RunReason::Budget),
             (AgentError::Context, RunReason::Budget),
-            (
-                AgentError::Tool(tools::ToolError::Denied),
-                RunReason::Denied,
-            ),
+            (AgentError::Tool(tools::ToolError::Denied), RunReason::Error),
+            (AgentError::Model(ModelError::Limit), RunReason::Model),
             (AgentError::Tool(tools::ToolError::File), RunReason::Error),
             (AgentError::Budget(ContextError::History), RunReason::Error),
             (AgentError::Instructions, RunReason::Error),
