@@ -482,6 +482,25 @@ fn result_line_has_reason_denied_and_usage() {
 }
 
 #[test]
+fn timeout_equals_form_and_double_dash_are_accepted() {
+    let fixture = Fixture::new();
+    let server = Server::start(vec![answer("First."), answer("Second.")]);
+    fixture.connect(&server);
+    let output = fixture.run(&["run", "--timeout=30", "--json", "say done"]);
+    assert_exit(&output, 0, "complete");
+    let session = result_line(&output)["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unknown = fixture.run(&["resume", &session, "--json", "--bogus", "go on"]);
+    assert_exit(&unknown, 2, "usage");
+    // After `--`, a prompt may start with `--`.
+    let output = fixture.run(&["run", "--json", "--", "--explain this flag"]);
+    assert_exit(&output, 0, "complete");
+    assert_eq!(server.finish(), 2);
+}
+
+#[test]
 fn timeout_flag_out_of_range_is_usage_error() {
     let fixture = Fixture::new();
     let server = Server::start(vec![]);
@@ -494,6 +513,34 @@ fn timeout_flag_out_of_range_is_usage_error() {
     assert_exit(&missing, 2, "usage");
     let no_prompt = fixture.run(&["run", "--json"]);
     assert_exit(&no_prompt, 2, "usage");
+    for arguments in [
+        &["run", "--json", "--verbose", "say done"][..],
+        &["run", "--verbose", "--json", "say done"],
+        &[
+            "run",
+            "--json",
+            "--timeout",
+            "30",
+            "--timeout",
+            "40",
+            "say done",
+        ],
+        &["run", "--json", "--timeout=30", "--timeout=40", "say done"],
+        &[
+            "run",
+            "--timeout",
+            "30",
+            "--json",
+            "--timeout=40",
+            "say done",
+        ],
+        &["run", "--json", "--timeout=", "say done"],
+        &["run", "--json", "--timeout=9", "say done"],
+        &["run", "--json", "--json", "say done"],
+    ] {
+        let output = fixture.run(arguments);
+        assert_exit(&output, 2, "usage");
+    }
     // Without --json there is no result line, but the exit code is the same.
     let plain = fixture.run(&["run", "--timeout", "86401", "say done"]);
     assert_eq!(plain.status.code(), Some(2));
