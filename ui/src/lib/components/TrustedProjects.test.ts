@@ -7,7 +7,13 @@ function client(paths: string[]) {
   return {
     status: vi.fn(),
     trust: vi.fn(),
-    trusted: vi.fn(async () => paths.map((path) => ({ path, sha256: 'abcdef0123456789' }))),
+    trusted: vi.fn(async () =>
+      paths.map((path) => ({
+        path,
+        label: path.replace(/^\\\\\?\\/, ''),
+        sha256: 'abcdef0123456789',
+      })),
+    ),
     untrust: vi.fn(async () => undefined),
   };
 }
@@ -36,5 +42,14 @@ describe('Trusted projects in Settings', () => {
     const empty = client([]);
     render(TrustedProjects, { client: empty });
     expect(await screen.findByText('No trusted projects.')).toBeInTheDocument();
+  });
+
+  it('shows Windows folders without the verbatim prefix but untrusts by the stored path', async () => {
+    const user = userEvent.setup();
+    const fake = client(['\\\\?\\C:\\work\\app']);
+    render(TrustedProjects, { client: fake });
+    expect(await screen.findByText('C:\\work\\app')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Untrust C:\\work\\app' }));
+    expect(fake.untrust).toHaveBeenCalledWith('\\\\?\\C:\\work\\app');
   });
 });

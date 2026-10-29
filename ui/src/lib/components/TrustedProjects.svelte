@@ -45,12 +45,12 @@
 <ul>
   {#each projects as project (project.path)}
     <li>
-      <span title={project.path}>{project.path}</span>
+      <span title={project.label}>{project.label}</span>
       <small>{project.sha256.slice(0, 12)}</small>
       <button
         onclick={() => untrust(project)}
         disabled={busy}
-        aria-label={`Untrust ${project.path}`}>Untrust</button
+        aria-label={`Untrust ${project.label}`}>Untrust</button
       >
     </li>
   {/each}
