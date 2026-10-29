@@ -239,8 +239,8 @@ status. When the app or `bw` exits, it waits up to 3 s for queued data.
 the last successful send, the last error as its class and HTTP status (`connect`, `timeout`,
 `redirect`, `http_status`, `missing_header`, …; response bodies are never read or shown), and the
 spans and metric batches sent and dropped since the app started. **Send test span** sends one span
-named `blackwall test span` with the saved settings (save changes first) and reports the HTTP
-status.
+named `blackwall test span` with the saved settings (save changes first), reading headers exactly
+as export does, and reports the HTTP status; a header saved for another origin fails the test.
 
 ### Examples
 

@@ -569,14 +569,15 @@ pub async fn send_test_span_with(
     post(&client()?, url, headers, config.protocol, body).await
 }
 
-/// Send one test span, reading header values from the credential store. Returns the HTTP status.
+/// Send one test span with saved settings, reading header values from the credential store the
+/// same way export does: a header saved for another origin fails the test, as it pauses export.
+/// Returns the HTTP status.
 pub async fn send_test_span(config: &ExportConfig, surface: &str) -> Result<u16, ExportError> {
     let validated = config.validated()?;
     let lookup = validated.clone();
-    let headers =
-        tokio::task::spawn_blocking(move || resolve_test_headers(&lookup, &keychain_header))
-            .await
-            .map_err(|_| ExportError::CredentialStore)??;
+    let headers = tokio::task::spawn_blocking(move || resolve_headers(&lookup, &keychain_header))
+        .await
+        .map_err(|_| ExportError::CredentialStore)??;
     send_test_span_with(&validated, &headers, surface).await
 }
 
