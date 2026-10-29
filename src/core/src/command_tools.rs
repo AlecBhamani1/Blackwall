@@ -230,6 +230,29 @@ impl CommandTools {
     }
 }
 
+/// Check that the owner's `tools.json` in `directory` has a tool named `name` that a subagent
+/// can run on. Used when the owner chooses it, so a mistake shows before a run needs it.
+pub fn check_delegate(directory: &Path, name: &str) -> Result<(), String> {
+    let mut body = vec![];
+    let read = std::fs::File::open(directory.join(COMMAND_TOOLS_FILE)).and_then(|file| {
+        use std::io::Read;
+        file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut body)
+    });
+    let tools = match read {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(_) => return Err("The tools file could not be read.".into()),
+        Ok(_) => parse_file(&body).map_err(str::to_owned)?,
+    };
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| format!("There is no command tool named {name} in {COMMAND_TOOLS_FILE}."))?;
+    match tool.delegate_problem() {
+        Some(problem) => Err(problem.into()),
+        None => Ok(()),
+    }
+}
+
 /// Check `args` against an owner schema: an object with only declared names, every required
 /// name present, and each value of its declared type and, when listed, one of its choices.
 pub fn validate_arguments(schema: &Schema, args: &Value) -> Result<(), ToolError> {
