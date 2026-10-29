@@ -113,9 +113,9 @@ Servers can be local commands or streamable HTTP addresses:
 `bw mcp add docs --url https://mcp.example.com/mcp --header Authorization=DOCS_TOKEN`, then
 `pbpaste | bw mcp secret docs DOCS_TOKEN`. Header values always come from saved secrets.
 In the desktop app, open **Settings → AI capabilities → MCP servers** to manage them.
+Settings groups related tools together; search by purpose or choose **Sort by → Name (A–Z)**.
 Command and HTTP tools are edited in `tools.json`; `bw tools secret <tool> <NAME>` saves an HTTP
 tool header value, piped on stdin, for that tool's origin.
-Settings groups related tools together; search by purpose or choose **Sort by → Name (A–Z)**.
 `/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
 proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.
 `bw skills import <path>` brings in `SKILL.md` skills from Claude Code, Codex, and other agents,
