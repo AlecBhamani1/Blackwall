@@ -77,6 +77,8 @@ impl Fixture {
         self.command(arguments).output().unwrap()
     }
 
+    // Only the Unix-only interrupt test spawns a background run.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn spawn(&self, arguments: &[&str]) -> Child {
         self.command(arguments).spawn().unwrap()
     }
@@ -113,6 +115,7 @@ struct Server {
     endpoint: String,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<usize>>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     received: Receiver<()>,
 }
 
