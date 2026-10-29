@@ -306,23 +306,40 @@ command. Give it a `url`, and `headers` whose values each name a saved secret:
 ```
 
 Each entry has exactly one of `command` and `url`. The URL must use https; plain http is allowed only
-for `127.0.0.1`, `::1`, and `localhost`, and a URL may not contain a user name or password. A header
-value must be exactly `{secret:NAME}`: the header is sent with that secret's saved value, so save the
-whole value, such as `Bearer <token>` for `Authorization`. Literal header values are refused, and
-the protocol's own headers (`Accept`, `Content-Type`, `Mcp-Session-Id`, `MCP-Protocol-Version`,
-`Host` and similar) cannot be set. Secret values are removed from tool results and errors.
+for the literal addresses `127.0.0.1` and `::1` (not `localhost`, which a hosts file could point
+elsewhere), and a URL may not contain a user name or password. A header value must be exactly
+`{secret:NAME}`: the header is sent with that secret's saved value, so save the whole value, such as
+`Bearer <token>` for `Authorization`. Literal header values are refused, and the protocol's and
+HTTP's own headers (`Accept`, `Content-Type`, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Host`,
+`Connection`, `Upgrade`, `Expect`, `Keep-Alive`, `Trailer`, `Proxy-Authorization`, `Cookie` and
+similar) cannot be set. Secret values are removed from tool results, errors, tool descriptions and
+input schemas.
+
+A URL server's secrets are bound to the origin (`scheme://host:port`) they were saved for:
+`bw mcp secret` records it under `secretOrigins`, and a header is sent only when its secret was saved
+for the URL's current origin. If the URL moves to another origin, or a local server's environment
+secret is reused as a header, the server is skipped with a warning until the secret is saved again,
+and `bw mcp list` and the desktop show which secrets were saved for another address. Saving a
+server whose origin changed through Blackwall also removes its approval rules, so it asks again;
+edit `url` with care by hand, as a hand edit keeps the rules in `policy.json`.
 
 Blackwall posts each JSON-RPC message with `Accept: application/json, text/event-stream`, reads a
-JSON or event-stream reply, keeps the `Mcp-Session-Id` from initialization, and sends `DELETE` to end
-the session when the run ends. It never uses a proxy from `HTTPS_PROXY` or similar variables and
-follows redirects only within the server's origin. Limits: a reply is at most 1 MiB in total, an
-event-stream line at most 64 KiB, and a session id at most 128 visible ASCII characters. Requests
-the server sends on a reply stream are answered "method not found" (ping is answered). Startup has
-15 seconds and calls use the command time limit, as for local servers; a server that times out or
-fails is not used again in that run. Servers that need OAuth sign-in are not supported yet; bearer
-tokens and API-key headers cover most hosted servers.
+JSON or event-stream reply (single messages or batches), keeps the `Mcp-Session-Id` from
+initialization, and sends `DELETE` to end the session when the run ends. If the server forgets the
+session (404), Blackwall initializes again once and retries. It never uses a proxy from
+`HTTPS_PROXY` or similar variables and follows only 307 and 308 redirects within the server's
+origin; others are errors. Replies to notifications and to the server's own requests should be
+202 Accepted; any body they carry is closed unread. Limits: a reply is at most 1 MiB in total, at
+most 256 messages wait at once, a server may send at most 32 requests of its own while answering
+one call (more stops the server for the run), and a session id is at most 128 visible ASCII
+characters. Requests the server sends on a reply stream are answered "method not found" (ping is
+answered). Startup has 15 seconds and calls use the command time limit, as for local servers; a
+server that times out or fails is not used again in that run. Servers that need OAuth sign-in are
+not supported yet; bearer tokens and API-key headers cover most hosted servers.
 
-Server names that start with `p-` are reserved for project servers and are refused in `mcp.json`.
+Server names that start with `p-` are reserved for project servers. Blackwall will not add one, and
+an existing `mcp.json` entry with such a name is skipped with a warning to rename it; the other
+servers still start.
 
 In the desktop app, **Settings → AI capabilities → MCP servers** lists the servers with enable and
 disable toggles, adds a server from its command line or, with the **Command | URL** switch, from
