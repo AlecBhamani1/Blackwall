@@ -1021,6 +1021,46 @@ mod tests {
         ]}})
     }
 
+    #[test]
+    fn project_json_parser_fuzz_is_panic_free_and_bounded() {
+        fn next(state: &mut u64) -> u8 {
+            *state = state
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            (*state >> 33) as u8
+        }
+
+        let mut seed = 0xb1ac_6a11_2026_1029;
+        for _ in 0..512 {
+            let len = usize::from(next(&mut seed)) * 16;
+            let bytes = (0..len).map(|_| next(&mut seed)).collect::<Vec<_>>();
+            assert!(bytes.len() <= 4 * 1024);
+            let parsed = std::panic::catch_unwind(|| parse(&bytes));
+            assert!(parsed.is_ok());
+            if let Ok(config) = parsed.unwrap() {
+                // Successful output is made only from the bounded input plus small defaults.
+                assert!(serde_json::to_vec(&config).unwrap().len() <= MAX_PROJECT_BYTES + 1024);
+            }
+        }
+
+        let nested = format!("{}0{}", "[".repeat(4096), "]".repeat(4096));
+        let many_rules = format!(
+            r#"{{"policy":{{"rules":[{}]}}}}"#,
+            r#"{"decision":"deny","kind":"network","host":"x"},"#
+                .repeat(201)
+                .trim_end_matches(',')
+        );
+        for bytes in [
+            nested.into_bytes(),
+            many_rules.into_bytes(),
+            vec![b' '; MAX_PROJECT_BYTES],
+            vec![0xff; MAX_PROJECT_BYTES],
+        ] {
+            assert!(bytes.len() <= MAX_PROJECT_BYTES + 1024);
+            assert!(std::panic::catch_unwind(|| parse(&bytes)).is_ok());
+        }
+    }
+
     #[tokio::test]
     async fn untrusted_project_allow_is_ignored() {
         let folders = Folders::new();
