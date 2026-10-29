@@ -427,29 +427,38 @@ Guest chats never receive owner memory, skills, project tools, or local conversa
 
 ## Agent traces
 
-Each CLI and desktop Agent run records a local trace in `~/.blackwall/traces` (or the
-`BLACKWALL_DATA_DIR` data folder). A trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with
-a span for the run, each model call, and each tool call, using the OpenTelemetry generative AI names
-(`invoke_agent`, `chat`, `execute_tool`). Spans keep timings, the model, token counts the server
-reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the newest 200
-traces and never sends them anywhere.
+Each CLI and desktop Agent run, and each desktop Chat run, records a local trace in
+`~/.blackwall/traces` (or the `BLACKWALL_DATA_DIR` data folder) through the OpenTelemetry SDK. A
+trace is one JSON file in the OpenTelemetry (OTLP/JSON) format with a span for the run, each model
+call, and each tool call, using the OpenTelemetry generative AI names (`invoke_agent`, `chat`,
+`execute_tool`). A `spawn_agent` child appears as `invoke_agent subagent` under its tool call,
+with its own model and tool calls nested beneath it. Spans keep timings, the model, token counts
+the server reports, finish reasons, tool names, errors, and approval requests. Blackwall keeps the
+newest 200 traces and never sends them anywhere.
+
+The same switch records usage metrics in `~/.blackwall/metrics/YYYY-MM-DD.jsonl`: token usage and
+duration per model call, tool calls by outcome, and runs by outcome, kept for 400 days. Metrics
+never include prompts, answers, tool arguments, or paths. See [Telemetry](TELEMETRY.md) for every
+signal, attribute, and file format.
 
 `bw traces` lists recent runs with their duration, model and tool calls, tokens, and any failure.
-`bw traces show <id>` prints one run as a tree. Turn traces off with `bw config set traces off`.
+`bw traces show <id>` prints one run as a tree. Turn traces and usage metrics off with
+`bw config set traces off`.
 
-By default a trace holds no prompt, answer, tool argument, or tool output text. `bw config set
-trace-content on` also records tool arguments, tool results, and model answers, each redacted like
-audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. A value
-redacted anywhere in a run is removed wherever else it appears in that trace, such as when the model
-repeats it. Redaction matches common secret names and forms and can miss others. A failed command's
-output is also content, so without it the trace only says the tool reported an error. If a trace
-with content would pass 4 MiB, its content is left out. Traces with content can still include private file contents, so
-turn it on only while investigating a run.
+By default a trace holds no prompt, answer, tool argument, or tool output text, and a failure shows
+only its error class, such as `denied`, `execution`, or `cancelled`. `bw config set
+trace-content on` also records tool arguments, tool results, model answers, and failure messages,
+each redacted like audit entries (plus secret-named JSON and YAML fields) and cut to 4 KiB. When
+the run ends, a value redacted anywhere in it is removed wherever else it appears in that trace,
+such as when the model repeats it. Redaction matches common secret names and forms and can miss
+others. If a trace with content would pass 4 MiB, its content is left out. Traces with content can
+still include private file contents, so turn it on only while investigating a run.
 
 In the desktop app, **Settings → Workflows → Runs** lists the 50 newest runs and opens one as a tree
-of model and tool steps, with failures, approval requests, and any captured content. **Record agent runs** and **Include
-content** in that panel set the desktop's `tracesEnabled` and `traceContent` preferences.
-Subagent runs and compaction requests are not traced yet.
+of model and tool steps, with failures, approval requests, and any captured content. **Record agent
+runs** and **Include content** in that panel set the desktop's `tracesEnabled` and `traceContent`
+preferences, which apply to Chat runs too. `/compact` requests are not recorded as runs; their
+summary calls count only toward usage metrics.
 
 ## App lock
 

@@ -281,6 +281,25 @@ enum BridgeError {
     Emit(#[source] tauri::Error),
 }
 
+impl BridgeError {
+    /// The error class for telemetry, in the same vocabulary as `ModelError::kind`, so both Chat
+    /// paths report failures alike.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "network",
+            Self::HttpStatus { .. } | Self::ModelError(_) => "http",
+            Self::Decode(_) | Self::EmptyModelResponse => "invalid_response",
+            Self::ResponseTooLarge { .. } => "limit",
+            Self::Protocol(_)
+            | Self::InvalidEndpoint { .. }
+            | Self::UnsupportedEndpointScheme(_)
+            | Self::EndpointCredentialsNotAllowed
+            | Self::AttachmentsRequireUserMessage
+            | Self::Emit(_) => "_OTHER",
+        }
+    }
+}
+
 /// Returns the normalized endpoint selected from the process configuration.
 #[tauri::command]
 pub(crate) fn model_endpoint(state: State<'_, AppState>) -> Result<String, CommandError> {
@@ -396,10 +415,59 @@ pub(crate) async fn chat(
     let selected =
         selected_endpoint(&request, &state.default_endpoint).map_err(CommandError::from)?;
     let api_key = scoped_api_key(&state, &selected).await?;
-    tokio::select! {
+    // Dropped with a stopped request, the scope is written as cancelled.
+    let scope = crate::data::run_scope(
+        &app,
+        &request.request_id,
+        blackwall_core::telemetry::Mode::Chat,
+        false,
+    )
+    .await;
+    let model = request.model.clone();
+    let call = scope.as_ref().map(|scope| {
+        let root = scope.root();
+        scope.rename(&root, &format!("chat {model}"));
+        scope.begin_model_call(&root, &model)
+    });
+    // `None` when stopped: like a stopped stream, the call is left open and closed as cancelled.
+    let outcome = tokio::select! {
         biased;
-        _ = job.cancelled() => Err(CommandError { code: "request_stopped", message: "Response stopped.".into(), retryable: false }),
-        response = complete_chat(&state.client, api_key.as_deref(), &state.default_endpoint, request) => response.map_err(CommandError::from),
+        _ = job.cancelled() => None,
+        response = complete_chat(&state.client, api_key.as_deref(), &state.default_endpoint, request) => Some(response),
+    };
+    if let (Some(scope), Some(call), Some(response)) = (&scope, call, &outcome) {
+        let message = response.as_ref().err().map(ToString::to_string);
+        scope.end_model_call(
+            call,
+            blackwall_core::telemetry::Mode::Chat,
+            &selected,
+            match (response, &message) {
+                (Ok(response), _) => Ok(blackwall_core::telemetry::ModelReply {
+                    usage: response.usage.as_ref(),
+                    tool_calls: false,
+                    content: &response.message.content,
+                }),
+                (Err(error), message) => Err(blackwall_core::telemetry::ModelFailure {
+                    kind: error.kind(),
+                    message: message.as_deref().unwrap_or_default(),
+                }),
+            },
+        );
+    }
+    if let Some(scope) = scope {
+        scope.finish(match &outcome {
+            Some(Ok(_)) => blackwall_core::telemetry::RunOutcome::Complete,
+            None => blackwall_core::telemetry::RunOutcome::Cancelled,
+            Some(Err(_)) => blackwall_core::telemetry::RunOutcome::Error,
+        });
+    }
+    match outcome {
+        Some(response) => response.map_err(CommandError::from),
+        None => Err(CommandError {
+            code: "request_stopped",
+            message: "Response stopped.".into(),
+            retryable: false,
+        }),
     }
 }
 
@@ -538,7 +606,13 @@ pub(crate) async fn stream_chat(
             })?;
         #[cfg(target_os = "macos")]
         crate::lifecycle::login_path_settled().await;
-        let trace = crate::data::trace_options(instruction_directory.clone()).await;
+        let trace = crate::data::run_scope(
+            &app,
+            &request_id,
+            blackwall_core::telemetry::Mode::Agent,
+            request.compact,
+        )
+        .await;
         workspace.execution = blackwall_core::sandbox::ExecutionPolicy {
             profile: options.execution_profile,
             network: options.command_network,
@@ -749,7 +823,13 @@ async fn stream_chat_events(
         budget: request.context_budget,
         instructions,
         compact: request.compact,
-        trace: Default::default(),
+        trace: crate::data::run_scope(
+            app,
+            &request.request_id,
+            blackwall_core::telemetry::Mode::Chat,
+            request.compact,
+        )
+        .await,
     };
     let emit = |event| {
         let _ = emit_event(app, &event);
@@ -1113,6 +1193,28 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn one_shot_chat_errors_use_the_model_error_vocabulary() {
+        let model_kinds = ["network", "http", "invalid_response", "limit"];
+        let errors = [
+            BridgeError::HttpStatus {
+                status: StatusCode::BAD_GATEWAY,
+                body: String::new(),
+            },
+            BridgeError::ModelError("rejected".into()),
+            BridgeError::EmptyModelResponse,
+            BridgeError::ResponseTooLarge { maximum_bytes: 1 },
+            BridgeError::Decode(serde_json::from_str::<u8>("x").unwrap_err()),
+        ];
+        for error in &errors {
+            assert!(model_kinds.contains(&error.kind()), "{error}");
+        }
+        assert_eq!(errors[0].kind(), "http");
+        assert_eq!(errors[2].kind(), "invalid_response");
+        assert_eq!(errors[3].kind(), "limit");
+        assert_eq!(BridgeError::EndpointCredentialsNotAllowed.kind(), "_OTHER");
+    }
 
     #[test]
     fn public_model_failures_classify_recovery_without_exposing_upstream_bodies() {

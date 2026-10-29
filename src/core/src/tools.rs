@@ -19,6 +19,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 const MAX_FILE: usize = 64 * 1024;
+/// The error a command that ran past its deadline returns; telemetry counts it as a timeout.
+pub(crate) const TIME_LIMIT_MESSAGE: &str = "The command exceeded its time limit and was stopped.";
 
 /// Project-relative labels use `/` everywhere; Windows file names cannot contain `\`.
 pub(crate) fn label(path: &Path) -> Option<String> {
@@ -697,9 +699,9 @@ pub(crate) async fn run_with_timeout(
             Err(ToolError::Execution(output))
         }
     };
-    tokio::time::timeout(timeout, capture).await.map_err(|_| {
-        ToolError::Execution("The command exceeded its time limit and was stopped.".into())
-    })?
+    tokio::time::timeout(timeout, capture)
+        .await
+        .map_err(|_| ToolError::Execution(TIME_LIMIT_MESSAGE.into()))?
 }
 
 #[cfg(test)]

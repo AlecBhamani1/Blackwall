@@ -138,6 +138,48 @@ pub(crate) async fn trace_options(
     }
 }
 
+/// The desktop's telemetry, started on first use and flushed at exit.
+#[derive(Default)]
+pub(crate) struct TelemetryState(std::sync::OnceLock<blackwall_core::telemetry::Telemetry>);
+
+impl TelemetryState {
+    /// Flush and stop the providers when the app exits.
+    pub(crate) fn shutdown(&self) {
+        if let Some(telemetry) = self.0.get() {
+            telemetry.clone().shutdown();
+        }
+    }
+}
+
+/// A run's telemetry under the owner's current trace settings. `None` only when the data folder
+/// cannot be found; with traces off the scope records nothing. A compaction request is not a run:
+/// its scope only meters the summary calls.
+pub(crate) async fn run_scope(
+    app: &AppHandle,
+    request_id: &str,
+    mode: blackwall_core::telemetry::Mode,
+    compact: bool,
+) -> Option<blackwall_core::telemetry::RunScope> {
+    let directory = crate::identity::data_directory(app).ok()?;
+    let options = trace_options(directory.clone()).await;
+    let state = app.state::<TelemetryState>();
+    let telemetry = state.0.get_or_init(|| {
+        blackwall_core::telemetry::Telemetry::start(
+            &directory,
+            blackwall_core::telemetry::TelemetryOptions::from_trace(
+                options,
+                blackwall_core::telemetry::Surface::Desktop,
+            ),
+        )
+    });
+    telemetry.set_options(options);
+    Some(if compact {
+        telemetry.compaction(mode)
+    } else {
+        telemetry.run(request_id, mode)
+    })
+}
+
 #[tauri::command]
 pub async fn load_preferences(app: AppHandle) -> Result<Value, String> {
     with_store(&app, |store| {
