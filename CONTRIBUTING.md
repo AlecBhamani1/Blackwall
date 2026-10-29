@@ -2,7 +2,9 @@
 
 Thank you for helping make Blackwall a dependable local-first agent harness. This guide
 describes the baseline expected of every change. The architecture and security invariants are
-documented in `docs/PLAN.md` while the initial implementation is being built.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), current behaviour in
+[docs/RUNTIME_GUIDE.md](docs/RUNTIME_GUIDE.md), and agent instructions in
+[docs/PROJECT_INSTRUCTIONS.md](docs/PROJECT_INSTRUCTIONS.md).
 
 Start feature branches from `origin/partial` and target `partial` with development PRs.
 `main` is production and accepts release promotions from `partial` only. Follow the
@@ -81,6 +83,15 @@ npm run test:release
 Tests should be deterministic and offline. Use scripted model backends and local test servers;
 cover both the success path and security boundaries such as path traversal, denial decisions,
 timeouts, interrupts, and SSRF protections.
+
+Parsers that read untrusted bytes (MCP streamable-HTTP events, `project.json`, text tool calls and
+`<think>` tags, the OTLP metrics files, command-tool URL templates and policy rules) each have a
+`*_fuzz_is_panic_free_and_bounded` test: a fixed-seed generator feeds random and adversarial input
+and checks that nothing panics and output stays within the input's size. They run with the normal
+suite (`cargo test … fuzz`). When you add a parser like these, add one in the same style.
+
+For a local coverage report, install `cargo-llvm-cov` and run
+`cargo llvm-cov --manifest-path src/Cargo.toml --workspace --html`. Coverage is not enforced in CI.
 
 Lefthook runs formatting and static analysis before commits, test suites before pushes, and
 commitlint on commit messages. Hooks supplement CI; they do not replace it.

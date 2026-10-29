@@ -1,7 +1,7 @@
 # Blackwall architecture
 
 This document describes the desktop chat, project agent, durable local data, and guest-sharing
-boundaries. `DELIVERY_PLAN.md` records verified work and remaining product/release gaps.
+boundaries. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) lists the remaining release gates.
 
 ## Context and containers
 
@@ -225,12 +225,15 @@ through the native folder picker; absolute paths, parent traversal, `.git`, and 
 project are rejected. Literal search is bounded and skips dependency folders. Edits display a unified
 diff and compare the original file again before an atomic replacement.
 
-Shell actions display the exact command and working directory. They run with the user's account
-permissions, **without an OS sandbox**. Each command has a configurable deadline (two minutes by default), output
+Shell actions display the exact command and working directory. They run under the owner's
+execution profile: **read-only** by default, **workspace-write**, or **unsandboxed** (full account
+permissions). On macOS the restricted profiles are enforced by Seatbelt before the program starts;
+Linux and Windows refuse restricted profiles rather than run unconfined (see
+[Runtime guide](RUNTIME_GUIDE.md)). Each command has a configurable deadline (two minutes by default), output
 trimmed to its start and end above a configurable cap (64 KiB by default) with a stream stopped
 past 64 MiB, and a process-group guard that kills descendants on cancellation. Known model,
-relay, and signing secrets are removed from the inherited environment. Other account access remains
-possible and is covered by the explicit command approval.
+relay, and signing secrets are removed from the inherited environment. In the unsandboxed profile other
+account access remains possible and is covered by the explicit command approval.
 
 `core::approvals` binds decisions to an active request and exact action. “Allow identical action this
 run” expires when the run ends. Dropping a pending action invalidates its decision handle.

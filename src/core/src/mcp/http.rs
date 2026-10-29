@@ -931,6 +931,53 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn sse_parser_fuzz_is_panic_free_and_bounded() {
+        fn next(state: &mut u64) -> u8 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (*state >> 32) as u8
+        }
+
+        let mut seed = 0x5eed_f00d_cafe_babe;
+        for _ in 0..512 {
+            let len = usize::from(next(&mut seed)) * 8;
+            let mut input = (0..len).map(|_| next(&mut seed)).collect::<Vec<_>>();
+            // Regularly mix in SSE delimiters and JSON-looking bytes.
+            for (at, byte) in b"data: {\"x\":1}\n\n\r:{}[]".iter().enumerate() {
+                if !input.is_empty() {
+                    let index = (at * 97 + usize::from(next(&mut seed))) % input.len();
+                    input[index] = *byte;
+                }
+            }
+            let mut parser = EventParser::default();
+            let mut out = VecDeque::new();
+            let mut at = 0;
+            while at < input.len() {
+                let width = usize::from(next(&mut seed) % 31) + 1;
+                let end = (at + width).min(input.len());
+                parser.feed(&input[at..end], &mut out).unwrap();
+                at = end;
+            }
+            parser.finish(&mut out);
+            assert!(parser.line.len() + parser.data.len() <= input.len());
+            assert!(out.len() <= input.len());
+        }
+
+        for input in [
+            vec![b'x'; MAX_MESSAGE_BYTES + 1],
+            [b"data: ".as_slice(), &vec![b'['; MAX_MESSAGE_BYTES]].concat(),
+            b"data:\ndata:\ndata:\n\n".repeat(32 * 1024),
+        ] {
+            let mut parser = EventParser::default();
+            let mut out = VecDeque::new();
+            let _ = parser.feed(&input, &mut out);
+            assert!(parser.line.len() + parser.data.len() <= MAX_MESSAGE_BYTES);
+            assert!(out.len() <= MAX_MESSAGE_BYTES);
+        }
+    }
+
     #[tokio::test]
     async fn session_id_bounds() {
         assert!(valid_session(b"a"));

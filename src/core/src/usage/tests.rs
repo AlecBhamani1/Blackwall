@@ -232,6 +232,51 @@ fn usage_skips_corrupt_lines_and_missing_days() {
 }
 
 #[test]
+fn otlp_json_reader_fuzz_is_panic_free_and_bounded() {
+    fn next(state: &mut u64) -> u8 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*state >> 24) as u8
+    }
+
+    let mut seed = 0x6f74_6c70_6a73_6f6e;
+    for _ in 0..512 {
+        let len = usize::from(next(&mut seed)) * 16;
+        let mut input = (0..len).map(|_| next(&mut seed)).collect::<Vec<_>>();
+        for byte in input.iter_mut().step_by(97) {
+            *byte = b'\n';
+        }
+        let mut requests = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_lines(std::io::Cursor::new(&input), |_| requests += 1)
+        }));
+        assert!(result.is_ok());
+        assert!(requests <= input.len() + 1);
+    }
+
+    // A syntactically valid request can still be hostile. It is skipped without hiding the next
+    // request, and the reader reads at most the cap plus one sentinel byte into its line buffer.
+    let mut adversarial =
+        br#"{"resourceMetrics":[{"resource":{"attributes":[{"key":"padding","value":{"stringValue":""#
+            .to_vec();
+    adversarial.extend(std::iter::repeat_n(b'x', MAX_METRICS_LINE));
+    adversarial.extend_from_slice(b"\"}}]}}]}\n{}\n");
+    let mut requests = 0;
+    let bad = read_lines(std::io::Cursor::new(adversarial), |_| requests += 1);
+    assert_eq!(bad, 1);
+    assert_eq!(requests, 1);
+
+    for input in [
+        b"[[[[[[[[[[[[[[[[[[[[".repeat(4096),
+        b"{\"resourceMetrics\":[".repeat(4096),
+        vec![0xff; 64 * 1024],
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| read_lines(std::io::Cursor::new(input), |_| {})).is_ok()
+        );
+    }
+}
+
+#[test]
 fn usage_empty_folder_is_zero_not_error() {
     let directory = folder();
     let summary = summary(&directory, Day(D), Day(D + 6), 0);

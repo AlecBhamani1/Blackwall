@@ -112,8 +112,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - List the periods when recording was off in the Usage page's gaps line and in `bw usage`.
 
-- Record usage metrics with OpenTelemetry: token usage and duration for every model call
-  (compaction summaries included), tool calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
+- Record usage metrics with OpenTelemetry: duration for every model call and token usage when the
+  server reports it (compaction summaries included), tool calls by outcome, and runs by outcome, written as OTLP JSON lines to `metrics/YYYY-MM-DD.jsonl`
   in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,
   or paths. See [Telemetry](docs/TELEMETRY.md).
 
@@ -134,6 +134,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Usage no longer reads an oversized line in a local OTLP metrics file into memory. A line over
+  4 MiB is counted as unreadable and skipped, and the next line is still read.
 - Keep credentials out of the approval audit log when a command passes them as headers such as
   `X-Api-Key: …`, `Authorization:…`, cookies, or custom token headers.
 

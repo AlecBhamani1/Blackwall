@@ -239,4 +239,50 @@ mod tests {
         let text = "```\n<tool_call>{}</tool_call>\n";
         assert_eq!(fenced.shown(text), text.len());
     }
+
+    #[test]
+    fn text_tool_parser_fuzz_is_panic_free_and_bounded() {
+        fn next(state: &mut u64) -> u8 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state as u8
+        }
+
+        let alphabet = b"<>/tool_ca`~{}[]\"':, abcdefghijklmnopqrstuvwxyz\n";
+        let valid = r#"<tool_call>{"name":"read_file","arguments":{}}</tool_call>"#;
+        let mut seed = 0x1234_5678_9abc_def0;
+        for round in 0..512 {
+            let len = usize::from(next(&mut seed)) * 8;
+            let mut content = String::with_capacity(len + valid.len());
+            for _ in 0..len {
+                content.push(alphabet[usize::from(next(&mut seed)) % alphabet.len()] as char);
+            }
+            if round % 4 == 0 {
+                let at = usize::from(next(&mut seed)) % (content.len() + 1);
+                content.insert_str(at, valid);
+            }
+            if let Some((calls, remaining)) = parse_text_tool_calls(&content, &offered()) {
+                assert!(!calls.is_empty() && calls.len() <= MAX_TEXT_CALLS);
+                assert!(remaining.len() <= content.len());
+                assert!(calls
+                    .iter()
+                    .all(|call| call.function.arguments.len() <= content.len()));
+            }
+
+            let mut scan = TagScan::default();
+            for end in 0..=content.len() {
+                assert!(scan.shown(&content[..end]) <= end);
+            }
+        }
+
+        for content in [
+            "<tool_call>".repeat(4096),
+            "```\n".repeat(4096),
+            "<".repeat(64 * 1024),
+        ] {
+            let parsed = parse_text_tool_calls(&content, &offered());
+            assert!(parsed.is_none() || parsed.as_ref().unwrap().0.len() <= MAX_TEXT_CALLS);
+        }
+    }
 }
