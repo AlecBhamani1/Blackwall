@@ -38,6 +38,11 @@ impl Input {
         Self { lines, terminal }
     }
 
+    /// Whether a person is typing, rather than a script piping input.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     pub fn prompt(&self, prompt: &str) -> Result<(), String> {
         if self.terminal {
             print!("{prompt}");
