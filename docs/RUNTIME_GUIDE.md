@@ -1,7 +1,7 @@
 # Using the current Blackwall development build
 
 Updated 2026-10-28. This guide describes the code in this checkout. It does not imply that a
-published installer contains these changes. See [delivery status](DELIVERY_PLAN.md) before release.
+published installer contains these changes. See the [release checklist](RELEASE_CHECKLIST.md) before release.
 
 Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
 credentials, and the app-lock verifier use the platform credential store: Keychain on macOS,
@@ -733,11 +733,69 @@ crash can still lose work since the last successful save; there is no continuous
 
 ## Memory and skills
 
-**Memory** contains only facts you explicitly save in that panel. Enable **Use saved memories in chat**
-to include a bounded selection in future chat and agent requests. Memory is off by default. Search,
-edit, and delete are available; automatic fact extraction and a Postgres memory adapter are not included.
-The advanced context-window setting changes the displayed estimate, not the model server's configured
-context length or a guaranteed token budget.
+**Memory** holds facts you saved or approved. Enable **Use saved memories in chat** to include a
+bounded selection in future chat and agent requests. Memory is off by default. The advanced
+context-window setting changes the displayed estimate, not the model server's configured context
+length or a guaranteed token budget.
+
+### Reviewed learning
+
+Enable Memory in the desktop Memory dialog or with `bw config set memory on`.
+In Agent mode, Blackwall can read reviewed facts with `memory_list` and suggest a
+preference, convention, correction, or lesson using `memory_propose`. Proposals
+stay out of persistent model context until you review them. Learning adds no
+extra model calls; the agent chooses when to propose a useful durable fact during
+a task or in response to a correction.
+
+Open **Memory** to review pending suggestions. Each shows its source conversation
+and user message, scope, saved text, and proposed text. Edit the proposed text and
+choose **Approve**, or **Reject** it. The saved list supports **Edit** and **Forget**.
+Review remains available while memory is off.
+
+The same queue and facts are available from the CLI:
+
+```sh
+bw memory pending
+bw memory approve <proposal-id>
+bw memory approve <proposal-id> Revised text to remember
+bw memory reject <proposal-id>
+bw memory list
+bw memory edit <memory-id> Updated text
+bw memory forget <memory-id>
+```
+
+Use `/memory pending` and the other actions during interactive chat. `/memory on`
+and `/memory off` control injection and agent access. CLI settings retain their
+existing precedence over desktop settings; each client's memory switch controls
+its own runs. Both clients share the same SQLite database in the configured data
+folder.
+
+User scope stores user preferences across projects. Project and environment
+scopes store conventions and environment facts for the canonical selected project
+folder only. Ordinary Chat receives user preferences; Agent runs also receive
+facts for their project. Child agents and guest chats have no owner memory tools.
+Guest chats use no owner memory injection. Memory is untrusted context and never
+grants file access, shell approval, network access, or any other tool permission.
+
+Stable topic keys identify related facts within a scope and project. The agent
+should read existing facts and reuse a key or provide a `replaces` ID when refining
+one. Whitespace/case-equivalent text and related pending keys are deduplicated.
+This is deterministic matching, not semantic similarity: different topics or
+wordings still need owner judgment. A proposal captures the saved revision;
+editing, another approval, or forgetting invalidates that snapshot. Stale approval
+fails without modifying the saved fact. Reject the old proposal and ask the agent
+for a new one. Forgetting also removes pending replacements.
+
+Schema version 3 adds scopes, stable keys, revisions, provenance, and the review
+queue. Existing memories migrate to user scope without changing their text. Each
+proposal references the actual saved user message that prompted the run. Accepted
+facts retain that source. No transcripts are copied into memory metadata. The
+queue is limited to 200 proposals, the fact store to 2,000 entries, individual
+text to 8,000 bytes, tool-list output to 16,000 bytes, and injected context to
+4,000 characters including its framing. The database upgrade is transactional;
+older app versions will refuse to open the newer schema.
+
+### Skills
 
 **Skills** manages reusable instructions stored as `~/.blackwall/skills/<name>.md`, or as a folder
 `<name>/SKILL.md` with bundled files for an imported skill. Create, edit,
@@ -1029,4 +1087,4 @@ platform, clean-machine installation, Apple signing/notarization, Windows code s
 Persistent pairing is implemented with a configured relay. Remote release gates still include
 packaged host-consent/revocation checks, an operated default relay, and two-computer tests across
 separate networks. TLS protects transport; application-level end-to-end encryption is
-not implemented. [The delivery plan](DELIVERY_PLAN.md) tracks these as open work.
+not implemented. [The release checklist](RELEASE_CHECKLIST.md) tracks these as open work.
