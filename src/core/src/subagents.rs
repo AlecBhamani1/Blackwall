@@ -266,7 +266,7 @@ pub(crate) async fn run_with_instructions(
     });
     let result = match &run.settings.runs_on {
         RunsOn::Local => local(run, &id, goal, context, instructions, traced.as_ref()).await,
-        RunsOn::Tool(name) => delegated(run, name, goal, context, traced.as_ref()).await,
+        RunsOn::Tool(name) => delegated(run, &id, name, goal, context, traced.as_ref()).await,
     };
     guard.finished = true;
     if let Some((trace, span)) = &traced {
@@ -299,6 +299,7 @@ fn prompt(goal: &str, context: &str) -> String {
 /// Hand the task to the owner's command tool; its standard output is the child's answer.
 async fn delegated(
     run: &Parent<'_>,
+    id: &str,
     name: &str,
     goal: &str,
     context: &str,
@@ -310,9 +311,28 @@ async fn delegated(
     if let Some(problem) = tool.delegate_problem() {
         return Err(problem.into());
     }
-    // Approval prompts raised by the delegation are recorded on the child's span.
+    let prompt = prompt(goal, context);
+    let arguments = json!({ "prompt": &prompt }).to_string();
+    let tool_span = traced.map(|(trace, parent)| {
+        let mut attributes = vec![
+            ("gen_ai.operation.name".into(), json!("execute_tool")),
+            ("gen_ai.tool.name".into(), json!(name)),
+            ("gen_ai.tool.call.id".into(), json!(id)),
+            ("gen_ai.tool.type".into(), json!("function")),
+        ];
+        if trace.content() {
+            attributes.push((
+                "gen_ai.tool.call.arguments".into(),
+                json!(trace.clip(&arguments)),
+            ));
+        }
+        trace.begin(parent, &format!("execute_tool {name}"), 1, attributes)
+    });
+    // Approval prompts raised by the delegation are recorded on its tool span.
     let emit = |event: AgentEvent| {
-        if let (Some((trace, span)), AgentEvent::ApprovalRequest { kind, .. }) = (traced, &event) {
+        if let (Some((trace, _)), Some(span), AgentEvent::ApprovalRequest { kind, .. }) =
+            (traced, &tool_span, &event)
+        {
             trace.event(
                 span,
                 "approval_requested",
@@ -325,7 +345,7 @@ async fn delegated(
     let result = tool
         .delegate(
             run.workspace,
-            &prompt(goal, context),
+            &prompt,
             run.request_id,
             run.approvals,
             &emit,
@@ -335,6 +355,29 @@ async fn delegated(
         .await;
     if let Some((trace, _)) = traced {
         trace.record_tool(name, crate::telemetry::ToolOutcome::of(&result));
+    }
+    if let (Some((trace, _)), Some(span)) = (traced, &tool_span) {
+        if let Err(error) = &result {
+            trace.set(span, vec![("error.type".into(), json!(error.kind()))]);
+        }
+        if trace.content() {
+            let text = match &result {
+                Ok(text) => text.clone(),
+                Err(error) => error.to_string(),
+            };
+            trace.set(
+                span,
+                vec![("gen_ai.tool.call.result".into(), json!(trace.clip(&text)))],
+            );
+        }
+        let quiet_error = matches!(&result, Err(crate::tools::ToolError::Execution(_)));
+        let message = result.as_ref().err().map(ToString::to_string);
+        let error = if quiet_error && !trace.content() {
+            Some("The tool reported an error.")
+        } else {
+            message.as_deref()
+        };
+        trace.end(span, error);
     }
     match result {
         Ok(text) => Ok(text.strip_prefix("Exit: 0\n").unwrap_or(&text).to_owned()),
@@ -976,6 +1019,106 @@ mod settings_tests {
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].1.contains(&prompt), "the whole prompt is shown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_on_tool_has_redacted_execute_span() {
+        for content in [false, true] {
+            let folder = Folder::new();
+            let tools = folder.tools(json!([review_tool(&folder.script())])).await;
+            let settings = SubagentSettings {
+                runs_on: RunsOn::Tool("review".into()),
+                ..Default::default()
+            };
+            let approvals = Approvals::default();
+            let (emit, _) = answer(&approvals, ApprovalDecision::Allow);
+            let mut workspace = Workspace::open(&folder.project()).unwrap();
+            workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+            let telemetry = crate::telemetry::Telemetry::start(
+                &folder.data(),
+                crate::telemetry::TelemetryOptions {
+                    traces: true,
+                    content,
+                    ..Default::default()
+                },
+            );
+            let trace = telemetry.run("delegate-span", Mode::Agent);
+            let root = trace.root();
+            run_with_instructions(
+                &Parent {
+                    backend: &Calls {
+                        name: "",
+                        arguments: "",
+                        turns: AtomicUsize::new(0),
+                    },
+                    workspace: &workspace,
+                    request_id: "delegate-span",
+                    approvals: &approvals,
+                    emit,
+                    settings: &settings,
+                    command_tools: &tools,
+                    web_enabled: false,
+                    budget: Default::default(),
+                },
+                "Review PROMPT-SENTINEL api_key=supersecret1",
+                "Some context.",
+                Default::default(),
+                Some((&trace, &root)),
+            )
+            .await
+            .unwrap();
+            trace.finish(crate::telemetry::RunOutcome::Complete);
+            telemetry.shutdown();
+
+            // The trace is written on a background thread that can outlast shutdown's wait.
+            let started = std::time::Instant::now();
+            let id = loop {
+                if let Some(trace) = crate::trace::list(&folder.data(), 1).pop() {
+                    break trace.id;
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(30));
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            let spans = crate::trace::read(&folder.data(), &id).unwrap();
+            let child = spans
+                .iter()
+                .find(|span| span.name == "invoke_agent subagent")
+                .unwrap();
+            let delegate = spans
+                .iter()
+                .find(|span| span.name == "execute_tool review")
+                .unwrap();
+            assert_eq!(delegate.parent.as_deref(), Some(child.id.as_str()));
+            assert_eq!(delegate.attributes["gen_ai.operation.name"], "execute_tool");
+            assert_eq!(delegate.attributes["gen_ai.tool.name"], "review");
+            assert_eq!(delegate.attributes["gen_ai.tool.type"], "function");
+            assert_eq!(delegate.events, ["approval_requested"]);
+            assert!(delegate.error.is_none());
+            assert_eq!(
+                delegate.attributes.contains_key("gen_ai.tool.call.id"),
+                content
+            );
+            for key in ["gen_ai.tool.call.arguments", "gen_ai.tool.call.result"] {
+                assert_eq!(delegate.attributes.contains_key(key), content);
+            }
+            if content {
+                assert_eq!(
+                    delegate.attributes["gen_ai.tool.call.id"],
+                    child.attributes["gen_ai.agent.id"]
+                );
+                let arguments = delegate.attributes["gen_ai.tool.call.arguments"]
+                    .as_str()
+                    .unwrap();
+                assert!(arguments.contains("PROMPT-SENTINEL"));
+                assert!(!arguments.contains("supersecret1"));
+                let result = delegate.attributes["gen_ai.tool.call.result"]
+                    .as_str()
+                    .unwrap();
+                assert!(result.contains("PROMPT-SENTINEL"));
+                assert!(!result.contains("supersecret1"));
+            }
+        }
     }
 
     #[cfg(unix)]
