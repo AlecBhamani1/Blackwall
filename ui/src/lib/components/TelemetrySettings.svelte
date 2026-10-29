@@ -178,8 +178,7 @@
   <h4>Export to an OpenTelemetry collector</h4>
   <p>
     Sends the same traces and usage metrics that are saved on this device, over OTLP/HTTP. Off until
-    you set an endpoint. Prompts and outputs are included only when <b>Record prompts and outputs</b
-    >
+    you set an endpoint. Prompts and outputs are included only when <b>Include content</b>
     is on in Runs.
   </p>
   <form
