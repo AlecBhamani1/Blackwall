@@ -1,4 +1,4 @@
-use crate::{input::Input, settings::Settings};
+use crate::{input::Input, project::safe, settings::Settings};
 use blackwall_core::{
     agent::{Agent, RunReason},
     approvals::Approvals,
@@ -764,8 +764,8 @@ fn render_event(
     match event {
         AgentEvent::ContextUpdated { state, .. } => *snapshot = Some(state),
         AgentEvent::AssistantDelta { delta, .. } => {
+            print!("{}", safe(&delta));
             answer.push_str(&delta);
-            print!("{delta}");
             let _ = io::stdout().flush();
         }
         AgentEvent::InstructionsLoaded {
@@ -782,28 +782,26 @@ fn render_event(
                 if sources.is_empty() {
                     "none".into()
                 } else {
-                    sources.join(", ")
+                    safe(&sources.join(", "))
                 }
             );
             for warning in warnings {
-                eprintln!("Instruction warning: {warning}");
+                eprintln!("Instruction warning: {}", safe(&warning));
             }
         }
-        AgentEvent::ToolCall { name, .. } => eprintln!("\n[{name}]"),
+        AgentEvent::ToolCall { name, .. } => eprintln!("\n[{}]", safe(&name)),
         AgentEvent::ToolResult {
             success: false,
             output,
             ..
-        } => eprintln!("{output}"),
+        } => eprintln!("{}", safe(&output)),
         AgentEvent::ApprovalRequest {
             request_id,
             approval_id,
             detail,
             ..
         } => {
-            eprintln!(
-                "\n{detail}\n\nAllow this action once? Type yes to allow; anything else denies."
-            );
+            eprintln!("{}", approval_prompt(&detail));
             *pending = Some(ResolveApprovalRequest {
                 request_id,
                 approval_id,
@@ -811,7 +809,7 @@ fn render_event(
             });
         }
         AgentEvent::SubagentStatus { state, summary, .. } => {
-            eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default())
+            eprintln!("\n[agent {state:?}] {}", safe(&summary.unwrap_or_default()))
         }
         // Reasoning stays collapsed: only how long it took is shown.
         AgentEvent::TurnComplete {
@@ -821,6 +819,14 @@ fn render_event(
         } => eprintln!("\n[{}]", thought_for(reasoning_ms.unwrap_or(0))),
         _ => {}
     }
+}
+
+/// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
+fn approval_prompt(detail: &str) -> String {
+    format!(
+        "\n{}\n\nAllow this action once? Type yes to allow; anything else denies.",
+        safe(detail)
+    )
 }
 
 fn execution_workspace(
@@ -840,6 +846,21 @@ fn execution_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_prompts_cannot_carry_terminal_escapes() {
+        let text =
+            approval_prompt("Delegate: \u{1b}[2J\u{1b}]8;;https://x.test\u{7}fix\u{202E}gnp.exe\r");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\r'),
+            "{text}"
+        );
+        assert!(text.contains("\\u{202E}gnp.exe"), "{text}");
+        assert!(
+            text.ends_with("Type yes to allow; anything else denies."),
+            "{text}"
+        );
+    }
 
     #[test]
     fn reasoning_is_shown_only_as_its_duration() {

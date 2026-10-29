@@ -201,6 +201,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Update `tauri-plugin-updater` to 2.14.1, which moves `zip` from 4.6.1 to 9.1.3 to fix
   [GHSA-m665-v7pm-7grj](https://github.com/advisories/GHSA-m665-v7pm-7grj) (inconsistent zip
   headers could overwrite files). The updater only uses `zip` on Windows.
+- `bw` no longer prints terminal escape codes from model or tool text. Approval prompts, streamed answers, tool errors, instruction warnings and subagent summaries drop control characters and show bidi characters as `\u{XXXX}`, so a delegate request can't repaint the approval prompt.
 - A trusted project's `command` allow rule (for example `"command": "github__delete_repository"`)
   could allow one of your own MCP or command tools. A project's allow rules now only ever allow
   its own `p-` servers.
