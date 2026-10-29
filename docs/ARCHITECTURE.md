@@ -1,7 +1,7 @@
 # Blackwall architecture
 
 This document describes the desktop chat, project agent, durable local data, and guest-sharing
-boundaries. `DELIVERY_PLAN.md` records verified work and remaining product/release gaps.
+boundaries. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) lists the remaining release gates.
 
 ## Context and containers
 

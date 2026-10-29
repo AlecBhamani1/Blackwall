@@ -134,6 +134,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A run now reads `.blackwall/project.json` once, so its rules and its limits always come from the same version of the file, even if the file changes while the run starts.
 - Usage no longer reads an oversized line in a local OTLP metrics file into memory. A line over
   4 MiB is counted as unreadable and skipped, and the next line is still read.
 - Keep credentials out of the approval audit log when a command passes them as headers such as
@@ -198,6 +199,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `bw run --json` now counts actions an owner or project deny rule blocks, and calls to tools the
   model was not offered, in `denied`, so those runs end with reason `denied` and exit 3 instead of
   reporting success. Each such `tool_result` event has `"denied": true`.
+- Update `tauri-plugin-updater` to 2.14.1, which moves `zip` from 4.6.1 to 9.1.3 to fix
+  [GHSA-m665-v7pm-7grj](https://github.com/advisories/GHSA-m665-v7pm-7grj) (inconsistent zip
+  headers could overwrite files). The updater only uses `zip` on Windows.
 - A trusted project's `command` allow rule (for example `"command": "github__delete_repository"`)
   could allow one of your own MCP or command tools. A project's allow rules now only ever allow
   its own `p-` servers.

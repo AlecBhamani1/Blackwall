@@ -179,7 +179,7 @@ tools, saved conversations, or stored credentials.
 The current UI still needs a relay origin and, where configured, a registration token. No default
 Blackwall-operated relay is deployed by this change. Four named invitations can now be active together and revoked separately. **Stop sharing** revokes
 every active invitation. Relay tokens are saved in the credential store after successful registration. Native two-computer acceptance and default relay operation remain open
-in [the delivery plan](DELIVERY_PLAN.md).
+in the [release checklist](RELEASE_CHECKLIST.md).
 
 
 ## Persistent computer pairing
@@ -231,6 +231,60 @@ starts a tunnel. If the original exchange is still open, **Finish pairing** retr
 otherwise remove it and pair again. Lost client responses retain the same pending credential for
 retry during the exchange lifetime. Definitively rejected new invitations can be replaced immediately.
 Unfinished exchanges are memory-only and expire on relay restart; completed device records survive.
+
+### Pairing identifiers
+
+| Item | Creation and storage | Exposure and lifetime |
+| --- | --- | --- |
+| Host identity | Native host generates an independent 256-bit secret; Keychain stores it | Secret never enters webview state; relay retains an ownership digest |
+| Pairing invitation | Host generates an independent 256-bit secret, plus random public exchange ID | Secret appears only in creation UI and invitation fragment; expires after five minutes |
+| Candidate device | Native client generates its own independent credential | Client Keychain stores raw credential; host/relay receive only the required digest |
+| Paired address | Host generates a fresh random address for each approved device | Stable across relaunch; not reused for a different pairing |
+| Display name | Explicit person-editable label, at most 120 UTF-8 bytes, no controls | Plain metadata, never proof of identity |
+| Confirmation code | Binds the particular exchange and candidate | Both screens must show the same code before host approval |
+
+HTTPS/WSS protects transport. The relay remains inside the trust boundary and can observe forwarded
+traffic. This release does not claim application-level end-to-end encryption. A compromised relay
+cannot be made trustworthy by a confirmation code; that code prevents accidental approval of
+the wrong pending device within the trusted deployment.
+
+### Pairing states and failures
+
+Pairing is a versioned extension with an explicit capability response. An older relay must return a clear
+"Pairing requires a relay update" result, without silently falling back to a reusable guest link.
+
+1. **Invite created.** Require an unlocked host, a successfully discovered model, available paired
+   device capacity, and an acknowledged relay registration before showing the invitation. Keep the
+   short-lived raw invitation only in memory. Cancel and expiry erase the pending exchange.
+2. **Candidate presented.** Validate the invitation locally before making any request. Send its
+   secret in an authorization header, never a query string or log. Atomically bind the exchange to
+   one candidate credential and name. A second candidate cannot replace the first. Bound failures
+   per exchange (five attempts), global pending exchanges, request sizes, and deployment-wide request rate (1,200 per minute).
+3. **Host review.** Show device name, matching code, chosen model, and the exact access granted.
+   The pairing remains unusable until the host approves that exact exchange and candidate. Denial,
+   cancellation and expiry reject approval. Locking cancels reachable pending exchanges and stops
+   tunnels immediately; network failures retain bounded retry state without granting model access.
+4. **Durable approval.** Persist host device metadata and its Keychain material before acknowledging
+   approval. Use a recoverable pending/committed record so a crash between Keychain and SQLite
+   writes cannot grant access without a visible, revocable device. Never return a successful pairing
+   if either durable write failed.
+5. **Client receipt.** Persist the device credential and host label before adding a usable saved
+   connection. Permit bounded idempotent retrieval by the same candidate after a lost response;
+   a different candidate or replayed invitation must not create another paired device. Clear the
+   invitation from the UI as soon as it has been handed to native code.
+6. **Connected.** Start the outbound host tunnel with the stable per-device address. Use a renewable
+   bounded lease, not a decades-long expiration. Renewal requires the retained host credential.
+   Advertise only the selected model and retain existing request/body/concurrency limits.
+7. **Offline.** Keep the device metadata and key. Retry connection with bounded backoff and jitter;
+   show **Computer offline** / **Reconnecting**. Never replay an interrupted or completed prompt.
+   Failed turns remain visible and require an explicit retry from the person.
+8. **Revoked.** Persist revocation before disconnecting and acknowledging it. Stop in-flight work
+   for that device. Revocation must survive host/relay restart, delayed renewal, and stale reconnect
+   attempts. Require a fresh exchange and fresh credentials to pair again.
+
+Keep pending exchanges ephemeral: a relay restart cancels unfinished pairing and asks the person
+to create a new invitation. Completed pairings survive restart. This avoids reconstructing partly
+approved exchanges from ambiguous state.
 
 Pairing API version 1 is exposed under `/v1/pairing`, with a capability endpoint for older-relay
 detection. Limits are 4 KiB request bodies, 256 exchanges, five wrong invitation guesses, and 1,200

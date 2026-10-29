@@ -112,7 +112,7 @@ process. See [UPDATES.md](UPDATES.md) for beta downloads, versions, and recovery
 ## Promote a release batch
 
 1. Check the version milestone: intended issues are complete and deferred work is explicitly
-   moved to a later milestone. Finish applicable [native acceptance checks](NATIVE_ACCEPTANCE.md).
+   moved to a later milestone. Finish the applicable [release checklist](RELEASE_CHECKLIST.md) items.
    Record evidence and remaining limitations accurately; automated builds cannot establish
    physical-device acceptance or Apple signing/notarization.
 2. Start a release-preparation branch from `origin/partial` and run:
