@@ -1371,7 +1371,19 @@ mod tests {
             .await
             .unwrap();
         telemetry.shutdown();
-        crate::trace::list(&directory.join("user"), 1).remove(0).id
+        // The trace is written on a background thread, which a loaded CI runner can delay past
+        // the shutdown wait; the thread still finishes the queued run, so wait for its file.
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(trace) = crate::trace::list(&directory.join("user"), 1).pop() {
+                return trace.id;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "no trace was written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
     #[tokio::test]
     async fn subagent_spans_are_children_of_spawn_agent() {

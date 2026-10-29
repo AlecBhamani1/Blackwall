@@ -15,13 +15,6 @@ ignore = [
     # glib 0.18 is pinned by Tauri's GTK 3 stack on Linux (gtk-rs ended GTK 3 bindings at 0.18).
     # The unsound VariantStrIter API is not called by Tauri, wry, tao, muda, gtk, or Blackwall.
     { id = "RUSTSEC-2024-0429", reason = "Linux-only transitive glib 0.18 via Tauri; affected API unused" },
-    # zip 4.x is pinned by tauri-plugin-updater 2.14, the latest stable, and no updater release uses zip 9 yet.
-    # The updater unpacks only update archives whose signature it has already verified against our release key
-    # (download() and install() both verify before extracting), so these need a signed malicious archive.
-    # Remove these three once the updater moves to zip >= 9.
-    { id = "RUSTSEC-2026-0367", reason = "zip 4 via tauri-plugin-updater; only signature-verified archives are extracted" },
-    { id = "RUSTSEC-2026-0368", reason = "zip 4 via tauri-plugin-updater; only signature-verified archives are extracted" },
-    { id = "RUSTSEC-2026-0369", reason = "zip 4 via tauri-plugin-updater; only signature-verified archives are extracted" },
 ]
 
 [licenses]
