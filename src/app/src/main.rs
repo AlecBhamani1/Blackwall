@@ -10,6 +10,7 @@ mod keychain;
 #[cfg(target_os = "macos")]
 mod lifecycle;
 mod pairing;
+mod project;
 mod setup;
 mod updates;
 
@@ -63,6 +64,10 @@ fn run() -> Result<(), StartupError> {
             agent_commands::read_workspace_file,
             agent_commands::resolve_approval,
             agent_commands::export_conversation,
+            project::project_status,
+            project::trust_project,
+            project::list_trusted_projects,
+            project::untrust_project,
             data::list_skills,
             data::save_skill,
             data::delete_skill,

@@ -12,6 +12,7 @@
   import ChatDropZone from './lib/components/ChatDropZone.svelte';
   import RecallPanel from './lib/components/RecallPanel.svelte';
   import WorkspaceFiles from './lib/components/WorkspaceFiles.svelte';
+  import ProjectTrust from './lib/components/ProjectTrust.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
   import { createChatController } from './lib/store';
@@ -265,6 +266,9 @@
             >{/if}
           <button class="export" onclick={() => controller.showRecall()}>Search history</button>
         </div>
+      {/if}
+      {#if !setupOpen && isDesktop() && $agentMode && $workspace}
+        <ProjectTrust workspace={$workspace} refresh={$runState} />
       {/if}
       {#if $agentMode && $executionProfile === 'unsandboxed'}
         <div class="storage-error" role="status">

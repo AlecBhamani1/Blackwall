@@ -11,6 +11,7 @@
   import LockSettings from './LockSettings.svelte';
   import CredentialSettings from './CredentialSettings.svelte';
   import TelemetrySettings from './TelemetrySettings.svelte';
+  import TrustedProjects from './TrustedProjects.svelte';
   import SavedConnections from './SavedConnections.svelte';
   import { connectionProfiles } from '../connections';
   import PairingPanel from './PairingPanel.svelte';
@@ -64,6 +65,7 @@
 
   let keysOpen = false;
   let telemetryOpen = false;
+  let trustedOpen = false;
   let activePanel: SettingsPanel | null = null;
   let selectedSetting: SettingsPage | null = null;
   let settingsQuery = '';
@@ -879,6 +881,10 @@
               <summary>Telemetry</summary>
               <p>Export traces and usage metrics over OTLP, and choose how long usage is kept.</p>
               {#if telemetryOpen}<TelemetrySettings />{/if}
+            </details>
+            <details class="access-keys" bind:open={trustedOpen}>
+              <summary>Trusted projects</summary>
+              {#if trustedOpen}<TrustedProjects />{/if}
             </details>
           {/if}
         {/if}
