@@ -3,6 +3,64 @@
 This document describes the desktop chat, project agent, durable local data, and guest-sharing
 boundaries. `DELIVERY_PLAN.md` records verified work and remaining product/release gaps.
 
+## Context and containers
+
+The diagrams use Mermaid's C4 syntax. The first shows what Blackwall talks to; every external
+connection except the model server is off or empty until the owner sets it up.
+
+```mermaid
+C4Context
+title Blackwall system context
+Person(owner, "Owner", "Chats, runs agents, reviews usage")
+Person_Ext(guest, "Guest", "Browser chat through an invitation")
+System(bw, "Blackwall", "Desktop app and bw CLI, a local-first agent harness")
+System_Ext(llm, "Model server", "Ollama, LM Studio, llama.cpp, vLLM, or another OpenAI-compatible service, here or on another computer")
+System_Ext(clis, "Command tools", "Owner-listed programs, such as claude, codex, or copilot")
+System_Ext(http, "HTTP services", "Owner-listed HTTP tools")
+System_Ext(mcp, "MCP servers", "stdio processes or streamable HTTP endpoints")
+System_Ext(web, "Public web", "Approved page reads and DuckDuckGo search")
+System_Ext(relay, "Hosted relay", "Self-hosted edge for guest links and pairing")
+System_Ext(otel, "OTLP receiver", "Optional: Collector, Grafana Alloy, Jaeger, Langfuse")
+System_Ext(store, "OS credential store", "Keychain, Credential Manager, Secret Service")
+Rel(owner, bw, "Uses")
+Rel(guest, relay, "HTTPS")
+Rel(bw, relay, "Outbound WSS")
+Rel(bw, llm, "OpenAI-compatible HTTP")
+Rel(bw, clis, "argv or JSON on stdin")
+Rel(bw, http, "HTTPS GET or POST")
+Rel(bw, mcp, "JSON-RPC over stdio or HTTP")
+Rel(bw, web, "HTTPS, each request approved")
+Rel(bw, otel, "OTLP/HTTP, off by default")
+Rel(bw, store, "Model, relay, MCP, tool, and export secrets")
+```
+
+```mermaid
+C4Container
+title Blackwall containers
+Person(owner, "Owner")
+System_Boundary(blackwall, "Blackwall") {
+  Container(ui, "Desktop UI", "Svelte 5, ui/", "Chat, Agent, Settings, Runs, Usage")
+  Container(app, "Tauri adapter", "Rust, src/app", "Typed commands, preferences, app lock, pairing")
+  Container(cli, "bw CLI", "Rust, src/bw", "REPL, bw run --json, bw usage, bw project, bw mcp")
+  Container(core, "Core runtime", "Rust, src/core", "Agent loop, tools, approvals, policy, MCP, telemetry, usage")
+  ContainerDb(data, "Data folder", "~/.blackwall", "blackwall.sqlite3, policy.json, policy-audit.jsonl, tools.json, mcp.json, trusted-projects.json, skills/, traces/, metrics/")
+}
+ContainerDb_Ext(proj, "Project file", "<project>/.blackwall/project.json", "Deny and ask rules apply at once; the rest after trust")
+Container_Ext(relay, "Relay", "Rust, src/relay", "Guest and pairing edge")
+System_Ext(llm, "Model server")
+System_Ext(otel, "OTLP receiver")
+Rel(owner, ui, "Uses")
+Rel(owner, cli, "Uses")
+Rel(ui, app, "Tauri invoke, blackwall://event")
+Rel(app, core, "Rust calls")
+Rel(cli, core, "Rust calls")
+Rel(core, data, "Reads and writes")
+Rel(core, proj, "Reads at each run; trust by SHA-256")
+Rel(core, llm, "OpenAI-compatible HTTP")
+Rel(core, otel, "OTLP/HTTP, JSON or protobuf")
+Rel(app, relay, "Outbound WSS")
+```
+
 ## Runtime flow
 
 ```text
@@ -21,8 +79,9 @@ Svelte UI
                           on a user-controlled machine
 ```
 
-The desktop connects to an already-running model service. Guided setup checks fixed loopback
-addresses and can explicitly request an allowlisted Ollama model download; it does not install or
+The desktop connects to an already-running model service. Guided setup lists the model servers
+listening on this computer's loopback addresses (`core::connection::discover_local_services`, GET
+probes only) and can explicitly request an allowlisted Ollama model download; it does not install or
 start the server software. Endpoint selection is, in order:
 
 1. an explicit trusted command request;
@@ -36,7 +95,7 @@ origin. `BLACKWALL_MODEL_API_KEY` is a fallback only for its configured origin. 
 redirects to avoid forwarding credentials to another service. New keys are tested before replacing
 an existing saved entry.
 
-`src/app/src/secrets.rs` is the only credential-store adapter: macOS Keychain through
+`src/core/src/secrets.rs` is the only credential-store adapter: macOS Keychain through
 `security-framework`, Windows Credential Manager and the Linux Secret Service through `keyring`.
 Service and account names are identical on every platform, and there is no plain-text fallback when
 a store is unavailable. Platform-specific process launching is limited to the approved shell tool
@@ -155,15 +214,21 @@ temporary invitations are implemented; they are not permanent guest accounts.
 
 ## Agent execution and authority
 
-`core::model` decodes bounded OpenAI-compatible streamed content and fragmented tool calls.
-`core::agent` runs at most 20 model/tool iterations. File tools use a directory capability selected
+`core::model` decodes bounded OpenAI-compatible streamed content and fragmented tool calls. It
+keeps `<think>` text and `reasoning` fields apart from the answer (`model/think.rs`) and, only when
+the connection opts in, reads `<tool_call>` blocks written as text (`model/text_tools.rs`); those
+calls always ask. Before a request, the adapter asks `core::connection::served_budget` for the
+server's loaded context window. `core::agent` runs up to the configured iteration limit (20
+model/tool iterations by default, 1–100) and maps how a run ended to a `RunReason`, which `bw`
+turns into its exit code. File tools use a directory capability selected
 through the native folder picker; absolute paths, parent traversal, `.git`, and escapes outside the
 project are rejected. Literal search is bounded and skips dependency folders. Edits display a unified
 diff and compare the original file again before an atomic replacement.
 
 Shell actions display the exact command and working directory. They run with the user's account
-permissions, **without an OS sandbox**. Each command has a configurable deadline (two minutes by default), separate 64 KiB
-stdout/stderr limits, and a process-group guard that kills descendants on cancellation. Known model,
+permissions, **without an OS sandbox**. Each command has a configurable deadline (two minutes by default), output
+trimmed to its start and end above a configurable cap (64 KiB by default) with a stream stopped
+past 64 MiB, and a process-group guard that kills descendants on cancellation. Known model,
 relay, and signing secrets are removed from the inherited environment. Other account access remains
 possible and is covered by the explicit command approval.
 
@@ -178,6 +243,33 @@ remembered, and marks the prompt off-device. Read-only child batches run up to t
 anything else runs one at a time. `tools::OutputCap` trims command output to
 `ContextBudget::max_output_bytes`; trusted `project.json` limits only lower these values.
 
+```mermaid
+C4Component
+title One Agent run in src/core
+Container(adapter, "Desktop or bw", "src/app or src/bw", "Discovers guidance and the served budget, starts the run")
+Container_Boundary(core, "src/core") {
+  Component(agent, "agent", "agent.rs", "Model and tool loop; RunReason at the end")
+  Component(model, "model", "model.rs, model/", "Streaming, reasoning filter, opt-in text tool calls")
+  Component(approvals, "approvals + policy", "approvals.rs, policy.rs", "Owner and project rules, prompts, policy-audit.jsonl")
+  Component(project, "project", "project.rs", "project.json hash and settings from the same bytes; trust; lower-only limits")
+  Component(tools, "tools", "tools.rs", "Files, shell, web; OutputCap trimming")
+  Component(ctools, "command_tools", "command_tools.rs", "Programs (argv or stdin JSON) and HTTP tools")
+  Component(mcp, "mcp", "mcp.rs, mcp/", "Stdio and streamable HTTP transports")
+  Component(subagents, "subagents", "subagents.rs", "Children on this model or on one command tool")
+  Component(telemetry, "telemetry", "telemetry/", "RunScope spans and metrics, RunBufferProcessor")
+}
+Rel(adapter, agent, "run")
+Rel(agent, model, "each turn")
+Rel(agent, approvals, "every action")
+Rel(approvals, project, "project rules")
+Rel(agent, tools, "built-in tools")
+Rel(agent, ctools, "owner tools")
+Rel(agent, mcp, "MCP tools")
+Rel(agent, subagents, "spawn_agent")
+Rel(subagents, ctools, "delegate, always asks")
+Rel(agent, telemetry, "spans and metrics")
+```
+
 Web access is disabled by default. Every request and redirect needs approval. The client disables
 proxies and automatic redirects, validates all resolved IPs, pins DNS results, rejects private and
 reserved ranges, and bounds response time and body size. Retrieved content is labeled untrusted.
@@ -190,7 +282,7 @@ Adapters start a `RunScope` for each Chat or Agent run and the core loops record
 metrics through it. The provider's only span processor buffers a whole run, applies the content
 allowlist or the redaction scrub, and writes one OTLP/JSON file under `traces/`; a periodic reader
 appends delta metrics to `metrics/YYYY-MM-DD.jsonl`. `core::trace` only reads trace files back.
-`core::usage` reads the metrics files for a range of UTC days and returns totals already
+`core::usage` reads the metrics files for a range of the viewer's local days and returns totals already
 aggregated (`summary`), or copies the range's files to a folder (`export`); the desktop
 `usage_summary` and `export_telemetry` commands and `bw usage` call it. `core::usage` also
 writes and reads `metrics/recording.jsonl`, the recording on/off markers behind the gaps line.
@@ -227,3 +319,12 @@ active shares; the UI flushes saves before clearing its conversation state. It d
 SQLite database or protect against the same user account reading files or using `bw`. Native dialogs
 recheck lock state after selection. Actions already accepted before a lock may finish; the lock is
 not a filesystem or process isolation boundary.
+
+## Not built yet
+
+- Application-level end-to-end encryption between guests or paired computers and the host; the
+  relay can read what it forwards.
+- An external policy-hook program that decides actions from JSON on stdin.
+- MCP servers that need OAuth sign-in; header secrets cover bearer tokens and API keys.
+- MCP server notifications over a GET stream; Blackwall only posts and reads replies.
+- Pricing for command-tool usage; the Usage page counts tokens, not money.

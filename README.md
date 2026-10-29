@@ -54,7 +54,7 @@ a SmartScreen or Gatekeeper warning.
   rules wait until you trust the file's exact contents; any edit asks again
   ([Project settings](docs/RUNTIME_GUIDE.md#project-settings))
 - Owner-defined command tools (argv or JSON on stdin, with typed argument schemas), HTTP tools,
-  and local MCP servers behind the same approvals, with their secrets kept in the platform
+  and MCP servers (local commands or streamable HTTP) behind the same approvals, with their secrets kept in the platform
   credential store ([Runtime guide](docs/RUNTIME_GUIDE.md))
 - Opt-in approved web reads/search and subagents with your chosen steps and tools (up to three
   read-only children at once), or delegated to a command tool such as `claude -p --permission-mode
@@ -103,7 +103,9 @@ bw
 ```
 
 If Rust is not installed, follow the link printed by the installer to install it first. To build
-from a local checkout instead, use `cargo install --locked --path src/bw`.
+from a local checkout instead, use `cargo install --locked --path src/bw`. In a terminal, `bw setup`
+lists the model servers it finds on this computer to choose from; `bw setup --list` only prints
+them.
 
 Setup asks for an existing OpenAI-compatible service address and its model ID, then saves your
 choices. Type `/commands` during chat to see the available controls. Change settings with
@@ -136,8 +138,7 @@ calls as text, `bw config set text-tool-calls on` reads them; each such call alw
 one as a tree; the desktop **Settings → Workflows → Runs** panel shows the same traces. See
 [Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
 `bw usage [--days N] [--utc] [--json]` totals tokens, runs, sessions, and tools for the last N
-local days (1–400), by
-project and model; **Settings → Workflows → Usage** shows the same numbers with a chart and a
+local days (1–400, default 7), by project and model; **Settings → Workflows → Usage** shows the same numbers with a chart and a
 per-project session breakdown. See [Usage](docs/RUNTIME_GUIDE.md#usage).
 `bw config set otlp-endpoint <url|off>` (plus `otlp-protocol`, `otlp-signals`, and
 `otlp-include-project`) exports them over OTLP/HTTP; `bw telemetry header <name>` stores a header
@@ -149,8 +150,9 @@ For development, `npm run cli -- setup` and `npm run cli` run the CLI without in
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
 an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resume` for scripts and
 CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied.
-`--timeout SECS` limits the whole run, and the exit code says why it ended (0 complete, 3 an
-approval was denied, 4 step limit, 5 model error, 6 context budget, 7 timeout, 130 interrupted). See
+`--timeout SECS` (10–86400) limits the whole run, and the exit code says why it ended (0 complete,
+1 other error, 2 usage error, 3 an approval was denied, 4 step limit, 5 model error, 6 context
+budget, 7 timeout, 130 interrupted). See
 the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
 
 Use `bw review` or `/review` in CLI or desktop Agent chat to inspect Git changes without agent tools. Choose `--uncommitted`,
@@ -168,7 +170,8 @@ See [Conversation recall](docs/CONVERSATION_RECALL.md) for limits, migration, an
 CLI and desktop Agent tasks discover `AGENTS.md` guidance, with `AGENTS.override.md` taking
 precedence in each directory. Source lists and discovery warnings are visible in both clients.
 Extra files such as `CLAUDE.md` can be read after `AGENTS.md`, and the per-file and total limits
-(8 and 32 KiB by default) can be changed. Use `/init` to review a starter instruction file before
+(8 and 32 KiB by default) can be changed, in **Memory → Advanced · Instructions** or with
+`bw config set instruction-files|instruction-file-kib|instruction-total-kib <value>`. Use `/init` to review a starter instruction file before
 writing it. See
 [Project instructions](docs/PROJECT_INSTRUCTIONS.md) for ordering, nested scopes, bounds,
 and approval behavior.
@@ -266,7 +269,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the [repository workflow](docs/REPOSI
 
 `blackwall-core` stays independent of Tauri so the desktop, CLI, and tests share the same runtime. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
 forms, and streams typed events back to the UI. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
+for context and container diagrams, including command tools, MCP servers, and telemetry export, and
+the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
 roadmap.
 
 ## First guest-sharing slice

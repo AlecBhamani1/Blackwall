@@ -161,8 +161,9 @@ and migrates the version 1 ownership registry without discarding reservations.
 
 The first relay protocol is encrypted in transit by HTTPS/WSS but is not end-to-end encrypted at
 the application layer. A relay operator can observe guest request and response contents while
-forwarding them. Run the relay on infrastructure you trust. Application-level end-to-end
-encryption and named guest accounts remain future work.
+forwarding them. Run the relay on infrastructure you trust. Guest and paired requests are not
+recorded in the host's traces or usage metrics. Application-level end-to-end encryption, named
+guest accounts, and host-side telemetry for relayed requests remain future work.
 
 ## Current desktop integration
 

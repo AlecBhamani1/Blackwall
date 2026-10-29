@@ -67,20 +67,26 @@ USAGE:
   bw setup --list            List the model servers found on this computer
   bw config [show]           Show effective settings
   bw config set <name> <value>
-                             Includes otlp-endpoint <url|off>, otlp-protocol <json|protobuf>,
-                             otlp-signals <traces,metrics>, otlp-include-project <on|off>,
-                             and usage-retention-days <30-3650|forever> (default 400);
-                             output-bytes <4096-1048576> (default 65536), subagent-steps <1-50>,
-                             subagent-tools <read_file,list_files,...|none>,
-                             subagent-runs-on <local|TOOL> (a stdin JSON command tool; always asks),
-                             instruction-file-kib <1-64> (default 8), instruction-total-kib
-                             <8-256> (default 32), and instruction-files <CLAUDE.md,...|none>
+                             Includes text-tool-calls <on|off> (default off);
+                             otlp-endpoint <url|off> (default off), otlp-protocol <json|protobuf>
+                             (default protobuf), otlp-signals <traces,metrics> (default both),
+                             otlp-include-project <on|off> (default off), and
+                             usage-retention-days <30-3650|forever> (default 400);
+                             output-bytes <4096-1048576> (default 65536), subagent-steps <1-50>
+                             (default 8), subagent-tools <read_file,list_files,...|none> (default
+                             read_file,list_files), subagent-runs-on <local|TOOL> (default local;
+                             a stdin JSON command tool, always asks), instruction-file-kib <1-64>
+                             (default 8), instruction-total-kib <8-256> (default 32), and
+                             instruction-files <CLAUDE.md,...|none> (default none)
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
   bw run [--json] [--timeout SECS] <prompt>  Run one task; --json prints JSON lines and denies prompts
-  bw resume <id> [--json] [prompt]
+  bw resume <id> [--json] [--timeout SECS] [prompt]
                              Continue a saved Agent conversation
+                             --timeout limits the whole run (10-86400 seconds). Exit codes:
+                             0 complete, 1 error, 2 usage, 3 an approval was denied, 4 step limit,
+                             5 model error, 6 context budget, 7 timeout, 130 interrupted
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw skills <action>         Review learned skill proposals (bw skills for pending)
