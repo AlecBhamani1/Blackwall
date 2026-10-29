@@ -223,8 +223,9 @@ server's page in **MCP servers** lists these rules and removes them; a removal a
 run. Removing a server also removes its rules, so a later server with the same name starts asking.
 
 To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
-(`~/.blackwall/`). Projects cannot supply rules. Each rule has a `decision` (`allow`, `ask`, or
-`deny`), a `kind` (`exec`, `file`, or `network`), and one matching field:
+(`~/.blackwall/`). A project can add its own rules too; see [Project settings](#project-settings).
+Each rule has a `decision` (`allow`, `ask`, or `deny`), a `kind` (`exec`, `file`, or `network`), and
+one matching field:
 
 ```json
 {"rules":[
@@ -239,13 +240,17 @@ everything below it, and `host` matches a host exactly or, with `*.`, its subdom
 an `exec` rule can use `tool` instead: a server name such as `context7` matches all of that server's
 tools, and `server__tool` matches one. `tool` rules never match shell commands. Any rule can add
 `project` with an absolute folder path, and then applies only to runs in that project. Ask and deny
-path rules ignore letter case, as the default macOS and Windows file systems do. Deny outranks ask,
-and ask outranks allow; actions that no rule matches still ask, and denied actions never show a
-prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
+path rules ignore letter case, as the default macOS and Windows file systems do. By default
+(`"mode": "strictest"`), deny outranks ask, and ask outranks allow. With `"mode": "ordered"` next to
+`rules`, the first matching rule in the file decides instead, so an earlier allow can make an
+exception to a later rule; see [ordered rules](#ordered-and-strictest-rules). Actions that no rule
+matches still ask, and denied actions never show a prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
 instead of matching an allow rule. Edits inside the data folder always ask, even when the project
 contains it. Rules load when a run starts. If the file is invalid, every action asks and the prompt
 shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
-common credential forms redacted; the log rotates at 1 MiB.
+common credential forms redacted; the log rotates at 1 MiB. Each record's `rule` names the rule that
+decided, as `{"source":"user"|"project","index":N,"mode":"strictest"|"ordered"}` (`index` counts
+from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default.
 
 To let Agent mode call other programs, such as another coding assistant's command line, list them
 in `tools.json` in the same data folder:
@@ -364,6 +369,70 @@ because some chat templates, such as Qwen's on vLLM, reject any other system mes
 Tool entries are collapsed by default and can be expanded to inspect results. Restored transcripts
 show past actions without executing them again. A fresh model turn currently receives the prior prose
 and attachments; historical tool-call protocol messages are not replayed across separate turns.
+
+## Project settings
+
+A project can carry its own settings in `.blackwall/project.json` at the project root. Because the
+file comes with the folder, anyone who can change the repository can change it, so Blackwall never
+lets it add permissions on its own:
+
+```json
+{
+  "policy": {"mode": "ordered", "rules": [
+    {"decision": "deny", "kind": "exec", "command": "cat secrets.env"},
+    {"decision": "allow", "kind": "exec", "command": "cargo test"}
+  ]},
+  "mcp": {"servers": [{"name": "docs", "url": "https://docs.example.com/mcp"}]},
+  "limits": {"max_output_bytes": 32768, "subagents": {"max_steps": 4, "tools": ["read_file"]}},
+  "instructions": {"max_file_kib": 4, "extra_files": ["CLAUDE.md"]}
+}
+```
+
+Every section is optional, and unknown fields make the file invalid. `policy` uses the same rule
+format as `policy.json`, except that a project rule cannot name a `project`.
+
+**Trust.** Until you trust the file, only its `deny` and `ask` rules apply, because they can only
+tighten. Its `allow` rules and every other section wait. To trust it:
+
+- Desktop: when the selected project has an untrusted or changed file, a banner appears under the
+  project bar. **Review project settings** shows the file (or, when it changed, the diff from the
+  version you trusted) and what applies now. Choose **Trust** or **Not now**.
+- CLI: `bw project status` shows the file's path, its trust, what applies now, and what waits.
+  `bw project trust` prints the file (or the diff) and asks `y/N`. Without a terminal it refuses
+  unless you pass `--yes`.
+
+Trust is saved in `trusted-projects.json` in the data folder as the project's canonical folder path
+and the SHA-256 of the file's exact bytes, plus a copy of the file to show later changes. Any edit,
+even whitespace, makes the file untrusted again until you review it. Only the bytes you were shown
+are trusted: if the file changes between showing and trusting, trusting is refused. Untrust a
+project with `bw project untrust` in it, or from **Settings → General → Security → Trusted
+projects**; its deny and ask rules keep applying.
+
+**What applies.** Rules load at the start of every run, from the owner's file and then the
+project's. Across files, a deny or ask from either file beats an allow from either file, whatever
+the mode. Writes to the data folder always ask. The file must be a regular file of at most 64 KiB in
+a real `.blackwall` folder; symbolic links are refused. It is read once, and its hash and settings
+come from those same bytes. If it cannot be read or is invalid, every action asks for approval
+until it is fixed, and the run's warnings and `bw project status` say why.
+
+The `mcp`, `limits` and `instructions` sections are validated now so the format is fixed, but this
+version does not use them yet. When it does, a project can only remove permissions: limits and
+instruction caps no higher than yours, subagent tools only from those you allow (`read_file` and
+`list_files`), and MCP servers only by `https` URL (`http` only on this computer), never commands,
+secrets or headers.
+
+### Ordered and strictest rules
+
+Each rules file, the owner's `policy.json` and a project's `policy`, has its own `mode`:
+
+| Mode | Within the file |
+| --- | --- |
+| `strictest` (default) | Deny outranks ask, ask outranks allow. Existing files keep this meaning. |
+| `ordered` | The first matching rule decides, so `allow git status` before `ask git` allows `git status` and asks for other `git` commands. |
+
+The mode only ranks rules inside one file. Blackwall then takes the strictest answer across files,
+so a project's deny still beats your allow. Commands with control syntax never match an allow rule
+in either mode.
 
 ## Conversations and saved data
 
@@ -615,7 +684,8 @@ Setup does not test connectivity or launch/download a model. `npm run cli -- set
 Type `//` to begin a literal message with `/`. Use `bw commands` to see the catalog outside chat.
 `bw config show` reviews settings, and `bw config set <name> <value>` changes them without entering
 chat. `bw status` also asks the configured service which server it is and its context window.
-`bw config set text-tool-calls on|off` controls [tool calls written as text](#local-models). Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
+`bw config set text-tool-calls on|off` controls [tool calls written as text](#local-models). `bw project status|trust|untrust` reviews and trusts the current folder's
+[project settings](#project-settings). Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), then the initial `llama3.2` and local Ollama defaults.
 CLI settings are separate from desktop preferences. They are stored in the same local SQLite
 database; `BLACKWALL_DATA_DIR` selects a different data folder, including its memory and skills.

@@ -46,7 +46,11 @@ a SmartScreen or Gatekeeper warning.
 - Optional desktop passphrase lock that stops active work and guest sharing
 - Agent mode with a native project picker, bounded file read/list/search, reviewed edits, and shell approval
 - Owner-selected command profiles with macOS filesystem isolation and default-off command network
-- Owner allow, ask, and deny rules for agent actions, with a redacted local audit log
+- Owner allow, ask, and deny rules for agent actions, strictest or first-match ordered, with a
+  redacted local audit log that names the deciding rule
+- Per-project `.blackwall/project.json` settings: deny and ask rules apply right away, and allow
+  rules wait until you trust the file's exact contents; any edit asks again
+  ([Project settings](docs/RUNTIME_GUIDE.md#project-settings))
 - Owner-defined command tools and local MCP servers behind the same approvals, with MCP secrets
   kept in the platform credential store
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
@@ -100,6 +104,9 @@ choices. Type `/commands` during chat to see the available controls. Change sett
 `/model <id>`, `/endpoint <url>`, `/web on|off`, `/memory on|off`, or `/settings <name> <value>`.
 Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
 reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
+Use `bw project status` to see a project's `.blackwall/project.json`, whether it is trusted, and
+what applies now; `bw project trust` shows it and asks before trusting, and `bw project untrust`
+undoes that. See [Project settings](docs/RUNTIME_GUIDE.md#project-settings).
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
 In the desktop app, open **Settings → AI capabilities → MCP servers** to manage them.
 Settings groups related tools together; search by purpose or choose **Sort by → Name (A–Z)**.

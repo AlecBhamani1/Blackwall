@@ -9,6 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Project settings in `.blackwall/project.json`. A project's deny and ask rules apply right away;
+  its allow rules (and its `mcp`, `limits` and `instructions` sections, validated now and used in
+  a later release) wait until the owner trusts the file. Trust is saved in `trusted-projects.json`
+  as the canonical folder and the SHA-256 of the exact bytes shown, and any edit untrusts it.
+  Review and trust with `bw project status|trust|untrust` or the desktop banner and dialog, which
+  shows a diff when the file changed; untrust from **Settings → Security → Trusted projects**.
+  The file must be a regular file of at most 64 KiB, never a symbolic link; an unusable file
+  makes every action ask.
+- `"mode": "ordered"` for rules files: the first matching rule in the file decides. The default
+  `strictest` keeps today's meaning, and across files a deny or ask always beats an allow.
+- Policy audit records gain `rule`: the deciding rule's source, index and mode, or `null`.
+
 - Distinct exit codes for `bw run` and `bw resume` with a prompt: 0 complete, 1 error, 2 usage,
   3 completed with a denied approval, 4 step limit, 5 model or network error, 6 context budget,
   7 time limit, 130 interrupted. The `--json` result line adds `reason`, `denied` and
