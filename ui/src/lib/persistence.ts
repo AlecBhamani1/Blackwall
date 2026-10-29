@@ -134,12 +134,51 @@ export interface UsageSummary {
   perModel: UsageGroupRow[];
   perMode: { mode: string; total: number; modelCalls: number; runs: number }[];
   tools: { name: string; calls: number; errors: number; denied: number; timeouts: number }[];
-  gaps: { firstDay: string | null; droppedRuns: number };
+  gaps: {
+    firstDay: string | null;
+    droppedRuns: number;
+    /** Periods with recording off; `null` ends are before the first marker or still off. */
+    offPeriods?: UsageOffPeriod[];
+  };
   warnings: string[];
   telemetryEnabled: boolean;
   files: number;
   newestUnixMs: number | null;
   stale: boolean;
+}
+export interface UsageOffPeriod {
+  surface: 'desktop' | 'cli' | string;
+  fromUnixMs: number | null;
+  toUnixMs: number | null;
+}
+/** Usage history: a number of days (30 to 3,650) or forever. */
+export type Retention = number | 'forever';
+export type ExportProtocol = 'http/json' | 'http/protobuf';
+/** OTLP export settings. Header names only; their values live in the credential store. */
+export interface ExportSettings {
+  endpoint?: string | null;
+  protocol: ExportProtocol;
+  traces: boolean;
+  metrics: boolean;
+  headers: string[];
+  includeProject: boolean;
+}
+export interface TelemetryPreferences {
+  export: ExportSettings;
+  retention: Retention;
+}
+export interface ExportStatus {
+  endpoint: string | null;
+  protocol: ExportProtocol;
+  traces: boolean;
+  metrics: boolean;
+  lastSuccessUnixMs: number | null;
+  /** The error class and HTTP status only; response bodies are never kept. */
+  lastError: { kind: string; status: number | null; signal: string; unixMs: number } | null;
+  sentSpans: number;
+  droppedSpans: number;
+  sentMetrics: number;
+  droppedMetrics: number;
 }
 export interface TelemetryExport {
   folder: string;
@@ -280,3 +319,18 @@ export const persistence = {
   saveKey: (endpoint: string, key: string) => command<void>('save_model_key', { endpoint, key }),
 };
 export type Persistence = typeof persistence;
+
+/** Settings → Security → Telemetry and the Usage page's export card. */
+export const telemetryClient = {
+  available: isDesktop,
+  load: () => command<TelemetryPreferences>('load_telemetry'),
+  save: (settings: TelemetryPreferences) => command<void>('save_telemetry', { settings }),
+  /** Saves the value in the credential store and returns the saved (lower-case) name. */
+  saveHeader: (name: string, value: string) =>
+    command<string>('save_telemetry_header', { name, value }),
+  deleteHeader: (name: string) => command<void>('delete_telemetry_header', { name }),
+  status: () => command<ExportStatus>('telemetry_status'),
+  /** Sends one test span with these settings; resolves to the HTTP status. */
+  test: (settings: ExportSettings) => command<number>('test_telemetry', { export: settings }),
+};
+export type TelemetryClient = typeof telemetryClient;

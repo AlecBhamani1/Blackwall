@@ -35,3 +35,34 @@ export const outcomeNames: Record<string, [string, string]> = {
   cancelled: ['stopped', 'stopped'],
   denied: ['denied', 'denied'],
 };
+
+const exportErrorNames: Record<string, string> = {
+  connect: 'could not connect',
+  timeout: 'timed out after 10 s',
+  redirect: 'redirect not followed',
+  http_status: 'collector refused',
+  missing_header: 'header value missing',
+  credential_store: 'credential store unavailable',
+  request: 'request failed',
+  invalid_endpoint: 'invalid endpoint',
+  insecure_endpoint: 'https required',
+  invalid_header: 'invalid header',
+  invalid_header_value: 'invalid header value',
+  too_many_headers: 'too many headers',
+  off: 'export is off',
+};
+
+/** An export failure as its error class and HTTP status; response bodies are never shown. */
+export function exportError(kind: string, status: number | null): string {
+  const name = exportErrorNames[kind] ?? kind;
+  return status ? `${name} (HTTP ${status})` : name;
+}
+
+/** How long ago a Unix time in milliseconds was, such as "4 min ago". */
+export function ago(ms: number, now = Date.now()): string {
+  const minutes = Math.max(0, Math.round((now - ms) / 60_000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`;
+}

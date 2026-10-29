@@ -145,6 +145,48 @@ describe('usage dialog', () => {
     expect(screen.getByText('stale')).toBeInTheDocument();
   });
 
+  it('lists past recording-off periods in the gaps line', async () => {
+    const from = new Date(2026, 9, 24, 9, 5).getTime();
+    const to = new Date(2026, 9, 24, 17, 40).getTime();
+    vi.spyOn(persistence, 'usage').mockResolvedValue({
+      ...usageFixture(),
+      gaps: {
+        firstDay: null,
+        droppedRuns: 0,
+        offPeriods: [
+          { surface: 'desktop', fromUnixMs: from, toUnixMs: to },
+          { surface: 'cli', fromUnixMs: to, toUnixMs: null },
+        ],
+      },
+    });
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    const gaps = await screen.findByText(/Missing from this picture/);
+    expect(gaps.parentElement).toHaveTextContent(
+      /recording off Oct 24, 09:05 AM – Oct 24, 05:40 PM/,
+    );
+    expect(gaps.parentElement).toHaveTextContent(/bw recording off since Oct 24, 05:40 PM/);
+  });
+
+  it('shows the export card', async () => {
+    vi.spyOn(persistence, 'usage').mockResolvedValue(usageFixture());
+    const { telemetryClient } = await import('../persistence');
+    vi.spyOn(telemetryClient, 'status').mockResolvedValue({
+      endpoint: 'http://127.0.0.1:4318/',
+      protocol: 'http/protobuf',
+      traces: true,
+      metrics: true,
+      lastSuccessUnixMs: null,
+      lastError: null,
+      sentSpans: 0,
+      droppedSpans: 0,
+      sentMetrics: 0,
+      droppedMetrics: 0,
+    });
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    expect(await screen.findByText('http://127.0.0.1:4318/')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send test span' })).toBeInTheDocument();
+  });
+
   it('refreshes every 2 minutes while visible', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const usage = vi.spyOn(persistence, 'usage').mockResolvedValue(usageFixture());

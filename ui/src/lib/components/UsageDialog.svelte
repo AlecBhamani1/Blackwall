@@ -2,10 +2,11 @@
   import { onDestroy, onMount } from 'svelte';
   import { persistence, type UsageGroupRow, type UsageSummary } from '../persistence';
   import Icon from './Icon.svelte';
+  import ExportCard from './usage/ExportCard.svelte';
   import StatTiles from './usage/StatTiles.svelte';
   import TokensChart from './usage/TokensChart.svelte';
   import UsageTable from './usage/UsageTable.svelte';
-  import { compact, dayLabel, modeNames, percent, plural } from './usage/format';
+  import { ago, compact, dayLabel, modeNames, percent, plural } from './usage/format';
   export let onClose: () => void;
 
   /** The page re-reads the metrics files this often while it is visible. */
@@ -110,9 +111,26 @@
       .filter(Boolean)
       .join(' · ');
   }
+  function moment(ms: number) {
+    return new Date(ms).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
   function gapParts(summary: UsageSummary) {
     const parts: string[] = [];
-    if (!summary.telemetryEnabled) parts.push('recording is off now');
+    const periods = summary.gaps.offPeriods ?? [];
+    const stillOff = periods.some((period) => period.surface === 'desktop' && !period.toUnixMs);
+    if (!summary.telemetryEnabled && !stillOff) parts.push('recording is off now');
+    for (const period of periods) {
+      const who = period.surface === 'cli' ? 'bw recording' : 'recording';
+      if (period.fromUnixMs && period.toUnixMs)
+        parts.push(`${who} off ${moment(period.fromUnixMs)} – ${moment(period.toUnixMs)}`);
+      else if (period.fromUnixMs) parts.push(`${who} off since ${moment(period.fromUnixMs)}`);
+      else if (period.toUnixMs) parts.push(`${who} off until ${moment(period.toUnixMs)}`);
+    }
     if (summary.gaps.droppedRuns > 0)
       parts.push(`${plural(summary.gaps.droppedRuns, 'run')} dropped (writer queue full)`);
     if (summary.gaps.firstDay)
@@ -135,12 +153,6 @@
         kind: kind as string,
       }))
       .filter((part) => part.value > 0);
-  }
-  function ago(ms: number) {
-    const minutes = Math.round((Date.now() - ms) / 60_000);
-    if (minutes < 60) return `${minutes} min ago`;
-    const hours = Math.round(minutes / 60);
-    return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`;
   }
 
   onMount(() => {
@@ -355,6 +367,7 @@
         </div>
         {#each summary.warnings as warning (warning)}<p class="sub warning">{warning}</p>{/each}
       {/if}
+      {#if summary}<ExportCard refreshed={lastRead} />{/if}
     {/if}
   </div>
 </dialog>

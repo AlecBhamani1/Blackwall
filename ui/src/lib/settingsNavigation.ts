@@ -32,8 +32,9 @@ export const settingsEntries: readonly SettingsEntry[] = [
     icon: 'shield',
     desktopOnly: true,
     title: 'Security',
-    description: 'Access keys and app lock',
-    keywords: 'credentials token password privacy',
+    description: 'Access keys, app lock, and telemetry',
+    keywords:
+      'credentials token password privacy telemetry otlp opentelemetry export collector retention',
   },
   {
     id: 'updates',
