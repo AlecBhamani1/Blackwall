@@ -30,6 +30,7 @@ pub mod secrets;
 pub mod telemetry;
 pub mod tools;
 pub mod trace;
+pub mod usage;
 
 pub mod web;
 

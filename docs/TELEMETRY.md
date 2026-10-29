@@ -29,6 +29,9 @@ detectors.
 | Metric | `gen_ai.client.operation.duration` | histogram, `s` | Once per model call |
 | Metric | `blackwall.tool.invocations` | counter, `{call}` | Once per tool call |
 | Metric | `blackwall.run.outcomes` | counter, `{run}` | Once per finished, failed, or stopped run |
+| Metric | `blackwall.client.output_speed` | histogram, `{token}/s` | Once per successful model call that produced output |
+| Metric | `blackwall.compaction.tokens_saved` | histogram, `{token}` | Once per compaction, the estimated context it released |
+| Metric | `blackwall.trace.dropped_runs` | counter, `{run}` | Once per run whose trace the writer queue dropped |
 
 `blackwall.*` is our namespace for what the conventions do not define yet.
 
@@ -51,7 +54,15 @@ made-up name is model-written text, so it never reaches a trace or a metric.
 **Model-call metrics:** `gen_ai.operation.name=chat`, `gen_ai.request.model`,
 `gen_ai.provider.name`, `server.address` (host only; left out when the endpoint has no host),
 `blackwall.mode=chat|agent|subagent`, and `blackwall.compaction=true` on compaction calls. Token
-usage adds `gen_ai.token.type=input|output`. Duration adds `error.type` on failure, one of
+usage adds `gen_ai.token.type=input|output`, plus `cached_input` (from the server's
+`prompt_tokens_details.cached_tokens`) and `reasoning` (from
+`completion_tokens_details.reasoning_tokens`) when the server reports them. These two are parts of
+`input` and `output`, not extra tokens: sum only `input` and `output` for a total.
+
+**Project and session:** model-call metrics, output speed, compaction savings, and run outcomes
+also carry `blackwall.project`, the workspace folder's name (never its path, and absent for Chat,
+which has no project), and `blackwall.session`, the conversation's neutral ID (absent when the ID
+is not plain letters, digits, `-`, or `_`). Titles and prompts are never recorded. Duration adds `error.type` on failure, one of
 `network`, `http`, `invalid_response`, `limit`, or `_OTHER`, the same in every Chat and Agent
 path. `gen_ai.provider.name` is `ollama` for an
 endpoint on port 11434 and `openai_compatible` otherwise.
@@ -118,9 +129,36 @@ receivers:
     include: ["/Users/you/.blackwall/metrics/*.jsonl", "/Users/you/.blackwall/traces/*.json"]
 ```
 
+## Usage page
+
+`core::usage::summary(data_dir, from, to, offset_minutes)` reads `metrics/` for a range of the
+viewer's local days and returns the totals the desktop **Usage** page and `bw usage` show: tokens per day and by type, rows per
+project and per model (tokens, runs for projects, sessions, model calls, median output speed, p90
+duration, and the busiest sessions), the Chat/Agent/Subagent split, the top 10 tools with error and
+denied counts, run success, compaction savings, and gaps. Medians and p90s are read from histogram
+buckets, so they are estimates within a bucket. Lines that cannot be parsed are skipped with one
+warning per file, and histogram points whose bucket bounds differ from the rest are left out of
+medians and p90s with one warning. `core::usage::export` copies into a new folder every
+`metrics/` file whose UTC day overlaps the range and every trace started within it; a failed
+export removes that folder. See [Usage](RUNTIME_GUIDE.md#usage).
+
+**Local days.** Metrics files are named by the UTC day the line was exported, but the page and
+`bw usage` count the viewer's local days: the desktop passes its current UTC offset, and `bw usage`
+reads it from `date +%z` (UTC on Windows, or with `--utc`). Each data point is counted on the local
+day of its timestamp, which is its export time, so the files from the day before to the day after
+the range are read. A line covers up to the 60 seconds before it was exported, so use in the last
+minute before local midnight can count on the next day. Points are bucketed with the offset in use
+when the page is read, so after a daylight-saving change older days shift by that hour.
+
+**What the gaps line cannot know.** It reports history before the first metrics point, runs whose
+trace the writer queue dropped, and whether recording is off now. It cannot tell past periods when
+recording was off from periods with no use, because nothing is written while recording is off; days
+with no data are shown as "no data", not as off. Planned with OTLP export (PR 3): recording on/off
+changes are written down, so past off periods can be listed.
+
 ## Retention
 
 Trace files: the newest 200. Metrics files: 400 days by default. Files older than the retention
 window are deleted when telemetry starts. In core, `Retention::Days(n)` (clamped to 30–3,650) or
-`Retention::Forever` sets the window; the Settings and `bw config` controls arrive with the Usage
-page.
+`Retention::Forever` sets the window; Settings and `bw config` controls for it are not exposed yet,
+so every client keeps the 400-day default.

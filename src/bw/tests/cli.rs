@@ -1183,3 +1183,31 @@ fn review_rejects_targets_and_forged_tool_calls_and_skips_clean_model_calls() {
         "changed\n"
     );
 }
+
+#[test]
+fn usage_reports_a_run_by_project_and_as_json() {
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    assert!(fixture.success(&["usage"], "").contains("No usage yet."));
+    let mut reply = answer("counted");
+    reply.push(json!({"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":80}}}));
+    let server = ModelServer::start(vec![reply]);
+    fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
+    fixture.success(&["run", "count my tokens"], "");
+    server.finish();
+    let summary: Value =
+        serde_json::from_str(&fixture.success(&["usage", "--days", "1", "--json"], "")).unwrap();
+    assert_eq!(summary["totals"]["tokens"]["input"], 120);
+    assert_eq!(summary["totals"]["tokens"]["cachedInput"], 80);
+    assert_eq!(summary["totals"]["runs"], 1);
+    assert_eq!(summary["perProject"][0]["name"], "project");
+    assert_eq!(summary["perProject"][0]["sessions"], 1);
+    let text = fixture.success(&["usage", "--days", "7"], "");
+    assert!(text.contains("Tokens recorded: 150"), "{text}");
+    assert!(text.contains("Run success: 100.0%"), "{text}");
+    assert!(fixture
+        .success(&["usage", "--days", "5", "--utc"], "")
+        .contains("UTC)"));
+    let rejected = fixture.run(&["usage", "--days", "0"], "");
+    assert!(!rejected.status.success());
+}

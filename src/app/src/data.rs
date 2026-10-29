@@ -153,12 +153,14 @@ impl TelemetryState {
 
 /// A run's telemetry under the owner's current trace settings. `None` only when the data folder
 /// cannot be found; with traces off the scope records nothing. A compaction request is not a run:
-/// its scope only meters the summary calls.
+/// its scope only meters the summary calls. `labels` are the workspace (Agent only) and the
+/// conversation ID.
 pub(crate) async fn run_scope(
     app: &AppHandle,
     request_id: &str,
     mode: blackwall_core::telemetry::Mode,
     compact: bool,
+    labels: (Option<&std::path::Path>, Option<&str>),
 ) -> Option<blackwall_core::telemetry::RunScope> {
     let directory = crate::identity::data_directory(app).ok()?;
     let options = trace_options(directory.clone()).await;
@@ -173,11 +175,12 @@ pub(crate) async fn run_scope(
         )
     });
     telemetry.set_options(options);
-    Some(if compact {
+    let scope = if compact {
         telemetry.compaction(mode)
     } else {
         telemetry.run(request_id, mode)
-    })
+    };
+    Some(scope.labelled(labels.0, labels.1))
 }
 
 #[tauri::command]
@@ -420,6 +423,67 @@ pub async fn read_trace(
     tokio::task::spawn_blocking(move || blackwall_core::trace::read(&directory, &id))
         .await
         .map_err(|_| "This trace could not be read.")?
+}
+
+/// The Usage page: the last `days` days (1–400) of local usage metrics, ending today in the
+/// viewer's zone, `offset_minutes` east of UTC (the webview's `-getTimezoneOffset()`).
+#[tauri::command]
+pub async fn usage_summary(
+    app: AppHandle,
+    days: u16,
+    offset_minutes: i32,
+) -> Result<blackwall_core::usage::UsageSummary, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let enabled = trace_options(directory.clone()).await.enabled;
+    let (from, to) = blackwall_core::usage::Day::range(
+        days.clamp(1, 400),
+        blackwall_core::usage::Day::today(offset_minutes),
+    );
+    let mut summary = tokio::task::spawn_blocking(move || {
+        blackwall_core::usage::summary(&directory, from, to, offset_minutes)
+    })
+    .await
+    .map_err(|_| "Usage could not be read.")?;
+    summary.telemetry_enabled = enabled;
+    Ok(summary)
+}
+/// Export the last `days` local days of metrics and traces into a folder the owner picks. The folder
+/// comes from the native picker, never from the webview. `None` when the picker is cancelled.
+#[tauri::command]
+pub async fn export_telemetry(
+    app: AppHandle,
+    days: u16,
+    offset_minutes: i32,
+) -> Result<Option<blackwall_core::usage::ExportReport>, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let picker = app.clone();
+    let chosen = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title("Export usage telemetry")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| "The picker could not open.")?;
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let dest = chosen.into_path().map_err(|_| "Choose a local folder.")?;
+    crate::auth::require_unlocked(&app).await?;
+    let (from, to) = blackwall_core::usage::Day::range(
+        days.clamp(1, 400),
+        blackwall_core::usage::Day::today(offset_minutes),
+    );
+    tokio::task::spawn_blocking(move || {
+        blackwall_core::usage::export(&directory, from, to, offset_minutes, &dest)
+    })
+    .await
+    .map_err(|_| "The export could not finish.")?
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 /// Skills found in other harnesses' folders (Claude Code, Codex, Agent Skills), ready to review.

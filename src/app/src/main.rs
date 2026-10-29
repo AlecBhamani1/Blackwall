@@ -77,6 +77,8 @@ fn run() -> Result<(), StartupError> {
             data::discard_skill_downloads,
             data::list_traces,
             data::read_trace,
+            data::usage_summary,
+            data::export_telemetry,
             data::list_mcp_servers,
             data::add_mcp_server,
             data::set_mcp_server_enabled,

@@ -21,6 +21,7 @@
   import SkillsDialog from './SkillsDialog.svelte';
   import McpDialog from './McpDialog.svelte';
   import RunsDialog from './RunsDialog.svelte';
+  import UsageDialog from './UsageDialog.svelte';
   import {
     settingsEntries,
     settingsGroups,
@@ -922,6 +923,8 @@
     <McpDialog onClose={closePanel} />
   {:else if activePanel === 'runs'}
     <RunsDialog onClose={closePanel} />
+  {:else if activePanel === 'usage'}
+    <UsageDialog onClose={closePanel} />
   {/if}
 {/if}
 

@@ -460,6 +460,40 @@ runs** and **Include content** in that panel set the desktop's `tracesEnabled` a
 preferences, which apply to Chat runs too. `/compact` requests are not recorded as runs; their
 summary calls count only toward usage metrics.
 
+## Usage
+
+**Settings → Workflows → Usage** and `bw usage` total what the local usage metrics recorded for
+Today, 7, 30, or 90 days on the desktop, or any 1 to 400 days with `bw usage --days N`. Days are
+local days in this computer's time zone; `bw usage --utc` counts UTC days instead. Nothing is estimated in dollars: models run locally, and
+command tools such as `claude` or `codex` are billed by their own services.
+
+- **Tiles:** tokens recorded, with runs, sessions, and model calls; run success and how other runs
+  ended; median output speed; tokens kept out of context by compaction.
+- **Missing from this picture:** history before the first day with metrics, runs whose trace the
+  writer queue dropped, and whether recording is off now. Past periods with recording off cannot
+  be told apart from days without use, so days with no data are marked "no data" in the chart.
+- **Where it went:** tokens by project (the workspace folder's name, never its path; Chat has no
+  project) or by model. Selecting a row shows its share of the range, its split across Agent,
+  Subagent, and Chat, and its busiest sessions by their neutral IDs. Titles and prompts are never
+  recorded. Under the list, the range splits into Agent, Subagent, and Chat tokens, runs, and
+  calls. In the Models view each row also shows calls, tokens in and out, median output speed, p90
+  call duration, and the share of failed calls.
+- **Tokens per day** as stacked input and output bars, with a table view; **What the tokens
+  contain**: input, cached input, output, and reasoning, where the model server reports the last
+  two; and **Top tools** with error and denied rates.
+
+The page re-reads the files every 2 minutes while it is open and visible, and marks the data
+*stale* when the newest point is more than 4 minutes old. A damaged or truncated line is skipped
+with one warning per file; the rest of the range still shows. **Export…** copies the range's
+metrics and trace files into a new `blackwall-telemetry-<from>-to-<to>` folder you choose, as plain
+OTLP JSON any OpenTelemetry Collector can import.
+
+```sh
+bw usage                 # last 7 local days as text
+bw usage --days 14 --json
+bw usage --days 1 --utc  # today in UTC
+```
+
 ## App lock
 
 Enable **App lock** in **Settings → General → Security** with a passphrase of at least 10 characters.
@@ -482,6 +516,7 @@ bw run "Explain this project's entry points"
 bw sessions
 bw resume SESSION_ID
 bw resume SESSION_ID "Continue the investigation"
+bw usage --days 30
 ```
 
 `bw` or `bw chat` opens an interactive conversation in the current folder. Setup asks for your

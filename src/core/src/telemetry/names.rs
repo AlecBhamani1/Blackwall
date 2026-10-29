@@ -32,8 +32,18 @@ pub use opentelemetry_semantic_conventions::SCHEMA_URL;
 
 pub const TOOL_INVOCATIONS: &str = "blackwall.tool.invocations";
 pub const RUN_OUTCOMES: &str = "blackwall.run.outcomes";
+/// Output tokens per second of each model call that produced output.
+pub const OUTPUT_SPEED: &str = "blackwall.client.output_speed";
+/// Estimated tokens each compaction removed from the context.
+pub const COMPACTION_SAVED: &str = "blackwall.compaction.tokens_saved";
+/// Finished runs whose trace was dropped because the writer queue was full.
+pub const DROPPED_RUNS: &str = "blackwall.trace.dropped_runs";
 
 pub const MODE: &str = "blackwall.mode";
+/// The workspace folder's name (never its path). Agent runs only; Chat has no project.
+pub const PROJECT: &str = "blackwall.project";
+/// The neutral conversation ID a run belongs to; never a title or prompt.
+pub const SESSION: &str = "blackwall.session";
 pub const SURFACE: &str = "blackwall.surface";
 pub const REQUEST_ID: &str = "blackwall.request_id";
 pub const TOOL_OUTCOME: &str = "blackwall.tool.outcome";

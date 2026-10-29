@@ -207,6 +207,7 @@ impl Conversation {
         let state = ContextState::restore(&source, self.saved_context()?.as_ref())
             .map_err(|e| e.to_string())?;
         let memory = self.memory_tools(directory);
+        let session = self.id().to_owned();
         let (_, snapshot, result) = execute(
             &backend,
             execution_workspace(&self.workspace, directory, settings)?,
@@ -223,6 +224,7 @@ impl Conversation {
             Some(input),
             memory.as_ref(),
             directory,
+            &session,
         )
         .await;
         result?;
@@ -280,6 +282,7 @@ impl Conversation {
         let (instructions, source): (Vec<_>, Vec<_>) =
             messages.into_iter().partition(|m| m["role"] == "system");
         let state = ContextState::restore(&source, saved.as_ref()).map_err(|e| e.to_string())?;
+        let session = self.id().to_owned();
         let (answer, snapshot, result) = execute(
             &backend,
             workspace,
@@ -296,6 +299,7 @@ impl Conversation {
             input,
             memory.as_ref(),
             directory,
+            &session,
         )
         .await;
         if let Some(snapshot) = snapshot {
@@ -388,6 +392,7 @@ fn run_scope(
     trace: blackwall_core::trace::TraceOptions,
     request_id: &str,
     compact: bool,
+    labels: (&Path, &str),
 ) -> blackwall_core::telemetry::RunScope {
     use blackwall_core::telemetry::{Mode, Surface, Telemetry, TelemetryOptions};
     let telemetry = TELEMETRY.get_or_init(|| {
@@ -395,11 +400,12 @@ fn run_scope(
     });
     telemetry.set_options(trace);
     // A compaction request is not a run: it only meters its summary calls.
-    if compact {
+    let scope = if compact {
         telemetry.compaction(Mode::Agent)
     } else {
         telemetry.run(request_id, Mode::Agent)
-    }
+    };
+    scope.labelled(Some(labels.0), Some(labels.1))
 }
 
 /// Write any buffered metrics before bw exits.
@@ -419,6 +425,7 @@ async fn execute(
     mut input: Option<&mut Input>,
     memory: Option<&MemoryTools>,
     directory: &Path,
+    session: &str,
 ) -> (String, Option<ContextState>, Result<(), String>) {
     let json = input.is_none();
     let approvals = Approvals::default();
@@ -434,7 +441,14 @@ async fn execute(
         emit,
     };
     let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    run.trace = Some(run_scope(directory, trace, &request_id, run.compact));
+    let project = agent.workspace.path.clone();
+    run.trace = Some(run_scope(
+        directory,
+        trace,
+        &request_id,
+        run.compact,
+        (&project, session),
+    ));
     let work = agent.run_context_with_guidance(&request_id, run, memory, Some(directory));
     tokio::pin!(work);
     let mut answer = String::new();

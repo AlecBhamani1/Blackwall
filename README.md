@@ -49,6 +49,8 @@ a SmartScreen or Gatekeeper warning.
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Local OpenTelemetry traces and usage metrics (tokens, durations, tool and run outcomes) for Chat,
   Agent, and subagent runs, kept in the data folder and never sent anywhere ([Telemetry](docs/TELEMETRY.md))
+- A Usage page and `bw usage`: tokens by project, model, and day, run success, output speed,
+  compaction savings, and top tools, read from those local metrics
 - Reviewed agent learning and user-managed local memory, plus reusable Markdown skills that load on
   demand, run directly with `/name`, and can be proposed from a successful run with `/learn`
 - Interactive CLI with guided setup, saved settings, `/commands`, and the same core agent runtime
@@ -104,6 +106,10 @@ Use `/settings` to review them. Changes apply to the next turn and future CLI la
 `bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
 one as a tree; the desktop **Settings → Workflows → Runs** panel shows the same traces. See
 [Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
+`bw usage [--days N] [--utc] [--json]` totals tokens, runs, sessions, and tools for the last N
+local days (1–400), by
+project and model; **Settings → Workflows → Usage** shows the same numbers with a chart and a
+per-project session breakdown. See [Usage](docs/RUNTIME_GUIDE.md#usage).
 
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues

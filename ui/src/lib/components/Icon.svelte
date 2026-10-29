@@ -8,6 +8,7 @@
     | 'folder'
     | 'search'
     | 'brain'
+    | 'chart'
     | 'history'
     | 'server'
     | 'shield'
@@ -74,6 +75,8 @@
     <path
       d="M12 18V5a3 3 0 0 0-5.8-1A4 4 0 0 0 4 11a4 4 0 0 0 2 7.5A3 3 0 0 0 12 18Zm0 0a3 3 0 0 0 6 .5 4 4 0 0 0 2-7.5 4 4 0 0 0-2.2-7A3 3 0 0 0 12 5M8 9a4 4 0 0 0 4-4M16 9a4 4 0 0 1-4-4M8 14a4 4 0 0 1 4 4M16 14a4 4 0 0 0-4 4"
     />
+  {:else if name === 'chart'}
+    <path d="M4 20h16M7 16v-5M12 16V6M17 16v-8" />
   {:else if name === 'history'}
     <path d="M3 3v6h6M3 9a9 9 0 1 1 0 6M12 7v5l3 2" />
   {:else if name === 'server'}

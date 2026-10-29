@@ -42,3 +42,15 @@ Object.defineProperty(window.navigator, 'userAgent', {
   configurable: true,
   value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)',
 });
+
+// jsdom has no layout; `bind:clientWidth` needs a ResizeObserver to exist.
+if (!('ResizeObserver' in window)) {
+  Object.defineProperty(window, 'ResizeObserver', {
+    configurable: true,
+    value: class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  });
+}
