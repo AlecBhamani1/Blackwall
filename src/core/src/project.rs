@@ -10,10 +10,10 @@
 //!   hash and the parsed settings come from those same bytes.
 //!
 //! The `mcp` section is applied by [`crate::mcp`] as `p-` servers, and `limits` by
-//! [`crate::agent`] through [`trusted_limits`], with the owner's own values as a ceiling: a
+//! [`crate::agent`], with the owner's own values as a ceiling: a
 //! project can only lower the output cap and subagent steps and narrow subagent tools. It can
-//! never choose where subagents run. The `instructions` section, also through [`trusted_limits`],
-//! can only lower instruction caps and keep fewer of the owner's extra files.
+//! never choose where subagents run. The `instructions` section can only lower instruction caps
+//! and keep fewer of the owner's extra files.
 use crate::policy::{Decision, RuleMode, RulesFile};
 use crate::protocol::ApprovalKind;
 use cap_std::fs::{Dir, OpenOptions};
@@ -104,7 +104,7 @@ pub struct ProjectConfig {
     /// Started by [`crate::mcp::McpServers::start`] as `p-<name>` once the file is trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpFile>,
-    /// Applied as ceilings once the file is trusted; see [`trusted_limits`].
+    /// Applied as ceilings once the file is trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ProjectLimits>,
     /// Applied once the file is trusted, only lowering the owner's caps and extra files.
@@ -280,27 +280,6 @@ pub struct ProjectStatus {
     pub waiting: Vec<String>,
     /// Why the file cannot be used, when it cannot. Every action then asks.
     pub error: Option<String>,
-}
-
-/// A trusted project's `limits` and `instructions` for a run. An untrusted, changed or unusable
-/// file has neither; its warnings are reported by the run's policy.
-pub async fn trusted_limits(
-    data_dir: &Path,
-    workspace: &Path,
-) -> (Option<ProjectLimits>, Option<InstructionSettings>) {
-    let (data, folder) = (data_dir.to_path_buf(), workspace.to_path_buf());
-    let loaded = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || try_load(&folder, &data)),
-    )
-    .await;
-    let Ok(Ok(Ok(loaded))) = loaded else {
-        return (None, None);
-    };
-    if loaded.trust != Trust::Trusted {
-        return (None, None);
-    }
-    (loaded.config.limits, loaded.config.instructions)
 }
 
 /// Load the project's settings for a run. When the file is not trusted, the config holds only its

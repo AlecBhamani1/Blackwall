@@ -210,6 +210,8 @@ pub struct Policy {
     pub error: Option<String>,
     /// Notes about the project's settings file, shown with the run's other warnings.
     pub warnings: Vec<String>,
+    pub(crate) project_limits: Option<crate::project::ProjectLimits>,
+    pub(crate) project_instructions: Option<crate::project::InstructionSettings>,
     /// Set when the project file could not be used: nothing is allowed without asking.
     ask_all: bool,
     audit: PathBuf,
@@ -289,6 +291,8 @@ impl Policy {
         let mut layers = vec![user];
         let mut warnings = vec![];
         let mut ask_all = false;
+        let mut project_limits = None;
+        let mut project_instructions = None;
         if with_project {
             let (data, folder) = (directory.to_path_buf(), workspace.to_path_buf());
             let loaded = tokio::time::timeout(
@@ -306,6 +310,10 @@ impl Policy {
                         }
                     }
                     warnings = loaded.warnings;
+                    if loaded.trust == crate::project::Trust::Trusted {
+                        project_limits = loaded.config.limits;
+                        project_instructions = loaded.config.instructions;
+                    }
                     layers.extend(
                         loaded
                             .config
@@ -331,6 +339,8 @@ impl Policy {
             layers,
             error,
             warnings,
+            project_limits,
+            project_instructions,
             ask_all,
             audit,
             protected,
@@ -877,6 +887,8 @@ mod tests {
                 .layer(Source::User)],
             error: None,
             warnings: vec![],
+            project_limits: None,
+            project_instructions: None,
             ask_all: false,
             with_project: false,
             audit: std::env::temp_dir().join(AUDIT_FILE),

@@ -59,6 +59,12 @@ struct Registry {
 }
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Registry>>);
+/// Trusted project settings captured by the same read as the run's project policy.
+pub struct LoadedProjectSettings {
+    pub warnings: Vec<String>,
+    pub limits: Option<crate::project::ProjectLimits>,
+    pub instructions: Option<crate::project::InstructionSettings>,
+}
 struct Waiting {
     approvals: Approvals,
     id: String,
@@ -87,21 +93,25 @@ impl Approvals {
     }
 
     /// Apply the owner's rules in `directory`, and the project's rules, to this run until the
-    /// run is cleared. Returns notes about the project's settings file for the run's warnings.
+    /// run is cleared. Returns trusted settings from that same project file read.
     pub async fn load_policy(
         &self,
         request_id: &str,
         directory: &Path,
         workspace: &Path,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<LoadedProjectSettings, String> {
         let policy = Arc::new(Policy::load(directory, workspace).await);
-        let warnings = policy.warnings.clone();
+        let settings = LoadedProjectSettings {
+            warnings: policy.warnings.clone(),
+            limits: policy.project_limits.clone(),
+            instructions: policy.project_instructions.clone(),
+        };
         self.0
             .lock()
             .map_err(|_| "The approval registry is unavailable.")?
             .policies
             .insert(request_id.into(), policy);
-        Ok(warnings)
+        Ok(settings)
     }
     /// `subject` is the command, workspace-relative path, or host that rules match.
     pub async fn request(
@@ -500,6 +510,70 @@ impl Approvals {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn project_policy_and_limits_share_one_load() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-project-policy-snapshot-{}",
+            rand::random::<u64>()
+        ));
+        let (directory, workspace) = (root.join("data"), root.join("work"));
+        std::fs::create_dir_all(workspace.join(crate::project::PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let file = workspace
+            .join(crate::project::PROJECT_DIRECTORY)
+            .join(crate::project::PROJECT_FILE);
+        std::fs::write(
+            &file,
+            json!({
+                "policy": {"rules": [{
+                    "decision": "deny", "kind": "exec", "command": "snapshot"
+                }]},
+                "limits": {"max_output_bytes": 4096}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let sha = crate::project::status(&workspace, &directory)
+            .sha256
+            .unwrap();
+        crate::project::trust(&workspace, &directory, &sha).unwrap();
+
+        let approvals = Approvals::default();
+        let settings = approvals
+            .load_policy("run", &directory, &workspace)
+            .await
+            .unwrap();
+
+        // A later edit cannot split the run between policy from one file version and limits from
+        // another, because both values above came from the same loaded snapshot.
+        std::fs::write(
+            &file,
+            json!({"policy": {"rules": []}, "limits": {"max_output_bytes": 8192}}).to_string(),
+        )
+        .unwrap();
+        let sha = crate::project::status(&workspace, &directory)
+            .sha256
+            .unwrap();
+        crate::project::trust(&workspace, &directory, &sha).unwrap();
+
+        assert_eq!(settings.limits.unwrap().max_output_bytes, Some(4096));
+        let never = |_| panic!("the loaded deny rule must not ask");
+        assert!(!approvals
+            .request(
+                "run",
+                ApprovalKind::Exec,
+                "snapshot",
+                "detail".into(),
+                &never,
+            )
+            .await
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn wrong_run_cannot_authorize_and_dropped_wait_is_revoked() {
         let approvals = Approvals::default();

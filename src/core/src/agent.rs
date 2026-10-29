@@ -279,13 +279,17 @@ impl Agent<'_> {
             }
         }
         // The owner's rules and this project's `.blackwall/project.json` rules, read every run.
-        let project_warnings = match user_directory {
+        let project_settings = match user_directory {
             Some(directory) => self
                 .approvals
                 .load_policy(request_id, directory, &self.workspace.path)
                 .await
                 .map_err(tools::ToolError::Execution)?,
-            None => vec![],
+            None => crate::approvals::LoadedProjectSettings {
+                warnings: vec![],
+                limits: None,
+                instructions: None,
+            },
         };
         let command_tools = match user_directory {
             Some(directory) => crate::command_tools::CommandTools::load(directory).await,
@@ -293,12 +297,8 @@ impl Agent<'_> {
         };
         // A trusted project can lower the output cap, narrow subagents, and lower instruction
         // caps or drop extra files, never raise or add them.
-        let (limits, project_instructions) = match user_directory {
-            Some(directory) => {
-                crate::project::trusted_limits(directory, &self.workspace.path).await
-            }
-            None => (None, None),
-        };
+        let limits = project_settings.limits;
+        let project_instructions = project_settings.instructions;
         let instruction_settings = instruction_settings.within(project_instructions.as_ref());
         if let Some(limits) = &limits {
             budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
@@ -333,7 +333,7 @@ impl Agent<'_> {
         })
         .await?;
         guidance.warnings.extend(command_tools.error.clone());
-        guidance.warnings.extend(project_warnings);
+        guidance.warnings.extend(project_settings.warnings);
         if !compact
             && source.last().is_some_and(|message| {
                 message["role"] == "user"
