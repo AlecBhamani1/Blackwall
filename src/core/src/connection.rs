@@ -506,6 +506,15 @@ async fn probe_local(origin: String) -> Option<LocalService> {
     }
     let listed = listed.ok()?;
     let models = model_names(listed.get("data")?.as_array()?, false);
+    // Ollama runs each loaded model in its own llama.cpp server on a private port, named after
+    // the model file. Chats belong to Ollama itself, which is listed on its own port.
+    if !models.is_empty()
+        && models
+            .iter()
+            .all(|model| model.replace('\\', "/").contains("/blobs/sha256-"))
+    {
+        return None;
+    }
     // Kind detection gets whatever time is left; a slow server is still listed, as unknown.
     let first = models.first().cloned().unwrap_or_default();
     let (kind, window) = tokio::time::timeout_at(deadline, identify(&endpoint, &first, None))
@@ -1084,9 +1093,20 @@ mod tests {
         ])
         .await;
         let generic = server(&[("/v1/models", serde_json::json!({"data": [{"id": "m"}]}))]).await;
+        let runner = server(&[
+            (
+                "/props",
+                serde_json::json!({"default_generation_settings": {"n_ctx": 2048}}),
+            ),
+            (
+                "/v1/models",
+                serde_json::json!({"data": [{"id": "/home/me/.ollama/models/blobs/sha256-970aa74c"}]}),
+            ),
+        ])
+        .await;
         let other = server(&[("/", serde_json::json!({"hello": "world"}))]).await;
         let found = discover_origins(
-            [&llama, &vllm, &studio, &ollama, &generic, &other]
+            [&llama, &vllm, &studio, &ollama, &generic, &other, &runner]
                 .iter()
                 .map(|fake| fake.origin())
                 .collect(),
