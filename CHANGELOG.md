@@ -193,6 +193,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- `bw run --json` now counts actions an owner or project deny rule blocks, and calls to tools the
+  model was not offered, in `denied`, so those runs end with reason `denied` and exit 3 instead of
+  reporting success. Each such `tool_result` event has `"denied": true`.
 - A trusted project's `command` allow rule (for example `"command": "github__delete_repository"`)
   could allow one of your own MCP or command tools. A project's allow rules now only ever allow
   its own `p-` servers.
