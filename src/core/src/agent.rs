@@ -836,6 +836,7 @@ impl Agent<'_> {
                         }
                         // Command and extension failures carry their output, which is content.
                         let quiet_error = matches!(&result, Err(tools::ToolError::Execution(_)));
+                        let denied = matches!(&result, Err(tools::ToolError::Denied));
                         let output = result.unwrap_or_else(|error| error.to_string());
                         if let (Some(trace), Some(span)) = (trace, &tool_span) {
                             if trace.content() {
@@ -860,6 +861,7 @@ impl Agent<'_> {
                             output: output.clone(),
                             success,
                             truncated: output_cap.trimmed(),
+                            denied,
                         });
                         (
                             index,
@@ -1940,12 +1942,26 @@ mod tests {
             approvals: approvals.clone(),
             emit: Arc::new(move |event| output.lock().unwrap().push(event)),
         };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            agent.run("cancel-write", vec![]),
-        )
-        .await;
-        assert!(result.is_err());
+        // Cancel once the write is waiting for approval, however slow the machine is.
+        let mut run = Box::pin(agent.run("cancel-write", vec![]));
+        let prompted = || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. }))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !prompted() {
+                tokio::select! {
+                    _ = &mut run => panic!("the run must wait for approval"),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(run);
         let events = events.lock().unwrap();
         let pending = events
             .iter()

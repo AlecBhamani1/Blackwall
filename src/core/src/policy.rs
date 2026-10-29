@@ -964,6 +964,62 @@ mod tests {
     }
 
     #[test]
+    fn rule_matching_fuzz_is_panic_free_and_bounded() {
+        fn next(state: &mut u64) -> u8 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state as u8
+        }
+
+        let alphabet = [
+            'a', 'Z', '.', '*', '/', '\\', ' ', '\t', '\n', '$', ';', 'é', '🦀',
+        ];
+        let mut seed = 0x706f_6c69_6379_7275;
+        for _ in 0..1024 {
+            let string = |seed: &mut u64| {
+                (0..usize::from(next(seed)))
+                    .map(|_| alphabet[usize::from(next(seed)) % alphabet.len()])
+                    .collect::<String>()
+            };
+            let pattern = string(&mut seed);
+            let subject = string(&mut seed);
+            let kind = match next(&mut seed) % 4 {
+                0 => ApprovalKind::Exec,
+                1 => ApprovalKind::File,
+                2 => ApprovalKind::Network,
+                _ => ApprovalKind::Subagent,
+            };
+            let rule = Rule {
+                decision: match next(&mut seed) % 3 {
+                    0 => Decision::Allow,
+                    1 => Decision::Ask,
+                    _ => Decision::Deny,
+                },
+                kind,
+                command: matches!(kind, ApprovalKind::Exec).then(|| pattern.clone()),
+                path: matches!(kind, ApprovalKind::File).then(|| pattern.clone()),
+                host: matches!(kind, ApprovalKind::Network).then(|| pattern.clone()),
+                tool: None,
+                project: None,
+            };
+            assert!(std::panic::catch_unwind(|| matches(&rule, &subject)).is_ok());
+        }
+
+        let long = "*.".to_owned() + &"a".repeat(MAX_POLICY_BYTES - 2);
+        let rule = Rule {
+            decision: Decision::Deny,
+            kind: ApprovalKind::Network,
+            command: None,
+            path: None,
+            host: Some(long),
+            tool: None,
+            project: None,
+        };
+        assert!(!matches(&rule, &"b".repeat(MAX_POLICY_BYTES)));
+    }
+
+    #[test]
     fn control_syntax_and_path_traversal_never_auto_allow() {
         let rules = policy(
             r#"{"rules":[
