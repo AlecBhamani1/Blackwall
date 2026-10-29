@@ -1,0 +1,35 @@
+@startuml context
+!include <C4/C4_Context>
+!include style.puml
+LAYOUT_TOP_DOWN()
+title Blackwall system context
+
+Person(owner, "Owner", "Chats, runs agents, reviews usage")
+Person_Ext(guest, "Guest", "Browser chat through an invitation")
+System(bw, "Blackwall", "Desktop app and bw CLI, a local-first agent harness")
+
+System_Ext(llm, "Model server", "Ollama, LM Studio, llama.cpp, vLLM or another OpenAI-compatible service")
+System_Ext(store, "OS credential store", "Keychain, Credential Manager, Secret Service")
+System_Ext(relay, "Hosted relay", "Self-hosted edge for guest links and pairing")
+System_Ext(clis, "Command tools", "Owner-listed programs such as claude, codex, copilot")
+System_Ext(http, "HTTP services", "Owner-listed HTTP tools")
+System_Ext(mcp, "MCP servers", "stdio processes or streamable HTTP")
+System_Ext(web, "Public web", "Approved page reads and search")
+System_Ext(otel, "OTLP receiver", "Optional collector, Alloy, Jaeger, Langfuse")
+
+Rel_D(owner, bw, "Uses")
+Rel_D(guest, relay, "HTTPS")
+Rel_L(bw, relay, "Outbound WSS")
+Rel_R(bw, llm, "OpenAI-compatible HTTP")
+Rel_R(bw, store, "Model, relay, MCP, tool and export secrets")
+Rel_D(bw, clis, "argv or JSON on stdin")
+Rel_D(bw, http, "HTTPS GET or POST")
+Rel_D(bw, mcp, "JSON-RPC over stdio or HTTP")
+Rel_D(bw, web, "HTTPS, each request approved")
+Rel_D(bw, otel, "OTLP/HTTP, off by default")
+Lay_R(clis, http)
+Lay_R(http, mcp)
+Lay_R(mcp, web)
+Lay_R(web, otel)
+$BwLegend()
+@enduml

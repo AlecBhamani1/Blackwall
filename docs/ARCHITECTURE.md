@@ -5,61 +5,16 @@ boundaries. `DELIVERY_PLAN.md` records verified work and remaining product/relea
 
 ## Context and containers
 
-The diagrams use Mermaid's C4 syntax. The first shows what Blackwall talks to; every external
+The diagrams follow the [C4 model](https://c4model.com) and are drawn with
+[C4-PlantUML](https://github.com/plantuml-stdlib/C4-PlantUML); the sources are in
+[diagrams/](diagrams/). The first shows what Blackwall talks to; every external
 connection except the model server is off or empty until the owner sets it up.
 
-```mermaid
-C4Context
-title Blackwall system context
-Person(owner, "Owner", "Chats, runs agents, reviews usage")
-Person_Ext(guest, "Guest", "Browser chat through an invitation")
-System(bw, "Blackwall", "Desktop app and bw CLI, a local-first agent harness")
-System_Ext(llm, "Model server", "Ollama, LM Studio, llama.cpp, vLLM, or another OpenAI-compatible service, here or on another computer")
-System_Ext(clis, "Command tools", "Owner-listed programs, such as claude, codex, or copilot")
-System_Ext(http, "HTTP services", "Owner-listed HTTP tools")
-System_Ext(mcp, "MCP servers", "stdio processes or streamable HTTP endpoints")
-System_Ext(web, "Public web", "Approved page reads and DuckDuckGo search")
-System_Ext(relay, "Hosted relay", "Self-hosted edge for guest links and pairing")
-System_Ext(otel, "OTLP receiver", "Optional: Collector, Grafana Alloy, Jaeger, Langfuse")
-System_Ext(store, "OS credential store", "Keychain, Credential Manager, Secret Service")
-Rel(owner, bw, "Uses")
-Rel(guest, relay, "HTTPS")
-Rel(bw, relay, "Outbound WSS")
-Rel(bw, llm, "OpenAI-compatible HTTP")
-Rel(bw, clis, "argv or JSON on stdin")
-Rel(bw, http, "HTTPS GET or POST")
-Rel(bw, mcp, "JSON-RPC over stdio or HTTP")
-Rel(bw, web, "HTTPS, each request approved")
-Rel(bw, otel, "OTLP/HTTP, off by default")
-Rel(bw, store, "Model, relay, MCP, tool, and export secrets")
-```
+![Blackwall system context](diagrams/context.svg)
 
-```mermaid
-C4Container
-title Blackwall containers
-Person(owner, "Owner")
-System_Boundary(blackwall, "Blackwall") {
-  Container(ui, "Desktop UI", "Svelte 5, ui/", "Chat, Agent, Settings, Runs, Usage")
-  Container(app, "Tauri adapter", "Rust, src/app", "Typed commands, preferences, app lock, pairing")
-  Container(cli, "bw CLI", "Rust, src/bw", "REPL, bw run --json, bw usage, bw project, bw mcp")
-  Container(core, "Core runtime", "Rust, src/core", "Agent loop, tools, approvals, policy, MCP, telemetry, usage")
-  ContainerDb(data, "Data folder", "~/.blackwall", "blackwall.sqlite3, policy.json, policy-audit.jsonl, tools.json, mcp.json, trusted-projects.json, skills/, traces/, metrics/")
-}
-ContainerDb_Ext(proj, "Project file", "<project>/.blackwall/project.json", "Deny and ask rules apply at once; the rest after trust")
-Container_Ext(relay, "Relay", "Rust, src/relay", "Guest and pairing edge")
-System_Ext(llm, "Model server")
-System_Ext(otel, "OTLP receiver")
-Rel(owner, ui, "Uses")
-Rel(owner, cli, "Uses")
-Rel(ui, app, "Tauri invoke, blackwall://event")
-Rel(app, core, "Rust calls")
-Rel(cli, core, "Rust calls")
-Rel(core, data, "Reads and writes")
-Rel(core, proj, "Reads at each run; trust by SHA-256")
-Rel(core, llm, "OpenAI-compatible HTTP")
-Rel(core, otel, "OTLP/HTTP, JSON or protobuf")
-Rel(app, relay, "Outbound WSS")
-```
+The second shows the parts of Blackwall and the files it reads and writes.
+
+![Blackwall containers](diagrams/container.svg)
 
 ## Runtime flow
 
@@ -246,32 +201,7 @@ remembered, and marks the prompt off-device. Read-only child batches run up to t
 anything else runs one at a time. `tools::OutputCap` trims command output to
 `ContextBudget::max_output_bytes`; trusted `project.json` limits only lower these values.
 
-```mermaid
-C4Component
-title One Agent run in src/core
-Container(adapter, "Desktop or bw", "src/app or src/bw", "Discovers guidance and the served budget, starts the run")
-Container_Boundary(core, "src/core") {
-  Component(agent, "agent", "agent.rs", "Model and tool loop; RunReason at the end")
-  Component(model, "model", "model.rs, model/", "Streaming, reasoning filter, opt-in text tool calls")
-  Component(approvals, "approvals + policy", "approvals.rs, policy.rs", "Owner and project rules, prompts, policy-audit.jsonl")
-  Component(project, "project", "project.rs", "project.json hash and settings from the same bytes; trust; lower-only limits")
-  Component(tools, "tools", "tools.rs", "Files, shell, web; OutputCap trimming")
-  Component(ctools, "command_tools", "command_tools.rs", "Programs (argv or stdin JSON) and HTTP tools")
-  Component(mcp, "mcp", "mcp.rs, mcp/", "Stdio and streamable HTTP transports")
-  Component(subagents, "subagents", "subagents.rs", "Children on this model or on one command tool")
-  Component(telemetry, "telemetry", "telemetry/", "RunScope spans and metrics, RunBufferProcessor")
-}
-Rel(adapter, agent, "run")
-Rel(agent, model, "each turn")
-Rel(agent, approvals, "every action")
-Rel(approvals, project, "project rules")
-Rel(agent, tools, "built-in tools")
-Rel(agent, ctools, "owner tools")
-Rel(agent, mcp, "MCP tools")
-Rel(agent, subagents, "spawn_agent")
-Rel(subagents, ctools, "delegate, always asks")
-Rel(agent, telemetry, "spans and metrics")
-```
+![One agent run in src/core](diagrams/component.svg)
 
 Web access is disabled by default. Every request and redirect needs approval. The client disables
 proxies and automatic redirects, validates all resolved IPs, pins DNS results, rejects private and
