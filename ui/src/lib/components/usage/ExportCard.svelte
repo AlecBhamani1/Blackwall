@@ -29,8 +29,7 @@
     result = '';
     failed = false;
     try {
-      const saved = await client.load();
-      const code = await client.test(saved.export);
+      const code = await client.test();
       result = `Test span sent · HTTP ${code}`;
     } catch (cause) {
       failed = true;

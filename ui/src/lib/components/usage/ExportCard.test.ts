@@ -69,7 +69,7 @@ describe('export card', () => {
     render(ExportCard, { client: api });
     await user.click(await screen.findByRole('button', { name: 'Send test span' }));
     expect(await screen.findByRole('status')).toHaveTextContent('Test span sent · HTTP 200');
-    expect(api.test).toHaveBeenCalledWith({ endpoint: 'https://otel.example.com/' });
+    expect(api.test).toHaveBeenCalledWith();
     expect(api.status).toHaveBeenCalledTimes(2);
     api.test.mockRejectedValueOnce('The collector could not be reached.');
     await user.click(screen.getByRole('button', { name: 'Send test span' }));

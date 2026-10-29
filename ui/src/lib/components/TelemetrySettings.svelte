@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import {
     telemetryClient,
     type ExportSettings,
     type Retention,
-    type TelemetryPreferences,
+    type SavedHeader,
+    type TelemetryView,
   } from '../persistence';
   import { platform } from '../platform';
 
@@ -18,18 +19,19 @@
     headers: [],
     includeProject: false,
   };
-  let saved: TelemetryPreferences | null = null;
+  let saved: TelemetryView | null = null;
   let endpoint = '';
   let protocol: ExportSettings['protocol'] = 'http/protobuf';
   let traces = true;
   let metrics = true;
   let includeProject = false;
-  let headers: string[] = [];
   let forever = false;
   let days = 400;
   let headerName = '';
   let headerValue = '';
+  let valueInput: HTMLInputElement | undefined;
   let busy = false;
+  let confirmingContent = false;
   let error = '';
   let feedback = '';
   let testResult = '';
@@ -39,17 +41,16 @@
   function message(cause: unknown, fallback: string) {
     return cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : fallback;
   }
-  function apply(settings: TelemetryPreferences) {
-    saved = settings;
-    const exported = { ...blank, ...settings.export };
+  function apply(view: TelemetryView) {
+    saved = view;
+    const exported = { ...blank, ...view.export };
     endpoint = exported.endpoint ?? '';
     protocol = exported.protocol;
     traces = exported.traces;
     metrics = exported.metrics;
     includeProject = exported.includeProject;
-    headers = [...exported.headers];
-    forever = settings.retention === 'forever';
-    days = settings.retention === 'forever' ? 400 : settings.retention;
+    forever = view.retention === 'forever';
+    days = view.retention === 'forever' ? 400 : view.retention;
   }
   function draft(): ExportSettings {
     return {
@@ -57,28 +58,39 @@
       protocol,
       traces,
       metrics,
-      headers,
+      headers: saved?.export.headers ?? [],
       includeProject,
     };
   }
   function retention(): Retention {
     return forever ? 'forever' : Math.round(days);
   }
+  $: savedExport = { ...blank, ...(saved?.export ?? {}) };
+  $: headers = savedExport.headers;
+  $: endpointChanged = endpoint.trim() !== (savedExport.endpoint ?? '');
+  $: dirty =
+    endpointChanged ||
+    protocol !== savedExport.protocol ||
+    traces !== savedExport.traces ||
+    metrics !== savedExport.metrics ||
+    includeProject !== savedExport.includeProject ||
+    (saved !== null && retention() !== saved.retention);
+  $: canAddHeader = Boolean(saved?.origin) && !endpointChanged;
+
   async function load() {
     try {
-      const settings = await client.load();
-      if (!closed) apply(settings);
+      const view = await client.load();
+      if (!closed) apply(view);
     } catch (cause) {
       if (!closed) error = message(cause, 'Telemetry settings could not be read.');
     }
   }
-  async function persist(settings: TelemetryPreferences, done: string) {
-    await client.save(settings);
-    if (closed) return;
-    saved = settings;
-    feedback = done;
+  /** Content leaves only when export of traces is turned on or moved while capture is on. */
+  function sendsContentNewly() {
+    if (!saved?.contentCapture || !endpoint.trim() || !traces) return false;
+    return endpointChanged || !savedExport.endpoint || !savedExport.traces;
   }
-  async function save() {
+  async function save(confirmed = false) {
     if (busy) return;
     error = '';
     feedback = '';
@@ -90,72 +102,70 @@
       error = 'Choose traces, metrics, or both, or clear the endpoint to turn export off.';
       return;
     }
+    if (!confirmed && sendsContentNewly()) {
+      confirmingContent = true;
+      return;
+    }
+    confirmingContent = false;
     busy = true;
     try {
-      await persist(
-        { export: draft(), retention: retention() },
-        endpoint.trim() ? 'Saved. New runs are exported.' : 'Saved. Export is off.',
-      );
+      const view = await client.save({ export: draft(), retention: retention() });
+      if (closed) return;
+      apply(view);
+      feedback = endpoint.trim() ? 'Saved. New runs are exported.' : 'Saved. Export is off.';
     } catch (cause) {
       if (!closed) error = message(cause, 'Telemetry settings could not be saved.');
     } finally {
       busy = false;
     }
   }
-  /** Header changes are saved at once, on top of the last saved settings. */
   async function addHeader() {
-    if (busy || !headerName.trim() || !headerValue.trim()) return;
+    if (busy || !canAddHeader || !headerName.trim() || !headerValue.trim()) return;
     busy = true;
     error = '';
     feedback = '';
     try {
-      const name = await client.saveHeader(headerName.trim(), headerValue);
+      const view = await client.saveHeader(headerName.trim(), headerValue);
       headerValue = '';
-      headerName = '';
       if (closed) return;
-      const base = saved ?? { export: blank, retention: 400 };
-      const names = base.export.headers.includes(name)
-        ? base.export.headers
-        : [...base.export.headers, name];
-      await persist(
-        { ...base, export: { ...base.export, headers: names } },
-        `Saved the ${name} header in ${platform.store}.`,
-      );
-      if (!headers.includes(name)) headers = [...headers, name];
+      const name = headerName.trim().toLowerCase();
+      headerName = '';
+      saved = view;
+      feedback = `Saved the ${name} header for ${view.origin} in ${platform.store}.`;
     } catch (cause) {
       if (!closed) error = message(cause, `${platform.store} could not be updated. Try again.`);
     } finally {
       busy = false;
     }
   }
-  async function removeHeader(name: string) {
+  async function removeHeader(header: SavedHeader) {
     if (busy) return;
     busy = true;
     error = '';
     feedback = '';
     try {
-      await client.deleteHeader(name);
-      const base = saved ?? { export: blank, retention: 400 };
-      await persist(
-        {
-          ...base,
-          export: { ...base.export, headers: base.export.headers.filter((h) => h !== name) },
-        },
-        `Removed the ${name} header.`,
-      );
-      headers = headers.filter((header) => header !== name);
+      const view = await client.deleteHeader(header);
+      if (closed) return;
+      saved = view;
+      feedback = `Removed the ${header.name} header.`;
     } catch (cause) {
       if (!closed) error = message(cause, `${platform.store} could not be updated. Try again.`);
     } finally {
       busy = false;
     }
+  }
+  async function enterAgain(header: SavedHeader) {
+    headerName = header.name;
+    headerValue = '';
+    await tick();
+    valueInput?.focus();
   }
   async function sendTest() {
     testResult = '';
     testFailed = false;
     busy = true;
     try {
-      const status = await client.test(draft());
+      const status = await client.test();
       if (!closed) testResult = `Test span sent · HTTP ${status}`;
     } catch (cause) {
       if (!closed) {
@@ -185,7 +195,7 @@
     novalidate
     onsubmit={(event) => {
       event.preventDefault();
-      void save();
+      void save(false);
     }}
   >
     <label
@@ -247,29 +257,64 @@
       >
     </div>
     <p class="hint">Older metrics files are deleted when the app starts. Default 400 days.</p>
+    {#if confirmingContent}
+      <div class="confirm" role="alertdialog" aria-label="Send prompts and outputs?">
+        <p>
+          <b>Include content</b> is on in Runs, so prompts, outputs, and tool data from new runs
+          will be sent to <code>{endpoint.trim()}</code>.
+        </p>
+        <div class="actions">
+          <button type="button" class="primary" onclick={() => save(true)}
+            >Save and send content</button
+          >
+          <button type="button" onclick={() => (confirmingContent = false)}>Cancel</button>
+        </div>
+      </div>
+    {/if}
     <div class="actions">
       <button type="submit" class="primary" disabled={busy}>Save</button>
-      <button type="button" onclick={sendTest} disabled={busy || !endpoint.trim()}
+      <button
+        type="button"
+        onclick={sendTest}
+        disabled={busy || dirty || !savedExport.endpoint}
+        title={dirty ? 'Save first: the test uses the saved settings.' : undefined}
         >Send test span</button
       >
     </div>
+    {#if dirty && savedExport.endpoint}<p class="hint">
+        The test span uses the saved settings. Save first to test changes.
+      </p>{/if}
   </form>
   {#if testResult}<p class="result" class:bad={testFailed} role="status">{testResult}</p>{/if}
 
   <h4>Headers</h4>
   <p>
-    Such as an API key. Values are saved only in {platform.store} and are never shown again.
+    Such as an API key. Each value is saved only in {platform.store}, for the saved endpoint's
+    origin alone, and is never shown again.
   </p>
   {#if headers.length}
     <ul class="headers" aria-label="Saved headers">
-      {#each headers as name (name)}
-        <li>
-          <code>{name}</code><span class="masked" aria-label="Value hidden">••••••••</span>
+      {#each headers as header (`${header.origin}|${header.name}`)}
+        {@const stale = header.origin !== saved?.origin}
+        <li class:stale>
+          <code>{header.name}</code>
+          {#if stale}
+            <span class="other">Saved for {header.origin}. Not sent; export is paused.</span>
+            <button
+              type="button"
+              class="subtle again"
+              aria-label={`Enter ${header.name} again`}
+              onclick={() => enterAgain(header)}
+              disabled={busy || !canAddHeader}>Enter again</button
+            >
+          {:else}
+            <span class="masked" aria-label="Value hidden">••••••••</span>
+          {/if}
           <button
             type="button"
             class="subtle"
-            aria-label={`Remove ${name}`}
-            onclick={() => removeHeader(name)}
+            aria-label={`Remove ${header.name}`}
+            onclick={() => removeHeader(header)}
             disabled={busy}>Remove</button
           >
         </li>
@@ -290,7 +335,7 @@
         placeholder="x-api-key"
         autocomplete="off"
         maxlength={64}
-        disabled={busy}
+        disabled={busy || !canAddHeader}
       />
     </label>
     <label
@@ -298,14 +343,22 @@
       <input
         type="password"
         bind:value={headerValue}
+        bind:this={valueInput}
         autocomplete="new-password"
         maxlength={8192}
-        disabled={busy}
+        disabled={busy || !canAddHeader}
       />
     </label>
-    <button type="submit" disabled={busy || !headerName.trim() || !headerValue.trim()}
+    <button
+      type="submit"
+      disabled={busy || !canAddHeader || !headerName.trim() || !headerValue.trim()}
       >Add header</button
     >
+    <p class="hint">
+      {canAddHeader
+        ? `Saved for ${saved?.origin} only.`
+        : 'Save an endpoint first: a header is saved for that endpoint only.'}
+    </p>
   </form>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if feedback}<p class="feedback" role="status">{feedback}</p>{/if}
@@ -432,6 +485,25 @@
     gap: 12px;
     padding: 6px 0;
     border-bottom: 1px solid var(--border);
+  }
+  .other {
+    color: var(--warn);
+    font-size: 12px;
+  }
+  .again {
+    margin-left: auto;
+    color: var(--text-primary);
+  }
+  .again + .subtle {
+    margin-left: 0;
+  }
+  .confirm {
+    padding: 10px 12px;
+    border: 1px solid var(--warn);
+    border-radius: 6px;
+  }
+  .confirm p {
+    color: var(--text-primary);
   }
   .masked {
     color: var(--text-faint);
