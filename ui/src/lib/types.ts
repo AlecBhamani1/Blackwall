@@ -151,6 +151,8 @@ export type AgentEvent =
       success: boolean;
       /** Command output over the cap was trimmed to its start and end. */
       truncated?: boolean;
+      /** A rule or the user denied the action, so it did not run. */
+      denied?: boolean;
     }
   | {
       type: 'approval_request';

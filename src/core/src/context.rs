@@ -758,6 +758,7 @@ async fn chat_traced(
                     trace.end(span, result.is_err().then_some(text.as_str()));
                 }
                 let success = result.is_ok();
+                let denied = matches!(&result, Err(crate::tools::ToolError::Denied));
                 let output = result.unwrap_or_else(|error| error.to_string());
                 emit(AgentEvent::ToolResult {
                     request_id: request_id.into(),
@@ -765,6 +766,7 @@ async fn chat_traced(
                     output: output.clone(),
                     success,
                     truncated: false,
+                    denied,
                 });
                 state
                     .transcript

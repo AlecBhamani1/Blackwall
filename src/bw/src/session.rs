@@ -561,7 +561,7 @@ struct Executed {
     answer: String,
     snapshot: Option<ContextState>,
     result: Result<(), Failure>,
-    /// Approvals denied during the run, by the user or because the run is headless.
+    /// Actions denied during the run, by a rule, the user, or because the run is headless.
     denied: u32,
     /// Tokens the server reported for the run's model calls, including any before a failure.
     usage: TokenUsage,
@@ -624,7 +624,6 @@ async fn execute(
                         Ok(line) => {
                             if let Some(mut request) = pending.take() {
                                 request.decision = if line.as_deref().is_some_and(|line| line.trim() == "yes") { ApprovalDecision::Allow } else { ApprovalDecision::Deny };
-                                if request.decision == ApprovalDecision::Deny { denied = denied.saturating_add(1); }
                                 if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
                             }
                         }
@@ -633,10 +632,10 @@ async fn execute(
                 }
                 event = incoming.recv() => if let Some(event) = event {
                     count_usage(&event, &request_id, &mut usage);
+                    count_denied(&event, &mut denied);
                     render_event(event, &mut answer, &mut pending, &mut snapshot, json);
                     // Nobody can answer a prompt in a headless run, so it is denied at once.
                     if let Some(request) = pending.take_if(|_| json) {
-                        denied = denied.saturating_add(1);
                         if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
                     }
                 },
@@ -663,6 +662,7 @@ async fn execute(
     // events before returning so fast completions retain text and instruction provenance.
     while let Ok(event) = incoming.try_recv() {
         count_usage(&event, &request_id, &mut usage);
+        count_denied(&event, &mut denied);
         render_event(event, &mut answer, &mut pending, &mut snapshot, json);
     }
     let _ = io::stdout().flush();
@@ -678,6 +678,14 @@ async fn execute(
         result,
         denied,
         usage,
+    }
+}
+
+/// Count actions that did not run because a rule, the user or a headless run denied them.
+/// Each denial, prompted or not, ends in one denied tool result.
+fn count_denied(event: &AgentEvent, denied: &mut u32) {
+    if matches!(event, AgentEvent::ToolResult { denied: true, .. }) {
+        *denied = denied.saturating_add(1);
     }
 }
 

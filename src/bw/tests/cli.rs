@@ -564,6 +564,38 @@ fn a_write_requires_explicit_yes_and_is_denied_when_stdin_ends() {
 }
 
 #[test]
+fn json_runs_count_actions_a_deny_rule_blocks() {
+    let fixture = Fixture::new();
+    fixture.configure_model();
+    let protected = fixture.project.join("protected.txt");
+    fs::write(&protected, "original\n").unwrap();
+    fs::create_dir_all(fixture.root.join("data")).unwrap();
+    fs::write(
+        fixture.root.join("data").join("policy.json"),
+        json!({"rules":[{"decision":"deny","kind":"file","path":"protected.txt"}]}).to_string(),
+    )
+    .unwrap();
+    let model = ModelServer::start(vec![proposed_write(), answer("write was blocked")]);
+    fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
+    let output = fixture.run(&["run", "--json", "change protected.txt"], "");
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // The rule decides without a prompt, and the run still reports the denial.
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "approval_request"));
+    let result = events.last().unwrap();
+    assert_eq!(result["reason"], "denied");
+    assert_eq!(result["denied"], 1);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(fs::read_to_string(&protected).unwrap(), "original\n");
+    model.finish();
+}
+
+#[test]
 fn json_runs_print_events_and_deny_prompts_even_when_stdin_says_yes() {
     let fixture = Fixture::new();
     fixture.configure_model();
@@ -932,7 +964,8 @@ fn disabled_memory_denies_forged_model_calls_without_owner_reads_or_writes() {
         answer("memory disabled"),
     ]);
     fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
-    fixture.success(&["run", "A task"], "");
+    // The forged call did not run, so the run reports a denial.
+    assert_eq!(fixture.run(&["run", "A task"], "").status.code(), Some(3));
     let requests = server.finish();
     assert!(!requests[0]["tools"]
         .as_array()
