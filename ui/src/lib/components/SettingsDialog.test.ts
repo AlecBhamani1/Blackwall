@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GuestShareClient } from '../ipc';
 import { persistence } from '../persistence';
 import SettingsDialog from './SettingsDialog.svelte';
@@ -27,6 +27,10 @@ function mockClient(): GuestShareClient {
 }
 
 describe('SettingsDialog', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('groups settings by purpose and can sort every destination by name', async () => {
     const user = userEvent.setup();
     const client = mockClient();

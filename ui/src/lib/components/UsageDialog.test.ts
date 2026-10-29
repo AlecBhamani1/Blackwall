@@ -93,9 +93,42 @@ describe('usage dialog', () => {
     await user.click(screen.getByRole('button', { name: /house-finder/ }));
     expect(screen.getByRole('region', { name: 'house-finder' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /No project/ })).toBeInTheDocument();
+    expect(screen.queryByText(/tok\/s · p90/)).not.toBeInTheDocument();
     await user.click(screen.getByRole('radio', { name: 'Models' }));
     expect(screen.getByRole('region', { name: 'qwen3.6' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /llama3.3/ })).toBeInTheDocument();
+  });
+
+  it('shows calls, tokens, speed, p90 and errors per model', async () => {
+    const user = userEvent.setup();
+    const summary = usageFixture();
+    summary.perModel[0].failedCalls = 9;
+    vi.spyOn(persistence, 'usage').mockResolvedValue(summary);
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('radio', { name: 'Models' }));
+    const qwen = screen.getByRole('button', { name: /qwen3.6/ });
+    expect(qwen).toHaveTextContent(
+      '1,000 calls · 3.47M in / 429k out · 41 tok/s · p90 6.4 s · 0.9% errors',
+    );
+  });
+
+  it('splits the range by Chat, Agent, and Subagent', async () => {
+    vi.spyOn(persistence, 'usage').mockResolvedValue(usageFixture());
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    const modes = within(await screen.findByRole('list', { name: 'By mode' }));
+    const items = modes.getAllByRole('listitem').map((item) => item.textContent?.trim());
+    expect(items).toEqual([
+      'Agent 4.24M · 128 runs · 1,040 calls',
+      'Subagent 430k · 120 calls',
+      'Chat 150k · 15 runs · 46 calls',
+    ]);
+  });
+
+  it('does not claim an export status it does not know', async () => {
+    vi.spyOn(persistence, 'usage').mockResolvedValue(usageFixture());
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    await screen.findByText('4.82M');
+    expect(screen.queryByText(/Export:/)).not.toBeInTheDocument();
   });
 
   it('lists gaps and marks stale data', async () => {

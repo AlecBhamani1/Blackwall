@@ -98,6 +98,18 @@
       .filter(([, share]) => (share as number) > 0)
       .map(([name, share]) => `${name} ${share}%`);
   }
+  /** Calls, tokens in and out, median speed, p90 duration, and failed calls for a model. */
+  function modelDetail(row: UsageGroupRow) {
+    return [
+      plural(row.modelCalls, 'call'),
+      `${compact(row.tokens.input)} in / ${compact(row.tokens.output)} out`,
+      row.medianOutputSpeed !== null ? `${Math.round(row.medianOutputSpeed)} tok/s` : null,
+      row.p90Seconds !== null ? `p90 ${row.p90Seconds.toFixed(1)} s` : null,
+      `${row.modelCalls ? percent(row.failedCalls / row.modelCalls) : '0.0%'} errors`,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+  }
   function gapParts(summary: UsageSummary) {
     const parts: string[] = [];
     if (!summary.telemetryEnabled) parts.push('recording is off now');
@@ -201,7 +213,6 @@
       >
       <span class="spacer"></span>
       <span>metrics/ · {plural(summary?.files ?? 0, 'file')} · OTLP JSON</span>
-      <span>Export: <b>off</b></span>
     </div>
   {/if}
   <div class="body" class:loading>
@@ -257,16 +268,33 @@
                       ><span class="row-name">{nameOf(row)}</span><span class="row-value"
                         >{compact(row.total)}{row.runs !== null
                           ? ` · ${plural(row.runs, 'run')}`
-                          : ` · ${plural(row.modelCalls, 'call')}`}</span
+                          : ''}</span
                       ></span
                     >
                     <span class="track"
                       ><i style={`width: ${Math.max(1, (row.total / largest) * 100)}%`}></i></span
                     >
+                    {#if view === 'models'}<span class="row-detail">{modelDetail(row)}</span>{/if}
                   </button>
                 </li>
               {/each}
             </ul>
+            {#if summary.perMode.length}
+              <ul class="modes" aria-label="By mode">
+                {#each summary.perMode as mode (mode.mode)}
+                  <li>
+                    <b>{modeNames[mode.mode] ?? mode.mode}</b>
+                    {[
+                      compact(mode.total),
+                      mode.runs > 0 ? plural(mode.runs, 'run') : null,
+                      plural(mode.modelCalls, 'call'),
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </section>
           {#if chosen}
             <section class="card detail" aria-label={nameOf(chosen)}>
@@ -277,15 +305,6 @@
                   `${compact(chosen.total)} tokens`,
                   chosen.runs !== null ? plural(chosen.runs, 'run') : null,
                   plural(chosen.sessions, 'session'),
-                  chosen.runs === null && chosen.medianOutputSpeed !== null
-                    ? `median ${Math.round(chosen.medianOutputSpeed)} tok/s`
-                    : null,
-                  chosen.runs === null && chosen.p90Seconds !== null
-                    ? `p90 ${chosen.p90Seconds.toFixed(1)} s`
-                    : null,
-                  chosen.runs === null && chosen.modelCalls > 0
-                    ? `${percent(chosen.failedCalls / chosen.modelCalls)} failed calls`
-                    : null,
                   ...modes,
                 ]
                   .filter(Boolean)
@@ -561,6 +580,29 @@
     flex: none;
     font: 12px var(--font-code);
     color: var(--text-muted);
+  }
+  .row-detail {
+    display: block;
+    margin-top: 5px;
+    font: 11.5px var(--font-code);
+    color: var(--text-faint);
+    overflow-wrap: anywhere;
+  }
+  .modes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+    margin: 10px 0 0;
+    padding: 10px 0 0;
+    list-style: none;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .modes b {
+    color: var(--text-primary);
+    font-weight: 500;
+    margin-right: 4px;
   }
   .track {
     display: block;

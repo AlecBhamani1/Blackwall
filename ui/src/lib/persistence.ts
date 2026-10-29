@@ -200,6 +200,10 @@ export interface MemoryProposal {
   source: { sessionId: string; messageId: string };
   createdAt: number;
 }
+/** Minutes east of UTC, as the usage commands count local days. */
+export function utcOffsetMinutes(): number {
+  return -new Date().getTimezoneOffset();
+}
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(name, args);
 }
@@ -244,9 +248,15 @@ export const persistence = {
     command<void>('discard_skill_downloads', { sources }),
   traces: () => command<TraceSummary[]>('list_traces'),
   trace: (id: string) => command<TraceSpan[]>('read_trace', { id }),
-  usage: (days: number) => command<UsageSummary>('usage_summary', { days }),
+  /** The last `days` local days, in this device's current time zone. */
+  usage: (days: number) =>
+    command<UsageSummary>('usage_summary', { days, offsetMinutes: utcOffsetMinutes() }),
   /** Opens a native folder picker; `null` when it is cancelled. */
-  exportTelemetry: (days: number) => command<TelemetryExport | null>('export_telemetry', { days }),
+  exportTelemetry: (days: number) =>
+    command<TelemetryExport | null>('export_telemetry', {
+      days,
+      offsetMinutes: utcOffsetMinutes(),
+    }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),
