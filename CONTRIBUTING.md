@@ -82,6 +82,15 @@ Tests should be deterministic and offline. Use scripted model backends and local
 cover both the success path and security boundaries such as path traversal, denial decisions,
 timeouts, interrupts, and SSRF protections.
 
+Parsers that read untrusted bytes (MCP streamable-HTTP events, `project.json`, text tool calls and
+`<think>` tags, the OTLP metrics files, command-tool URL templates and policy rules) each have a
+`*_fuzz_is_panic_free_and_bounded` test: a fixed-seed generator feeds random and adversarial input
+and checks that nothing panics and output stays within the input's size. They run with the normal
+suite (`cargo test … fuzz`). When you add a parser like these, add one in the same style.
+
+For a local coverage report, install `cargo-llvm-cov` and run
+`cargo llvm-cov --manifest-path src/Cargo.toml --workspace --html`. Coverage is not enforced in CI.
+
 Lefthook runs formatting and static analysis before commits, test suites before pushes, and
 commitlint on commit messages. Hooks supplement CI; they do not replace it.
 

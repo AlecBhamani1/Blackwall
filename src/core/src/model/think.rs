@@ -115,4 +115,56 @@ mod tests {
         assert_eq!(filter.push(" text <"), (" text ".into(), String::new()));
         assert_eq!(filter.push("b>"), ("<b>".into(), String::new()));
     }
+
+    #[test]
+    fn think_filter_fuzz_is_panic_free_and_bounded() {
+        fn next(state: &mut u64) -> u8 {
+            *state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (*state >> 24) as u8
+        }
+
+        let alphabet = ['<', '>', '/', 't', 'h', 'i', 'n', 'k', '\n', ' ', 'é', '🦀'];
+        let mut seed = 0xa11c_e55e_dead_beef;
+        for _ in 0..512 {
+            let mut input = String::new();
+            for _ in 0..usize::from(next(&mut seed)) * 4 {
+                input.push(alphabet[usize::from(next(&mut seed)) % alphabet.len()]);
+            }
+            let mut filter = ThinkFilter::default();
+            let (mut answer, mut reasoning) = (String::new(), String::new());
+            let mut at = 0;
+            while at < input.len() {
+                let mut end = (at + usize::from(next(&mut seed) % 17) + 1).min(input.len());
+                while !input.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == at {
+                    end = input[at..]
+                        .char_indices()
+                        .nth(1)
+                        .map_or(input.len(), |(n, _)| at + n);
+                }
+                let (a, r) = filter.push(&input[at..end]);
+                answer.push_str(&a);
+                reasoning.push_str(&r);
+                assert!(answer.len() + reasoning.len() <= input.len());
+                at = end;
+            }
+            let pending = filter.pending.len();
+            let (a, r) = filter.finish();
+            answer.push_str(&a);
+            reasoning.push_str(&r);
+            assert!(answer.len() + reasoning.len() <= input.len());
+            assert!(pending <= OPEN.len().max(CLOSE.len()));
+        }
+
+        for input in [
+            "<think>".repeat(8192),
+            "</think>".repeat(8192),
+            "<".repeat(64 * 1024),
+        ] {
+            let (answer, reasoning) = run(&[&input]);
+            assert!(answer.len() + reasoning.len() <= input.len());
+        }
+    }
 }

@@ -10,6 +10,47 @@ use tokio::{
     net::TcpListener,
 };
 
+#[test]
+fn url_template_parser_fuzz_is_panic_free_and_bounded() {
+    fn next(state: &mut u64) -> u8 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (*state >> 32) as u8
+    }
+
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/?#@{}&=._-% ";
+    let mut seed = 0x6874_7470_746f_6f6c;
+    for round in 0..1024 {
+        let mut text = if round % 3 == 0 {
+            "https://example.com/".to_owned()
+        } else {
+            String::new()
+        };
+        for _ in 0..usize::from(next(&mut seed)) * 8 {
+            text.push(alphabet[usize::from(next(&mut seed)) % alphabet.len()] as char);
+        }
+        text.truncate(text.len().min(MAX_URL));
+        let parsed = std::panic::catch_unwind(|| Template::parse(&text));
+        assert!(parsed.is_ok());
+        if let Ok(template) = parsed.unwrap() {
+            assert!(template.names.len() <= text.len());
+            assert!(template.origin.len() <= text.len() + 6);
+            let built = template.build(&mut |_| Ok("x".into())).unwrap();
+            assert!(built.len() <= text.len() + template.names.len());
+        }
+    }
+
+    for text in [
+        "{".repeat(MAX_URL),
+        "https://example.com/?".to_owned() + &"&".repeat(MAX_URL - 21),
+        "https://{host}/".to_owned(),
+        "https://example.com/".to_owned() + &"{x}".repeat(MAX_URL),
+    ] {
+        assert!(std::panic::catch_unwind(|| Template::parse(&text)).is_ok());
+    }
+}
+
 /// A fake server that records each raw request and answers every one with `response`.
 async fn serve(response: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
