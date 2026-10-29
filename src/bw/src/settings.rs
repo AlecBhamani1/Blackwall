@@ -367,6 +367,15 @@ fn load_with_environment(
                 .map(|v| v.as_u64().ok_or("Invalid command time limit."))
                 .transpose()?
                 .unwrap_or(120),
+            max_output_bytes: object
+                .get("maxOutputBytes")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid output cap.")
+                })
+                .transpose()?
+                .unwrap_or(blackwall_core::context::DEFAULT_OUTPUT_BYTES),
         },
     };
     settings.validate()?;
@@ -676,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             saved["contextBudget"],
-            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600,"maxOutputBytes":65536})
         );
         assert!(saved.get("apiKey").is_none());
     }

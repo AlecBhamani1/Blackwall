@@ -19,6 +19,141 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 const MAX_FILE: usize = 64 * 1024;
+/// A command whose standard output or error passes this many bytes is stopped.
+const MAX_STREAMED: u64 = 64 * 1024 * 1024;
+
+/// One tool call's command output cap ([`crate::context::ContextBudget::max_output_bytes`]),
+/// and whether that call's output was trimmed to fit it.
+#[derive(Debug)]
+pub struct OutputCap {
+    bytes: usize,
+    trimmed: std::sync::atomic::AtomicBool,
+}
+impl Default for OutputCap {
+    fn default() -> Self {
+        Self::new(crate::context::DEFAULT_OUTPUT_BYTES)
+    }
+}
+impl OutputCap {
+    /// A cap outside 4 KiB to 1 MiB is moved to the nearest end of that range.
+    pub fn new(bytes: u32) -> Self {
+        let range = crate::context::OUTPUT_BYTES_RANGE;
+        Self {
+            bytes: bytes.clamp(*range.start(), *range.end()) as usize,
+            trimmed: Default::default(),
+        }
+    }
+    /// Whether output was trimmed during this call.
+    pub fn trimmed(&self) -> bool {
+        self.trimmed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// `text`, already redacted, trimmed to the cap.
+    pub(crate) fn trim_text(&self, text: String) -> String {
+        if text.len() <= self.bytes {
+            return text;
+        }
+        self.trim(&[Piece::Bytes(text.as_bytes())])
+    }
+    fn trim(&self, pieces: &[Piece<'_>]) -> String {
+        let (text, trimmed) = trim_pieces(pieces, self.bytes);
+        if trimmed {
+            self.trimmed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        text
+    }
+}
+
+/// Part of a command's output: bytes that were kept, or a run of bytes that were not.
+enum Piece<'a> {
+    Bytes(&'a [u8]),
+    Gap(u64),
+}
+
+/// `bytes` as text of at most about `cap` bytes: whole when it fits, otherwise its first 40% and
+/// last 60% around a line that says how many bytes were left out. Cuts never split a character.
+pub fn trim_output(bytes: &[u8], cap: usize) -> (String, bool) {
+    trim_pieces(&[Piece::Bytes(bytes)], cap)
+}
+
+fn trim_pieces(pieces: &[Piece<'_>], cap: usize) -> (String, bool) {
+    let total: u64 = pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Bytes(bytes) => bytes.len() as u64,
+            Piece::Gap(length) => *length,
+        })
+        .sum();
+    let whole = pieces.iter().all(|piece| matches!(piece, Piece::Bytes(_)));
+    if whole && total <= cap as u64 {
+        let bytes: Vec<u8> = pieces
+            .iter()
+            .flat_map(|piece| match piece {
+                Piece::Bytes(bytes) => bytes.iter().copied(),
+                Piece::Gap(_) => [].iter().copied(),
+            })
+            .collect();
+        return (String::from_utf8_lossy(&bytes).into_owned(), false);
+    }
+    let head_length = cap * 2 / 5;
+    let mut head = Vec::with_capacity(head_length);
+    for piece in pieces {
+        let Piece::Bytes(bytes) = piece else { break };
+        let room = head_length - head.len();
+        head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        if head.len() == head_length {
+            break;
+        }
+    }
+    let tail_length = cap - head_length;
+    let mut tail = std::collections::VecDeque::with_capacity(tail_length);
+    for piece in pieces.iter().rev() {
+        let Piece::Bytes(bytes) = piece else { break };
+        let room = tail_length - tail.len();
+        for byte in bytes[bytes.len().saturating_sub(room)..].iter().rev() {
+            tail.push_front(*byte);
+        }
+        if tail.len() == tail_length {
+            break;
+        }
+    }
+    let mut tail = Vec::from(tail);
+    head.truncate(char_end(&head));
+    let skip = tail
+        .iter()
+        .take(3)
+        .take_while(|byte| **byte & 0xC0 == 0x80)
+        .count();
+    tail.drain(..skip);
+    let omitted = total.saturating_sub((head.len() + tail.len()) as u64);
+    (
+        format!(
+            "{}\n[… {omitted} bytes omitted …]\n{}",
+            String::from_utf8_lossy(&head),
+            String::from_utf8_lossy(&tail)
+        ),
+        true,
+    )
+}
+
+/// The length of `bytes` without a character cut off at its end.
+fn char_end(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(4) {
+        let index = bytes.len() - back;
+        let byte = bytes[index];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let needed = match byte {
+            0xF0..=0xF7 => 4,
+            0xE0..=0xEF => 3,
+            0xC0..=0xDF => 2,
+            _ => 1,
+        };
+        return if back < needed { index } else { bytes.len() };
+    }
+    bytes.len()
+}
 /// The error a command that ran past its deadline returns; telemetry counts it as a timeout.
 pub(crate) const TIME_LIMIT_MESSAGE: &str = "The command exceeded its time limit and was stopped.";
 
@@ -39,7 +174,9 @@ pub enum ToolError {
     Path,
     #[error("The file could not be accessed inside this project. It may be missing, protected, or outside the folder.")]
     File,
-    #[error("This tool supports text files up to 64 KiB. Use a smaller file.")]
+    #[error(
+        "This is larger than the 64 KiB this tool accepts. Use a smaller file or a shorter value."
+    )]
     Limit,
     #[error("The tool arguments are missing or invalid.")]
     Arguments,
@@ -327,6 +464,7 @@ pub async fn execute(
     approvals: &Approvals,
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
     command_timeout: Duration,
+    output: &OutputCap,
 ) -> Result<String, ToolError> {
     let arguments: Value =
         serde_json::from_str(&call.function.arguments).map_err(|_| ToolError::Arguments)?;
@@ -389,6 +527,7 @@ pub async fn execute(
                 &workspace.path,
                 crate::sandbox::wrap(workspace, shell_command(command))?,
                 command_timeout,
+                output,
             )
             .await
         }
@@ -454,7 +593,13 @@ async fn shell_with_timeout(
         ))
     }
     #[cfg(any(unix, windows))]
-    run_with_timeout(directory, shell_command(command), timeout).await
+    run_with_timeout(
+        directory,
+        shell_command(command),
+        timeout,
+        &OutputCap::default(),
+    )
+    .await
 }
 /// Run a resolved program with separate arguments, never parsed by a shell. `input`, when
 /// given, is written to its standard input, which is otherwise empty.
@@ -464,10 +609,11 @@ pub(crate) async fn program_with_timeout(
     args: &[String],
     input: Option<Vec<u8>>,
     timeout: Duration,
+    output: &OutputCap,
 ) -> Result<String, ToolError> {
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (workspace, program, args, input, timeout);
+        let _ = (workspace, program, args, input, timeout, output);
         Err(ToolError::Execution(
             "Owner tools are not supported on this platform.".into(),
         ))
@@ -481,6 +627,7 @@ pub(crate) async fn program_with_timeout(
             crate::sandbox::wrap(workspace, process)?,
             input,
             timeout,
+            output,
         )
         .await
     }
@@ -584,14 +731,60 @@ pub(crate) fn spawn_server(
         Ok((ServerProcess { _child: child }, stdin, stdout, stderr))
     }
 }
-/// Bounded, time-limited capture with the same descendant cleanup for every process.
+/// Bounded, time-limited capture with the same descendant cleanup for every process. Output over
+/// the cap is trimmed to its start and end.
 #[cfg(any(unix, windows))]
 pub(crate) async fn run_with_timeout(
     directory: &Path,
     process: tokio::process::Command,
     timeout: Duration,
+    output: &OutputCap,
 ) -> Result<String, ToolError> {
-    run_with_input(directory, process, None, timeout).await
+    run_with_input(directory, process, None, timeout, output).await
+}
+/// The start and end of one output stream, and how many bytes it had in all.
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct Stream {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+}
+#[cfg(any(unix, windows))]
+impl Stream {
+    /// Keep up to `keep` bytes from each end, which covers any cut a cap of `keep` makes. Reading
+    /// stops once the stream passes [`MAX_STREAMED`].
+    async fn read(
+        mut reader: impl tokio::io::AsyncRead + Unpin,
+        keep: usize,
+    ) -> std::io::Result<Self> {
+        let mut stream = Self::default();
+        let mut buffer = vec![0; 16 * 1024];
+        while stream.total <= MAX_STREAMED {
+            let read = reader.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            stream.total += read as u64;
+            let chunk = &buffer[..read];
+            let room = keep.saturating_sub(stream.head.len()).min(chunk.len());
+            stream.head.extend_from_slice(&chunk[..room]);
+            stream.tail.extend(&chunk[room..]);
+            let excess = stream.tail.len().saturating_sub(keep);
+            stream.tail.drain(..excess);
+        }
+        Ok(stream)
+    }
+    fn pieces<'a>(&'a self, pieces: &mut Vec<Piece<'a>>) {
+        let (first, second) = self.tail.as_slices();
+        let kept = (self.head.len() + first.len() + second.len()) as u64;
+        pieces.push(Piece::Bytes(&self.head));
+        if self.total > kept {
+            pieces.push(Piece::Gap(self.total - kept));
+        }
+        pieces.push(Piece::Bytes(first));
+        pieces.push(Piece::Bytes(second));
+    }
 }
 /// [`run_with_timeout`], writing `input` to standard input while output is captured.
 #[cfg(any(unix, windows))]
@@ -600,6 +793,7 @@ async fn run_with_input(
     mut process: tokio::process::Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
+    output: &OutputCap,
 ) -> Result<String, ToolError> {
     process
         .current_dir(directory)
@@ -668,22 +862,8 @@ async fn run_with_input(
             let _ = stdin.write_all(&input).await;
         }
     });
-    let mut out_task = Box::pin(async {
-        let mut bytes = vec![];
-        stdout
-            .take(MAX_FILE as u64 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        Ok::<_, std::io::Error>(bytes)
-    });
-    let mut err_task = Box::pin(async {
-        let mut bytes = vec![];
-        stderr
-            .take(MAX_FILE as u64 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        Ok::<_, std::io::Error>(bytes)
-    });
+    let mut out_task = Box::pin(Stream::read(stdout, output.bytes));
+    let mut err_task = Box::pin(Stream::read(stderr, output.bytes));
     let mut wait_task = Box::pin(async {
         #[cfg(unix)]
         {
@@ -700,34 +880,52 @@ async fn run_with_input(
         }
     });
     let capture = async {
-        // A completed capped read reports overflow immediately, rather than waiting for a
+        // A stream past its hard limit stops the command at once, rather than waiting for a
         // child blocked on a full pipe. The process group/job kills descendants on return.
-        let mut out = None;
-        let mut err = None;
+        let mut out: Option<Stream> = None;
+        let mut err: Option<Stream> = None;
         let mut status = None;
         let mut written = false;
-        while out.is_none() || err.is_none() || status.is_none() {
+        let mut stopped = false;
+        while !stopped && (out.is_none() || err.is_none() || status.is_none()) {
             tokio::select! {
                 () = &mut in_task, if !written => written = true,
-                result=&mut out_task, if out.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}out=Some(bytes);},
-                result=&mut err_task, if err.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}err=Some(bytes);},
-                result=&mut wait_task, if status.is_none()=>status=Some(result.map_err(|_|ToolError::File)?),
+                result = &mut out_task, if out.is_none() => {
+                    let stream = result.map_err(|_| ToolError::File)?;
+                    stopped |= stream.total > MAX_STREAMED;
+                    out = Some(stream);
+                }
+                result = &mut err_task, if err.is_none() => {
+                    let stream = result.map_err(|_| ToolError::File)?;
+                    stopped |= stream.total > MAX_STREAMED;
+                    err = Some(stream);
+                }
+                result = &mut wait_task, if status.is_none() => {
+                    status = Some(result.map_err(|_| ToolError::File)?)
+                }
             }
         }
-        let successful = status.is_some_and(|status| status.success());
-        let output = format!(
-            "Exit: {}\n{}{}",
-            status
-                .and_then(|s| s.code())
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            String::from_utf8_lossy(&out.unwrap_or_default()),
-            String::from_utf8_lossy(&err.unwrap_or_default())
+        let successful = !stopped && status.is_some_and(|status| status.success());
+        let exit = format!(
+            "Exit: {}\n",
+            match status.and_then(|s| s.code()) {
+                _ if stopped => "stopped".to_owned(),
+                Some(code) => code.to_string(),
+                None => "signal".to_owned(),
+            }
         );
+        let (out, err) = (out.unwrap_or_default(), err.unwrap_or_default());
+        let mut pieces = vec![Piece::Bytes(exit.as_bytes())];
+        out.pieces(&mut pieces);
+        err.pieces(&mut pieces);
+        let mut text = output.trim(&pieces);
+        if stopped {
+            text.push_str("\nThe command was stopped after 64 MiB of output.");
+        }
         if successful {
-            Ok(output)
+            Ok(text)
         } else {
-            Err(ToolError::Execution(output))
+            Err(ToolError::Execution(text))
         }
     };
     tokio::time::timeout(timeout, capture)
@@ -739,6 +937,88 @@ async fn run_with_input(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn trim_keeps_whole_characters_and_counts_what_it_leaves_out() {
+        let (text, trimmed) = trim_output(b"short", 4096);
+        assert_eq!((text.as_str(), trimmed), ("short", false));
+        // 'é' is two bytes, so 3000 of them cannot be cut evenly at 40% and 60% of 4096.
+        let input = "é".repeat(3000);
+        let (text, trimmed) = trim_output(input.as_bytes(), 4096);
+        assert!(trimmed && !text.contains('\u{fffd}'));
+        let (head, rest) = text.split_once("\n[… ").unwrap();
+        let (marker, tail) = rest.split_once(" bytes omitted …]\n").unwrap();
+        assert!(head.chars().all(|c| c == 'é') && tail.chars().all(|c| c == 'é'));
+        assert!(head.len() <= 1638 && tail.len() <= 2458);
+        assert_eq!(
+            marker.parse::<usize>().unwrap(),
+            input.len() - head.len() - tail.len()
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_over_cap_is_trimmed_head_and_tail() {
+        let cap = OutputCap::new(4096);
+        // 300,000 bytes: a start line, filler, and an end line.
+        let output = run_with_timeout(
+            &std::env::temp_dir(),
+            shell_command("printf START; head -c 299992 /dev/zero | tr '\\0' x; printf END"),
+            Duration::from_secs(30),
+            &cap,
+        )
+        .await
+        .unwrap();
+        assert!(cap.trimmed());
+        assert!(output.starts_with("Exit: 0\nSTARTxxx") && output.ends_with("xxxEND"));
+        let head = output.split("\n[… ").next().unwrap();
+        assert_eq!(head.len(), 4096 * 2 / 5);
+        assert!(output.contains(&format!(
+            "[… {} bytes omitted …]",
+            "Exit: 0\n".len() + 300_000 - 4096
+        )));
+        assert!(output.len() < 4096 + 64);
+        // Within the cap nothing changes, and the default cap is the old 64 KiB limit.
+        let cap = OutputCap::default();
+        let output = run_with_timeout(
+            &std::env::temp_dir(),
+            shell_command("head -c 60000 /dev/zero | tr '\\0' y"),
+            Duration::from_secs(30),
+            &cap,
+        )
+        .await
+        .unwrap();
+        assert!(!cap.trimmed() && output.len() == "Exit: 0\n".len() + 60000);
+        // A failing command's output is trimmed too, and a stream past 64 MiB stops it.
+        let cap = OutputCap::new(4096);
+        let error = run_with_timeout(
+            &std::env::temp_dir(),
+            shell_command("yes overflow"),
+            Duration::from_secs(60),
+            &cap,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(cap.trimmed() && error.starts_with("Exit: stopped\noverflow"));
+        assert!(error.ends_with("The command was stopped after 64 MiB of output."));
+    }
+    #[test]
+    fn file_read_cap_unchanged() {
+        let path = std::env::temp_dir().join(format!(
+            "blackwall-read-cap-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("fits.txt"), "a".repeat(MAX_FILE)).unwrap();
+        std::fs::write(path.join("large.txt"), "a".repeat(MAX_FILE + 1)).unwrap();
+        let workspace = Workspace::open(&path).unwrap();
+        assert_eq!(workspace.read("fits.txt").unwrap().len(), MAX_FILE);
+        // Reads are never trimmed: a larger file is refused, and the message says why.
+        let error = workspace.read("large.txt").unwrap_err();
+        assert!(matches!(error, ToolError::Limit));
+        assert!(error.to_string().contains("64 KiB") && !error.to_string().contains("text files"));
+        drop(workspace);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn file_tools_reject_escape_and_stale_edits() {
         let path = std::env::temp_dir().join(format!(

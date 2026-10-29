@@ -137,6 +137,67 @@ impl Approvals {
         )
         .await
     }
+    /// A subagent handing its prompt to an owner command tool. It always asks, even when an
+    /// allow rule matches `subject` (the tool's command), and the answer is never remembered.
+    /// A deny rule still denies without asking: tightening always wins.
+    pub async fn request_delegate(
+        &self,
+        request_id: &str,
+        subject: &str,
+        detail: String,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<bool, String> {
+        let policy = self
+            .0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .policies
+            .get(request_id)
+            .cloned();
+        let verdict = policy
+            .as_ref()
+            .map(|policy| policy.evaluate(ApprovalKind::Exec, subject));
+        if let (Some(policy), Some(verdict)) = (&policy, &verdict) {
+            if verdict.decision == Decision::Deny {
+                policy
+                    .record(
+                        ApprovalKind::Exec,
+                        subject,
+                        Decision::Deny,
+                        false,
+                        None,
+                        verdict.matched,
+                    )
+                    .await;
+                return Ok(false);
+            }
+        }
+        let allowed = self
+            .ask(
+                request_id,
+                ApprovalKind::Exec,
+                None,
+                detail,
+                emit,
+                false,
+                true,
+            )
+            .await?
+            != ApprovalDecision::Deny;
+        if let (Some(policy), Some(verdict)) = (&policy, verdict) {
+            policy
+                .record(
+                    ApprovalKind::Exec,
+                    subject,
+                    Decision::Ask,
+                    allowed,
+                    None,
+                    verdict.matched,
+                )
+                .await;
+        }
+        Ok(allowed)
+    }
     /// MCP calls match `tool` rules, and the owner can save one from the prompt.
     pub async fn request_tool(
         &self,
@@ -180,7 +241,9 @@ impl Approvals {
                 return Ok(true);
             }
             // Without the owner's data folder there is nowhere to save a rule.
-            let answer = self.ask(request_id, kind, None, detail, emit, true).await?;
+            let answer = self
+                .ask(request_id, kind, None, detail, emit, true, false)
+                .await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
         let verdict = match (&tool, http_tool) {
@@ -202,7 +265,7 @@ impl Approvals {
                     None => detail,
                 };
                 let answer = self
-                    .ask(request_id, kind, tool.clone(), detail, emit, true)
+                    .ask(request_id, kind, tool.clone(), detail, emit, true, false)
                     .await?;
                 if let Some(tool) = tool.filter(|_| answer != ApprovalDecision::Deny) {
                     match self.save_tool_rule(request_id, &policy, tool, answer).await {
@@ -295,7 +358,7 @@ impl Approvals {
             clipped(arguments, MAX_SHOWN_ARGUMENTS)
         );
         let allowed = self
-            .ask(request_id, kind, None, detail, emit, false)
+            .ask(request_id, kind, None, detail, emit, false, false)
             .await?
             != ApprovalDecision::Deny;
         if allowed && covers_request && kind == ApprovalKind::Network {
@@ -322,6 +385,8 @@ impl Approvals {
                 .is_ok_and(|mut state| state.text_web_calls.remove(request_id))
     }
     /// `remember` lets "allow identical action this run" skip later identical prompts.
+    /// `off_device` marks a prompt whose data may leave this device.
+    #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
         request_id: &str,
@@ -330,6 +395,7 @@ impl Approvals {
         detail: String,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         remember: bool,
+        off_device: bool,
     ) -> Result<ApprovalDecision, String> {
         let (sender, receiver) = oneshot::channel();
         let id = format!("approval_{:016x}", UnwrapErr(SysRng).next_u64());
@@ -369,6 +435,7 @@ impl Approvals {
             detail: detail.clone(),
             tool,
             remember,
+            off_device,
         });
         let decision = tokio::time::timeout(Duration::from_secs(10 * 60), receiver)
             .await

@@ -149,6 +149,7 @@ impl Agent<'_> {
                 instructions,
                 compact: false,
                 trace: Default::default(),
+                subagents: Default::default(),
             },
             None,
             user_directory,
@@ -217,11 +218,15 @@ impl Agent<'_> {
         let crate::context::ContextRun {
             source,
             mut state,
-            budget,
+            mut budget,
             mut instructions,
             compact,
             trace: _,
+            subagents,
         } = run;
+        subagents
+            .validate()
+            .map_err(|error| tools::ToolError::Execution(error.into()))?;
         state.validate()?;
         let _guard = RunGuard {
             approvals: self.approvals.clone(),
@@ -281,6 +286,17 @@ impl Agent<'_> {
             Some(directory) => crate::command_tools::CommandTools::load(directory).await,
             None => Default::default(),
         };
+        // A trusted project can lower the output cap and narrow subagents, never raise them.
+        let limits = match user_directory {
+            Some(directory) => {
+                crate::project::trusted_limits(directory, &self.workspace.path).await
+            }
+            None => None,
+        };
+        if let Some(limits) = &limits {
+            budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
+        }
+        let subagents = subagents.within(limits.as_ref());
         let mcp_directory = user_directory.map(std::path::Path::to_path_buf);
         let skills_directory = user_directory.map(|directory| directory.join("skills"));
         let skills = match user_directory {
@@ -397,7 +413,8 @@ impl Agent<'_> {
             }
         }
 
-        let mut definitions = tools::definitions(self.web_enabled, true);
+        let mut definitions = tools::definitions(self.web_enabled, false);
+        definitions.push(subagents.definition());
         definitions.extend(command_tools.definitions());
         if let Some(memory) = memory {
             if memory.available().await.unwrap_or(false) {
@@ -584,10 +601,11 @@ impl Agent<'_> {
             }
             // Only read-only child batches run concurrently. Ordered project mutations keep
             // their proposal, approval, and resulting model history in the original order.
-            let concurrency = if turn
-                .calls
-                .iter()
-                .all(|call| call.function.name == "spawn_agent")
+            let concurrency = if subagents.read_only()
+                && turn
+                    .calls
+                    .iter()
+                    .all(|call| call.function.name == "spawn_agent")
             {
                 3
             } else {
@@ -605,7 +623,9 @@ impl Agent<'_> {
                     let skills_directory = &skills_directory;
                     let proposals = &proposals;
                     let invoked = &invoked;
+                    let subagents = &subagents;
                     async move {
+                        let output_cap = tools::OutputCap::new(budget.max_output_bytes);
                         let permitted = definitions.iter().any(|definition| {
                             definition["function"]["name"].as_str()
                                 == Some(call.function.name.as_str())
@@ -735,12 +755,19 @@ impl Agent<'_> {
                             let args: Value =
                                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
                             crate::subagents::run_with_instructions(
-                                self.backend,
-                                &self.workspace,
-                                request_id,
+                                &crate::subagents::Parent {
+                                    backend: self.backend,
+                                    workspace: &self.workspace,
+                                    request_id,
+                                    approvals: &self.approvals,
+                                    emit: self.emit.clone(),
+                                    settings: subagents,
+                                    command_tools,
+                                    web_enabled: self.web_enabled,
+                                    budget,
+                                },
                                 args["goal"].as_str().unwrap_or(""),
                                 args["context"].as_str().unwrap_or(""),
-                                self.emit.clone(),
                                 guidance.clone(),
                                 trace.zip(tool_span.as_ref()),
                             )
@@ -764,6 +791,7 @@ impl Agent<'_> {
                                 &self.approvals,
                                 &emit,
                                 std::time::Duration::from_secs(budget.command_timeout_seconds),
+                                &output_cap,
                             )
                             .await
                         } else {
@@ -774,6 +802,7 @@ impl Agent<'_> {
                                 &self.approvals,
                                 &emit,
                                 std::time::Duration::from_secs(budget.command_timeout_seconds),
+                                &output_cap,
                             )
                             .await
                         };
@@ -817,6 +846,7 @@ impl Agent<'_> {
                             tool_call_id: ui_id,
                             output: output.clone(),
                             success,
+                            truncated: output_cap.trimmed(),
                         });
                         (
                             index,
@@ -1128,6 +1158,7 @@ mod tests {
                 instructions: vec![],
                 compact: false,
                 trace: Some(telemetry.run(&request, crate::telemetry::Mode::Agent)),
+                subagents: Default::default(),
             };
             agent
                 .run_context_with_guidance(&request, run, None, Some(&directory.join("user")))
@@ -1205,6 +1236,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Default::default(),
+            subagents: Default::default(),
         };
         agent
             .run_context_with_guidance("untraced", run, None, Some(&directory.join("user")))
@@ -1311,6 +1343,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Some(telemetry.run("delegated", crate::telemetry::Mode::Agent)),
+            subagents: Default::default(),
         };
         agent
             .run_context_with_guidance("delegated", run, None, Some(&directory.join("user")))
@@ -1472,6 +1505,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Some(telemetry.run("unknown", crate::telemetry::Mode::Agent)),
+            subagents: Default::default(),
         };
         agent
             .run_context_with_guidance("unknown", run, None, Some(&directory.join("user")))
@@ -1566,6 +1600,120 @@ mod tests {
         drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    /// Runs one shell command that prints 10,000 bytes, then finishes.
+    struct LargeOutput;
+    impl ModelBackend for LargeOutput {
+        fn generate<'a>(
+            &'a self,
+            messages: &'a [Value],
+            _: &'a [Value],
+            _: &'a mut (dyn FnMut(String) + Send),
+        ) -> BoxFuture<'a, Result<ModelTurn, ModelError>> {
+            Box::pin(async move {
+                if messages.iter().any(|message| message["role"] == "tool") {
+                    return Ok(ModelTurn {
+                        content: "Done.".into(),
+                        ..Default::default()
+                    });
+                }
+                Ok(ModelTurn {
+                    calls: vec![ToolCall {
+                        id: "large".into(),
+                        function: ToolFunction {
+                            name: "shell".into(),
+                            arguments: json!({"command":"head -c 10000 /dev/zero | tr '\\0' z"})
+                                .to_string(),
+                        },
+                    }],
+                    ..Default::default()
+                })
+            })
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_limits_can_only_lower() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-limits-{}", rand::random::<u64>()));
+        let (project, user) = (directory.join("project"), directory.join("user"));
+        std::fs::create_dir_all(project.join(crate::project::PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        // (owner cap, project cap, expected cap): the lower one always wins.
+        for (owner, limit, expected) in [
+            (65536, None, None),
+            (65536, Some(4096), Some(4096)),
+            (4096, Some(8192), Some(4096)),
+        ] {
+            let file = project
+                .join(crate::project::PROJECT_DIRECTORY)
+                .join(crate::project::PROJECT_FILE);
+            let body = match limit {
+                Some(limit) => json!({"limits":{"max_output_bytes":limit}}),
+                None => json!({}),
+            };
+            std::fs::write(&file, body.to_string()).unwrap();
+            let sha = crate::project::status(&project, &user).sha256.unwrap();
+            crate::project::trust(&project, &user, &sha).unwrap();
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let results = Arc::new(Mutex::new(vec![]));
+            let seen = results.clone();
+            let mut workspace = Workspace::open(&project).unwrap();
+            workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+            let agent = Agent {
+                backend: &LargeOutput,
+                workspace,
+                web_enabled: false,
+                approvals,
+                emit: Arc::new(move |event| match event {
+                    AgentEvent::ApprovalRequest {
+                        request_id,
+                        approval_id,
+                        ..
+                    } => decisions
+                        .resolve(ResolveApprovalRequest {
+                            request_id,
+                            approval_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .unwrap(),
+                    AgentEvent::ToolResult {
+                        output, truncated, ..
+                    } => seen.lock().unwrap().push((output, truncated)),
+                    _ => {}
+                }),
+            };
+            let source = vec![json!({"role":"user","content":"Print a lot."})];
+            let run = crate::context::ContextRun {
+                state: crate::context::ContextState::restore(&source, None).unwrap(),
+                source,
+                budget: crate::context::ContextBudget {
+                    max_output_bytes: owner,
+                    ..Default::default()
+                },
+                instructions: vec![],
+                compact: false,
+                trace: None,
+                subagents: Default::default(),
+            };
+            agent
+                .run_context_with_guidance("limits", run, None, Some(&user))
+                .await
+                .unwrap();
+            let results = results.lock().unwrap();
+            let (output, truncated) = &results[0];
+            match expected {
+                None => assert!(!truncated && output.len() == "Exit: 0\n".len() + 10000),
+                Some(cap) => {
+                    assert!(*truncated, "{owner} {limit:?}");
+                    let head = output.split("\n[… ").next().unwrap();
+                    assert_eq!(head.len(), cap * 2 / 5);
+                }
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     struct RepeatingTool {
         name: &'static str,
         arguments: &'static str,
@@ -1647,6 +1795,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Default::default(),
+            subagents: Default::default(),
         };
         assert!(matches!(
             agent.run_context("limited", run).await,
@@ -2362,6 +2511,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Default::default(),
+            subagents: Default::default(),
         };
         assert_eq!(
             agent
@@ -2469,6 +2619,7 @@ mod tests {
                     instructions: vec![],
                     compact: false,
                     trace: Default::default(),
+                    subagents: Default::default(),
                 },
             )
             .await;
@@ -2549,6 +2700,7 @@ mod context_tests {
                     instructions: vec![],
                     compact: false,
                     trace: Default::default(),
+                    subagents: Default::default(),
                 },
             )
             .await
@@ -2688,6 +2840,7 @@ mod recall_tests {
                         instructions: vec![],
                         compact: false,
                         trace: Default::default(),
+                        subagents: Default::default(),
                     },
                     Some(&memory),
                 )

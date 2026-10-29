@@ -465,6 +465,9 @@ pub enum AgentEvent {
         output: String,
         /// Whether the tool completed successfully.
         success: bool,
+        /// Whether command output over the cap was trimmed to its start and end.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// A gated operation waiting for a user decision.
     ApprovalRequest {
@@ -485,6 +488,14 @@ pub enum AgentEvent {
         /// model wrote as text, which always asks.
         #[serde(default = "offered", skip_serializing_if = "is_offered")]
         remember: bool,
+        /// The action hands data to another program that may send it off this device, such as
+        /// a subagent running on an owner command tool. Shown as "Sends data off this device".
+        #[serde(
+            default,
+            rename = "offDevice",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        off_device: bool,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -780,6 +791,7 @@ mod tests {
                 tool_call_id: "tc1".to_owned(),
                 output: "# Blackwall".to_owned(),
                 success: true,
+                truncated: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -788,6 +800,7 @@ mod tests {
                 detail: "cargo test".to_owned(),
                 tool: None,
                 remember: true,
+                off_device: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -796,6 +809,7 @@ mod tests {
                 detail: "write_file written as text".to_owned(),
                 tool: None,
                 remember: false,
+                off_device: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -807,6 +821,7 @@ mod tests {
                     tool: "docs__search".to_owned(),
                 }),
                 remember: true,
+                off_device: false,
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),

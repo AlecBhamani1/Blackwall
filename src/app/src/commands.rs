@@ -635,7 +635,7 @@ pub(crate) async fn stream_chat(
         tokio::select! {
             biased;
             _=job.cancelled()=>Err(stopped()),
-            result=runner.run_context_with_guidance(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact, trace },memory.as_ref(),Some(&instruction_directory))=>result.map(|_|()).map_err(CommandError::from),
+            result=runner.run_context_with_guidance(&request_id,blackwall_core::context::ContextRun { source: source.clone(), state: context, budget: request.context_budget, instructions: blackwall_core::model::messages(&request).into_iter().take(request.messages.len().saturating_sub(source.len())).collect(), compact: request.compact, trace, subagents: Default::default() },memory.as_ref(),Some(&instruction_directory))=>result.map(|_|()).map_err(CommandError::from),
         }
     } else {
         inject_memory(&app, &mut request, None).await?;
@@ -847,6 +847,7 @@ async fn stream_chat_events(
             (None, session_id),
         )
         .await,
+        subagents: Default::default(),
     };
     let emit = |event| {
         let _ = emit_event(app, &event);

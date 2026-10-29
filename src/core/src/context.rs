@@ -16,7 +16,13 @@ pub struct ContextBudget {
     pub auto_compact: bool,
     pub max_iterations: u32,
     pub command_timeout_seconds: u64,
+    /// Command output over this many bytes is trimmed to its start and end. 4 KiB to 1 MiB.
+    pub max_output_bytes: u32,
 }
+/// The default command output cap, which was the hard limit before it was configurable.
+pub const DEFAULT_OUTPUT_BYTES: u32 = 64 * 1024;
+/// The range a command output cap can take.
+pub const OUTPUT_BYTES_RANGE: std::ops::RangeInclusive<u32> = 4096..=1_048_576;
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
@@ -25,6 +31,7 @@ impl Default for ContextBudget {
             auto_compact: false,
             max_iterations: 20,
             command_timeout_seconds: 120,
+            max_output_bytes: DEFAULT_OUTPUT_BYTES,
         }
     }
 }
@@ -36,6 +43,7 @@ impl ContextBudget {
             || u64::from(self.output_tokens) + self.safety_tokens() >= self.context_window
             || !(1..=100).contains(&self.max_iterations)
             || !(10..=3600).contains(&self.command_timeout_seconds)
+            || !OUTPUT_BYTES_RANGE.contains(&self.max_output_bytes)
         {
             return Err(ContextError::Budget);
         }
@@ -495,6 +503,8 @@ pub struct ContextRun {
     pub compact: bool,
     /// This run's telemetry, from the adapter's `Telemetry::run`; `None` records nothing.
     pub trace: Option<crate::telemetry::RunScope>,
+    /// The owner's subagent settings; a trusted project can only lower them.
+    pub subagents: crate::subagents::SubagentSettings,
 }
 
 /// Shared tool-free chat/compaction path. Unexpected calls are rejected entirely.
@@ -580,6 +590,7 @@ async fn chat_traced(
         mut instructions,
         compact,
         trace: _,
+        subagents: _,
     } = run;
     use crate::protocol::AgentEvent;
     state.validate()?;
@@ -750,6 +761,7 @@ async fn chat_traced(
                     tool_call_id: ui_id,
                     output: output.clone(),
                     success,
+                    truncated: false,
                 });
                 state
                     .transcript
@@ -893,6 +905,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Some(telemetry.run("chat-1", crate::telemetry::Mode::Chat)),
+            subagents: Default::default(),
         };
         assert_eq!(
             chat(&model, "chat-1", run, &|_| {}).await.unwrap(),
@@ -957,6 +970,7 @@ mod tests {
             instructions: vec![],
             compact: true,
             trace: Some(telemetry.compaction(crate::telemetry::Mode::Chat)),
+            subagents: Default::default(),
         };
         assert_eq!(chat(&model, "compact-1", run, &|_| {}).await.unwrap(), "");
         let calls = model.requests.lock().unwrap().len();
@@ -1052,6 +1066,7 @@ mod tests {
             instructions: vec![],
             compact: true,
             trace: Default::default(),
+            subagents: Default::default(),
         };
         assert_eq!(
             chat_with_web(
@@ -1227,6 +1242,7 @@ mod tests {
             instructions: vec![],
             compact: false,
             trace: Default::default(),
+            subagents: Default::default(),
         };
         assert_eq!(
             chat(&Automatic, "auto", run, &|event| events

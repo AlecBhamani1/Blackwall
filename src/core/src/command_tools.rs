@@ -219,6 +219,15 @@ impl CommandTools {
     pub fn get(&self, name: &str) -> Option<&CommandTool> {
         self.tools.iter().find(|tool| tool.name == name)
     }
+
+    /// The names of the tools a subagent can run on, with `stdin: "json"` and a `prompt`.
+    pub fn delegates(&self) -> Vec<&str> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.delegate_problem().is_none())
+            .map(|tool| tool.name.as_str())
+            .collect()
+    }
 }
 
 /// Check `args` against an owner schema: an object with only declared names, every required
@@ -322,6 +331,7 @@ impl CommandTool {
 
     /// Command rules match the configured command template, so `claude -p` can allow every
     /// prompt. HTTP tools ask with kind Network, and rules match the request's host.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         workspace: &crate::tools::Workspace,
@@ -330,11 +340,12 @@ impl CommandTool {
         approvals: &Approvals,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         timeout: Duration,
+        output: &crate::tools::OutputCap,
     ) -> Result<String, ToolError> {
         let keychain: http::Lookup =
             std::sync::Arc::new(|account: &str| crate::secrets::get(SECRET_SERVICE, account));
         self.run_with(
-            workspace, arguments, request_id, approvals, emit, timeout, keychain,
+            workspace, arguments, request_id, approvals, emit, timeout, output, keychain,
         )
         .await
     }
@@ -348,6 +359,7 @@ impl CommandTool {
         approvals: &Approvals,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         timeout: Duration,
+        output: &crate::tools::OutputCap,
         secrets: http::Lookup,
     ) -> Result<String, ToolError> {
         let values: Value = serde_json::from_str(arguments).map_err(|_| ToolError::Arguments)?;
@@ -369,38 +381,12 @@ impl CommandTool {
             None => {}
         }
         if self.kind == ToolKind::Http {
-            return http::run(self, &values, request_id, approvals, emit, timeout, secrets).await;
+            // Trimmed after the response is redacted, so a cut never splits a secret.
+            return http::run(self, &values, request_id, approvals, emit, timeout, secrets)
+                .await
+                .map(|text| output.trim_text(text));
         }
-        let args = self.command[1..]
-            .iter()
-            .map(|arg| match placeholder(arg) {
-                Some(name) => {
-                    self.value_text(&values, name)
-                        .and_then(|value| match is_option(&value) {
-                            true => Err(ToolError::Arguments),
-                            false => Ok(value),
-                        })
-                }
-                None => Ok(arg.clone()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let input = match self.stdin {
-            StdinMode::None => None,
-            StdinMode::Json => {
-                let input = serde_json::to_vec(&json!({ "arguments": values }))
-                    .map_err(|_| ToolError::Arguments)?;
-                if input.len() > MAX_INPUT_BYTES {
-                    return Err(ToolError::Arguments);
-                }
-                Some(input)
-            }
-        };
-        let program = resolve_program(&self.command[0]).ok_or_else(|| {
-            ToolError::Execution(format!(
-                "{} was not found on this computer.",
-                self.command[0]
-            ))
-        })?;
+        let (program, args, input) = self.prepared(&values)?;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
             "Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
@@ -426,9 +412,113 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
-        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout).await
+        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout, output).await
+    }
+
+    /// Why this tool cannot take a subagent's prompt, or `None` when it can: it must run a
+    /// program, read `{"arguments":{"prompt":…}}` from standard input, and accept a `prompt`
+    /// string as its only required argument.
+    pub fn delegate_problem(&self) -> Option<&'static str> {
+        if self.kind != ToolKind::Command {
+            return Some("A subagent can only run on a command tool, not an HTTP tool.");
+        }
+        if self.stdin != StdinMode::Json {
+            return Some("A subagent tool must set \"stdin\": \"json\", so the prompt is sent on standard input.");
+        }
+        // The prompt never goes on the command line, where its size is limited and other
+        // programs on this computer can read it.
+        let accepts = self.placeholders().is_empty()
+            && self.parameters.as_ref().is_some_and(|schema| {
+                schema
+                    .properties
+                    .get("prompt")
+                    .is_some_and(|property| property.kind == ValueType::String)
+                    && schema.required.iter().all(|name| name == "prompt")
+            });
+        (!accepts).then_some(
+            "A subagent tool must declare a string \"prompt\" in \"parameters\", need no other argument, and use no {placeholders} in its command.",
+        )
+    }
+
+    /// Run this tool as a subagent: `prompt` goes to it as `{"arguments":{"prompt":…}}` on
+    /// standard input. This always asks, the answer is never remembered, the owner sees the
+    /// whole prompt, and an allow rule never skips the prompt. Deny rules still apply.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delegate(
+        &self,
+        workspace: &crate::tools::Workspace,
+        prompt: &str,
+        request_id: &str,
+        approvals: &Approvals,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        timeout: Duration,
+        output: &crate::tools::OutputCap,
+    ) -> Result<String, ToolError> {
+        if let Some(problem) = self.delegate_problem() {
+            return Err(ToolError::Execution(problem.into()));
+        }
+        let values = json!({ "prompt": prompt });
+        if let Some(schema) = &self.parameters {
+            validate_arguments(schema, &values)?;
+        }
+        let (program, args, input) = self.prepared(&values)?;
+        let detail = format!(
+            "A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}\n\n{}",
+            workspace.path.display(),
+            self.name,
+            program.display(),
+            serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
+            prompt.len(),
+            workspace.execution.description(),
+        );
+        if !approvals
+            .request_delegate(request_id, &self.command.join(" "), detail, emit)
+            .await
+            .map_err(ToolError::Execution)?
+        {
+            return Err(ToolError::Denied);
+        }
+        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout, output).await
+    }
+
+    /// The resolved program, its arguments, and its standard input for checked `values`.
+    fn prepared(&self, values: &Value) -> Result<Prepared, ToolError> {
+        let args = self.command[1..]
+            .iter()
+            .map(|arg| match placeholder(arg) {
+                Some(name) => {
+                    self.value_text(values, name)
+                        .and_then(|value| match is_option(&value) {
+                            true => Err(ToolError::Arguments),
+                            false => Ok(value),
+                        })
+                }
+                None => Ok(arg.clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let input = match self.stdin {
+            StdinMode::None => None,
+            StdinMode::Json => {
+                let input = serde_json::to_vec(&json!({ "arguments": values }))
+                    .map_err(|_| ToolError::Arguments)?;
+                if input.len() > MAX_INPUT_BYTES {
+                    return Err(ToolError::Arguments);
+                }
+                Some(input)
+            }
+        };
+        let program = resolve_program(&self.command[0]).ok_or_else(|| {
+            ToolError::Execution(format!(
+                "{} was not found on this computer.",
+                self.command[0]
+            ))
+        })?;
+        Ok((program, args, input))
     }
 }
+
+/// A command tool's resolved program, its arguments, and its standard input.
+type Prepared = (PathBuf, Vec<String>, Option<Vec<u8>>);
 
 /// Size, digest, and the start of a payload for an approval prompt. The digest keeps a
 /// remembered approval exact when the shown text is clipped.
@@ -686,6 +776,7 @@ mod tests {
                 &approvals,
                 &allow,
                 Duration::from_secs(10),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -700,6 +791,7 @@ mod tests {
                 &approvals,
                 &allow,
                 Duration::from_secs(10),
+                &Default::default(),
             )
             .await,
             Err(ToolError::Arguments)
@@ -851,7 +943,8 @@ mod tests {
                         "run",
                         &approvals,
                         &never,
-                        Duration::from_secs(10)
+                        Duration::from_secs(10),
+                        &Default::default(),
                     )
                     .await,
                 Err(ToolError::Arguments)
@@ -907,6 +1000,7 @@ mod tests {
                 &approvals,
                 &allow,
                 Duration::from_secs(10),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -947,7 +1041,8 @@ mod tests {
                             "run",
                             &approvals,
                             &never,
-                            Duration::from_secs(10)
+                            Duration::from_secs(10),
+                            &Default::default(),
                         )
                         .await,
                     Err(ToolError::Arguments)
