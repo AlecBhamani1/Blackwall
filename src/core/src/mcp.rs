@@ -1,4 +1,5 @@
-//! Owner-configured local MCP servers whose tools join Agent runs behind Blackwall approvals.
+//! Owner-configured MCP servers, local processes or streamable HTTP endpoints, whose tools join
+//! Agent runs behind Blackwall approvals.
 use crate::{
     approvals::Approvals,
     protocol::{AgentEvent, ApprovalTool},
@@ -6,10 +7,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::{io::BufReader, sync::Mutex};
 use transport::{StdioTransport, Transport};
 
+mod http;
 mod transport;
 
 pub const MCP_FILE: &str = "mcp.json";
@@ -31,7 +33,15 @@ const EDIT_LOCK: &str = ".mcp.lock";
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerConfig {
     pub name: String,
+    /// The program and arguments of a local server. Empty for a `url` server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// A streamable HTTP endpoint, used instead of `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Headers sent to a `url` server. Each value names a saved secret as `{secret:NAME}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +143,45 @@ fn saved_name(name: &str) -> String {
 
 /// Add a server under its saved name, which is returned.
 pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
+    add(directory, name, command, None, BTreeMap::new())
+}
+
+/// Add a streamable HTTP server. Each header is `(header name, secret name)`; the secret's value
+/// is saved for this server with [`save_secret`].
+pub fn add_http_server(
+    directory: &Path,
+    name: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+) -> Result<String, String> {
+    let mut references = BTreeMap::new();
+    for (header, secret) in headers {
+        if references
+            .insert(
+                header.trim().to_owned(),
+                format!("{{secret:{}}}", secret.trim()),
+            )
+            .is_some()
+        {
+            return Err(format!("The {header} header is given twice."));
+        }
+    }
+    add(
+        directory,
+        name,
+        vec![],
+        Some(url.trim().to_owned()),
+        references,
+    )
+}
+
+fn add(
+    directory: &Path,
+    name: &str,
+    command: Vec<String>,
+    url: Option<String>,
+    headers: BTreeMap<String, String>,
+) -> Result<String, String> {
     let name = saved_name(name);
     let name = name.as_str();
     let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
@@ -144,6 +193,8 @@ pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<
     servers.push(ServerConfig {
         name: name.into(),
         command,
+        url,
+        headers,
         enabled: true,
         allow_tools: None,
         deny_tools: vec![],
@@ -224,11 +275,14 @@ struct Tool {
 
 struct Server {
     name: String,
+    /// The host of a URL server, shown when asking to call its tools.
+    host: Option<String>,
     connection: Mutex<Connection>,
     tools: Vec<Tool>,
 }
 
-/// MCP servers started for one run. Dropping them stops every server process.
+/// MCP servers started for one run. Dropping them stops every server process and ends every HTTP
+/// session.
 #[derive(Default)]
 pub struct McpServers {
     servers: Vec<Server>,
@@ -263,19 +317,40 @@ impl McpServers {
             .filter_map(|definition| definition["function"]["name"].as_str())
             .map(str::to_owned)
             .collect();
+        started
+            .add_servers(configs, Source::Owner, directory, &mut names)
+            .await;
+        started
+    }
+
+    /// Start enabled servers from one file. `names` holds every tool name already taken.
+    async fn add_servers(
+        &mut self,
+        configs: Vec<ServerConfig>,
+        source: Source,
+        directory: &Path,
+        names: &mut Vec<String>,
+    ) {
+        let configs = match validate_for(configs, source) {
+            Ok(configs) => configs,
+            Err(error) => {
+                self.warnings
+                    .push(format!("{error} MCP servers are unavailable for this run."));
+                return;
+            }
+        };
         for config in configs.into_iter().filter(|config| config.enabled) {
             // A credential store prompt gets its own, longer wait than the server's startup.
             let environment =
                 match tokio::time::timeout(SECRET_TIMEOUT, read_secrets(&config)).await {
                     Ok(Ok(environment)) => environment,
                     Ok(Err(error)) => {
-                        started
-                            .warnings
+                        self.warnings
                             .push(format!("MCP server {} did not start: {error}", config.name));
                         continue;
                     }
                     Err(_) => {
-                        started.warnings.push(format!(
+                        self.warnings.push(format!(
                             "MCP server {} is waiting for {}. {}, then try again.",
                             config.name,
                             crate::secrets::STORE,
@@ -288,18 +363,17 @@ impl McpServers {
                 .await
             {
                 Ok(Ok(connection)) => {
-                    started.add(config, connection, &mut names).await;
+                    self.add(config, connection, names).await;
                 }
-                Ok(Err(error)) => started
+                Ok(Err(error)) => self
                     .warnings
                     .push(format!("MCP server {} did not start: {error}", config.name)),
-                Err(_) => started.warnings.push(format!(
+                Err(_) => self.warnings.push(format!(
                     "MCP server {} did not start within 15 seconds.",
                     config.name
                 )),
             }
         }
-        started
     }
 
     async fn add(
@@ -361,6 +435,11 @@ impl McpServers {
             }
         }
         self.servers.push(Server {
+            host: config
+                .url
+                .as_deref()
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.host_str().map(str::to_owned)),
             name: config.name,
             connection: Mutex::new(connection),
             tools,
@@ -410,10 +489,16 @@ impl McpServers {
         if !arguments.is_object() {
             return Err(ToolError::Arguments);
         }
-        let detail = format!(
-            "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
-            server.name, tool.name
-        );
+        let detail = match &server.host {
+            None => format!(
+                "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
+                server.name, tool.name
+            ),
+            Some(host) => format!(
+                "MCP server: {} ({host})\nTool: {}\nArguments: {arguments}\n\nThe arguments are sent to {host}, which may change data in the services it connects to.",
+                server.name, tool.name
+            ),
+        };
         let approval = ApprovalTool {
             server: server.name.clone(),
             tool: tool.exposed.clone(),
@@ -618,6 +703,25 @@ async fn launch(
     directory: &Path,
     environment: Vec<(String, String)>,
 ) -> Result<Connection, ToolError> {
+    let transport: Box<dyn Transport> = match &config.url {
+        Some(url) => Box::new(http::HttpTransport::new(
+            url,
+            http::headers(config, &environment)?,
+        )?),
+        None => start_process(config, directory, &environment)?,
+    };
+    let secrets = environment.into_iter().map(|(_, value)| value).collect();
+    let mut connection = Connection::new(transport, secrets);
+    let initialized = connection.initialize().await;
+    initialized.map_err(|error| connection.redact(error))?;
+    Ok(connection)
+}
+
+fn start_process(
+    config: &ServerConfig,
+    directory: &Path,
+    environment: &[(String, String)],
+) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
         let program =
@@ -628,22 +732,17 @@ async fn launch(
                 ))
             })?;
         let (process, stdin, stdout, stderr) =
-            crate::tools::spawn_server(directory, &program, &config.command[1..], &environment)?;
+            crate::tools::spawn_server(directory, &program, &config.command[1..], environment)?;
         // Server logs are not shown; draining them keeps a chatty server from blocking.
         tokio::spawn(async move {
             let mut stderr = stderr;
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         });
-        let transport = StdioTransport {
+        Ok(Box::new(StdioTransport {
             reader: Box::new(BufReader::new(stdout)),
             writer: Box::new(stdin),
             process: Some(process),
-        };
-        let secrets = environment.into_iter().map(|(_, value)| value).collect();
-        let mut connection = Connection::new(Box::new(transport), secrets);
-        let initialized = connection.initialize().await;
-        initialized.map_err(|error| connection.redact(error))?;
-        Ok(connection)
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -692,7 +791,24 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Where server entries come from. Project servers, from a trusted project file, are URL-only,
+/// carry no secrets or headers, and use the reserved `p-` name prefix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Owner,
+    // Wired up with trusted project settings.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Project,
+}
+
 fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static str> {
+    validate_for(servers, Source::Owner)
+}
+
+fn validate_for(
+    servers: Vec<ServerConfig>,
+    source: Source,
+) -> Result<Vec<ServerConfig>, &'static str> {
     if servers.len() > MAX_SERVERS {
         return Err("The MCP file has too many servers.");
     }
@@ -708,15 +824,53 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
         {
             return Err("Two MCP servers have the same name.");
         }
-        if server.command.is_empty() || server.command.len() > 64 {
-            return Err("Give each MCP server a command with at most 63 arguments.");
+        match source {
+            Source::Owner if server.name.starts_with("p-") => {
+                return Err("MCP server names starting with p- are reserved for project servers.");
+            }
+            Source::Project if !server.name.starts_with("p-") => {
+                return Err("Project MCP server names start with p-.");
+            }
+            Source::Project if server.url.is_none() || !server.command.is_empty() => {
+                return Err("A project can only add MCP servers by URL.");
+            }
+            Source::Project if !server.secrets.is_empty() || !server.headers.is_empty() => {
+                return Err("Project MCP servers cannot use secrets or headers.");
+            }
+            _ => {}
         }
-        if !crate::command_tools::valid_program(&server.command[0]) {
-            return Err(if cfg!(windows) {
-                "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
-            } else {
-                "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
-            });
+        match &server.url {
+            Some(_) if !server.command.is_empty() => {
+                return Err("Give each MCP server either a command or a URL, not both.");
+            }
+            Some(url) => {
+                if !http::valid_url(url) {
+                    return Err("An MCP server URL must use https, or http on 127.0.0.1, ::1, or localhost, and must not include a user name or password.");
+                }
+                if server.headers.len() > 16
+                    || !server
+                        .headers
+                        .iter()
+                        .all(|(name, value)| http::valid_header(name, value))
+                {
+                    return Err("MCP server headers must be {secret:NAME}, naming a secret saved for that server, and cannot replace the protocol's own headers.");
+                }
+            }
+            None => {
+                if server.command.is_empty() || server.command.len() > 64 {
+                    return Err("Give each MCP server a command with at most 63 arguments.");
+                }
+                if !crate::command_tools::valid_program(&server.command[0]) {
+                    return Err(if cfg!(windows) {
+                        "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
+                    } else {
+                        "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
+                    });
+                }
+                if !server.headers.is_empty() {
+                    return Err("Only MCP servers with a URL take headers.");
+                }
+            }
         }
         if server.secrets.len() > 16
             || server.secrets.iter().enumerate().any(|(index, name)| {
@@ -813,6 +967,8 @@ mod tests {
         let config = ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: None,
             deny_tools: vec!["delete_issue".into()],
@@ -866,6 +1022,8 @@ mod tests {
         let config = ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: Some(vec!["search".into(), "fail".into()]),
             deny_tools: vec![],
@@ -969,6 +1127,8 @@ mod tests {
         let server = |secrets: &[&str]| ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: None,
             deny_tools: vec![],
