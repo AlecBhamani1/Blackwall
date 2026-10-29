@@ -233,6 +233,12 @@ async fn text_tool_call_always_asks() {
             asked[0]
         );
         assert!(asked[0].contains("Tool: write_file"));
+        let prompt = events.iter().find_map(|event| match event {
+            AgentEvent::ApprovalRequest { kind, remember, .. } => Some((*kind, *remember)),
+            _ => None,
+        });
+        // A file change asks as one, and cannot be remembered for the run.
+        assert_eq!(prompt, Some((crate::protocol::ApprovalKind::File, false)));
         let shown = shown(&events);
         assert!(!shown.contains("<tool_call>"), "{shown}");
         let written = std::fs::read_to_string(project.join("notes.txt")).unwrap();

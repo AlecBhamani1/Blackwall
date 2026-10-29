@@ -85,6 +85,27 @@ describe('native chat failure boundary', () => {
     });
   });
 
+  it('marks a prompt for a call written as text as one that cannot be remembered', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    const prompt = { type: 'approval_request', requestId: 'text', kind: 'file', detail: 'd' };
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({ payload: { ...prompt, approvalId: 'a1', remember: false } });
+      listener({ payload: { ...prompt, approvalId: 'a2' } });
+      listener({ payload: { type: 'turn_complete', requestId: 'text' } });
+      return { requestId: 'text' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'text', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a1', remember: false });
+    expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
+  });
+
   it('passes reasoning and its duration through with the completed turn', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

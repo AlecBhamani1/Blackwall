@@ -149,6 +149,7 @@ export type AgentEvent =
       kind: string;
       detail: string;
       tool?: ApprovalTool;
+      remember?: boolean;
     };
 
 export interface ChildEntry {
@@ -186,6 +187,8 @@ export interface PendingApproval {
   kind: string;
   detail: string;
   tool?: ApprovalTool;
+  /** False for a tool call the model wrote as text: it can only be allowed once. */
+  remember?: boolean;
 }
 
 export interface StreamCallbacks {

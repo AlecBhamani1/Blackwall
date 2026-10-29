@@ -710,6 +710,7 @@ async fn chat_traced(
                     || approvals
                         .confirm_text_call(
                             request_id,
+                            crate::approvals::text_call_kind(&call.function.name),
                             &call.function.name,
                             &call.function.arguments,
                             emit,
@@ -721,6 +722,9 @@ async fn chat_traced(
                 } else {
                     Err(crate::tools::ToolError::Denied)
                 };
+                if turn.text_calls {
+                    approvals.end_text_call(request_id);
+                }
                 if let (Some(trace), Some(span)) = (trace, &tool) {
                     trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                     if let Err(error) = &result {

@@ -481,6 +481,10 @@ pub enum AgentEvent {
         /// The MCP tool, for approvals that can be saved as an owner rule.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<ApprovalTool>,
+        /// Whether "allow identical action this run" is offered. False for a tool call the
+        /// model wrote as text, which always asks.
+        #[serde(default = "offered", skip_serializing_if = "is_offered")]
+        remember: bool,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -557,6 +561,13 @@ pub enum AgentEvent {
         /// `created`, `updated`, or `deleted`.
         action: String,
     },
+}
+
+fn offered() -> bool {
+    true
+}
+fn is_offered(value: &bool) -> bool {
+    *value
 }
 
 impl AgentEvent {
@@ -766,6 +777,15 @@ mod tests {
                 kind: ApprovalKind::Exec,
                 detail: "cargo test".to_owned(),
                 tool: None,
+                remember: true,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "a3".to_owned(),
+                kind: ApprovalKind::File,
+                detail: "write_file written as text".to_owned(),
+                tool: None,
+                remember: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -776,6 +796,7 @@ mod tests {
                     server: "docs".to_owned(),
                     tool: "docs__search".to_owned(),
                 }),
+                remember: true,
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),

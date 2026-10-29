@@ -12,17 +12,50 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// The most argument bytes a text-written call's prompt shows.
+const MAX_SHOWN_ARGUMENTS: usize = 4 * 1024;
+
+/// `text` cut to at most `limit` bytes on a character boundary, with a marker when cut.
+fn clipped(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let end = (0..=limit)
+        .rev()
+        .find(|&index| text.is_char_boundary(index))
+        .unwrap_or(0);
+    format!(
+        "{}\n… [{} more bytes not shown]",
+        &text[..end],
+        text.len() - end
+    )
+}
+
+/// What a built-in tool does, for the prompt shown before a call the model wrote as text.
+pub fn text_call_kind(name: &str) -> ApprovalKind {
+    match name {
+        "write_file" => ApprovalKind::File,
+        "web_fetch" | "web_search" => ApprovalKind::Network,
+        _ => ApprovalKind::Exec,
+    }
+}
+
 struct Pending {
     request_id: String,
     sender: oneshot::Sender<ApprovalDecision>,
     /// Whether the owner may save a rule for this approval.
     tool: bool,
+    /// Whether "allow identical action this run" may be remembered.
+    remember: bool,
 }
 #[derive(Default)]
 struct Registry {
     pending: HashMap<String, Pending>,
     allowed: HashSet<(String, String)>,
     policies: HashMap<String, Arc<Policy>>,
+    /// Runs whose current text-written web call was just approved; its first network prompt
+    /// is answered by that approval.
+    text_web_calls: HashSet<String>,
 }
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Registry>>);
@@ -116,6 +149,9 @@ impl Approvals {
             .get(request_id)
             .cloned();
         let Some(policy) = policy else {
+            if self.approved_text_call(request_id, kind) {
+                return Ok(true);
+            }
             // Without the owner's data folder there is nowhere to save a rule.
             let answer = self.ask(request_id, kind, None, detail, emit, true).await?;
             return Ok(answer != ApprovalDecision::Deny);
@@ -128,6 +164,7 @@ impl Approvals {
         let allowed = match decision {
             Decision::Allow => true,
             Decision::Deny => false,
+            Decision::Ask if self.approved_text_call(request_id, kind) => true,
             Decision::Ask => {
                 let detail = match &policy.error {
                     Some(error) => format!("{error}\n\n{detail}"),
@@ -197,22 +234,47 @@ impl Approvals {
         Ok(Some(saved))
     }
     /// A tool call the model wrote as text always asks, whatever rules are saved, and the
-    /// answer is never remembered, not even for an identical call later in the run. The tool's
-    /// own checks still apply after this.
+    /// answer is never remembered, not even for an identical call later in the run. `kind` is
+    /// what the tool does. The tool's own checks still apply after this, except that an approved
+    /// web call does not ask again for its first request; call [`Self::end_text_call`] after it.
     pub async fn confirm_text_call(
         &self,
         request_id: &str,
+        kind: ApprovalKind,
         name: &str,
         arguments: &str,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
         let detail = format!(
-            "The model wrote this tool call as text, so Blackwall asks before running it.\n\nTool: {name}\nArguments: {arguments}"
+            "The model wrote this tool call as text, so Blackwall asks before running it.\n\nTool: {name}\nArguments: {}",
+            clipped(arguments, MAX_SHOWN_ARGUMENTS)
         );
-        let answer = self
-            .ask(request_id, ApprovalKind::Exec, None, detail, emit, false)
-            .await?;
-        Ok(answer != ApprovalDecision::Deny)
+        let allowed = self
+            .ask(request_id, kind, None, detail, emit, false)
+            .await?
+            != ApprovalDecision::Deny;
+        if allowed && kind == ApprovalKind::Network {
+            self.0
+                .lock()
+                .map_err(|_| "The approval registry is unavailable.")?
+                .text_web_calls
+                .insert(request_id.to_owned());
+        }
+        Ok(allowed)
+    }
+    /// Drop an approved text-written web call's unused approval once the call has finished.
+    pub fn end_text_call(&self, request_id: &str) {
+        if let Ok(mut state) = self.0.lock() {
+            state.text_web_calls.remove(request_id);
+        }
+    }
+    /// Whether a network prompt is already answered by the text-written call that raised it.
+    fn approved_text_call(&self, request_id: &str, kind: ApprovalKind) -> bool {
+        kind == ApprovalKind::Network
+            && self
+                .0
+                .lock()
+                .is_ok_and(|mut state| state.text_web_calls.remove(request_id))
     }
     /// `remember` lets "allow identical action this run" skip later identical prompts.
     async fn ask(
@@ -247,6 +309,7 @@ impl Approvals {
                     request_id: request_id.into(),
                     sender,
                     tool: tool.is_some(),
+                    remember,
                 },
             );
         }
@@ -260,6 +323,7 @@ impl Approvals {
             kind,
             detail: detail.clone(),
             tool,
+            remember,
         });
         let decision = tokio::time::timeout(Duration::from_secs(10 * 60), receiver)
             .await
@@ -297,9 +361,14 @@ impl Approvals {
             return Err("This approval cannot be saved as a rule.".into());
         }
         if let Some(pending) = state.pending.remove(&request.approval_id) {
+            // A prompt that cannot be remembered is allowed once at most.
+            let decision = match request.decision {
+                ApprovalDecision::AlwaysAllow if !pending.remember => ApprovalDecision::Allow,
+                decision => decision,
+            };
             pending
                 .sender
-                .send(request.decision)
+                .send(decision)
                 .map_err(|_| "This approval is no longer active.")?;
         }
         Ok(())
@@ -311,6 +380,7 @@ impl Approvals {
                 .retain(|_, pending| pending.request_id != request_id);
             state.allowed.retain(|(id, _)| id != request_id);
             state.policies.remove(request_id);
+            state.text_web_calls.remove(request_id);
         }
     }
 }
@@ -596,5 +666,156 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+    /// Resolves every prompt with `decision` and keeps each prompt event.
+    fn answer_all(
+        approvals: &Approvals,
+        decision: ApprovalDecision,
+    ) -> (
+        Arc<Mutex<Vec<AgentEvent>>>,
+        impl Fn(AgentEvent) + Send + Sync,
+    ) {
+        let events = Arc::new(Mutex::new(vec![]));
+        let (captured, decisions) = (events.clone(), approvals.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = &event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id: request_id.clone(),
+                        approval_id: approval_id.clone(),
+                        decision,
+                    })
+                    .unwrap();
+            }
+            captured.lock().unwrap().push(event);
+        };
+        (events, emit)
+    }
+    #[tokio::test]
+    async fn text_call_prompts_are_never_remembered_and_show_their_kind() {
+        let approvals = Approvals::default();
+        let (events, emit) = answer_all(&approvals, ApprovalDecision::AlwaysAllow);
+        let arguments = format!(r#"{{"path":"a.txt","content":"{}"}}"#, "x".repeat(20_000));
+        for _ in 0..2 {
+            assert!(approvals
+                .confirm_text_call("run", ApprovalKind::File, "write_file", &arguments, &emit)
+                .await
+                .unwrap());
+        }
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "an identical text call asks again");
+        let AgentEvent::ApprovalRequest {
+            kind,
+            detail,
+            remember,
+            ..
+        } = &events[0]
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(*kind, ApprovalKind::File);
+        assert!(!remember);
+        assert!(detail.len() < 5_000, "{}", detail.len());
+        assert!(detail.contains("more bytes not shown"), "{detail}");
+        // Ordinary prompts can still be remembered.
+        let (events, emit) = answer_all(&approvals, ApprovalDecision::Allow);
+        approvals
+            .request("run", ApprovalKind::Exec, "ls", "ls".into(), &emit)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.lock().unwrap()[0],
+            AgentEvent::ApprovalRequest { remember: true, .. }
+        ));
+    }
+    #[tokio::test]
+    async fn approved_text_web_call_skips_its_own_network_prompt_once() {
+        let approvals = Approvals::default();
+        let (_, allow) = answer_all(&approvals, ApprovalDecision::Allow);
+        let arguments = r#"{"url":"https://docs.rs"}"#;
+        assert!(approvals
+            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &allow)
+            .await
+            .unwrap());
+        assert!(approvals
+            .request(
+                "run",
+                ApprovalKind::Network,
+                "docs.rs",
+                "GET https://docs.rs".into(),
+                &|_| panic!("the approved text call already asked")
+            )
+            .await
+            .unwrap());
+        // The approval covered one request only.
+        let (_, deny) = answer_all(&approvals, ApprovalDecision::Deny);
+        assert!(!approvals
+            .request(
+                "run",
+                ApprovalKind::Network,
+                "docs.rs",
+                "GET https://docs.rs".into(),
+                &deny
+            )
+            .await
+            .unwrap());
+        // An unused approval ends with its call.
+        approvals
+            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &allow)
+            .await
+            .unwrap();
+        approvals.end_text_call("run");
+        assert!(!approvals
+            .request(
+                "run",
+                ApprovalKind::Network,
+                "docs.rs",
+                "GET https://docs.rs".into(),
+                &deny
+            )
+            .await
+            .unwrap());
+        // A denied text call grants nothing.
+        approvals
+            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &deny)
+            .await
+            .unwrap();
+        assert!(!approvals
+            .request(
+                "run",
+                ApprovalKind::Network,
+                "docs.rs",
+                "GET https://docs.rs".into(),
+                &deny
+            )
+            .await
+            .unwrap());
+    }
+    #[test]
+    fn approving_a_text_call_always_allows_only_once() {
+        let approvals = Approvals::default();
+        let (sender, mut receiver) = oneshot::channel();
+        approvals.0.lock().unwrap().pending.insert(
+            "a1".into(),
+            Pending {
+                request_id: "run".into(),
+                sender,
+                tool: false,
+                remember: false,
+            },
+        );
+        approvals
+            .resolve(ResolveApprovalRequest {
+                request_id: "run".into(),
+                approval_id: "a1".into(),
+                decision: ApprovalDecision::AlwaysAllow,
+            })
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::Allow);
     }
 }

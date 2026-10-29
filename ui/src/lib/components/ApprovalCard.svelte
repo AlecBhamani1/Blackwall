@@ -51,9 +51,11 @@
   </div>
   <div class="actions">
     <button class="deny" disabled={busy} onclick={() => decide('deny')}>Deny</button><span
-    ></span><button class="remember" disabled={busy} onclick={() => decide('always_allow')}
-      >Allow identical action this run</button
-    ><button class="allow" disabled={busy} onclick={() => decide('allow')}
+    ></span>{#if approval.remember !== false}<button
+        class="remember"
+        disabled={busy}
+        onclick={() => decide('always_allow')}>Allow identical action this run</button
+      >{/if}<button class="allow" disabled={busy} onclick={() => decide('allow')}
       >{busy ? 'Sending…' : 'Allow once'}</button
     >
   </div>

@@ -549,6 +549,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       detail: event.detail,
       kind: event.kind,
       ...approvalTool(event.tool),
+      ...(event.remember === false ? { remember: false } : {}),
     };
   return null;
 }

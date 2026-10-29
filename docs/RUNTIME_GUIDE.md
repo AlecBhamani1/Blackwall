@@ -94,8 +94,10 @@ writes tool calls as text** for that connection in **Settings → Model connecti
 calls, each block outside a code fence that names an offered tool with object arguments becomes a
 call (at most 8 per reply) and is removed from the answer; anything else stays text. Text from the
 first block onward is shown when the reply ends. **A call read from text always asks for approval**,
-even when a saved rule would allow it, and that answer is never remembered for later calls. The
-tool's own approvals still apply after that. Child investigations never run calls written as text.
+even when a saved rule would allow it. The prompt names what the tool does (a file change, a web
+request, or a command), shows the arguments (cut to 4 KiB), and offers only **Allow once** or
+**Deny**; the answer is never remembered for later calls. The tool's own approvals still apply
+after that, except that an approved web read or search does not ask a second time for its request. Child investigations never run calls written as text.
 
 ## Attach and reference files
 

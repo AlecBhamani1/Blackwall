@@ -605,6 +605,7 @@ impl Agent<'_> {
                                 .approvals
                                 .confirm_text_call(
                                     request_id,
+                                    crate::approvals::text_call_kind(&call.function.name),
                                     &call.function.name,
                                     &call.function.arguments,
                                     &emit,
@@ -706,6 +707,9 @@ impl Agent<'_> {
                             )
                             .await
                         };
+                        if text_calls {
+                            self.approvals.end_text_call(request_id);
+                        }
                         let success = result.is_ok();
                         if let Some(trace) = trace {
                             trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
