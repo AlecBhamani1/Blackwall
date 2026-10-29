@@ -456,16 +456,18 @@ async fn shell_with_timeout(
     #[cfg(any(unix, windows))]
     run_with_timeout(directory, shell_command(command), timeout).await
 }
-/// Run a resolved program with separate arguments, never parsed by a shell.
+/// Run a resolved program with separate arguments, never parsed by a shell. `input`, when
+/// given, is written to its standard input, which is otherwise empty.
 pub(crate) async fn program_with_timeout(
     workspace: &Workspace,
     program: &Path,
     args: &[String],
+    input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<String, ToolError> {
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (workspace, program, args, timeout);
+        let _ = (workspace, program, args, input, timeout);
         Err(ToolError::Execution(
             "Owner tools are not supported on this platform.".into(),
         ))
@@ -474,9 +476,10 @@ pub(crate) async fn program_with_timeout(
     {
         let mut process = tokio::process::Command::new(program);
         process.args(args);
-        run_with_timeout(
+        run_with_input(
             &workspace.path,
             crate::sandbox::wrap(workspace, process)?,
+            input,
             timeout,
         )
         .await
@@ -585,12 +588,26 @@ pub(crate) fn spawn_server(
 #[cfg(any(unix, windows))]
 pub(crate) async fn run_with_timeout(
     directory: &Path,
+    process: tokio::process::Command,
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    run_with_input(directory, process, None, timeout).await
+}
+/// [`run_with_timeout`], writing `input` to standard input while output is captured.
+#[cfg(any(unix, windows))]
+async fn run_with_input(
+    directory: &Path,
     mut process: tokio::process::Command,
+    input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<String, ToolError> {
     process
         .current_dir(directory)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -639,6 +656,18 @@ pub(crate) async fn run_with_timeout(
     let stderr = child.stderr.take().ok_or(ToolError::File)?;
     #[cfg(windows)]
     let stderr = child.stderr().take().ok_or(ToolError::File)?;
+    #[cfg(unix)]
+    let stdin = child.stdin.take();
+    #[cfg(windows)]
+    let stdin = child.stdin().take();
+    // A program that exits without reading its input is not an error, so write failures are
+    // ignored; dropping the pipe after the write ends the program's input.
+    let mut in_task = Box::pin(async move {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&input).await;
+        }
+    });
     let mut out_task = Box::pin(async {
         let mut bytes = vec![];
         stdout
@@ -676,8 +705,10 @@ pub(crate) async fn run_with_timeout(
         let mut out = None;
         let mut err = None;
         let mut status = None;
+        let mut written = false;
         while out.is_none() || err.is_none() || status.is_none() {
             tokio::select! {
+                () = &mut in_task, if !written => written = true,
                 result=&mut out_task, if out.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}out=Some(bytes);},
                 result=&mut err_task, if err.is_none()=>{let bytes=result.map_err(|_|ToolError::File)?;if bytes.len()>MAX_FILE{return Err(ToolError::Limit);}err=Some(bytes);},
                 result=&mut wait_task, if status.is_none()=>status=Some(result.map_err(|_|ToolError::File)?),
