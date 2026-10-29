@@ -23,13 +23,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and Copilot. The model is not offered that tool directly.
 - A trusted project's `limits` now apply, and only lower yours: a smaller output cap and step
   limit and fewer subagent tools. A project can never choose where subagents run.
-- Settings saved by this version carry `subagents` and `contextBudget.maxOutputBytes`, which an
-  earlier `bw` rejects; to go back, remove those keys from the CLI settings file.
 - Setup, **Settings → Model connection** and `bw setup` find every model server on this computer:
   the common model server ports plus every port listening on loopback (Linux `/proc/net/tcp`, macOS
   `lsof`, Windows `netstat`), at most 64, asked at once for 1.5 s each with credential-free GETs.
   Each is listed with its kind (Ollama, llama.cpp, vLLM, LM Studio or OpenAI-compatible), address,
   models, loaded model and context window. Only loopback is asked. `bw setup --list` prints the list.
+- Instruction limits and extra instruction files (Memory → Advanced · Instructions, or
+  `bw config set instruction-file-kib`, `instruction-total-kib`, `instruction-files`): a per-file
+  limit (1–64 KiB, default 8), a total for a turn (8–256 KiB, default 32), and up to 8 extra files
+  such as `CLAUDE.md` or `.github/copilot-instructions.md`, read after `AGENTS.md` in each folder
+  with the same symlink and UTF-8 rules. Extra names must be relative paths with no `..`, `.git`,
+  root or drive, checked when saved and at every run. A trusted project's `instructions` section
+  now applies and only lowers the limits or keeps fewer of your extra files; it cannot add one.
+- Settings saved by this version carry `subagents`, `instructions` and
+  `contextBudget.maxOutputBytes`, which an earlier `bw` rejects; to go back, remove those keys from
+  the CLI settings file.
 
 - Command tools in `tools.json` can take JSON on stdin (`"stdin":"json"` writes
   `{"arguments":{…}}`), declare a typed argument schema (`parameters`: string, number, integer or
@@ -174,6 +182,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Use the Chat and Agent selector beneath Blackwall in the sidebar; remove the duplicate selector
   above the conversation.
+
+- An instruction file over the per-file limit is now cut at the limit on a character boundary,
+  with a warning naming it and a note after its guidance, instead of being skipped. Guidance lines
+  that look like the prompt's `BEGIN GUIDANCE`, `END GUIDANCE`, `Source:` or `Scope:` markers are
+  prefixed with `> `.
 
 ### Security
 

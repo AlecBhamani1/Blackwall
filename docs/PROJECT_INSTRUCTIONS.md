@@ -19,6 +19,8 @@ Each agent turn starts with:
 
 At each directory, a present `AGENTS.override.md` replaces `AGENTS.md`. This includes an empty,
 malformed, oversized, or unreadable override: such a file never falls back to `AGENTS.md`.
+Extra files you choose, such as `CLAUDE.md`, are read next in each directory, in your order (see
+[Project instructions](RUNTIME_GUIDE.md#project-instructions) in the runtime guide).
 Missing files are normal. Empty files contribute no text. Other skipped files produce warnings.
 
 User guidance applies to the whole workspace. Workspace-root guidance supersedes user guidance,
@@ -39,8 +41,10 @@ explicit application-data-directory capability. Absolute paths, parent traversal
 and symlinks escaping either boundary cannot contribute guidance. Guidance files themselves must
 be regular files; file symlinks are skipped even when their target stays inside the boundary.
 
-Each file is limited to **8 KiB** of UTF-8 text without NUL bytes; the combined file content is
-limited to **32 KiB** per turn. Files that exceed either budget are skipped, not truncated. Discovery
+Each file is limited to **8 KiB** of UTF-8 text without NUL bytes, and the combined file content to
+**32 KiB** per turn, by default; both can be changed (1–64 and 8–256 KiB). A longer file is cut at
+the limit on a character boundary, with a warning naming it; a file that would pass the total is
+skipped. Lines that look like the prompt's guidance markers are prefixed with `> `. Discovery
 also limits targets to 32 directory components and visits at most 128 directories, including the
 user and workspace roots. Discovery work runs off the async executor with a ten-second wait limit.
 Warnings are bounded and do not include instruction contents.

@@ -595,6 +595,32 @@ allows it.
 A trusted project can lower the step limit and narrow the tools (see
 [Project settings](#project-settings)) but can never set where children run.
 
+## Project instructions
+
+Agent runs read `AGENTS.md` guidance (see [Project instructions](PROJECT_INSTRUCTIONS.md)). Set its
+limits and extra files in **Memory → Advanced · Instructions** or with `bw config set`:
+
+| Setting | `bw config set` | Default |
+| --- | --- | --- |
+| Per-file limit, 1–64 KiB | `instruction-file-kib <n>` | 8 |
+| Total for a turn, 8–256 KiB | `instruction-total-kib <n>` | 32 |
+| Up to 8 extra files read after `AGENTS.md` | `instruction-files <a,b,…\|none>` | none |
+
+A file over the per-file limit is cut at the limit, on a character boundary, and the run's warnings
+name it; the model sees a note after the file's guidance, not inside it. A file that would pass the
+total is skipped with a warning, as before.
+
+Extra files, such as `CLAUDE.md` or `.github/copilot-instructions.md`, are read after `AGENTS.md` (or
+`AGENTS.override.md`) in your data folder and in each project folder that is searched, in the order
+you list them. They follow the same rules: regular UTF-8 files only, symbolic links refused, never
+outside the folder. Each must be a relative path of plain names with `/`: no `..`, `.`, `.git`,
+leading `/`, drive letter, backslash or colon, and not `AGENTS.md` itself. The CLI and the desktop
+check this when you save, and every run checks again.
+
+Guidance lines that look like the prompt's own markers (`BEGIN GUIDANCE`, `END GUIDANCE`, `Source:`,
+`Scope:`, in any case and spacing) reach the model prefixed with `> `, so a file cannot end its block
+early or pose as another file.
+
 ## Project settings
 
 A project can carry its own settings in `.blackwall/project.json` at the project root. Because the
@@ -672,8 +698,9 @@ without a `project` is ignored.
 your and the project's `max_output_bytes` and `subagents.max_steps`, and only those of your
 subagent tools the project also lists (`read_file` and `list_files`). A project cannot raise a
 limit, add a tool, or name `runs_on`; a file that tries is invalid. The `instructions` section is
-validated now so the format is fixed, but this version does not use it yet; when it does, its caps
-can only be lower than yours.
+applied once the file is trusted and also only lowers yours: the run uses the smaller
+`max_file_kib` and `max_total_kib`, and if it lists `extra_files`, only those of your extra files
+that it also lists. A project cannot add an extra file.
 
 ### Ordered and strictest rules
 
