@@ -51,6 +51,72 @@ describe('memory management', () => {
       expect.objectContaining({ maxIterations: 40, commandTimeoutSeconds: 600 }),
     );
   });
+  it('saves the command output cap only within its range', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const cap = await screen.findByLabelText('Command output cap (bytes)');
+    await vi.waitFor(() => expect(cap).toBeEnabled());
+    expect(cap).toHaveValue(65536);
+    const button = screen.getByRole('button', { name: 'Save context limit' });
+    await user.clear(cap);
+    await user.type(cap, '1024');
+    expect(button).toBeDisabled();
+    await user.clear(cap);
+    await user.type(cap, '8192');
+    await user.click(button);
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ maxOutputBytes: 8192 }));
+  });
+  it('saves subagent steps and tools, and marks a command tool as off-device', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const steps = await screen.findByLabelText('Subagent step limit');
+    await vi.waitFor(() => expect(steps).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Subagents'));
+    expect(steps).toHaveValue(8);
+    expect(screen.getByLabelText('Read files')).toBeChecked();
+    expect(screen.getByLabelText('Run commands (asks)')).not.toBeChecked();
+    expect(screen.queryByText(/Sends data off this device/)).not.toBeInTheDocument();
+    const button = screen.getByRole('button', { name: 'Save subagent settings' });
+    await user.clear(steps);
+    await user.type(steps, '51');
+    expect(button).toBeDisabled();
+    await user.clear(steps);
+    await user.type(steps, '12');
+    await user.click(screen.getByLabelText('Run commands (asks)'));
+    await user.click(screen.getByLabelText('List folders'));
+    await user.click(button);
+    expect(save).toHaveBeenLastCalledWith({
+      subagentMaxSteps: 12,
+      subagentTools: ['read_file', 'shell'],
+      subagentRunsOn: 'local',
+    });
+    await user.click(screen.getByLabelText('A command tool'));
+    expect(screen.getByText(/Sends data off this device/)).toBeVisible();
+    expect(button).toBeDisabled();
+    await user.type(screen.getByLabelText('Command tool name'), 'review');
+    await user.click(button);
+    expect(save).toHaveBeenLastCalledWith({
+      subagentMaxSteps: 12,
+      subagentTools: ['read_file', 'shell'],
+      subagentRunsOn: { tool: 'review' },
+    });
+  });
+  it('loads saved subagent settings that run on a command tool', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({
+      subagentMaxSteps: 3,
+      subagentRunsOn: { tool: 'review' },
+    });
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const name = await screen.findByLabelText('Command tool name');
+    await vi.waitFor(() => expect(name).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Subagents'));
+    expect(name).toHaveValue('review');
+    expect(screen.getByLabelText('Subagent step limit')).toHaveValue(3);
+    expect(screen.getByText(/Sends data off this device/)).toBeVisible();
+  });
   it('keeps the draft available when saving fails', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'saveMemory').mockRejectedValue(new Error('disk full'));

@@ -535,6 +535,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       toolCallId: event.toolCallId,
       output: event.output,
       success: event.success === true,
+      ...(event.truncated === true ? { truncated: true } : {}),
     };
   if (
     type === 'approval_request' &&
@@ -550,6 +551,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       kind: event.kind,
       ...approvalTool(event.tool),
       ...(event.remember === false ? { remember: false } : {}),
+      ...(event.offDevice === true ? { offDevice: true } : {}),
     };
   return null;
 }

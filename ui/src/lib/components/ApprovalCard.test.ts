@@ -20,11 +20,31 @@ describe('action approval', () => {
     ).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
   });
+  it('marks a subagent delegation as sending data off this device and allows it only once', () => {
+    render(ApprovalCard, {
+      props: {
+        approval: {
+          ...approval,
+          kind: 'exec',
+          detail: 'Tool: review\nPrompt (40 bytes, on standard input):\nTask: Review the diff',
+          remember: false,
+          offDevice: true,
+        },
+        onResolve: vi.fn(),
+      },
+    });
+    expect(screen.getByText(/Sends data off this device/)).toBeVisible();
+    expect(screen.getByText(/Task: Review the diff/)).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Allow identical action this run' }),
+    ).not.toBeInTheDocument();
+  });
   it('still offers a run-wide allow for ordinary prompts', () => {
     render(ApprovalCard, { props: { approval, onResolve: vi.fn() } });
     expect(
       screen.getByRole('button', { name: 'Allow identical action this run' }),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/Sends data off this device/)).not.toBeInTheDocument();
   });
   it('shows the exact proposed action and sends only one decision while pending', async () => {
     const user = userEvent.setup();

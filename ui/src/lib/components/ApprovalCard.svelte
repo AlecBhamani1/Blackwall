@@ -44,6 +44,10 @@
             : 'Allow this command?'}</strong
     ><small>Waiting for you</small>
   </div>
+  {#if approval.offDevice}<p class="off-device">
+      Sends data off this device. The program below may pass this prompt to an online service.
+      Blackwall asks every time.
+    </p>{/if}
   <!-- Scrollable action details need a keyboard focus target. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="action-details" role="region" aria-label="Proposed action details" tabindex="0">
@@ -178,6 +182,11 @@
   .note {
     display: block;
     margin-top: 6px;
+  }
+  .off-device {
+    margin: 0 0 8px;
+    font-weight: 600;
+    color: var(--warn);
   }
   p {
     color: var(--err);

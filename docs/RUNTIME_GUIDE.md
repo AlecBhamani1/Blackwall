@@ -130,8 +130,16 @@ check the limit when switching models. Defaults are 32,000 context tokens, up to
 tokens, and automatic compaction off. The browser development UI also saves these controls locally.
 When the model service reports the window it loaded the model with, CLI and desktop requests use
 that window instead (see [Local models](#local-models)). The same section sets the Agent iteration limit (1–100, default
-20) and the command time limit (10–3,600 seconds, default 120). The browser development UI also saves
+20), the command time limit (10–3,600 seconds, default 120) and the command output cap (4,096–1,048,576
+bytes, default 65,536; `bw config set output-bytes`). The browser development UI also saves
 these controls locally.
+
+Command output over the cap is trimmed instead of failing: the model gets the first 40% and the
+last 60% of the cap with a `[… N bytes omitted …]` line between them, and the tool result is marked
+`truncated` (the desktop says "Output trimmed" next to, not inside, the output). Cuts never split a
+character, and HTTP tool responses are trimmed only after saved secrets are redacted. A command
+whose standard output or error passes 64 MiB is stopped. Shell commands and owner command tools
+are trimmed; file reads keep their hard 64 KiB limit, and MCP results their own limits.
 
 Type `/context` in the composer or CLI to see estimated prompt and tool-definition tokens, the
 output reserve, the 5% safety reserve, and separately labeled server-reported usage when available.
@@ -211,7 +219,7 @@ is the authority for file tools; a folder must be selected again after reopening
 | Edit a file | Shows a unified diff; writes only after approval; rejects stale source contents |
 | Run a command | Shows the exact shell command and working folder; requires approval |
 | Read/search the web | Requires the Web access toggle and a separate request approval |
-| Delegate an investigation | Read-only child; no commands, edits, web, or further delegation |
+| Delegate a subtask | A child with the [subagent tools](#subagents) you allow (read-only by default); never further delegation |
 
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
 The last option remembers only the exact action until the current run ends. It does not grant a
@@ -486,14 +494,78 @@ File tools remain workspace jailed, with reviewed edits; **Web access** controls
 tools and does not enable command network. Model connections remain available with command network off.
 
 Use **Stop** or Escape to interrupt the run. Child tasks stop with their parent. The agent stops after
-the configured iteration limit (20 model/tool iterations by default); each child stops after eight. Pure child batches have a maximum concurrency
-of three. The selected model must support OpenAI-compatible tool calls for Agent mode to work well.
+the configured iteration limit (20 model/tool iterations by default); each child stops after its
+step limit (eight by default, see [Subagents](#subagents)). Batches of read-only children run at most
+three at once; children that can edit, run commands or use the web, or that run on a command tool,
+run one at a time. The selected model must support OpenAI-compatible tool calls for Agent mode to work well.
 Blackwall's instructions and any project guidance reach the model as one system message at the start,
 because some chat templates, such as Qwen's on vLLM, reject any other system message.
 
 Tool entries are collapsed by default and can be expanded to inspect results. Restored transcripts
 show past actions without executing them again. A fresh model turn currently receives the prior prose
 and attachments; historical tool-call protocol messages are not replayed across separate turns.
+
+## Subagents
+
+`spawn_agent` hands a focused subtask to a child. Set its limits in **Memory → Advanced ·
+Subagents** or with `bw config set`:
+
+| Setting | `bw config set` | Default |
+| --- | --- | --- |
+| Step limit, 1–50 model turns | `subagent-steps <n>` | 8 |
+| Tools: any of `read_file`, `list_files`, `search_files`, `write_file`, `shell`, `web_fetch`, `web_search` | `subagent-tools <a,b,…\|none>` | `read_file,list_files` |
+| Runs on: this model, or one owner command tool | `subagent-runs-on <local\|TOOL>` | `local` |
+
+A child never gets `spawn_agent`, memory or skills. Edits, commands and web requests from a child
+ask for approval and obey your rules and execution profile exactly as the parent's do; web tools
+also need **Web access** on. A child cannot confirm a tool call written as text, so such calls never
+run.
+
+**Running on a command tool.** With `subagent-runs-on <name>`, a child does not use this model.
+Its goal and context go, as one prompt, to that `tools.json` tool, and the tool's output (without
+the `Exit: 0` line) is the child's answer. The tool must:
+
+- run a program (not `"kind":"http"`) with `"stdin":"json"`; the prompt arrives as
+  `{"arguments":{"prompt":"Task: …\n\nContext:\n…"}}` and never on the command line;
+- declare a string `prompt` in `parameters`, need no other argument, and use no `{placeholders}`.
+
+`bw config set subagent-runs-on` and the desktop check this when you choose the tool, and every
+run checks again. Each delegation **always asks**: an allow rule never skips the prompt (a deny
+rule still denies), "allow identical action this run" is not offered, and the prompt shows the
+whole text being sent, marked **Sends data off this device**. The model is not offered that tool
+directly, so it can reach it only this way. The delegation is traced as
+`invoke_agent subagent` with `blackwall.mode` `subagent`.
+
+Delegate CLIs can act on their own, so give them read-only flags. A wrapper that reads the prompt
+from stdin JSON, as in [Work in a project](#work-in-a-project):
+
+```sh
+#!/bin/sh
+# ~/bin/review: a read-only second opinion. Swap the last line for another CLI below.
+python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"]["prompt"])' \
+  | exec claude -p --permission-mode plan
+```
+
+```json
+{"tools":[
+  {"name":"review","description":"Ask another assistant for a read-only review","command":["/Users/me/bin/review"],
+   "stdin":"json",
+   "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}
+]}
+```
+
+| CLI | Last line of the wrapper |
+| --- | --- |
+| Claude Code | `\| exec claude -p --permission-mode plan` |
+| Codex | `\| exec codex exec --sandbox read-only -` (`-` reads the prompt from stdin) |
+| GitHub Copilot CLI | `\| xargs -0 copilot -p` with no `--allow-tool` or `--allow-all-tools`, so it cannot use tools that need permission (Copilot takes the prompt as an argument; check `copilot --help` for your version) |
+
+Then `bw config set subagent-runs-on review`. The tool runs under your execution profile, and the
+delegate CLI needs network to reach its service, so turn on command network or pick a profile that
+allows it.
+
+A trusted project can lower the step limit and narrow the tools (see
+[Project settings](#project-settings)) but can never set where children run.
 
 ## Project settings
 
@@ -568,11 +640,12 @@ connect. Approvals for its tools say the server is "defined by this project", an
 for a `p-` server or tool is always saved for this project only; an owner rule allowing a `p-` tool
 without a `project` is ignored.
 
-The `mcp`, `limits` and `instructions` sections are validated now so the format is fixed, but this
-version does not use them yet. When it does, a project can only remove permissions: limits and
-instruction caps no higher than yours, subagent tools only from those you allow (`read_file` and
-`list_files`), and MCP servers only by `https` URL (`http` only on this computer), never commands,
-secrets or headers.
+`limits` applies once the file is trusted, and only ever lowers yours: the run uses the smaller of
+your and the project's `max_output_bytes` and `subagents.max_steps`, and only those of your
+subagent tools the project also lists (`read_file` and `list_files`). A project cannot raise a
+limit, add a tool, or name `runs_on`; a file that tries is invalid. The `instructions` section is
+validated now so the format is fixed, but this version does not use it yet; when it does, its caps
+can only be lower than yours.
 
 ### Ordered and strictest rules
 

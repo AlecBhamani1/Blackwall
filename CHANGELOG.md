@@ -9,6 +9,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A configurable command output cap (`maxOutputBytes`, 4 KiB to 1 MiB, default 64 KiB; Memory →
+  Advanced, or `bw config set output-bytes`). Output over it keeps its first 40% and last 60%
+  around a `[… N bytes omitted …]` line, cut on character boundaries after redaction, and the tool
+  result is marked `truncated`; it used to fail at 64 KiB. File reads keep their 64 KiB limit.
+- Subagent settings (Memory → Advanced · Subagents, or `bw config set subagent-steps`,
+  `subagent-tools`, `subagent-runs-on`): a step limit (1–50, default 8), any of the built-in file,
+  search, edit, shell and web tools (default `read_file` and `list_files`; edits, commands and web
+  still ask and follow your rules), and where children run. `runs_on` a command tool sends the
+  goal and context as `{"arguments":{"prompt":…}}` on stdin to a `"stdin":"json"` tool with a
+  `prompt` parameter; each delegation always asks, cannot be remembered, shows the whole prompt
+  and is marked "Sends data off this device". The docs give read-only flags for Claude Code, Codex
+  and Copilot. The model is not offered that tool directly.
+- A trusted project's `limits` now apply, and only lower yours: a smaller output cap and step
+  limit and fewer subagent tools. A project can never choose where subagents run.
+- Settings saved by this version carry `subagents` and `contextBudget.maxOutputBytes`, which an
+  earlier `bw` rejects; to go back, remove those keys from the CLI settings file.
+
 - Command tools in `tools.json` can take JSON on stdin (`"stdin":"json"` writes
   `{"arguments":{…}}`), declare a typed argument schema (`parameters`: string, number, integer or
   boolean properties with `enum`, `description` and `required`), or send an HTTP request

@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import {
     persistence,
+    SUBAGENT_TOOLS,
+    type SubagentTool,
     type MemoryEntry,
     type MemoryProposal,
     type Preferences,
@@ -17,6 +19,7 @@
     autoCompact: boolean;
     maxIterations: number;
     commandTimeoutSeconds: number;
+    maxOutputBytes: number;
   }) => void = () => {};
   export let onClose: () => void;
   let dialog: HTMLDialogElement;
@@ -36,6 +39,46 @@
   let autoCompact = false;
   let maxIterations = 20;
   let commandTimeoutSeconds = 120;
+  let maxOutputBytes = 65536;
+  let subagentMaxSteps = 8;
+  let subagentTools: SubagentTool[] = ['read_file', 'list_files'];
+  let subagentRunsOn: 'local' | 'tool' = 'local';
+  let subagentTool = '';
+  const toolLabels: Record<SubagentTool, string> = {
+    read_file: 'Read files',
+    list_files: 'List folders',
+    search_files: 'Search files',
+    write_file: 'Propose file edits (asks)',
+    shell: 'Run commands (asks)',
+    web_fetch: 'Read web pages (asks)',
+    web_search: 'Search the web (asks)',
+  };
+  $: subagentToolValid = /^[a-z0-9_]{1,64}$/.test(subagentTool);
+  $: subagentsValid =
+    Number.isInteger(Number(subagentMaxSteps)) &&
+    subagentMaxSteps >= 1 &&
+    subagentMaxSteps <= 50 &&
+    (subagentRunsOn === 'local' || subagentToolValid);
+  function toggleTool(tool: SubagentTool, on: boolean) {
+    subagentTools = SUBAGENT_TOOLS.filter((name) =>
+      name === tool ? on : subagentTools.includes(name),
+    );
+  }
+  async function saveSubagents() {
+    busy = true;
+    error = '';
+    try {
+      await persistence.savePreferences({
+        subagentMaxSteps: Number(subagentMaxSteps),
+        subagentTools,
+        subagentRunsOn: subagentRunsOn === 'local' ? 'local' : { tool: subagentTool },
+      });
+    } catch (cause) {
+      error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
+    } finally {
+      busy = false;
+    }
+  }
   let loaded = false;
   let savedPreferences: Awaited<ReturnType<typeof persistence.preferences>> = {};
   const desktop = persistence.available();
@@ -137,6 +180,7 @@
           autoCompact,
           maxIterations: Number(maxIterations),
           commandTimeoutSeconds: Number(commandTimeoutSeconds),
+          maxOutputBytes: Number(maxOutputBytes),
         });
       onPreferences({
         memoryEnabled: enabled,
@@ -145,6 +189,7 @@
         autoCompact,
         maxIterations: Number(maxIterations),
         commandTimeoutSeconds: Number(commandTimeoutSeconds),
+        maxOutputBytes: Number(maxOutputBytes),
       });
     } catch {
       error = 'These settings could not be saved. Try again.';
@@ -161,6 +206,7 @@
       autoCompact = contextPreferences.autoCompact ?? false;
       maxIterations = contextPreferences.maxIterations ?? 20;
       commandTimeoutSeconds = contextPreferences.commandTimeoutSeconds ?? 120;
+      maxOutputBytes = contextPreferences.maxOutputBytes ?? 65536;
       loaded = true;
       return;
     }
@@ -174,6 +220,12 @@
         autoCompact = savedPreferences.autoCompact ?? false;
         maxIterations = savedPreferences.maxIterations ?? 20;
         commandTimeoutSeconds = savedPreferences.commandTimeoutSeconds ?? 120;
+        maxOutputBytes = savedPreferences.maxOutputBytes ?? 65536;
+        subagentMaxSteps = savedPreferences.subagentMaxSteps ?? 8;
+        subagentTools = savedPreferences.subagentTools ?? ['read_file', 'list_files'];
+        const runsOn = savedPreferences.subagentRunsOn ?? 'local';
+        subagentRunsOn = runsOn === 'local' ? 'local' : 'tool';
+        subagentTool = runsOn === 'local' ? '' : runsOn.tool;
         await refresh();
         loaded = true;
       } catch {
@@ -386,6 +438,19 @@
         bind:value={commandTimeoutSeconds}
         disabled={busy || !loaded}
       />
+      <label for="output-cap">Command output cap (bytes)</label>
+      <input
+        id="output-cap"
+        type="number"
+        min="4096"
+        max="1048576"
+        step="4096"
+        bind:value={maxOutputBytes}
+        disabled={busy || !loaded}
+      />
+      <p class="hint">
+        Longer command output keeps its first 40% and last 60%. File reads stay limited to 64 KiB.
+      </p>
       <button
         class="secondary"
         disabled={busy ||
@@ -400,15 +465,90 @@
           maxIterations > 100 ||
           !Number.isInteger(Number(commandTimeoutSeconds)) ||
           commandTimeoutSeconds < 10 ||
-          commandTimeoutSeconds > 3600}
+          commandTimeoutSeconds > 3600 ||
+          !Number.isInteger(Number(maxOutputBytes)) ||
+          maxOutputBytes < 4096 ||
+          maxOutputBytes > 1048576}
         onclick={saveSettings}>Save context limit</button
       >
     </details>
+    {#if desktop}
+      <details>
+        <summary>Advanced · Subagents</summary>
+        <label for="subagent-steps">Subagent step limit</label>
+        <input
+          id="subagent-steps"
+          type="number"
+          min="1"
+          max="50"
+          bind:value={subagentMaxSteps}
+          disabled={busy || !loaded}
+        />
+        <fieldset disabled={busy || !loaded}>
+          <legend>Subagents run on</legend>
+          <label
+            ><input type="radio" bind:group={subagentRunsOn} value="local" /> This model, with the tools
+            below</label
+          >
+          <label
+            ><input type="radio" bind:group={subagentRunsOn} value="tool" /> A command tool</label
+          >
+        </fieldset>
+        {#if subagentRunsOn === 'local'}
+          <fieldset disabled={busy || !loaded}>
+            <legend>Subagent tools</legend>
+            {#each SUBAGENT_TOOLS as tool (tool)}
+              <label
+                ><input
+                  type="checkbox"
+                  checked={subagentTools.includes(tool)}
+                  onchange={(event) => toggleTool(tool, event.currentTarget.checked)}
+                />
+                {toolLabels[tool]}</label
+              >
+            {/each}
+          </fieldset>
+        {:else}
+          <label for="subagent-tool">Command tool name</label>
+          <input
+            id="subagent-tool"
+            bind:value={subagentTool}
+            placeholder="review"
+            autocomplete="off"
+            disabled={busy || !loaded}
+          />
+          <p class="off-device" role="note">
+            Sends data off this device. The subagent's whole prompt goes to this tool as JSON on
+            standard input, and you are asked every time. The tool needs "stdin": "json" and a
+            "prompt" parameter in tools.json.
+          </p>
+        {/if}
+        <p class="hint">Projects can lower these limits but never choose where subagents run.</p>
+        <button
+          class="secondary"
+          disabled={busy || !loaded || !subagentsValid}
+          onclick={saveSubagents}>Save subagent settings</button
+        >
+      </details>
+    {/if}
     {#if error}<p role="alert" class="error">{error}</p>{/if}
   </div>
 </dialog>
 
 <style>
+  fieldset {
+    border: 0;
+    margin: 8px 0;
+    padding: 0;
+  }
+  legend {
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+  .off-device {
+    font-weight: 600;
+    color: var(--warn);
+  }
   .proposals {
     margin-bottom: 24px;
   }

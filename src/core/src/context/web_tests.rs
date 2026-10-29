@@ -88,6 +88,7 @@ fn run() -> ContextRun {
         instructions: vec![],
         compact: false,
         trace: Default::default(),
+        subagents: Default::default(),
     }
 }
 

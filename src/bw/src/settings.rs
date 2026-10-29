@@ -1,3 +1,4 @@
+use blackwall_core::subagents::{RunsOn, SubagentSettings};
 use blackwall_core::{
     connection::normalize_endpoint,
     storage::LocalStore,
@@ -27,6 +28,8 @@ pub struct Settings {
     pub export: ExportConfig,
     /// How long usage metrics are kept; 400 days by default.
     pub retention: Retention,
+    /// Child agents' steps, tools, and where they run.
+    pub subagents: SubagentSettings,
 }
 
 /// The export and retention settings saved under `telemetryExport` and `usageRetention`.
@@ -77,6 +80,7 @@ impl Settings {
         let endpoint = validated_endpoint(&self.endpoint)?;
         let model = validated_model(&self.model)?;
         let export = self.export.validated().map_err(|error| error.to_string())?;
+        self.subagents.validate()?;
         self.endpoint = endpoint;
         self.model = model;
         self.export = export;
@@ -100,6 +104,7 @@ impl Settings {
             "textToolCalls": validated.text_tool_calls,
             "telemetryExport": validated.export,
             "usageRetention": validated.retention,
+            "subagents": validated.subagents,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -165,6 +170,32 @@ impl Settings {
                     .map_err(|_| "Enter an output reserve in tokens.")?
             }
             "compact" => updated.budget.auto_compact = on_or_off(value)?,
+            "output-bytes" => {
+                updated.budget.max_output_bytes = value
+                    .parse()
+                    .ok()
+                    .filter(|n| blackwall_core::context::OUTPUT_BYTES_RANGE.contains(n))
+                    .ok_or("Enter a command output cap between 4096 and 1048576 bytes.")?
+            }
+            "subagent-steps" => {
+                updated.subagents.max_steps = value
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=50).contains(n))
+                    .ok_or("Enter a subagent step limit between 1 and 50.")?
+            }
+            "subagent-tools" => {
+                updated.subagents.tools = match value.trim() {
+                    "none" => vec![],
+                    list => list.split(',').map(|tool| tool.trim().to_owned()).collect(),
+                }
+            }
+            "subagent-runs-on" => {
+                updated.subagents.runs_on = match value.trim() {
+                    "local" => RunsOn::Local,
+                    tool => RunsOn::Tool(tool.strip_prefix("tool:").unwrap_or(tool).to_owned()),
+                }
+            }
             "iterations" => {
                 updated.budget.max_iterations = value
                     .parse()
@@ -180,7 +211,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, compact, iterations, timeout, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
                     .into(),
             ),
         }
@@ -197,7 +228,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -207,11 +238,31 @@ impl Settings {
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
             self.budget.max_iterations, self.budget.command_timeout_seconds,
+            self.budget.max_output_bytes,
+            describe_subagents(&self.subagents),
             self.execution_profile.name(),
             if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
             describe_export(&self.export),
             self.retention,
         )
+    }
+}
+
+/// One line for the subagent settings.
+fn describe_subagents(subagents: &SubagentSettings) -> String {
+    let tools = if subagents.tools.is_empty() {
+        "none".to_owned()
+    } else {
+        subagents.tools.join(",")
+    };
+    match &subagents.runs_on {
+        RunsOn::Local => format!(
+            "{} steps; tools: {tools}; runs on: local model",
+            subagents.max_steps
+        ),
+        RunsOn::Tool(name) => {
+            format!("runs on: the {name} tool (always asks; sends data off this device)")
+        }
     }
 }
 
@@ -326,6 +377,8 @@ fn load_with_environment(
         export: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?.0,
         retention: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?
             .1,
+        subagents: SubagentSettings::from_preferences(object)
+            .map_err(|_| "The saved desktop subagent settings are invalid.")?,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -367,6 +420,15 @@ fn load_with_environment(
                 .map(|v| v.as_u64().ok_or("Invalid command time limit."))
                 .transpose()?
                 .unwrap_or(120),
+            max_output_bytes: object
+                .get("maxOutputBytes")
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or("Invalid output cap.")
+                })
+                .transpose()?
+                .unwrap_or(blackwall_core::context::DEFAULT_OUTPUT_BYTES),
         },
     };
     settings.validate()?;
@@ -393,6 +455,7 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
                 | "textToolCalls"
                 | "telemetryExport"
                 | "usageRetention"
+                | "subagents"
         )
     }) {
         return Err(invalid.into());
@@ -445,6 +508,11 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .unwrap_or(false),
         export,
         retention,
+        subagents: object
+            .get("subagents")
+            .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
     };
     settings
         .validate()
@@ -547,6 +615,7 @@ mod tests {
                 text_tool_calls: false,
                 export: Default::default(),
                 retention: Default::default(),
+                subagents: Default::default(),
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
@@ -666,7 +735,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 13);
+        assert_eq!(saved.as_object().unwrap().len(), 14);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -676,7 +745,7 @@ mod tests {
         );
         assert_eq!(
             saved["contextBudget"],
-            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600})
+            json!({"contextWindow":8192,"outputTokens":1024,"autoCompact":true,"maxIterations":40,"commandTimeoutSeconds":600,"maxOutputBytes":65536})
         );
         assert!(saved.get("apiKey").is_none());
     }
@@ -820,6 +889,7 @@ mod tests {
             text_tool_calls: false,
             export: Default::default(),
             retention: Default::default(),
+            subagents: Default::default(),
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());
@@ -852,6 +922,59 @@ mod tests {
             .describe()
             .contains("otlp export: off\nusage history: 400 days"));
         assert_eq!(store.setting(SETTINGS_KEY).unwrap().as_deref(), Some(old));
+        // Neither file knew the output cap or subagents: both keep today's behaviour.
+        for settings in [&from_desktop, &loaded] {
+            assert_eq!(settings.budget.max_output_bytes, 65536);
+            assert_eq!(settings.subagents, SubagentSettings::default());
+        }
+        assert!(loaded.describe().contains(
+            "command output cap: 65536 bytes\nsubagents: 8 steps; tools: read_file,list_files; runs on: local model"
+        ));
+        // A CLI file whose contextBudget predates maxOutputBytes loads with the default cap.
+        let budget = r#"{"endpoint":"http://localhost:11434/v1","model":"fixture","webEnabled":false,"memoryEnabled":false,"contextBudget":{"contextWindow":32000,"outputTokens":4096,"autoCompact":false,"maxIterations":20,"commandTimeoutSeconds":120}}"#;
+        store.save_setting(SETTINGS_KEY, budget).unwrap();
+        assert_eq!(defaults(&store).budget.max_output_bytes, 65536);
+    }
+
+    #[test]
+    fn output_cap_and_subagent_settings_validate_and_persist() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        settings.set(&store, "output-bytes", "8192").unwrap();
+        settings.set(&store, "subagent-steps", "20").unwrap();
+        settings
+            .set(&store, "subagent-tools", "read_file, search_files,shell")
+            .unwrap();
+        settings.set(&store, "subagent-runs-on", "review").unwrap();
+        let reopened = defaults(&store);
+        assert_eq!(reopened.budget.max_output_bytes, 8192);
+        assert_eq!(reopened.subagents.max_steps, 20);
+        assert_eq!(
+            reopened.subagents.tools,
+            ["read_file", "search_files", "shell"]
+        );
+        assert_eq!(reopened.subagents.runs_on, RunsOn::Tool("review".into()));
+        assert!(reopened.describe().contains("sends data off this device"));
+        let saved: Value =
+            serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["subagents"]["runsOn"], json!({"tool":"review"}));
+        for (key, value) in [
+            ("output-bytes", "1024"),
+            ("output-bytes", "2000000"),
+            ("subagent-steps", "0"),
+            ("subagent-steps", "51"),
+            ("subagent-tools", "spawn_agent"),
+            ("subagent-tools", "read_file,read_file"),
+            ("subagent-runs-on", "Not A Tool"),
+        ] {
+            assert!(settings.set(&store, key, value).is_err(), "{key} {value}");
+        }
+        assert_eq!(defaults(&store), reopened);
+        settings.set(&store, "subagent-tools", "none").unwrap();
+        settings.set(&store, "subagent-runs-on", "local").unwrap();
+        assert!(defaults(&store).subagents.tools.is_empty());
+        assert_eq!(defaults(&store).subagents.runs_on, RunsOn::Local);
     }
 
     #[test]

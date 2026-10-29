@@ -9,10 +9,11 @@
 //! - The file is read once (a regular file, never a symbolic link, at most 64 KiB), and both the
 //!   hash and the parsed settings come from those same bytes.
 //!
-//! The `mcp` section is applied by [`crate::mcp`] as `p-` servers. The `limits` and
-//! `instructions` sections are parsed and validated now so the file format is fixed, but nothing
-//! applies them yet. Whoever consumes them must treat the owner's own value
-//! as a ceiling: a project can only lower limits, narrow tools, and lower instruction caps.
+//! The `mcp` section is applied by [`crate::mcp`] as `p-` servers, and `limits` by
+//! [`crate::agent`] through [`trusted_limits`], with the owner's own values as a ceiling: a
+//! project can only lower the output cap and subagent steps and narrow subagent tools. It can
+//! never choose where subagents run. The `instructions` section is parsed and validated so the
+//! file format is fixed, but nothing applies it yet; it may only lower instruction caps.
 use crate::policy::{Decision, RuleMode, RulesFile};
 use crate::protocol::ApprovalKind;
 use cap_std::fs::{Dir, OpenOptions};
@@ -104,7 +105,7 @@ pub struct ProjectConfig {
     /// Started by [`crate::mcp::McpServers::start`] as `p-<name>` once the file is trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpFile>,
-    /// Not applied yet.
+    /// Applied as ceilings once the file is trusted; see [`trusted_limits`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ProjectLimits>,
     /// Not applied yet.
@@ -279,6 +280,23 @@ pub struct ProjectStatus {
     pub waiting: Vec<String>,
     /// Why the file cannot be used, when it cannot. Every action then asks.
     pub error: Option<String>,
+}
+
+/// A trusted project's `limits` for a run. An untrusted, changed or unusable file has none; its
+/// warnings are reported by the run's policy.
+pub async fn trusted_limits(data_dir: &Path, workspace: &Path) -> Option<ProjectLimits> {
+    let (data, folder) = (data_dir.to_path_buf(), workspace.to_path_buf());
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || try_load(&folder, &data)),
+    )
+    .await;
+    let Ok(Ok(Ok(loaded))) = loaded else {
+        return None;
+    };
+    (loaded.trust == Trust::Trusted)
+        .then_some(loaded.config.limits)
+        .flatten()
 }
 
 /// Load the project's settings for a run. When the file is not trusted, the config holds only its
@@ -514,7 +532,7 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
         ));
     }
     if config.limits.is_some() {
-        other.push(format!("limits{later}"));
+        other.push("limits, which can only lower yours".to_owned());
     }
     if config.instructions.is_some() {
         other.push(format!("instruction settings{later}"));
@@ -1269,6 +1287,41 @@ mod tests {
         let owner = vec!["list_files".to_owned()];
         assert!(limits.subagent_tools(&owner).is_empty());
         assert_eq!(ProjectLimits::default().subagent_tools(&owner), owner);
+    }
+
+    #[test]
+    fn project_cannot_set_runs_on() {
+        let folders = Folders::new();
+        for body in [
+            json!({"limits":{"subagents":{"runs_on":{"tool":"review"}}}}),
+            json!({"limits":{"subagents":{"runsOn":"local"}}}),
+            json!({"limits":{"runs_on":{"tool":"review"}}}),
+            json!({"subagents":{"runs_on":{"tool":"review"}}}),
+        ] {
+            // Such a file cannot even be trusted, so it never applies.
+            folders.write(body.clone());
+            assert!(status(&folders.workspace, &folders.data).error.is_some());
+            assert!(
+                try_load(&folders.workspace, &folders.data).is_err(),
+                "{body}"
+            );
+            let (config, _, warnings) = load(&folders.workspace, &folders.data);
+            assert!(config.limits.is_none() && !warnings.is_empty(), "{body}");
+        }
+        // Even an accepted file has nowhere to name a delegate: the owner's choice is kept.
+        folders.write(json!({"limits":{"subagents":{"max_steps":2,"tools":["read_file"]}}}));
+        folders.trust_current();
+        let limits = load(&folders.workspace, &folders.data).0.limits.unwrap();
+        let owner = crate::subagents::SubagentSettings {
+            runs_on: crate::subagents::RunsOn::Tool("review".into()),
+            ..Default::default()
+        };
+        let applied = owner.within(Some(&limits));
+        assert_eq!(applied.runs_on, owner.runs_on);
+        assert_eq!(
+            (applied.max_steps, applied.tools),
+            (2, vec!["read_file".to_owned()])
+        );
     }
 
     #[test]

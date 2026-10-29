@@ -8,6 +8,17 @@ export interface ConnectionProfile {
   /** "This model writes tool calls as text". Off when absent; such calls always ask. */
   textToolCalls?: boolean;
 }
+export const SUBAGENT_TOOLS = [
+  'read_file',
+  'list_files',
+  'search_files',
+  'write_file',
+  'shell',
+  'web_fetch',
+  'web_search',
+] as const;
+export type SubagentTool = (typeof SUBAGENT_TOOLS)[number];
+export type SubagentRunsOn = 'local' | { tool: string };
 export interface Preferences {
   connections?: ConnectionProfile[];
   endpoint?: string;
@@ -19,6 +30,14 @@ export interface Preferences {
   autoCompact?: boolean;
   maxIterations?: number;
   commandTimeoutSeconds?: number;
+  /** Command output cap in bytes, 4,096 to 1,048,576. */
+  maxOutputBytes?: number;
+  /** Model turns a subagent may take, 1 to 50. */
+  subagentMaxSteps?: number;
+  /** The built-in tools subagents may use; edits and commands still ask. */
+  subagentTools?: SubagentTool[];
+  /** Where subagents run: the current model, or an owner command tool. */
+  subagentRunsOn?: SubagentRunsOn;
   memoryEnabled?: boolean;
   recallEnabled?: boolean;
   tracesEnabled?: boolean;

@@ -54,7 +54,10 @@ a SmartScreen or Gatekeeper warning.
 - Owner-defined command tools (argv or JSON on stdin, with typed argument schemas), HTTP tools,
   and local MCP servers behind the same approvals, with their secrets kept in the platform
   credential store ([Runtime guide](docs/RUNTIME_GUIDE.md))
-- Opt-in approved web reads/search and up to three concurrent read-only child investigations
+- Opt-in approved web reads/search and subagents with your chosen steps and tools (up to three
+  read-only children at once), or delegated to a command tool such as `claude -p --permission-mode
+  plan` that always asks and shows the whole prompt ([Subagents](docs/RUNTIME_GUIDE.md#subagents))
+- Long command output trimmed to its start and end under a configurable cap (64 KiB by default)
 - Local OpenTelemetry traces and usage metrics (tokens, durations, tool and run outcomes) for Chat,
   Agent, and subagent runs, kept in the data folder ([Telemetry](docs/TELEMETRY.md))
 - Optional OTLP/HTTP export of those traces and metrics to an OpenTelemetry Collector, Grafana
@@ -108,6 +111,9 @@ reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes
 Use `bw project status` to see a project's `.blackwall/project.json`, whether it is trusted, and
 what applies now; `bw project trust` shows it and asks before trusting, and `bw project untrust`
 undoes that. See [Project settings](docs/RUNTIME_GUIDE.md#project-settings).
+Use `bw config set output-bytes <n>` for the command output cap and `bw config set
+subagent-steps|subagent-tools|subagent-runs-on <value>` for subagents; see
+[Subagents](docs/RUNTIME_GUIDE.md#subagents).
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
 Servers can be local commands or streamable HTTP addresses:
 `bw mcp add docs --url https://mcp.example.com/mcp --header Authorization=DOCS_TOKEN`, then

@@ -264,6 +264,7 @@ mod tests {
                     &self.workspace.path,
                     process,
                     Duration::from_secs(5),
+                    &Default::default(),
                 )
                 .await
             }
@@ -439,7 +440,8 @@ mod tests {
                 "run",
                 &approvals,
                 &allow,
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                &Default::default()
             )
             .await
             .is_err());
@@ -452,7 +454,8 @@ mod tests {
                     "run",
                     &approvals,
                     &allow,
-                    Duration::from_secs(5)
+                    Duration::from_secs(5),
+                    &Default::default(),
                 )
                 .await
                 .is_err());
@@ -465,6 +468,7 @@ mod tests {
                 &approvals,
                 &allow,
                 Duration::from_secs(5),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -505,6 +509,7 @@ mod tests {
                     &approvals,
                     &allow,
                     Duration::from_secs(5),
+                    &Default::default(),
                 )
                 .await
                 .unwrap();
@@ -559,7 +564,8 @@ mod tests {
             assert!(crate::tools::run_with_timeout(
                 &project.workspace.path,
                 process,
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                &Default::default()
             )
             .await
             .is_err());
@@ -617,7 +623,8 @@ mod tests {
             assert!(crate::tools::run_with_timeout(
                 &project.workspace.path,
                 process,
-                Duration::from_millis(100)
+                Duration::from_millis(100),
+                &Default::default()
             )
             .await
             .is_err());

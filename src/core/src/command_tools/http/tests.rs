@@ -141,6 +141,7 @@ async fn call(
             approvals,
             emit,
             Duration::from_secs(10),
+            &Default::default(),
             secrets,
         )
         .await;
@@ -935,4 +936,57 @@ async fn http_tool_header_names_unique_ignoring_case() {
     .await;
     assert!(tools.error.is_some());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn trim_cuts_on_char_boundary_after_redaction() {
+    // The secret sits where an even 40% cut of the raw body would split it, among two-byte
+    // characters, so trimming before redaction would leave part of it in the output.
+    let secret = "tok-fixture-fixture-";
+    let body = format!("{}{secret}{}", "é".repeat(805), "ü".repeat(4000));
+    let (origin, _) = serve(reply(
+        "200 OK",
+        "Content-Type: text/plain\r\n",
+        body.as_bytes(),
+    ))
+    .await;
+    let (tools, directory) = tool(json!({
+        "name":"echo","description":"Echo","kind":"http","url":format!("{origin}/api"),
+        "headers":{"PRIVATE-TOKEN":"{secret:TOKEN}"}
+    }))
+    .await;
+    let lookup: Lookup = Arc::new(move |_: &str| Ok(Some(secret.to_owned())));
+    let approvals = Approvals::default();
+    let (emit, _) = allow_all(&approvals);
+    let workspace = crate::tools::Workspace::open(&directory).unwrap();
+    let cap = crate::tools::OutputCap::new(4096);
+    let output = tools
+        .get("echo")
+        .unwrap()
+        .run_with(
+            &workspace,
+            "{}",
+            "run",
+            &approvals,
+            &emit,
+            Duration::from_secs(10),
+            &cap,
+            lookup,
+        )
+        .await
+        .unwrap();
+    assert!(cap.trimmed());
+    assert!(
+        !output.contains("tok-") && !output.contains("fixture") && !output.contains('\u{fffd}')
+    );
+    let (head, rest) = output.split_once("\n[… ").unwrap();
+    let tail = rest.split_once(" bytes omitted …]\n").unwrap().1;
+    // "HTTP 200\n" and 805 'é' end at byte 1619; the raw secret would cross the cut at 1638.
+    let expected = format!("HTTP 200\n{}[redacted]", "é".repeat(805));
+    assert!(head.starts_with(&expected), "{head}");
+    assert!(head[expected.len()..].chars().all(|c| c == 'ü'));
+    assert!(tail.chars().all(|c| c == 'ü'));
+    assert!(head.len() <= 1638 && tail.len() <= 2458);
+    drop(workspace);
+    tokio::fs::remove_dir_all(&directory).await.unwrap();
 }

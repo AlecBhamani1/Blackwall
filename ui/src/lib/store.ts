@@ -469,6 +469,7 @@ export function createChatController(
       autoCompact: settings.autoCompact ?? false,
       maxIterations: settings.maxIterations ?? 20,
       commandTimeoutSeconds: settings.commandTimeoutSeconds ?? 120,
+      maxOutputBytes: settings.maxOutputBytes ?? 65536,
     };
   }
   function showContext(): void {
@@ -978,6 +979,7 @@ export function createChatController(
                               ? {
                                   ...tool,
                                   output: event.output,
+                                  ...(event.truncated ? { truncated: true } : {}),
                                   status: event.success ? 'complete' : 'error',
                                 }
                               : tool,

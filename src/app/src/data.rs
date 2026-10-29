@@ -123,6 +123,27 @@ pub(crate) struct TelemetrySettings {
     pub retention: blackwall_core::telemetry::Retention,
 }
 
+/// The owner's saved subagent settings for an Agent run. They are read here, not taken from the
+/// request, so only the owner's own settings can choose where children run.
+pub(crate) async fn subagent_settings(
+    directory: std::path::PathBuf,
+) -> Result<blackwall_core::subagents::SubagentSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        let saved = LocalStore::open(&directory)
+            .map_err(|error| error.to_string())?
+            .setting("preferences")
+            .map_err(|error| error.to_string())?;
+        let saved: Value = match saved {
+            Some(text) => serde_json::from_str(&text).map_err(|_| "Invalid settings.")?,
+            None => serde_json::json!({}),
+        };
+        let object = saved.as_object().ok_or("Invalid settings.")?;
+        blackwall_core::subagents::SubagentSettings::from_preferences(object).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "Settings could not be read.".to_owned())?
+}
+
 /// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
 pub(crate) async fn trace_options(
     directory: std::path::PathBuf,
@@ -418,6 +439,10 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "autoCompact"
                 | "maxIterations"
                 | "commandTimeoutSeconds"
+                | "maxOutputBytes"
+                | "subagentMaxSteps"
+                | "subagentTools"
+                | "subagentRunsOn"
                 | "memoryEnabled"
                 | "recallEnabled"
                 | "tracesEnabled"
@@ -465,6 +490,24 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
         .is_some_and(|v| !v.as_u64().is_some_and(|n| (10..=3600).contains(&n)))
     {
         return Err("Choose a command time limit between 10 and 3,600 seconds.".into());
+    }
+    if object.get("maxOutputBytes").is_some_and(|v| {
+        !v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .is_some_and(|n| blackwall_core::context::OUTPUT_BYTES_RANGE.contains(&n))
+    }) {
+        return Err("Choose a command output cap between 4,096 and 1,048,576 bytes.".into());
+    }
+    // A delegate must exist and take its prompt on standard input before it is chosen.
+    if let blackwall_core::subagents::RunsOn::Tool(name) =
+        blackwall_core::subagents::SubagentSettings::from_preferences(object)?.runs_on
+    {
+        let directory = crate::identity::data_directory(&app)?;
+        tokio::task::spawn_blocking(move || {
+            blackwall_core::command_tools::check_delegate(&directory, &name)
+        })
+        .await
+        .map_err(|_| "The tools file could not be read.".to_owned())??;
     }
     if object
         .values()
@@ -1060,6 +1103,11 @@ mod telemetry_settings_tests {
             .unwrap();
         let settings = telemetry_settings(directory.clone()).await;
         assert!(!settings.trace.enabled && settings.trace.content);
+        // Saved before subagent settings existed: children keep today's defaults.
+        assert_eq!(
+            subagent_settings(directory.clone()).await.unwrap(),
+            blackwall_core::subagents::SubagentSettings::default()
+        );
         assert_eq!(settings.export, ExportConfig::default());
         assert_eq!(settings.retention, Retention::Days(400));
         store

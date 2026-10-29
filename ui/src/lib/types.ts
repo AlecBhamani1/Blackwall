@@ -74,6 +74,8 @@ export interface ContextBudget {
   /** Omitted limits use the runtime defaults of 20 iterations and 120 seconds. */
   maxIterations?: number;
   commandTimeoutSeconds?: number;
+  /** Command output over this many bytes is trimmed to its start and end; 65,536 by default. */
+  maxOutputBytes?: number;
 }
 export interface ContextReport {
   estimatedPromptTokens: number;
@@ -141,7 +143,15 @@ export type AgentEvent =
   | { type: 'error'; requestId: string; message: string; code?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
-  | { type: 'tool_result'; requestId: string; toolCallId: string; output: string; success: boolean }
+  | {
+      type: 'tool_result';
+      requestId: string;
+      toolCallId: string;
+      output: string;
+      success: boolean;
+      /** Command output over the cap was trimmed to its start and end. */
+      truncated?: boolean;
+    }
   | {
       type: 'approval_request';
       requestId: string;
@@ -150,6 +160,7 @@ export type AgentEvent =
       detail: string;
       tool?: ApprovalTool;
       remember?: boolean;
+      offDevice?: boolean;
     };
 
 export interface ChildEntry {
@@ -164,6 +175,8 @@ export interface ToolEntry {
   /** Position in the response text when called; absent in older saved conversations. */
   contentOffset?: number;
   output?: string;
+  /** The output was trimmed to fit the command output cap. */
+  truncated?: boolean;
   status: 'running' | 'complete' | 'error' | 'stopped';
 }
 /** The MCP tool an approval is for; `tool` is the namespaced `server__tool` name. */
@@ -189,6 +202,8 @@ export interface PendingApproval {
   tool?: ApprovalTool;
   /** False for a tool call the model wrote as text: it can only be allowed once. */
   remember?: boolean;
+  /** The action hands data to a program that may send it off this device. */
+  offDevice?: boolean;
 }
 
 export interface StreamCallbacks {
