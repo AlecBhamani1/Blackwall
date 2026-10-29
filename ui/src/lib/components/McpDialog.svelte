@@ -35,11 +35,26 @@
   function secretOf(reference: string) {
     return reference.replace(/^\{secret:(.*)\}$/, '$1');
   }
-  // Header secrets that have no saved value yet, so the server cannot connect.
+  function originOf(url: string) {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return '';
+    }
+  }
+  // Why a header secret will not be sent: not saved, or saved for another address or for a
+  // local command. Secrets are only ever sent to the origin they were saved for.
+  function secretProblem(server: McpServer, secret: string) {
+    if (!(server.secrets ?? []).includes(secret)) return 'not saved yet';
+    const saved = server.secretOrigins?.[secret];
+    if (!saved) return 'saved for a local command; save it again';
+    if (saved !== originOf(server.url ?? '')) return `saved for ${saved}; save it again`;
+    return '';
+  }
   function missingSecrets(server: McpServer) {
     return Object.values(server.headers ?? {})
       .map(secretOf)
-      .filter((secret) => !(server.secrets ?? []).includes(secret));
+      .filter((secret) => secretProblem(server, secret));
   }
   async function load() {
     servers = await persistence.mcpServers();
@@ -145,14 +160,14 @@
     const headers = headerRows
       .filter((row) => row.header.trim() || row.secret.trim())
       .map((row): [string, string] => [row.header.trim(), row.secret.trim()]);
+    let saved = '';
     if (
-      await run(
-        () => persistence.addMcpHttpServer(name, url, headers),
-        'This server could not be added.',
-      )
+      await run(async () => {
+        saved = await persistence.addMcpHttpServer(name, url, headers);
+      }, 'This server could not be added.')
     ) {
       // The new server opens so its header secrets can be saved next.
-      const added = servers.find((server) => server.url === url.trim());
+      const added = servers.find((server) => server.name === saved);
       cancelAdd();
       if (added) {
         open(added);
@@ -263,7 +278,7 @@
             placeholder="https://mcp.example.com/mcp"
           />
           <p class="field-hint">
-            A streamable HTTP endpoint. Use https, or http only on 127.0.0.1, ::1, or localhost.
+            A streamable HTTP endpoint. Use https, or http only on 127.0.0.1 or ::1.
           </p>
           <h3>Headers</h3>
           {#each headerRows as row, index (index)}<div class="header-row">
@@ -355,12 +370,11 @@
         >
       </div>
       {#if server.url}<code>{server.url}</code>
-        {#each Object.entries(server.headers ?? {}) as [header, reference] (header)}<p
-            class="header-line"
-          >
-            <code>{header}</code> from secret <code>{secretOf(reference)}</code>{#if missingSecrets(
-              server,
-            ).includes(secretOf(reference))}<span class="missing">{' · not saved yet'}</span>{/if}
+        {#each Object.entries(server.headers ?? {}) as [header, reference] (header)}{@const problem =
+            secretProblem(server, secretOf(reference))}<p class="header-line">
+            <code>{header}</code> from secret <code>{secretOf(reference)}</code>{#if problem}<span
+                class="missing">{` · ${problem}`}</span
+              >{/if}
           </p>{/each}
       {:else}<code>{JSON.stringify(server.command ?? [])}</code>{/if}
       <h3>Allowed without asking</h3>

@@ -188,8 +188,11 @@ describe('MCP server management', () => {
       headers: { Authorization: '{secret:DOCS_TOKEN}' },
       enabled: true,
     };
+    // Another server at the same address must not be the one that opens.
+    const other = { ...added, name: 'docs-old', headers: {} };
     const add = vi.spyOn(persistence, 'addMcpHttpServer').mockImplementation(async () => {
-      vi.spyOn(persistence, 'mcpServers').mockResolvedValue([added]);
+      vi.spyOn(persistence, 'mcpServers').mockResolvedValue([other, added]);
+      return 'docs';
     });
     const command = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
     render(McpDialog, { props: { onClose: vi.fn() } });
@@ -215,20 +218,32 @@ describe('MCP server management', () => {
     expect(await screen.findByText(/not saved yet/)).toBeInTheDocument();
     expect(screen.getByLabelText('Secret name')).toHaveValue('DOCS_TOKEN');
     expect(screen.getByText('https://mcp.example.com/mcp')).toBeInTheDocument();
+    expect(screen.getByText('docs')).toBeInTheDocument();
   });
   it('lists URL servers by address and counts unsaved header secrets', async () => {
     vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
       {
         name: 'docs',
         url: 'https://mcp.example.com/mcp',
-        headers: { Authorization: '{secret:DOCS_TOKEN}', 'X-Team': '{secret:TEAM}' },
-        secrets: ['TEAM'],
+        headers: {
+          Authorization: '{secret:DOCS_TOKEN}',
+          'X-Team': '{secret:TEAM}',
+          'X-Old': '{secret:OLD}',
+          'X-Env': '{secret:ENV}',
+        },
+        secrets: ['TEAM', 'OLD', 'ENV'],
+        secretOrigins: { TEAM: 'https://mcp.example.com', OLD: 'https://old.example.com' },
         enabled: true,
       },
     ]);
+    const user = userEvent.setup();
     render(McpDialog, { props: { onClose: vi.fn() } });
     expect(await screen.findByText('https://mcp.example.com/mcp')).toBeInTheDocument();
-    expect(screen.getByText(/1 secret · 1 secret to save/)).toBeInTheDocument();
+    expect(screen.getByText(/3 secrets · 3 secrets to save/)).toBeInTheDocument();
+    await user.click(screen.getByText('docs'));
+    expect(screen.getByText(/not saved yet/)).toBeInTheDocument();
+    expect(screen.getByText(/saved for https:\/\/old.example.com; save it again/)).toBeInTheDocument();
+    expect(screen.getByText(/saved for a local command; save it again/)).toBeInTheDocument();
   });
   it('switches back to a command when a suggestion is picked', async () => {
     const user = userEvent.setup();

@@ -229,6 +229,8 @@ export interface McpServer {
   url?: string;
   /** Header name to `{secret:NAME}`. */
   headers?: Record<string, string>;
+  /** Secret name to the origin it was saved for. */
+  secretOrigins?: Record<string, string>;
   enabled: boolean;
   allowTools?: string[];
   denyTools?: string[];
@@ -315,9 +317,9 @@ export const persistence = {
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),
-  /** Each header pairs a header name with a secret saved for this server. */
+  /** Each header pairs a header name with a secret saved for this server. Resolves to the saved name. */
   addMcpHttpServer: (name: string, url: string, headers: [string, string][]) =>
-    command<void>('add_mcp_http_server', { name, url, headers }),
+    command<string>('add_mcp_http_server', { name, url, headers }),
   setMcpServerEnabled: (name: string, enabled: boolean) =>
     command<void>('set_mcp_server_enabled', { name, enabled }),
   removeMcpServer: (name: string) => command<void>('remove_mcp_server', { name }),
