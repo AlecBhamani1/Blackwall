@@ -14,6 +14,10 @@
   let name = '';
   let commandLine = '';
   let commandInput: HTMLInputElement;
+  // A server is a local command or a streamable HTTP address with secret-backed headers.
+  let mode: 'command' | 'url' = 'command';
+  let url = '';
+  let headerRows: { header: string; secret: string }[] = [];
   let suggestion: McpSuggestion | null = null;
   // Suggestions start with npx, a batch file on Windows, which servers cannot run there.
   const windows = detectPlatform() === 'windows';
@@ -27,6 +31,15 @@
     selected = server;
     secretName = '';
     secretValue = '';
+  }
+  function secretOf(reference: string) {
+    return reference.replace(/^\{secret:(.*)\}$/, '$1');
+  }
+  // Header secrets that have no saved value yet, so the server cannot connect.
+  function missingSecrets(server: McpServer) {
+    return Object.values(server.headers ?? {})
+      .map(secretOf)
+      .filter((secret) => !(server.secrets ?? []).includes(secret));
   }
   async function load() {
     servers = await persistence.mcpServers();
@@ -52,9 +65,11 @@
   function summary(rules: McpToolRule[], server: McpServer) {
     const allowed = serverRules(rules, server.name).length;
     const secrets = server.secrets?.length ?? 0;
+    const missing = missingSecrets(server).length;
     return [
       allowed ? `${allowed} allowed without asking` : 'Asks before every call',
       secrets ? `${secrets} secret${secrets === 1 ? '' : 's'}` : '',
+      missing ? `${missing} secret${missing === 1 ? '' : 's'} to save` : '',
     ]
       .filter(Boolean)
       .join(' · ');
@@ -78,6 +93,7 @@
     return true;
   }
   async function suggest(item: McpSuggestion) {
+    mode = 'command';
     suggestion = item;
     name = item.name;
     commandLine = item.command.join(' ') + (item.needs ? ' ' : '');
@@ -92,6 +108,9 @@
     suggestion = null;
     name = '';
     commandLine = '';
+    url = '';
+    headerRows = [];
+    mode = 'command';
     error = '';
   }
   // A command retyped by the owner is no longer the suggestion, so its hint and check stop.
@@ -101,6 +120,7 @@
   }
   async function add(event: SubmitEvent) {
     event.preventDefault();
+    if (mode === 'url') return addUrl();
     const words = commandLine.trim().split(/\s+/);
     if (suggestion?.needs && words.length <= suggestion.command.length) {
       error =
@@ -119,6 +139,25 @@
       suggestion = null;
       name = '';
       commandLine = '';
+    }
+  }
+  async function addUrl() {
+    const headers = headerRows
+      .filter((row) => row.header.trim() || row.secret.trim())
+      .map((row): [string, string] => [row.header.trim(), row.secret.trim()]);
+    if (
+      await run(
+        () => persistence.addMcpHttpServer(name, url, headers),
+        'This server could not be added.',
+      )
+    ) {
+      // The new server opens so its header secrets can be saved next.
+      const added = servers.find((server) => server.url === url.trim());
+      cancelAdd();
+      if (added) {
+        open(added);
+        secretName = missingSecrets(added)[0] ?? '';
+      }
     }
   }
   async function saveSecret(event: SubmitEvent) {
@@ -146,7 +185,7 @@
   <header>
     <div>
       <h2 id="mcp-title">MCP servers</h2>
-      <p>Local programs that give agent runs more tools.</p>
+      <p>Local programs and HTTP servers that give agent runs more tools.</p>
     </div>
     <button class="icon-button" aria-label="Close MCP servers" onclick={() => dialog.close()}
       ><Icon name="x" /></button
@@ -181,6 +220,20 @@
             after adding one downloads that exact version from npm, so it needs a network connection.
           </p>
         {/if}
+        <div class="modes" role="radiogroup" aria-label="Server type">
+          {#each [['command', 'Command'], ['url', 'URL']] as [value, label] (value)}<button
+              type="button"
+              role="radio"
+              aria-checked={mode === value}
+              class:chosen={mode === value}
+              disabled={busy}
+              onclick={() => {
+                mode = value as 'command' | 'url';
+                suggestion = null;
+                error = '';
+              }}>{label}</button
+            >{/each}
+        </div>
         <label for="mcp-name">Name</label><input
           id="mcp-name"
           autocapitalize="none"
@@ -195,6 +248,71 @@
         <p class="field-hint">
           Saved in lowercase with hyphens for spaces and underscores, so My Jira becomes my-jira.
         </p>
+        {#if mode === 'url'}
+          <label for="mcp-url">URL</label><input
+            id="mcp-url"
+            type="url"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+            class="code"
+            bind:value={url}
+            maxlength="2048"
+            required
+            disabled={busy}
+            placeholder="https://mcp.example.com/mcp"
+          />
+          <p class="field-hint">
+            A streamable HTTP endpoint. Use https, or http only on 127.0.0.1, ::1, or localhost.
+          </p>
+          <h3>Headers</h3>
+          {#each headerRows as row, index (index)}<div class="header-row">
+              <input
+                aria-label={`Header ${index + 1} name`}
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                class="code"
+                bind:value={row.header}
+                maxlength="64"
+                required
+                disabled={busy}
+                placeholder="Authorization"
+              /><input
+                aria-label={`Header ${index + 1} secret`}
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                class="code"
+                bind:value={row.secret}
+                pattern="[A-Z_][A-Z0-9_]*"
+                maxlength="64"
+                required
+                disabled={busy}
+                placeholder="API_TOKEN"
+              /><button
+                type="button"
+                class="delete"
+                aria-label={`Remove header ${index + 1}`}
+                disabled={busy}
+                onclick={() => (headerRows = headerRows.filter((_, other) => other !== index))}
+                >Remove</button
+              >
+            </div>{/each}
+          <button
+            type="button"
+            class="secondary"
+            disabled={busy || headerRows.length >= 16}
+            onclick={() => (headerRows = [...headerRows, { header: '', secret: '' }])}
+            >Add header</button
+          >
+          <p class="hint">
+            Each header is sent with the value of a secret saved for this server, never a value typed
+            here. After adding the server, save each secret's full header value, such as
+            <code>Bearer &lt;token&gt;</code> for Authorization. Servers that need OAuth sign-in are not
+            supported yet.
+          </p>
+        {:else}
         <label for="mcp-command">Command</label><input
           id="mcp-command"
           autocapitalize="none"
@@ -218,6 +336,7 @@
           that contains a space. Servers start without a shell in the Blackwall data folder, so pass a
           project path as an argument when a server needs one.
         </p>
+        {/if}
         <div class="actions">
           <button type="button" class="secondary" disabled={busy} onclick={cancelAdd}
             >Cancel</button
@@ -235,7 +354,15 @@
           onclick={() => open(null)}>Back</button
         >
       </div>
-      <code>{JSON.stringify(server.command)}</code>
+      {#if server.url}<code>{server.url}</code>
+        {#each Object.entries(server.headers ?? {}) as [header, reference] (header)}<p
+            class="header-line"
+          >
+            <code>{header}</code> from secret <code>{secretOf(reference)}</code>{#if missingSecrets(
+              server,
+            ).includes(secretOf(reference))}<span class="missing"> · not saved yet</span>{/if}
+          </p>{/each}
+      {:else}<code>{JSON.stringify(server.command ?? [])}</code>{/if}
       <h3>Allowed without asking</h3>
       {#each serverRules(rules, server.name) as rule (`${rule.tool} ${rule.project}`)}<article>
           <span class="rule"
@@ -274,7 +401,7 @@
           No secrets. Add one if this server needs a token.
         </p>{/each}
       <form onsubmit={saveSecret}>
-        <label for="mcp-secret-name">Environment variable</label><input
+        <label for="mcp-secret-name">{server.url ? 'Secret name' : 'Environment variable'}</label><input
           id="mcp-secret-name"
           autocapitalize="none"
           autocorrect="off"
@@ -285,7 +412,7 @@
           maxlength="64"
           required
           disabled={busy}
-          placeholder="JIRA_API_TOKEN"
+          placeholder={server.url ? 'API_TOKEN' : 'JIRA_API_TOKEN'}
         /><label for="mcp-secret-value">Value</label><input
           id="mcp-secret-value"
           type="password"
@@ -297,7 +424,8 @@
         />
         <p class="hint">
           Saved values are kept only in the system credential store and given to this server when it
-          starts. They are never shown again.
+          {server.url ? 'connects, in the headers that name them' : 'starts'}. They are never shown
+          again.
         </p>
         <div class="actions">
           <button
@@ -328,7 +456,7 @@
       {#each servers as server (server.name)}<article>
           <button class="server" disabled={busy} onclick={() => open(server)}
             ><strong>{server.name}</strong>
-            <p class="code">{server.command.join(' ')}</p>
+            <p class="code">{server.url ?? (server.command ?? []).join(' ')}</p>
             <small>{summary(rules, server)}</small></button
           ><button
             class="secondary manage"
@@ -504,6 +632,42 @@
   }
   .suggestion:disabled {
     opacity: 0.55;
+  }
+  .modes {
+    display: inline-flex;
+    margin: 18px 0 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .modes button {
+    padding: 7px 14px;
+    font-size: 11.5px;
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+  }
+  .modes button.chosen {
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-weight: 600;
+  }
+  .header-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 8px;
+    align-items: center;
+    margin: 0 0 8px;
+  }
+  .header-line {
+    margin: 6px 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .header-line code {
+    display: inline;
+  }
+  .missing {
+    color: var(--err);
   }
   .manage {
     display: flex;

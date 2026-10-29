@@ -224,7 +224,11 @@ export interface SuggestedSkill {
 }
 export interface McpServer {
   name: string;
-  command: string[];
+  /** Absent for a server reached by URL. */
+  command?: string[];
+  url?: string;
+  /** Header name to `{secret:NAME}`. */
+  headers?: Record<string, string>;
   enabled: boolean;
   allowTools?: string[];
   denyTools?: string[];
@@ -311,6 +315,9 @@ export const persistence = {
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
   addMcpServer: (name: string, commandLine: string) =>
     command<void>('add_mcp_server', { name, command: commandLine }),
+  /** Each header pairs a header name with a secret saved for this server. */
+  addMcpHttpServer: (name: string, url: string, headers: [string, string][]) =>
+    command<void>('add_mcp_http_server', { name, url, headers }),
   setMcpServerEnabled: (name: string, enabled: boolean) =>
     command<void>('set_mcp_server_enabled', { name, enabled }),
   removeMcpServer: (name: string) => command<void>('remove_mcp_server', { name }),
