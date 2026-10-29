@@ -377,7 +377,8 @@ fn load_with_environment(
         export: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?.0,
         retention: telemetry_options(object, "The saved desktop telemetry settings are invalid.")?
             .1,
-        subagents: desktop_subagents(object)?,
+        subagents: SubagentSettings::from_preferences(object)
+            .map_err(|_| "The saved desktop subagent settings are invalid.")?,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -432,29 +433,6 @@ fn load_with_environment(
     };
     settings.validate()?;
     Ok(settings)
-}
-
-/// The desktop's `subagentMaxSteps`, `subagentTools`, and `subagentRunsOn` preferences.
-fn desktop_subagents(object: &serde_json::Map<String, Value>) -> Result<SubagentSettings, String> {
-    let invalid = "The saved desktop subagent settings are invalid.";
-    let defaults = SubagentSettings::default();
-    Ok(SubagentSettings {
-        max_steps: object
-            .get("subagentMaxSteps")
-            .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or(invalid))
-            .transpose()?
-            .unwrap_or(defaults.max_steps),
-        tools: object
-            .get("subagentTools")
-            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
-            .transpose()?
-            .unwrap_or(defaults.tools),
-        runs_on: object
-            .get("subagentRunsOn")
-            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
-            .transpose()?
-            .unwrap_or(defaults.runs_on),
-    })
 }
 
 fn saved_settings(body: &str) -> Result<Settings, String> {

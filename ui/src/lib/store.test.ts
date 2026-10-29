@@ -1141,6 +1141,7 @@ describe('context commands', () => {
       autoCompact: true,
       maxIterations: 40,
       commandTimeoutSeconds: 600,
+      maxOutputBytes: 8192,
     });
     await controller.send('Initial task', []);
     await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
@@ -1150,6 +1151,7 @@ describe('context commands', () => {
       autoCompact: true,
       maxIterations: 40,
       commandTimeoutSeconds: 600,
+      maxOutputBytes: 8192,
     });
     const original = structuredClone(get(controller.messages));
     const snapshot = {

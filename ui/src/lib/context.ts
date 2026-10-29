@@ -46,7 +46,8 @@ export function contextBudget(request: ChatRequest): ContextBudget {
     budget.outputTokens < 1 ||
     budget.outputTokens + Math.floor(budget.contextWindow / 20) >= budget.contextWindow ||
     !optionalInRange(budget.maxIterations, 1, 100) ||
-    !optionalInRange(budget.commandTimeoutSeconds, 10, 3600)
+    !optionalInRange(budget.commandTimeoutSeconds, 10, 3600) ||
+    !optionalInRange(budget.maxOutputBytes, 4096, 1048576)
   )
     throw new Error('Invalid model context limit, output reserve, or agent limits.');
   return budget;

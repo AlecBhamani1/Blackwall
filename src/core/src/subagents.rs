@@ -76,6 +76,34 @@ impl SubagentSettings {
         Ok(())
     }
 
+    /// The desktop's saved `subagentMaxSteps`, `subagentTools`, and `subagentRunsOn`
+    /// preferences; a missing one is its default. Values are checked.
+    pub fn from_preferences(
+        preferences: &serde_json::Map<String, Value>,
+    ) -> Result<Self, &'static str> {
+        let invalid = "The saved subagent settings are invalid.";
+        let defaults = Self::default();
+        let settings = Self {
+            max_steps: preferences
+                .get("subagentMaxSteps")
+                .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or(invalid))
+                .transpose()?
+                .unwrap_or(defaults.max_steps),
+            tools: preferences
+                .get("subagentTools")
+                .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
+                .transpose()?
+                .unwrap_or(defaults.tools),
+            runs_on: preferences
+                .get("subagentRunsOn")
+                .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
+                .transpose()?
+                .unwrap_or(defaults.runs_on),
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+
     /// These settings under a trusted project's limits: the project can only lower them.
     pub fn within(&self, project: Option<&crate::project::ProjectLimits>) -> Self {
         let Some(project) = project else {
@@ -736,6 +764,32 @@ mod settings_tests {
         ] {
             let settings: SubagentSettings = serde_json::from_value(bad.clone()).unwrap();
             assert!(settings.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn desktop_preferences_load_subagent_settings() {
+        let saved = json!({"endpoint":"http://localhost:11434/v1","maxIterations":20});
+        assert_eq!(
+            SubagentSettings::from_preferences(saved.as_object().unwrap()).unwrap(),
+            SubagentSettings::default()
+        );
+        let saved = json!({"subagentMaxSteps":12,"subagentTools":["read_file","shell"],"subagentRunsOn":{"tool":"review"}});
+        let settings = SubagentSettings::from_preferences(saved.as_object().unwrap()).unwrap();
+        assert_eq!(settings.max_steps, 12);
+        assert_eq!(settings.tools, ["read_file", "shell"]);
+        assert_eq!(settings.runs_on, RunsOn::Tool("review".into()));
+        for bad in [
+            json!({"subagentMaxSteps":0}),
+            json!({"subagentMaxSteps":300}),
+            json!({"subagentTools":"read_file"}),
+            json!({"subagentTools":["memory_list"]}),
+            json!({"subagentRunsOn":"elsewhere"}),
+        ] {
+            assert!(
+                SubagentSettings::from_preferences(bad.as_object().unwrap()).is_err(),
+                "{bad}"
+            );
         }
     }
 

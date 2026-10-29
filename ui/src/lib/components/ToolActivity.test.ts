@@ -44,6 +44,35 @@ describe('agent actions', () => {
     expect(screen.getByText('1 failed · 1 stopped')).toBeVisible();
   });
 
+  it('says when command output was trimmed, outside the output itself', async () => {
+    const user = userEvent.setup();
+    const { container } = render(ToolActivity, {
+      props: {
+        tools: [
+          {
+            id: 'big',
+            name: 'shell',
+            arguments: '{"command":"cat big.log"}',
+            output: 'Exit: 0\nstart\n[… 900 bytes omitted …]\nend',
+            truncated: true,
+            status: 'complete' as const,
+          },
+          {
+            id: 'small',
+            name: 'shell',
+            arguments: '{"command":"ls"}',
+            output: 'Exit: 0\nfile',
+            status: 'complete' as const,
+          },
+        ],
+      },
+    });
+    await user.click(screen.getByText('2 tool calls'));
+    for (const row of container.querySelectorAll<HTMLDetailsElement>('.tool-row')) row.open = true;
+    const notes = screen.getAllByText(/Output trimmed to its start and end/);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].closest('pre')).toBeNull();
+  });
   it('keeps the group keyboard focusable and labels historical activity', async () => {
     const user = userEvent.setup();
     const { container } = render(ToolActivity, {

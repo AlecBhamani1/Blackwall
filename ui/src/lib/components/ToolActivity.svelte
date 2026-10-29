@@ -79,6 +79,9 @@
             <pre>{tool.arguments}</pre>
             {#if tool.output !== undefined}
               <small>Result</small>
+              {#if tool.truncated}<small class="trimmed"
+                  >Output trimmed to its start and end to fit the output cap.</small
+                >{/if}
               <pre>{tool.output}</pre>
             {/if}
           </div>
@@ -162,6 +165,10 @@
   }
   small {
     font-size: 10px;
+    color: var(--text-muted);
+  }
+  .trimmed {
+    display: block;
     color: var(--text-muted);
   }
   .warning {
