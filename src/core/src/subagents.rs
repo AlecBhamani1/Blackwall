@@ -730,7 +730,9 @@ mod settings_tests {
         command_tools: &CommandTools,
         goal: &str,
     ) -> Result<String, String> {
-        let workspace = Workspace::open(project).unwrap();
+        let mut workspace = Workspace::open(project).unwrap();
+        // CI Linux has no sandbox; the delegate tests run a fake script.
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         run_with_instructions(
             &Parent {
                 backend,
