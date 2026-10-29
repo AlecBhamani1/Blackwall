@@ -463,18 +463,21 @@ summary calls count only toward usage metrics.
 ## Usage
 
 **Settings → Workflows → Usage** and `bw usage` total what the local usage metrics recorded for
-Today, 7, 30, or 90 days (UTC days). Nothing is estimated in dollars: models run locally, and
+Today, 7, 30, or 90 days on the desktop, or any 1 to 400 days with `bw usage --days N`. Days are
+local days in this computer's time zone; `bw usage --utc` counts UTC days instead. Nothing is estimated in dollars: models run locally, and
 command tools such as `claude` or `codex` are billed by their own services.
 
 - **Tiles:** tokens recorded, with runs, sessions, and model calls; run success and how other runs
   ended; median output speed; tokens kept out of context by compaction.
 - **Missing from this picture:** history before the first day with metrics, runs whose trace the
-  writer queue dropped, and whether recording is off now. Days with no metrics file are marked
-  "no data" in the chart rather than counted as zero use.
+  writer queue dropped, and whether recording is off now. Past periods with recording off cannot
+  be told apart from days without use, so days with no data are marked "no data" in the chart.
 - **Where it went:** tokens by project (the workspace folder's name, never its path; Chat has no
   project) or by model. Selecting a row shows its share of the range, its split across Agent,
   Subagent, and Chat, and its busiest sessions by their neutral IDs. Titles and prompts are never
-  recorded.
+  recorded. Under the list, the range splits into Agent, Subagent, and Chat tokens, runs, and
+  calls. In the Models view each row also shows calls, tokens in and out, median output speed, p90
+  call duration, and the share of failed calls.
 - **Tokens per day** as stacked input and output bars, with a table view; **What the tokens
   contain**: input, cached input, output, and reasoning, where the model server reports the last
   two; and **Top tools** with error and denied rates.
@@ -486,8 +489,9 @@ metrics and trace files into a new `blackwall-telemetry-<from>-to-<to>` folder y
 OTLP JSON any OpenTelemetry Collector can import.
 
 ```sh
-bw usage                 # last 7 days as text
-bw usage --days 30 --json
+bw usage                 # last 7 local days as text
+bw usage --days 14 --json
+bw usage --days 1 --utc  # today in UTC
 ```
 
 ## App lock

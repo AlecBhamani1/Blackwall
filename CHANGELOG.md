@@ -14,7 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in the data folder and kept for 400 days. Metrics never include prompts, answers, tool arguments,
   or paths. See [Telemetry](docs/TELEMETRY.md).
 
-- Add a Usage page under **Settings → Workflows** and `bw usage [--days 1|7|30|90] [--json]`:
+- Add a Usage page under **Settings → Workflows** and `bw usage [--days N] [--utc] [--json]`, by
+  local day:
   tokens by project, model, and day, cached and reasoning tokens where the server reports them,
   run success, median output speed, tokens saved by compaction, top tools, and what the range
   cannot show. Session drill-downs use neutral IDs only. **Export…** copies the range's metrics

@@ -106,7 +106,8 @@ Use `/settings` to review them. Changes apply to the next turn and future CLI la
 `bw traces` lists recent agent runs with their model and tool calls; `bw traces show <id>` prints
 one as a tree; the desktop **Settings → Workflows → Runs** panel shows the same traces. See
 [Agent traces](docs/RUNTIME_GUIDE.md#agent-traces).
-`bw usage [--days 1|7|30|90] [--json]` totals tokens, runs, sessions, and tools for a range, by
+`bw usage [--days N] [--utc] [--json]` totals tokens, runs, sessions, and tools for the last N
+local days (1–400), by
 project and model; **Settings → Workflows → Usage** shows the same numbers with a chart and a
 per-project session breakdown. See [Usage](docs/RUNTIME_GUIDE.md#usage).
 
