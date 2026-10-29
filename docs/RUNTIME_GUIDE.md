@@ -296,8 +296,54 @@ variable name under `secrets`; the value lives only in the platform credential s
 that server's process when it starts. If the file is invalid, a secret is missing, or a server does
 not start, the run continues without those tools and shows a warning.
 
+A server offered as a web address uses MCP streamable HTTP (protocol 2025-06-18) instead of a
+command. Give it a `url`, and `headers` whose values each name a saved secret:
+
+```json
+{"servers":[
+  {"name":"docs","url":"https://mcp.example.com/mcp","headers":{"Authorization":"{secret:DOCS_TOKEN}"},"secrets":["DOCS_TOKEN"]}
+]}
+```
+
+Each entry has exactly one of `command` and `url`. The URL must use https; plain http is allowed only
+for the literal addresses `127.0.0.1` and `::1` (not `localhost`, which a hosts file could point
+elsewhere), and a URL may not contain a user name or password. A header value must be exactly
+`{secret:NAME}`: the header is sent with that secret's saved value, so save the whole value, such as
+`Bearer <token>` for `Authorization`. Literal header values are refused, and the protocol's and
+HTTP's own headers (`Accept`, `Content-Type`, `Mcp-Session-Id`, `MCP-Protocol-Version`, `Host`,
+`Connection`, `Upgrade`, `Expect`, `Keep-Alive`, `Trailer`, `Proxy-Authorization`, `Cookie` and
+similar) cannot be set. Secret values are removed from tool results, errors, tool descriptions and
+input schemas.
+
+A URL server's secrets are bound to the origin (`scheme://host:port`) they were saved for:
+`bw mcp secret` records it under `secretOrigins`, and a header is sent only when its secret was saved
+for the URL's current origin. If the URL moves to another origin, or a local server's environment
+secret is reused as a header, the server is skipped with a warning until the secret is saved again,
+and `bw mcp list` and the desktop show which secrets were saved for another address. Saving a
+server whose origin changed through Blackwall also removes its approval rules, so it asks again;
+edit `url` with care by hand, as a hand edit keeps the rules in `policy.json`.
+
+Blackwall posts each JSON-RPC message with `Accept: application/json, text/event-stream`, reads a
+JSON or event-stream reply (single messages or batches), keeps the `Mcp-Session-Id` from
+initialization, and sends `DELETE` to end the session when the run ends. If the server forgets the
+session (404), Blackwall initializes again once and retries. It never uses a proxy from
+`HTTPS_PROXY` or similar variables and follows only 307 and 308 redirects within the server's
+origin; others are errors. Replies to notifications and to the server's own requests should be
+202 Accepted; any body they carry is closed unread. Limits: a reply is at most 1 MiB in total, at
+most 256 messages wait at once, a server may send at most 32 requests of its own while answering
+one call (more stops the server for the run), and a session id is at most 128 visible ASCII
+characters. Requests the server sends on a reply stream are answered "method not found" (ping is
+answered). Startup has 15 seconds and calls use the command time limit, as for local servers; a
+server that times out or fails is not used again in that run. Servers that need OAuth sign-in are
+not supported yet; bearer tokens and API-key headers cover most hosted servers.
+
+Server names that start with `p-` are reserved for project servers. Blackwall will not add one, and
+an existing `mcp.json` entry with such a name is skipped with a warning to rename it; the other
+servers still start.
+
 In the desktop app, **Settings → AI capabilities → MCP servers** lists the servers with enable and
-disable toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
+disable toggles, adds a server from its command line or, with the **Command | URL** switch, from
+its address with header rows that each name a secret, removes one, and saves or removes its secrets through a
 password field. It uses the same validation and credential store as the CLI. **Add server** offers
 suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
 thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
@@ -307,7 +353,8 @@ package from npm the first time the server starts, without asking again. Suggest
 `npx`, so they are not offered on Windows.
 
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
-an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
+an enabled server, `bw mcp add <name> --url <url> [--header <Header>=<SECRET_NAME>]...` adds an HTTP
+server whose headers come from those secrets (save each with `bw mcp secret`), `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
 `bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
 they are saved, apply from the next Agent run, and an invalid or linked file is reported rather than
 replaced.
@@ -430,6 +477,18 @@ many. The file must be a regular file of at most 64 KiB in
 a real `.blackwall` folder; symbolic links are refused. It is read once, and its hash and settings
 come from those same bytes. If it cannot be read or is invalid, every action asks for approval
 until it is fixed, and the run's warnings and `bw project status` say why.
+
+**Project MCP servers.** Once the file is trusted, each server in its `mcp` section starts with the
+run as `p-<name>`, so a project's `docs` is `p-docs` and its tools are `p-docs__<tool>`; it can
+never shadow one of your servers, and your own `mcp.json` cannot use the `p-` prefix. A project
+server is reached only by `url` over streamable HTTP, never by a command, and it never gets your
+secrets or headers. Its address must be on the public internet: a URL whose host is, or resolves
+to, a loopback, private, link-local or shared address (`127.0.0.0/8`, `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7`,
+`fe80::/10` and similar) is refused with a warning, and the checked addresses are the ones used to
+connect. Approvals for its tools say the server is "defined by this project", and **Always allow**
+for a `p-` server or tool is always saved for this project only; an owner rule allowing a `p-` tool
+without a `project` is ignored.
 
 The `mcp`, `limits` and `instructions` sections are validated now so the format is fixed, but this
 version does not use them yet. When it does, a project can only remove permissions: limits and

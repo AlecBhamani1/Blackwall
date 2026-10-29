@@ -423,7 +423,8 @@ impl Agent<'_> {
         let mut reasoning = crate::model::Reasoning::default();
         let mcp = match (&mcp_directory, compact) {
             (Some(directory), false) => {
-                crate::mcp::McpServers::start(directory, &definitions).await
+                crate::mcp::McpServers::start(directory, Some(&self.workspace.path), &definitions)
+                    .await
             }
             _ => Default::default(),
         };

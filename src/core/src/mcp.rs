@@ -1,4 +1,5 @@
-//! Owner-configured local MCP servers whose tools join Agent runs behind Blackwall approvals.
+//! Owner-configured MCP servers, local processes or streamable HTTP endpoints, whose tools join
+//! Agent runs behind Blackwall approvals.
 use crate::{
     approvals::Approvals,
     protocol::{AgentEvent, ApprovalTool},
@@ -6,11 +7,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::Mutex,
-};
+use std::{collections::BTreeMap, path::Path, time::Duration};
+use tokio::{io::BufReader, sync::Mutex};
+use transport::{StdioTransport, Transport};
+
+mod http;
+mod transport;
 
 pub const MCP_FILE: &str = "mcp.json";
 /// Credential store service for server secrets; each account is `server/NAME`.
@@ -21,17 +23,29 @@ const MAX_TOOLS: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+/// Requests a server may send back while answering one of ours.
+const MAX_SERVER_REQUESTS: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SECRET_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const EDIT_LOCK: &str = ".mcp.lock";
+const RESERVED_PREFIX: &str =
+    "MCP server names starting with p- are reserved for project servers; rename it.";
 
 /// One server entry in `mcp.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerConfig {
     pub name: String,
+    /// The program and arguments of a local server. Empty for a `url` server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// A streamable HTTP endpoint, used instead of `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Headers sent to a `url` server. Each value names a saved secret as `{secret:NAME}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +55,36 @@ pub struct ServerConfig {
     /// Names of environment variables the server receives from the platform credential store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// For a `url` server, the origin each secret was saved for. A header is sent only when its
+    /// secret was saved for the URL's current origin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_origins: BTreeMap<String, String>,
+}
+
+impl ServerConfig {
+    /// The credential store account of one of this server's secrets.
+    fn account(&self, key: &str) -> String {
+        match self.secret_origins.get(key) {
+            Some(origin) => format!("{}/{origin}/{key}", self.name),
+            None => format!("{}/{key}", self.name),
+        }
+    }
+
+    /// Secrets of a URL server saved for another origin, with that origin. They are not sent
+    /// until saved again.
+    pub fn secrets_saved_elsewhere(&self) -> Vec<(&str, &str)> {
+        let origin = self.endpoint();
+        self.secret_origins
+            .iter()
+            .filter(|(_, saved)| self.url.is_some() && Some(saved.as_str()) != origin.as_deref())
+            .map(|(key, saved)| (key.as_str(), saved.as_str()))
+            .collect()
+    }
+
+    /// What a header secret is bound to: the URL's origin, or `None` for a local command.
+    fn endpoint(&self) -> Option<String> {
+        self.url.as_deref().and_then(http::origin)
+    }
 }
 
 fn enabled() -> bool {
@@ -80,6 +124,17 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
     let failed = "The MCP file could not be saved.";
+    // Approvals were given for a server at one address; one that moves starts asking again.
+    let moved: Vec<String> = read_config(directory)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|old| {
+            servers
+                .iter()
+                .any(|new| new.name == old.name && new.endpoint() != old.endpoint())
+        })
+        .map(|old| old.name)
+        .collect();
     let mut body = serde_json::to_vec_pretty(&McpFile {
         servers: validate(servers)?,
     })
@@ -93,7 +148,12 @@ pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), 
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("The MCP file must not be a symbolic link.");
     }
-    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)
+    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)?;
+    for name in moved {
+        crate::policy::remove_server_rules(directory, &name)
+            .map_err(|_| "The MCP file was saved, but approval rules for a server whose address changed could not be removed.")?;
+    }
+    Ok(())
 }
 
 /// Owner edits shared by the CLI and desktop. Each one validates before anything is saved.
@@ -133,8 +193,50 @@ fn saved_name(name: &str) -> String {
 
 /// Add a server under its saved name, which is returned.
 pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
+    add(directory, name, command, None, BTreeMap::new())
+}
+
+/// Add a streamable HTTP server. Each header is `(header name, secret name)`; the secret's value
+/// is saved for this server with [`save_secret`].
+pub fn add_http_server(
+    directory: &Path,
+    name: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+) -> Result<String, String> {
+    let mut references = BTreeMap::new();
+    for (header, secret) in headers {
+        if references
+            .insert(
+                header.trim().to_owned(),
+                format!("{{secret:{}}}", secret.trim()),
+            )
+            .is_some()
+        {
+            return Err(format!("The {header} header is given twice."));
+        }
+    }
+    add(
+        directory,
+        name,
+        vec![],
+        Some(url.trim().to_owned()),
+        references,
+    )
+}
+
+fn add(
+    directory: &Path,
+    name: &str,
+    command: Vec<String>,
+    url: Option<String>,
+    headers: BTreeMap<String, String>,
+) -> Result<String, String> {
     let name = saved_name(name);
     let name = name.as_str();
+    if name.starts_with("p-") {
+        return Err(RESERVED_PREFIX.into());
+    }
     let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
         .map_err(|_| "The MCP file could not be saved.")?;
     let mut servers = read_config(directory)?;
@@ -144,10 +246,13 @@ pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<
     servers.push(ServerConfig {
         name: name.into(),
         command,
+        url,
+        headers,
         enabled: true,
         allow_tools: None,
         deny_tools: vec![],
         secrets: vec![],
+        secret_origins: BTreeMap::new(),
     });
     write_config(directory, servers)?;
     Ok(name.into())
@@ -177,7 +282,7 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
     // The removal is saved; a keychain prompt below must not hold up other processes' edits.
     drop(_editing);
     for key in &removed.secrets {
-        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
+        crate::secrets::delete(SECRET_SERVICE, &removed.account(key)).map_err(store_error)?;
     }
     crate::policy::remove_server_rules(directory, name)
 }
@@ -192,14 +297,25 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
         return Err("Provide a value of up to 16 KiB.".into());
     }
     edit(directory, name, |servers, index| {
-        crate::secrets::set(SECRET_SERVICE, &format!("{name}/{key}"), value)
-            .map_err(store_error)?;
-        if !servers[index]
+        let server = &mut servers[index];
+        // A URL server's secrets are bound to its origin, so a value saved for one address is
+        // never sent to another.
+        let previous = server
             .secrets
             .iter()
             .any(|existing| existing == key)
-        {
-            servers[index].secrets.push(key.into());
+            .then(|| server.account(key));
+        match server.endpoint() {
+            Some(origin) => server.secret_origins.insert(key.into(), origin),
+            None => server.secret_origins.remove(key),
+        };
+        let account = server.account(key);
+        crate::secrets::set(SECRET_SERVICE, &account, value).map_err(store_error)?;
+        if let Some(previous) = previous.filter(|previous| *previous != account) {
+            crate::secrets::delete(SECRET_SERVICE, &previous).map_err(store_error)?;
+        }
+        if !server.secrets.iter().any(|existing| existing == key) {
+            server.secrets.push(key.into());
         }
         Ok(())
     })
@@ -209,8 +325,10 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
 pub fn delete_secret(directory: &Path, name: &str, key: &str) -> Result<(), String> {
     let name = &saved_name(name);
     edit(directory, name, |servers, index| {
-        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
-        servers[index].secrets.retain(|existing| existing != key);
+        let server = &mut servers[index];
+        crate::secrets::delete(SECRET_SERVICE, &server.account(key)).map_err(store_error)?;
+        server.secrets.retain(|existing| existing != key);
+        server.secret_origins.remove(key);
         Ok(())
     })
 }
@@ -224,11 +342,16 @@ struct Tool {
 
 struct Server {
     name: String,
+    /// Defined by the trusted project rather than the owner.
+    project: bool,
+    /// The host of a URL server, shown when asking to call its tools.
+    host: Option<String>,
     connection: Mutex<Connection>,
     tools: Vec<Tool>,
 }
 
-/// MCP servers started for one run. Dropping them stops every server process.
+/// MCP servers started for one run. Dropping them stops every server process and ends every HTTP
+/// session.
 #[derive(Default)]
 pub struct McpServers {
     servers: Vec<Server>,
@@ -236,8 +359,10 @@ pub struct McpServers {
 }
 
 impl McpServers {
-    /// Start enabled servers from owner data. Failures become warnings and never stop the run.
-    pub async fn start(directory: &Path, reserved: &[Value]) -> Self {
+    /// Start enabled servers from owner data and, when `workspace` is given and its
+    /// `.blackwall/project.json` is trusted, the project's URL servers as `p-<name>`. Failures
+    /// become warnings and never stop the run.
+    pub async fn start(directory: &Path, workspace: Option<&Path>, reserved: &[Value]) -> Self {
         let mut started = Self::default();
         let path = directory.join(MCP_FILE);
         let read = crate::policy::read_bounded(&path, MAX_FILE_BYTES);
@@ -245,37 +370,75 @@ impl McpServers {
             .await
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return started,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(_) => Err("The MCP file could not be read."),
             Ok(body) => parse(&body),
         };
-        let configs = match configs {
-            Ok(configs) => configs,
-            Err(error) => {
-                started
-                    .warnings
-                    .push(format!("{error} MCP servers are unavailable for this run."));
-                return started;
-            }
-        };
+        // A problem with the owner's file does not hold back the project's servers.
+        let configs = configs.unwrap_or_else(|error| {
+            started
+                .warnings
+                .push(format!("{error} MCP servers are unavailable for this run."));
+            vec![]
+        });
         let mut names: Vec<String> = reserved
             .iter()
             .filter_map(|definition| definition["function"]["name"].as_str())
             .map(str::to_owned)
             .collect();
+        started
+            .add_servers(configs, Source::Owner, directory, &mut names)
+            .await;
+        if let Some(workspace) = workspace {
+            let projects = project_servers(directory, workspace).await;
+            if !projects.is_empty() {
+                started
+                    .add_servers(projects, Source::Project, directory, &mut names)
+                    .await;
+            }
+        }
+        started
+    }
+
+    /// Start enabled servers from one file. `names` holds every tool name already taken.
+    async fn add_servers(
+        &mut self,
+        configs: Vec<ServerConfig>,
+        source: Source,
+        directory: &Path,
+        names: &mut Vec<String>,
+    ) {
+        let configs = match validate_for(configs, source) {
+            Ok(configs) => configs,
+            Err(error) => {
+                self.warnings
+                    .push(format!("{error} MCP servers are unavailable for this run."));
+                return;
+            }
+        };
+        let defined = match source {
+            Source::Owner => "",
+            Source::Project => "Project ",
+        };
         for config in configs.into_iter().filter(|config| config.enabled) {
+            if source == Source::Owner && config.name.starts_with("p-") {
+                self.warnings.push(format!(
+                    "MCP server {} was skipped: {RESERVED_PREFIX}",
+                    config.name
+                ));
+                continue;
+            }
             // A credential store prompt gets its own, longer wait than the server's startup.
             let environment =
                 match tokio::time::timeout(SECRET_TIMEOUT, read_secrets(&config)).await {
                     Ok(Ok(environment)) => environment,
                     Ok(Err(error)) => {
-                        started
-                            .warnings
+                        self.warnings
                             .push(format!("MCP server {} did not start: {error}", config.name));
                         continue;
                     }
                     Err(_) => {
-                        started.warnings.push(format!(
+                        self.warnings.push(format!(
                             "MCP server {} is waiting for {}. {}, then try again.",
                             config.name,
                             crate::secrets::STORE,
@@ -284,22 +447,41 @@ impl McpServers {
                         continue;
                     }
                 };
-            match tokio::time::timeout(STARTUP_TIMEOUT, launch(&config, directory, environment))
-                .await
+            // A project's server must be on the public internet, and the address checked here is
+            // the one connected to.
+            let pinned = match source {
+                Source::Owner => None,
+                Source::Project => {
+                    match http::public_addresses(config.url.as_deref().unwrap_or_default()).await {
+                        Ok(pinned) => pinned,
+                        Err(error) => {
+                            self.warnings.push(format!(
+                                "{defined}MCP server {} did not start: {error}",
+                                config.name
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
+            match tokio::time::timeout(
+                STARTUP_TIMEOUT,
+                launch(&config, directory, environment, pinned),
+            )
+            .await
             {
                 Ok(Ok(connection)) => {
-                    started.add(config, connection, &mut names).await;
+                    self.add(config, connection, names).await;
                 }
-                Ok(Err(error)) => started
+                Ok(Err(error)) => self
                     .warnings
                     .push(format!("MCP server {} did not start: {error}", config.name)),
-                Err(_) => started.warnings.push(format!(
+                Err(_) => self.warnings.push(format!(
                     "MCP server {} did not start within 15 seconds.",
                     config.name
                 )),
             }
         }
-        started
     }
 
     async fn add(
@@ -344,16 +526,23 @@ impl McpServers {
             tools.push(Tool {
                 exposed,
                 name: name.to_owned(),
-                description: tool["description"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(1024)
-                    .collect(),
+                description: redact(
+                    tool["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(1024)
+                        .collect(),
+                    &connection.secrets,
+                ),
+                // A schema is text the model reads too, so a secret echoed into it is removed.
                 input_schema: tool
                     .get("inputSchema")
                     .filter(|schema| schema.is_object())
-                    .cloned()
+                    .and_then(|schema| {
+                        serde_json::from_str(&redact(schema.to_string(), &connection.secrets)).ok()
+                    })
+                    .filter(Value::is_object)
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
             });
             if tools.len() == MAX_TOOLS {
@@ -361,6 +550,13 @@ impl McpServers {
             }
         }
         self.servers.push(Server {
+            // Owner servers never have this prefix; those that do are skipped at start.
+            project: config.name.starts_with("p-"),
+            host: config
+                .url
+                .as_deref()
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.host_str().map(str::to_owned)),
             name: config.name,
             connection: Mutex::new(connection),
             tools,
@@ -410,10 +606,18 @@ impl McpServers {
         if !arguments.is_object() {
             return Err(ToolError::Arguments);
         }
-        let detail = format!(
-            "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
-            server.name, tool.name
-        );
+        let detail = match &server.host {
+            None => format!(
+                "MCP server: {}\nTool: {}\nArguments: {arguments}\n\nThe server runs with your account permissions and may change data in the services it connects to.",
+                server.name, tool.name
+            ),
+            Some(host) => format!(
+                "MCP server: {} ({host}){}\nTool: {}\nArguments: {arguments}\n\nThe arguments are sent to {host}, which may change data in the services it connects to.",
+                server.name,
+                if server.project { ", defined by this project" } else { "" },
+                tool.name
+            ),
+        };
         let approval = ApprovalTool {
             server: server.name.clone(),
             tool: tool.exposed.clone(),
@@ -439,8 +643,7 @@ impl McpServers {
             Err(_) => {
                 // A late reply would arrive out of order, so the server is stopped and not reused.
                 connection.broken = true;
-                #[cfg(any(unix, windows))]
-                connection.process.take();
+                connection.transport.abandon();
                 return Err(ToolError::Execution(
                     "The MCP tool exceeded its time limit and was stopped.".into(),
                 ));
@@ -472,17 +675,23 @@ impl McpServers {
 }
 
 struct Connection {
-    reader: Box<dyn AsyncBufRead + Send + Unpin>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    transport: Box<dyn Transport>,
     next_id: u64,
     broken: bool,
     /// Values given to the server, removed from anything it sends back.
     secrets: Vec<String>,
-    #[cfg(any(unix, windows))]
-    process: Option<crate::tools::ServerProcess>,
 }
 
 impl Connection {
+    fn new(transport: Box<dyn Transport>, secrets: Vec<String>) -> Self {
+        Self {
+            transport,
+            next_id: 0,
+            broken: false,
+            secrets,
+        }
+    }
+
     fn redact(&self, error: ToolError) -> ToolError {
         match error {
             ToolError::Execution(text) => ToolError::Execution(redact(text, &self.secrets)),
@@ -492,19 +701,19 @@ impl Connection {
 
     async fn initialize(&mut self) -> Result<(), ToolError> {
         let result = self
-            .request(
+            .request_once(
             "initialize",
             json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"Blackwall","version":env!("CARGO_PKG_VERSION")}}),
         )
         .await?;
         // Tool discovery and calls are unchanged across these versions.
-        if !["2025-06-18", "2025-03-26", "2024-11-05"]
-            .contains(&result["protocolVersion"].as_str().unwrap_or_default())
-        {
+        let version = result["protocolVersion"].as_str().unwrap_or_default();
+        if !["2025-06-18", "2025-03-26", "2024-11-05"].contains(&version) {
             return Err(ToolError::Execution(
                 "The MCP server uses an unsupported protocol version.".into(),
             ));
         }
+        self.transport.negotiated(version);
         self.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await
     }
@@ -527,36 +736,55 @@ impl Connection {
     }
 
     async fn send(&mut self, message: &Value) -> Result<(), ToolError> {
-        let unavailable = || ToolError::Execution("The MCP server stopped responding.".into());
-        let mut line = serde_json::to_vec(message).map_err(|_| ToolError::Arguments)?;
-        line.push(b'\n');
-        self.writer
-            .write_all(&line)
-            .await
-            .map_err(|_| unavailable())?;
-        self.writer.flush().await.map_err(|_| unavailable())
+        let sent = self.transport.send(message).await;
+        if sent.is_err() {
+            self.broken = true;
+        }
+        sent
     }
 
+    /// Send one request. A server that forgot its session is initialized again, once, and the
+    /// request is retried.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
-        let unavailable = || ToolError::Execution("The MCP server stopped responding.".into());
+        match self.request_once(method, params.clone()).await {
+            Err(_) if self.transport.expired() => {
+                self.broken = false;
+                self.initialize().await?;
+                self.request_once(method, params).await
+            }
+            result => result,
+        }
+    }
+
+    async fn request_once(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
         if self.broken {
-            return Err(unavailable());
+            return Err(ToolError::Execution(
+                "The MCP server stopped responding.".into(),
+            ));
         }
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
+        let mut asked = 0;
         loop {
-            let message = match read_message(&mut self.reader).await {
-                Ok(Some(message)) => message,
-                _ => {
+            let message = match self.transport.recv().await {
+                Ok(message) => message,
+                Err(error) => {
                     self.broken = true;
-                    return Err(unavailable());
+                    return Err(error);
                 }
             };
             if message.get("method").is_some() {
                 // Server requests are not supported; answer so the server does not wait.
                 if let Some(request) = message.get("id") {
+                    asked += 1;
+                    if asked > MAX_SERVER_REQUESTS {
+                        self.broken = true;
+                        return Err(ToolError::Execution(
+                            "The MCP server sent too many requests of its own.".into(),
+                        ));
+                    }
                     let reply = if message["method"] == "ping" {
                         json!({"jsonrpc":"2.0","id":request,"result":{}})
                     } else {
@@ -583,45 +811,53 @@ impl Connection {
     }
 }
 
-/// One bounded line of JSON. Blank and non-JSON lines are skipped.
-async fn read_message(
-    reader: &mut (dyn AsyncBufRead + Send + Unpin),
-) -> std::io::Result<Option<Value>> {
-    loop {
-        let mut line = vec![];
-        loop {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(None);
+/// For each header of a URL server: the header, the secret's name, and its credential store
+/// account. A secret saved for another origin, or for a local command, is never used.
+fn header_accounts(config: &ServerConfig) -> Result<Vec<(String, String, String)>, ToolError> {
+    let origin = config.endpoint().unwrap_or_default();
+    let mut accounts = vec![];
+    for (header, reference) in &config.headers {
+        let key = http::secret_reference(reference).unwrap_or_default();
+        let again = format!("Save it again with bw mcp secret {} {key}.", config.name);
+        if !config.secrets.iter().any(|saved| saved == key) {
+            return Err(ToolError::Execution(format!(
+                "{key} is not saved. Add it with bw mcp secret {} {key}.",
+                config.name
+            )));
+        }
+        match config.secret_origins.get(key) {
+            Some(saved) if *saved == origin => {}
+            Some(saved) => {
+                return Err(ToolError::Execution(format!(
+                    "{key} was saved for {saved}, not {origin}. {again}"
+                )))
             }
-            let (chunk, done) = match available.iter().position(|byte| *byte == b'\n') {
-                Some(end) => (&available[..end], true),
-                None => (available, false),
-            };
-            if line.len() + chunk.len() > MAX_MESSAGE_BYTES {
-                return Err(std::io::ErrorKind::InvalidData.into());
-            }
-            line.extend_from_slice(chunk);
-            let used = chunk.len() + usize::from(done);
-            reader.consume(used);
-            if done {
-                break;
+            None => {
+                return Err(ToolError::Execution(format!(
+                    "{key} was saved for a local command, not {origin}. {again}"
+                )))
             }
         }
-        if let Ok(message) = serde_json::from_slice::<Value>(&line) {
-            if message.is_object() {
-                return Ok(Some(message));
-            }
-        }
+        accounts.push((header.clone(), key.to_owned(), config.account(key)));
     }
+    Ok(accounts)
 }
 
-/// Servers start in the data folder so a project cannot shadow what a package runner loads.
 /// Read a server's secrets from the credential store, which may first ask the owner for access.
+/// A local server gets environment variables; a URL server gets headers. Each pair is the
+/// variable or header name and its value.
 async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, ToolError> {
-    let mut environment = vec![];
-    for name in &config.secrets {
-        let account = format!("{}/{name}", config.name);
+    let wanted = if config.url.is_some() {
+        header_accounts(config)?
+    } else {
+        config
+            .secrets
+            .iter()
+            .map(|key| (key.clone(), key.clone(), config.account(key)))
+            .collect()
+    };
+    let mut values = vec![];
+    for (target, name, account) in wanted {
         let value =
             tokio::task::spawn_blocking(move || crate::secrets::get(SECRET_SERVICE, &account))
                 .await
@@ -638,16 +874,70 @@ async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, To
                         config.name
                     ))
                 })?;
-        environment.push((name.clone(), value));
+        values.push((target, value));
     }
-    Ok(environment)
+    Ok(values)
+}
+
+/// Servers start in the data folder so a project cannot shadow what a package runner loads.
+/// The trusted project's URL servers, named `p-<name>`. An untrusted, changed or unusable file
+/// adds none; its warnings are reported by the run's policy.
+async fn project_servers(directory: &Path, workspace: &Path) -> Vec<ServerConfig> {
+    let (data, folder) = (directory.to_path_buf(), workspace.to_path_buf());
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || crate::project::try_load(&folder, &data)),
+    )
+    .await;
+    let Ok(Ok(Ok(loaded))) = loaded else {
+        return vec![];
+    };
+    if loaded.trust != crate::project::Trust::Trusted {
+        return vec![];
+    }
+    let servers = loaded.config.mcp.map(|mcp| mcp.servers).unwrap_or_default();
+    servers
+        .into_iter()
+        .map(|server| ServerConfig {
+            name: format!("p-{}", server.name),
+            command: vec![],
+            url: Some(server.url),
+            headers: BTreeMap::new(),
+            enabled: server.enabled,
+            allow_tools: server.allow_tools,
+            deny_tools: server.deny_tools,
+            secrets: vec![],
+            secret_origins: BTreeMap::new(),
+        })
+        .collect()
 }
 
 async fn launch(
     config: &ServerConfig,
     directory: &Path,
     environment: Vec<(String, String)>,
+    pinned: Option<http::Pinned>,
 ) -> Result<Connection, ToolError> {
+    let transport: Box<dyn Transport> = match &config.url {
+        Some(url) => Box::new(http::HttpTransport::new(
+            url,
+            http::headers(&environment)?,
+            pinned,
+        )?),
+        None => start_process(config, directory, &environment)?,
+    };
+    let secrets = environment.into_iter().map(|(_, value)| value).collect();
+    let mut connection = Connection::new(transport, secrets);
+    let initialized = connection.initialize().await;
+    initialized.map_err(|error| connection.redact(error))?;
+    Ok(connection)
+}
+
+fn start_process(
+    config: &ServerConfig,
+    directory: &Path,
+    environment: &[(String, String)],
+) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
         let program =
@@ -658,23 +948,17 @@ async fn launch(
                 ))
             })?;
         let (process, stdin, stdout, stderr) =
-            crate::tools::spawn_server(directory, &program, &config.command[1..], &environment)?;
+            crate::tools::spawn_server(directory, &program, &config.command[1..], environment)?;
         // Server logs are not shown; draining them keeps a chatty server from blocking.
         tokio::spawn(async move {
             let mut stderr = stderr;
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         });
-        let mut connection = Connection {
+        Ok(Box::new(StdioTransport {
             reader: Box::new(BufReader::new(stdout)),
             writer: Box::new(stdin),
-            next_id: 0,
-            broken: false,
-            secrets: environment.into_iter().map(|(_, value)| value).collect(),
             process: Some(process),
-        };
-        let initialized = connection.initialize().await;
-        initialized.map_err(|error| connection.redact(error))?;
-        Ok(connection)
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -723,7 +1007,22 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Where server entries come from. Project servers, from a trusted project file, are URL-only,
+/// carry no secrets or headers, and use the reserved `p-` name prefix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Owner,
+    Project,
+}
+
 fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static str> {
+    validate_for(servers, Source::Owner)
+}
+
+fn validate_for(
+    servers: Vec<ServerConfig>,
+    source: Source,
+) -> Result<Vec<ServerConfig>, &'static str> {
     if servers.len() > MAX_SERVERS {
         return Err("The MCP file has too many servers.");
     }
@@ -739,15 +1038,50 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
         {
             return Err("Two MCP servers have the same name.");
         }
-        if server.command.is_empty() || server.command.len() > 64 {
-            return Err("Give each MCP server a command with at most 63 arguments.");
+        match source {
+            Source::Project if !server.name.starts_with("p-") => {
+                return Err("Project MCP server names start with p-.");
+            }
+            Source::Project if server.url.is_none() || !server.command.is_empty() => {
+                return Err("A project can only add MCP servers by URL.");
+            }
+            Source::Project if !server.secrets.is_empty() || !server.headers.is_empty() => {
+                return Err("Project MCP servers cannot use secrets or headers.");
+            }
+            _ => {}
         }
-        if !crate::command_tools::valid_program(&server.command[0]) {
-            return Err(if cfg!(windows) {
-                "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
-            } else {
-                "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
-            });
+        match &server.url {
+            Some(_) if !server.command.is_empty() => {
+                return Err("Give each MCP server either a command or a URL, not both.");
+            }
+            Some(url) => {
+                if !http::valid_url(url) {
+                    return Err("An MCP server URL must use https, or http on 127.0.0.1, ::1, or localhost, and must not include a user name or password.");
+                }
+                if server.headers.len() > 16
+                    || !server
+                        .headers
+                        .iter()
+                        .all(|(name, value)| http::valid_header(name, value))
+                {
+                    return Err("MCP server headers must be {secret:NAME}, naming a secret saved for that server, and cannot replace the protocol's own headers.");
+                }
+            }
+            None => {
+                if server.command.is_empty() || server.command.len() > 64 {
+                    return Err("Give each MCP server a command with at most 63 arguments.");
+                }
+                if !crate::command_tools::valid_program(&server.command[0]) {
+                    return Err(if cfg!(windows) {
+                        "An MCP server program must be an .exe given by name or absolute path; batch files are not supported."
+                    } else {
+                        "An MCP server program must be a program name or an absolute path, and not a .bat or .cmd file."
+                    });
+                }
+                if !server.headers.is_empty() {
+                    return Err("Only MCP servers with a URL take headers.");
+                }
+            }
         }
         if server.secrets.len() > 16
             || server.secrets.iter().enumerate().any(|(index, name)| {
@@ -755,6 +1089,11 @@ fn validate(servers: Vec<ServerConfig>) -> Result<Vec<ServerConfig>, &'static st
             })
         {
             return Err("An MCP server has an invalid secret name.");
+        }
+        if server.secret_origins.iter().any(|(key, origin)| {
+            !server.secrets.contains(key) || http::origin(origin).as_ref() != Some(origin)
+        }) {
+            return Err("An MCP server lists a secret origin that is not valid.");
         }
     }
     Ok(servers)
@@ -766,6 +1105,21 @@ mod tests {
     use super::*;
     use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
     use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use transport::read_message;
+
+    fn stdio(
+        reader: impl tokio::io::AsyncBufRead + Send + Unpin + 'static,
+        writer: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
+    ) -> Connection {
+        let transport = StdioTransport {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            #[cfg(any(unix, windows))]
+            process: None,
+        };
+        Connection::new(Box::new(transport), vec![])
+    }
 
     /// An in-memory MCP server: lists fixed tools and answers calls by name.
     fn fake_server(calls: Arc<StdMutex<Vec<String>>>) -> Connection {
@@ -820,15 +1174,7 @@ mod tests {
                     .unwrap();
             }
         });
-        Connection {
-            reader: Box::new(BufReader::new(client_read)),
-            writer: Box::new(client_write),
-            next_id: 0,
-            broken: false,
-            secrets: vec![],
-            #[cfg(any(unix, windows))]
-            process: None,
-        }
+        stdio(BufReader::new(client_read), client_write)
     }
 
     async fn servers(calls: Arc<StdMutex<Vec<String>>>, reserved: &[&str]) -> McpServers {
@@ -837,10 +1183,13 @@ mod tests {
         let config = ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: None,
             deny_tools: vec!["delete_issue".into()],
             secrets: vec![],
+            secret_origins: BTreeMap::new(),
         };
         let mut names: Vec<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
         let mut servers = McpServers::default();
@@ -890,10 +1239,13 @@ mod tests {
         let config = ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: Some(vec!["search".into(), "fail".into()]),
             deny_tools: vec![],
             secrets: vec!["JIRA_API_TOKEN".into()],
+            secret_origins: BTreeMap::new(),
         };
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
@@ -993,10 +1345,13 @@ mod tests {
         let server = |secrets: &[&str]| ServerConfig {
             name: "jira".into(),
             command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
             allow_tools: None,
             deny_tools: vec![],
             secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
+            secret_origins: BTreeMap::new(),
         };
         assert!(validate(vec![server(&["JIRA_API_TOKEN", "JIRA_2"])]).is_ok());
         for invalid in [
@@ -1065,7 +1420,7 @@ mod tests {
             tokio::fs::write(directory.join(MCP_FILE), body)
                 .await
                 .unwrap();
-            let servers = McpServers::start(&directory, &[]).await;
+            let servers = McpServers::start(&directory, None, &[]).await;
             assert_eq!(servers.warnings.len(), 1, "{body}");
             assert!(servers.definitions().is_empty());
         }
@@ -1075,7 +1430,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let disabled = McpServers::start(&directory, &[]).await;
+        let disabled = McpServers::start(&directory, None, &[]).await;
         assert!(disabled.warnings.is_empty() && disabled.definitions().is_empty());
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
@@ -1092,15 +1447,7 @@ mod tests {
     async fn unsupported_protocol_versions_are_refused() {
         let reply: &[u8] =
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"1999-01-01\"}}\n";
-        let mut connection = Connection {
-            reader: Box::new(reply),
-            writer: Box::new(tokio::io::sink()),
-            next_id: 0,
-            broken: false,
-            secrets: vec![],
-            #[cfg(any(unix, windows))]
-            process: None,
-        };
+        let mut connection = stdio(reply, tokio::io::sink());
         assert!(connection.initialize().await.is_err());
     }
 }

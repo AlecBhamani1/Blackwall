@@ -218,6 +218,8 @@ impl Approvals {
             ApprovalDecision::AllowServer => (tool.server, false),
             _ => return Ok(None),
         };
+        // A project's server (`p-`) is allowed only in that project, whatever was chosen.
+        let in_project = in_project || rule.starts_with("p-");
         let (directory, workspace) = policy.scope();
         let directory = directory.to_path_buf();
         let project = in_project.then(|| workspace.to_path_buf());
@@ -513,6 +515,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("The tool was not run."), "{error}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+    #[tokio::test]
+    async fn p_tool_allow_scoped_to_project() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-p-tool-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let workspace = tokio::fs::canonicalize(&directory).await.unwrap();
+        // A hand-written rule allowing a project's server everywhere is ignored.
+        tokio::fs::write(
+            directory.join(crate::policy::POLICY_FILE),
+            r#"{"rules":[{"decision":"allow","kind":"exec","tool":"p-docs"}]}"#,
+        )
+        .await
+        .unwrap();
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace)
+            .await
+            .unwrap();
+        let asked = Arc::new(Mutex::new(0));
+        let count = asked.clone();
+        let decisions = approvals.clone();
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                *count.lock().unwrap() += 1;
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::AllowServer,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = ApprovalTool {
+            server: "p-docs".into(),
+            tool: "p-docs__search".into(),
+        };
+        assert!(approvals
+            .request_tool("run", tool, "detail".into(), &emit)
+            .await
+            .unwrap());
+        assert_eq!(*asked.lock().unwrap(), 1);
+        // "Always allow this server" is saved for this project only.
+        let saved = crate::policy::tool_rules(&directory).unwrap();
+        assert!(saved.contains(&crate::policy::ToolRule {
+            tool: "p-docs".into(),
+            project: Some(workspace.to_string_lossy().into_owned()),
+        }));
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
     #[tokio::test]

@@ -268,6 +268,14 @@ impl Policy {
         // Project rules apply only in their own folder. The workspace path is already canonical.
         let mut kept = Vec::with_capacity(user.rules.len());
         for (index, rule) in user.rules {
+            // A project's MCP servers (`p-`) are only ever allowed within a project.
+            let project_tool = rule
+                .tool
+                .as_deref()
+                .is_some_and(|tool| tool.starts_with("p-"));
+            if project_tool && rule.project.is_none() && rule.decision == Decision::Allow {
+                continue;
+            }
             if let Some(project) = &rule.project {
                 let folder =
                     tokio::time::timeout(IO_TIMEOUT, tokio::fs::canonicalize(project)).await;

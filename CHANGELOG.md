@@ -10,8 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Project settings in `.blackwall/project.json`. A project's deny and ask rules apply right away;
-  its allow rules (and its `mcp`, `limits` and `instructions` sections, validated now and used in
-  a later release) wait until the owner trusts the file. Trust is saved in `trusted-projects.json`
+  its allow rules (and its `mcp`, `limits` and `instructions` sections, validated now; `mcp` is
+  used from this release) wait until the owner trusts the file. Trust is saved in `trusted-projects.json`
   as the canonical folder and the SHA-256 of the exact bytes shown, and any edit untrusts it.
   Review and trust with `bw project status|trust|untrust` or the desktop banner and dialog, which
   shows a diff when the file changed; untrust from **Settings → Security → Trusted projects**.
@@ -23,6 +23,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `strictest` keeps today's meaning, and across files a deny or ask always beats an allow.
 - Policy audit records gain `rule`: the deciding rule's source, index and mode, or `null`.
 
+- Connect to MCP servers over streamable HTTP (protocol 2025-06-18). A server in `mcp.json` takes a
+  `url` instead of a `command`, plus `headers` whose values name saved secrets as `{secret:NAME}`;
+  literal values are refused. Add one with `bw mcp add NAME --url URL [--header NAME=SECRET]` or the
+  new **Command | URL** switch in the desktop MCP screen. Header secrets are bound to the origin they
+  were saved for and never sent elsewhere; a server whose origin changes loses its approval rules.
+  URLs must be https (http only on 127.0.0.1 or ::1), only same-origin 307/308 redirects are
+  followed, proxies are never used, replies are capped at 1 MiB, and server-sent requests and
+  queued messages are bounded. OAuth sign-in is not supported yet. Server names starting with `p-`
+  are now reserved for project servers: an existing one is skipped with a warning to rename it.
+- A trusted project's `mcp` servers start with each run as `p-<name>`: URL only, no secrets or
+  headers, and only on public addresses (private, loopback and link-local hosts are refused, and
+  the checked address is pinned). Their approvals say "defined by this project", and Always allow
+  saves a project-only rule.
 - Distinct exit codes for `bw run` and `bw resume` with a prompt: 0 complete, 1 error, 2 usage,
   3 completed with a denied approval, 4 step limit, 5 model or network error, 6 context budget,
   7 time limit, 130 interrupted. The `--json` result line adds `reason`, `denied` and

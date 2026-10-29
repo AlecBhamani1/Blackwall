@@ -84,7 +84,7 @@ USAGE:
   bw telemetry test          Send one test span to the OTLP endpoint and show the result
   bw telemetry header <name> [--delete]
                              Save an export header (value piped on stdin) in the credential store
-  bw mcp <action>            Add, list, enable, disable, or remove MCP servers
+  bw mcp <action>            Add (by command or --url), list, enable, disable, or remove MCP servers
   bw project [status]        Show this project's .blackwall/project.json, its trust, and what applies
   bw project trust [--yes]   Review and trust it (asks y/N; --yes when there is no terminal)
   bw project untrust         Stop trusting it; only its deny and ask rules apply until trusted

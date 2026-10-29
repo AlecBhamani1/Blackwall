@@ -180,4 +180,80 @@ describe('MCP server management', () => {
     await user.click(screen.getByRole('button', { name: 'Add server' }));
     expect(add).toHaveBeenCalledWith('filesystem', 'my-server --stdio');
   });
+  it('adds a server by URL with headers that name secrets', async () => {
+    const user = userEvent.setup();
+    const added = {
+      name: 'docs',
+      url: 'https://mcp.example.com/mcp',
+      headers: { Authorization: '{secret:DOCS_TOKEN}' },
+      enabled: true,
+    };
+    // Another server at the same address must not be the one that opens.
+    const other = { ...added, name: 'docs-old', headers: {} };
+    const add = vi.spyOn(persistence, 'addMcpHttpServer').mockImplementation(async () => {
+      vi.spyOn(persistence, 'mcpServers').mockResolvedValue([other, added]);
+      return 'docs';
+    });
+    const command = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    expect(screen.getByRole('radio', { name: 'Command' })).toHaveAttribute('aria-checked', 'true');
+    await user.click(screen.getByRole('radio', { name: 'URL' }));
+    expect(screen.queryByLabelText('Command')).not.toBeInTheDocument();
+    expect(screen.getByText(/OAuth sign-in are not supported yet/)).toBeInTheDocument();
+    await user.type(screen.getByLabelText('Name'), 'Docs');
+    await user.type(screen.getByLabelText('URL'), 'https://mcp.example.com/mcp');
+    await user.click(screen.getByRole('button', { name: 'Add header' }));
+    await user.type(screen.getByLabelText('Header 1 name'), 'Authorization');
+    await user.type(screen.getByLabelText('Header 1 secret'), 'DOCS_TOKEN');
+    await user.click(screen.getByRole('button', { name: 'Add header' }));
+    await user.click(screen.getByRole('button', { name: 'Remove header 2' }));
+    expect(screen.queryByLabelText('Header 2 name')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).toHaveBeenCalledWith('Docs', 'https://mcp.example.com/mcp', [
+      ['Authorization', 'DOCS_TOKEN'],
+    ]);
+    expect(command).not.toHaveBeenCalled();
+    // The new server opens with its first unsaved header secret ready to save.
+    expect(await screen.findByText(/not saved yet/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Secret name')).toHaveValue('DOCS_TOKEN');
+    expect(screen.getByText('https://mcp.example.com/mcp')).toBeInTheDocument();
+    expect(screen.getByText('docs')).toBeInTheDocument();
+  });
+  it('lists URL servers by address and counts unsaved header secrets', async () => {
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      {
+        name: 'docs',
+        url: 'https://mcp.example.com/mcp',
+        headers: {
+          Authorization: '{secret:DOCS_TOKEN}',
+          'X-Team': '{secret:TEAM}',
+          'X-Old': '{secret:OLD}',
+          'X-Env': '{secret:ENV}',
+        },
+        secrets: ['TEAM', 'OLD', 'ENV'],
+        secretOrigins: { TEAM: 'https://mcp.example.com', OLD: 'https://old.example.com' },
+        enabled: true,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    expect(await screen.findByText('https://mcp.example.com/mcp')).toBeInTheDocument();
+    expect(screen.getByText(/3 secrets · 3 secrets to save/)).toBeInTheDocument();
+    await user.click(screen.getByText('docs'));
+    expect(screen.getByText(/not saved yet/)).toBeInTheDocument();
+    expect(screen.getByText(/saved for https:\/\/old.example.com; save it again/)).toBeInTheDocument();
+    expect(screen.getByText(/saved for a local command; save it again/)).toBeInTheDocument();
+  });
+  it('switches back to a command when a suggestion is picked', async () => {
+    const user = userEvent.setup();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.click(screen.getByRole('radio', { name: 'URL' }));
+    await user.click(screen.getByRole('button', { name: /^filesystem/ }));
+    expect(screen.getByRole('radio', { name: 'Command' })).toHaveAttribute('aria-checked', 'true');
+    expect((screen.getByLabelText('Command') as HTMLInputElement).value).toContain(
+      'server-filesystem',
+    );
+  });
 });

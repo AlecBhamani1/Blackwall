@@ -17,7 +17,7 @@ async fn programs_are_found_and_run_with_the_search_path() {
     )
     .unwrap();
 
-    let before = blackwall_core::mcp::McpServers::start(&root, &[]).await;
+    let before = blackwall_core::mcp::McpServers::start(&root, None, &[]).await;
     assert!(
         before.warnings[0].contains("was not found"),
         "{:?}",
@@ -25,7 +25,7 @@ async fn programs_are_found_and_run_with_the_search_path() {
     );
 
     blackwall_core::tools::set_search_path(tools.clone().into_os_string());
-    let after = blackwall_core::mcp::McpServers::start(&root, &[]).await;
+    let after = blackwall_core::mcp::McpServers::start(&root, None, &[]).await;
     assert!(
         !after.warnings[0].contains("was not found"),
         "{:?}",
