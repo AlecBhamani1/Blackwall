@@ -203,7 +203,7 @@ impl Conversation {
         let guidance = blackwall_core::instructions::Instructions::discover(
             &workspace,
             Some(directory),
-            &Default::default(),
+            &settings.instructions,
         );
         if !guidance.prompt().is_empty() {
             messages.insert(0, json!({"role":"system","content":guidance.prompt()}));
@@ -276,7 +276,7 @@ impl Conversation {
                 compact: true,
                 trace: None,
                 subagents: settings.subagents.clone(),
-                instruction_settings: Default::default(),
+                instruction_settings: settings.instructions.clone(),
             },
             settings.trace,
             Some(input),
@@ -378,7 +378,7 @@ impl Conversation {
                 compact: false,
                 trace: None,
                 subagents: settings.subagents.clone(),
-                instruction_settings: Default::default(),
+                instruction_settings: settings.instructions.clone(),
             },
             settings.trace,
             input,

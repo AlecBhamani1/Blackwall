@@ -35,6 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the same symlink and UTF-8 rules. Extra names must be relative paths with no `..`, `.git`,
   root or drive, checked when saved and at every run. A trusted project's `instructions` section
   now applies and only lowers the limits or keeps fewer of your extra files; it cannot add one.
+  A `project.json` whose `instructions.extra_files` names `AGENTS.md`, `.`, `.git` or a `:` is now
+  invalid; fix it and trust the project again. A file larger than the total limit is skipped, so
+  keep the total at least as large as the per-file limit.
 - Settings saved by this version carry `subagents`, `instructions` and
   `contextBudget.maxOutputBytes`, which an earlier `bw` rejects; to go back, remove those keys from
   the CLI settings file.
