@@ -836,6 +836,7 @@ impl Agent<'_> {
                         }
                         // Command and extension failures carry their output, which is content.
                         let quiet_error = matches!(&result, Err(tools::ToolError::Execution(_)));
+                        let denied = matches!(&result, Err(tools::ToolError::Denied));
                         let output = result.unwrap_or_else(|error| error.to_string());
                         if let (Some(trace), Some(span)) = (trace, &tool_span) {
                             if trace.content() {
@@ -860,6 +861,7 @@ impl Agent<'_> {
                             output: output.clone(),
                             success,
                             truncated: output_cap.trimmed(),
+                            denied,
                         });
                         (
                             index,
