@@ -86,20 +86,22 @@ impl Approvals {
         Ok(())
     }
 
-    /// Apply the owner's rules in `directory` to this run until the run is cleared.
+    /// Apply the owner's rules in `directory`, and the project's rules, to this run until the
+    /// run is cleared. Returns notes about the project's settings file for the run's warnings.
     pub async fn load_policy(
         &self,
         request_id: &str,
         directory: &Path,
         workspace: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         let policy = Arc::new(Policy::load(directory, workspace).await);
+        let warnings = policy.warnings.clone();
         self.0
             .lock()
             .map_err(|_| "The approval registry is unavailable.")?
             .policies
             .insert(request_id.into(), policy);
-        Ok(())
+        Ok(warnings)
     }
     /// `subject` is the command, workspace-relative path, or host that rules match.
     pub async fn request(
@@ -156,10 +158,11 @@ impl Approvals {
             let answer = self.ask(request_id, kind, None, detail, emit, true).await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
-        let decision = match tool {
-            Some(_) => policy.decide_tool(subject),
-            None => policy.decide(kind, subject),
+        let verdict = match tool {
+            Some(_) => policy.evaluate_tool(subject),
+            None => policy.evaluate(kind, subject),
         };
+        let decision = verdict.decision;
         let mut saved = None;
         let allowed = match decision {
             Decision::Allow => true,
@@ -177,7 +180,9 @@ impl Approvals {
                     match self.save_tool_rule(request_id, &policy, tool, answer).await {
                         Ok(rule) => saved = rule,
                         Err(error) => {
-                            policy.record(kind, subject, decision, false, None).await;
+                            policy
+                                .record(kind, subject, decision, false, None, verdict.matched)
+                                .await;
                             return Err(error);
                         }
                     }
@@ -186,7 +191,14 @@ impl Approvals {
             }
         };
         policy
-            .record(kind, subject, decision, allowed, saved.as_ref())
+            .record(
+                kind,
+                subject,
+                decision,
+                allowed,
+                saved.as_ref(),
+                verdict.matched,
+            )
             .await;
         Ok(allowed)
     }

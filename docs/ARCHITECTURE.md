@@ -206,7 +206,10 @@ enabled skills by name and description under a bounded budget, and the model loa
 `read_skill`. After `/learn`, `skill_propose` records a proposal under `skills/.proposals`; nothing
 is loaded until the owner approves it, and approval refuses a skill that changed after the proposal.
 `policy.json`, `tools.json`, and `mcp.json` in the data folder hold owner rules, command tools, and
-MCP servers; projects cannot supply them. Only user-saved facts enter memory; automatic learning
+MCP servers. A project's `.blackwall/project.json` (`core/src/project.rs`) can add rules: its deny
+and ask rules apply at once, and the rest waits until the owner trusts the file's SHA-256, recorded
+in `trusted-projects.json`; `policy.rs` merges each file's answer, strictest across files. Only
+user-saved facts enter memory; automatic learning
 and the optional Postgres adapter are not implemented. Guests never receive owner memory, skills,
 workspace tools, or conversation history.
 

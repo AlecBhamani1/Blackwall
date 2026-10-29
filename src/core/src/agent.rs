@@ -268,12 +268,15 @@ impl Agent<'_> {
                 }
             }
         }
-        if let Some(directory) = user_directory {
-            self.approvals
+        // The owner's rules and this project's `.blackwall/project.json` rules, read every run.
+        let project_warnings = match user_directory {
+            Some(directory) => self
+                .approvals
                 .load_policy(request_id, directory, &self.workspace.path)
                 .await
-                .map_err(tools::ToolError::Execution)?;
-        }
+                .map_err(tools::ToolError::Execution)?,
+            None => vec![],
+        };
         let command_tools = match user_directory {
             Some(directory) => crate::command_tools::CommandTools::load(directory).await,
             None => Default::default(),
@@ -303,6 +306,7 @@ impl Agent<'_> {
         })
         .await?;
         guidance.warnings.extend(command_tools.error.clone());
+        guidance.warnings.extend(project_warnings);
         if !compact
             && source.last().is_some_and(|message| {
                 message["role"] == "user"

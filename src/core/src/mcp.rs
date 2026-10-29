@@ -708,7 +708,7 @@ pub(crate) fn valid_tool_rule(rule: &str) -> bool {
     }
 }
 
-fn valid_server_name(name: &str) -> bool {
+pub(crate) fn valid_server_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name
             .bytes()
@@ -716,7 +716,7 @@ fn valid_server_name(name: &str) -> bool {
 }
 
 /// Model tool names must stay within the common function-name alphabet and length.
-fn valid_tool_name(name: &str) -> bool {
+pub(crate) fn valid_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .bytes()
