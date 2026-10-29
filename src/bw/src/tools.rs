@@ -11,8 +11,10 @@ const USAGE: &str = "Use bw tools secret <tool> <NAME> [--delete], with the valu
 pub fn run(directory: &Path, args: &[String]) -> Result<(), String> {
     match args {
         [command, tool, key, flag] if command == "secret" && flag == "--delete" => {
-            let origin = command_tools::delete_secret(directory, tool, key)?;
-            println!("Removed {key} for {origin}.");
+            match command_tools::delete_secret(directory, tool, key)? {
+                (origin, true) => println!("Removed {key} for {origin}."),
+                (origin, false) => println!("Nothing saved: {key} had no value for {origin}."),
+            }
         }
         [command, tool, key] if command == "secret" => {
             if std::io::stdin().is_terminal() {

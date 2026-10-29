@@ -150,7 +150,14 @@ impl ValueType {
         match self {
             Self::String => value.is_string(),
             Self::Number => value.is_number(),
-            Self::Integer => value.is_i64() || value.is_u64(),
+            // JSON has one number type, so a whole-number float such as `3.0` is an integer.
+            Self::Integer => {
+                value.is_i64()
+                    || value.is_u64()
+                    || value
+                        .as_f64()
+                        .is_some_and(|n| n.is_finite() && n.fract() == 0.0)
+            }
             Self::Boolean => value.is_boolean(),
         }
     }
@@ -240,6 +247,14 @@ pub fn validate_arguments(schema: &Schema, args: &Value) -> Result<(), ToolError
 }
 
 impl CommandTool {
+    /// The approval kind a call asks with: Network for HTTP tools, Exec for programs.
+    pub fn approval_kind(&self) -> ApprovalKind {
+        match self.kind {
+            ToolKind::Command => ApprovalKind::Exec,
+            ToolKind::Http => ApprovalKind::Network,
+        }
+    }
+
     /// Placeholder names in first-use order, each once: argv placeholders, or URL placeholders.
     fn placeholders(&self) -> Vec<&str> {
         let names: Vec<&str> = match self.kind {
@@ -282,8 +297,18 @@ impl CommandTool {
     /// The text a placeholder becomes. Without an owner schema only strings are accepted, as
     /// before schemas existed; with one, numbers and booleans are written as JSON writes them.
     fn value_text(&self, values: &Value, name: &str) -> Result<String, ToolError> {
+        let integer = self.parameters.as_ref().is_some_and(|schema| {
+            schema
+                .properties
+                .get(name)
+                .is_some_and(|property| property.kind == ValueType::Integer)
+        });
         let text = match values.get(name) {
             Some(Value::String(text)) => text.clone(),
+            // `3.0` for an integer is written `3`, as the owner's program or service expects.
+            Some(Value::Number(number)) if integer && !number.is_i64() && !number.is_u64() => {
+                format!("{:.0}", number.as_f64().ok_or(ToolError::Arguments)?)
+            }
             Some(value @ (Value::Number(_) | Value::Bool(_))) if self.parameters.is_some() => {
                 value.to_string()
             }
@@ -326,8 +351,22 @@ impl CommandTool {
         secrets: http::Lookup,
     ) -> Result<String, ToolError> {
         let values: Value = serde_json::from_str(arguments).map_err(|_| ToolError::Arguments)?;
-        if let Some(schema) = &self.parameters {
-            validate_arguments(schema, &values)?;
+        match &self.parameters {
+            Some(schema) => validate_arguments(schema, &values)?,
+            // Arguments sent whole, on stdin or as a body, follow the placeholder schema exactly;
+            // argv-only tools still ignore names they do not use, as before schemas existed.
+            None if self.stdin == StdinMode::Json || self.body == BodyMode::Json => {
+                let names = self.placeholders();
+                let object = values.as_object().ok_or(ToolError::Arguments)?;
+                if names.iter().any(|name| !object.contains_key(*name))
+                    || object
+                        .iter()
+                        .any(|(name, value)| !value.is_string() || !names.contains(&name.as_str()))
+                {
+                    return Err(ToolError::Arguments);
+                }
+            }
+            None => {}
         }
         if self.kind == ToolKind::Http {
             return http::run(self, &values, request_id, approvals, emit, timeout, secrets).await;
@@ -443,7 +482,7 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .bytes()
@@ -878,6 +917,60 @@ mod tests {
         assert!(detail.contains("Standard input: JSON,"), "{detail}");
         assert!(detail.contains("sha256 "), "{detail}");
         drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdin_json_without_parameters_takes_only_placeholders() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"ask","description":"Ask","command":["ask","{prompt}"],"stdin":"json"}]}"#,
+        )
+        .await;
+        assert!(tools.error.is_none(), "{:?}", tools.error);
+        let workspace = crate::tools::Workspace::open(&directory).unwrap();
+        let approvals = Approvals::default();
+        let never = |_: AgentEvent| panic!("invalid arguments never ask for approval");
+        for arguments in [
+            r#"{"prompt":"a","extra":"b"}"#,
+            r#"{"prompt":{"nested":"a"}}"#,
+            r#"{"prompt":"a","more":{"nested":1}}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                matches!(
+                    tools
+                        .get("ask")
+                        .unwrap()
+                        .run(
+                            &workspace,
+                            arguments,
+                            "run",
+                            &approvals,
+                            &never,
+                            Duration::from_secs(10)
+                        )
+                        .await,
+                    Err(ToolError::Arguments)
+                ),
+                "{arguments}"
+            );
+        }
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn integer_accepts_whole_number_floats() {
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"issue","description":"Issue","command":["issue","{n}"],"parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}]}"#,
+        )
+        .await;
+        let tool = tools.get("issue").unwrap();
+        let schema = tool.parameters.as_ref().unwrap();
+        assert!(validate_arguments(schema, &json!({"n":3.0})).is_ok());
+        assert!(validate_arguments(schema, &json!({"n":3.5})).is_err());
+        assert_eq!(tool.value_text(&json!({"n":3.0}), "n").unwrap(), "3");
+        assert_eq!(tool.value_text(&json!({"n":-4}), "n").unwrap(), "-4");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 }

@@ -112,8 +112,30 @@ impl Approvals {
         detail: String,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
-        self.decide(request_id, kind, subject, None, detail, emit)
+        self.decide(request_id, kind, subject, None, None, detail, emit)
             .await
+    }
+    /// An owner HTTP command tool's request, asked with kind Network; `host` is the subject. See
+    /// [`Policy::evaluate_http_tool`] for which rules apply.
+    pub async fn request_http_tool(
+        &self,
+        request_id: &str,
+        tool: &str,
+        host: &str,
+        credentialed: bool,
+        detail: String,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<bool, String> {
+        self.decide(
+            request_id,
+            ApprovalKind::Network,
+            host,
+            None,
+            Some((tool, credentialed)),
+            detail,
+            emit,
+        )
+        .await
     }
     /// MCP calls match `tool` rules, and the owner can save one from the prompt.
     pub async fn request_tool(
@@ -129,17 +151,20 @@ impl Approvals {
             ApprovalKind::Exec,
             &subject,
             Some(tool),
+            None,
             detail,
             emit,
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn decide(
         &self,
         request_id: &str,
         kind: ApprovalKind,
         subject: &str,
         tool: Option<ApprovalTool>,
+        http_tool: Option<(&str, bool)>,
         detail: String,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
@@ -158,9 +183,12 @@ impl Approvals {
             let answer = self.ask(request_id, kind, None, detail, emit, true).await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
-        let verdict = match tool {
-            Some(_) => policy.evaluate_tool(subject),
-            None => policy.evaluate(kind, subject),
+        let verdict = match (&tool, http_tool) {
+            (Some(_), _) => policy.evaluate_tool(subject),
+            (None, Some((name, credentialed))) => {
+                policy.evaluate_http_tool(name, subject, credentialed)
+            }
+            (None, None) => policy.evaluate(kind, subject),
         };
         let decision = verdict.decision;
         let mut saved = None;
@@ -249,12 +277,15 @@ impl Approvals {
     }
     /// A tool call the model wrote as text always asks, whatever rules are saved, and the
     /// answer is never remembered, not even for an identical call later in the run. `kind` is
-    /// what the tool does. The tool's own checks still apply after this, except that an approved
-    /// web call does not ask again for its first request; call [`Self::end_text_call`] after it.
+    /// what the tool does. The tool's own checks still apply after this. With `covers_request`,
+    /// an approved web call does not ask again for its first request; call
+    /// [`Self::end_text_call`] after it. Owner HTTP tools pass `false`, so the owner still sees
+    /// the prompt with the resolved URL.
     pub async fn confirm_text_call(
         &self,
         request_id: &str,
         kind: ApprovalKind,
+        covers_request: bool,
         name: &str,
         arguments: &str,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
@@ -267,7 +298,7 @@ impl Approvals {
             .ask(request_id, kind, None, detail, emit, false)
             .await?
             != ApprovalDecision::Deny;
-        if allowed && kind == ApprovalKind::Network {
+        if allowed && covers_request && kind == ApprovalKind::Network {
             self.0
                 .lock()
                 .map_err(|_| "The approval registry is unavailable.")?
@@ -772,7 +803,14 @@ mod tests {
         let arguments = format!(r#"{{"path":"a.txt","content":"{}"}}"#, "x".repeat(20_000));
         for _ in 0..2 {
             assert!(approvals
-                .confirm_text_call("run", ApprovalKind::File, "write_file", &arguments, &emit)
+                .confirm_text_call(
+                    "run",
+                    ApprovalKind::File,
+                    true,
+                    "write_file",
+                    &arguments,
+                    &emit
+                )
                 .await
                 .unwrap());
         }
@@ -808,7 +846,14 @@ mod tests {
         let (_, allow) = answer_all(&approvals, ApprovalDecision::Allow);
         let arguments = r#"{"url":"https://docs.rs"}"#;
         assert!(approvals
-            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &allow)
+            .confirm_text_call(
+                "run",
+                ApprovalKind::Network,
+                true,
+                "web_fetch",
+                arguments,
+                &allow
+            )
             .await
             .unwrap());
         assert!(approvals
@@ -835,7 +880,14 @@ mod tests {
             .unwrap());
         // An unused approval ends with its call.
         approvals
-            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &allow)
+            .confirm_text_call(
+                "run",
+                ApprovalKind::Network,
+                true,
+                "web_fetch",
+                arguments,
+                &allow,
+            )
             .await
             .unwrap();
         approvals.end_text_call("run");
@@ -851,7 +903,14 @@ mod tests {
             .unwrap());
         // A denied text call grants nothing.
         approvals
-            .confirm_text_call("run", ApprovalKind::Network, "web_fetch", arguments, &deny)
+            .confirm_text_call(
+                "run",
+                ApprovalKind::Network,
+                true,
+                "web_fetch",
+                arguments,
+                &deny,
+            )
             .await
             .unwrap();
         assert!(!approvals

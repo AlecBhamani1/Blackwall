@@ -6,12 +6,7 @@ use super::{
     shown_bytes, valid_name, BodyMode, CommandTool, Method, StdinMode, ToolKind,
     COMMAND_TOOLS_FILE, MAX_FILE_BYTES,
 };
-use crate::{
-    approvals::Approvals,
-    protocol::{AgentEvent, ApprovalKind},
-    secrets::SecretError,
-    tools::ToolError,
-};
+use crate::{approvals::Approvals, protocol::AgentEvent, secrets::SecretError, tools::ToolError};
 use futures_util::StreamExt;
 use reqwest::{
     header::{HeaderName, HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, USER_AGENT},
@@ -27,6 +22,8 @@ use std::{io::Read, path::Path, sync::Arc, time::Duration};
 pub const SECRET_SERVICE: &str = "com.blackwall.tools";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_URL: usize = 2048;
+/// The longest request URL once values are filled in.
+const MAX_RESOLVED_URL: usize = 8 * 1024;
 const MAX_HEADERS: usize = 8;
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 /// How much of an error response is shown, after redaction.
@@ -48,16 +45,21 @@ const RESERVED_HEADERS: [&str; 13] = [
     "proxy-authorization",
     "proxy-connection",
 ];
-/// Query names whose values are hidden in the approval prompt.
-const SECRET_QUERY_NAMES: [&str; 8] = [
+/// Query names whose values are hidden in the approval prompt, matched exactly (ignoring case),
+/// as are names ending in `_key` or `_token`.
+const SECRET_QUERY_NAMES: [&str; 12] = [
     "token",
     "secret",
     "password",
     "passwd",
     "key",
+    "apikey",
     "auth",
     "signature",
+    "sig",
     "credential",
+    "credentials",
+    "client_secret",
 ];
 /// Value prefixes of common access tokens, hidden in the approval prompt whatever their name.
 const SECRET_VALUE_PREFIXES: [&str; 8] = [
@@ -246,6 +248,9 @@ impl<'a> Template<'a> {
         {
             return Err(ToolError::Arguments);
         }
+        if text.len() > MAX_RESOLVED_URL {
+            return Err(ToolError::Arguments);
+        }
         let url = Url::parse(&text).map_err(|_| ToolError::Arguments)?;
         if checked_origin(&url).ok().as_deref() != Some(self.origin.as_str()) {
             return Err(ToolError::Arguments);
@@ -302,6 +307,16 @@ pub(super) fn validate(tool: &CommandTool) -> Result<(), &'static str> {
     if tool.body == BodyMode::Json && tool.method != Some(Method::Post) {
         return Err("A JSON body needs method POST.");
     }
+    let mut names: Vec<String> = tool
+        .headers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.len() != tool.headers.len() {
+        return Err("A tool lists the same header twice.");
+    }
     if tool.headers.len() > MAX_HEADERS
         || tool.headers.iter().any(|(name, value)| {
             let plain = !name.is_empty()
@@ -328,7 +343,9 @@ fn shown(url: &Url) -> String {
         .map(|pair| match pair.split_once('=') {
             Some((name, value)) => {
                 let lower = name.to_ascii_lowercase();
-                let hidden = SECRET_QUERY_NAMES.iter().any(|word| lower.contains(word))
+                let hidden = SECRET_QUERY_NAMES.contains(&lower.as_str())
+                    || lower.ends_with("_key")
+                    || lower.ends_with("_token")
                     || SECRET_VALUE_PREFIXES
                         .iter()
                         .any(|prefix| value.starts_with(prefix));
@@ -454,8 +471,11 @@ pub(super) async fn run(
         "\nRequest sha256: {digest}\n\nThe service receives this request and your network address. Its response is treated as untrusted information."
     ));
     let host = url.host_str().unwrap_or_default().to_owned();
+    // A request that carries saved credentials or model-written data is allowed only by a rule
+    // naming this tool; a host allow alone still asks. Deny and ask rules for the host apply.
+    let credentialed = !tool.headers.is_empty() || tool.body == BodyMode::Json;
     if !approvals
-        .request(request_id, ApprovalKind::Network, &host, detail, emit)
+        .request_http_tool(request_id, &tool.name, &host, credentialed, detail, emit)
         .await
         .map_err(ToolError::Execution)?
     {
@@ -515,7 +535,9 @@ pub(super) async fn run(
         )));
     }
     // Without a decoder the streamed bytes are the response bytes, so the cap counts what the
-    // model would read. A compressed body could inflate past it, so it is refused.
+    // model would read. A compressed body could inflate past it, so it is refused. If reqwest's
+    // gzip, brotli, deflate or zstd feature is ever enabled, `http_tool_cap_counts_decompressed_bytes`
+    // in `http/tests.rs` is the guard: it must keep passing with the cap counted after decoding.
     if response
         .headers()
         .get(CONTENT_ENCODING)
@@ -603,14 +625,21 @@ pub fn save_secret(directory: &Path, tool: &str, key: &str, value: &str) -> Resu
     Ok(origin)
 }
 
-/// Remove the header value saved for the origin of HTTP tool `tool`. Blocking.
-pub fn delete_secret(directory: &Path, tool: &str, key: &str) -> Result<String, String> {
+/// Remove the header value saved for the origin of HTTP tool `tool`. Blocking. Returns the
+/// origin and whether a value was saved.
+pub fn delete_secret(directory: &Path, tool: &str, key: &str) -> Result<(String, bool), String> {
     if !crate::mcp::valid_secret_name(key) {
         return Err("Use a name of uppercase letters, digits, and _, such as GITLAB_TOKEN.".into());
     }
     let origin = tool_origin(directory, tool)?;
-    crate::secrets::delete(SECRET_SERVICE, &account(&origin, key)).map_err(store_error)?;
-    Ok(origin)
+    let account = account(&origin, key);
+    let saved = crate::secrets::get(SECRET_SERVICE, &account)
+        .map_err(store_error)?
+        .is_some();
+    if saved {
+        crate::secrets::delete(SECRET_SERVICE, &account).map_err(store_error)?;
+    }
+    Ok((origin, saved))
 }
 
 #[cfg(test)]

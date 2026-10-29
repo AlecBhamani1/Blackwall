@@ -711,6 +711,7 @@ async fn chat_traced(
                         .confirm_text_call(
                             request_id,
                             crate::approvals::text_call_kind(&call.function.name),
+                            true,
                             &call.function.name,
                             &call.function.arguments,
                             emit,

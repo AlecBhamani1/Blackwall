@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     command_tools::{CommandTools, COMMAND_TOOLS_FILE},
-    protocol::{ApprovalDecision, ResolveApprovalRequest},
+    protocol::{ApprovalDecision, ApprovalKind, ResolveApprovalRequest},
 };
 use serde_json::json;
 use std::sync::Mutex;
@@ -708,4 +708,231 @@ async fn http_tool_ignores_proxy_env() {
     assert!(status.success());
     assert_eq!(requests(&seen).len(), 1);
     assert!(requests(&proxied).is_empty());
+}
+
+#[tokio::test]
+async fn http_tool_body_json_without_parameters_takes_only_placeholders() {
+    let (origin, log) = serve(ok("{}")).await;
+    let (tools, directory) = tool(json!({
+        "name":"note","description":"Note","kind":"http","method":"POST","body":"json",
+        "url":format!("{origin}/notes/{{id}}")
+    }))
+    .await;
+    let approvals = Approvals::default();
+    let (emit, _) = allow_all(&approvals);
+    for arguments in [
+        json!({"id":"a","extra":"b"}),
+        json!({"id":{"nested":"a"}}),
+        json!({"id":["a"]}),
+        json!({}),
+    ] {
+        assert!(
+            matches!(
+                call(
+                    &tools,
+                    &directory,
+                    "note",
+                    arguments.clone(),
+                    &approvals,
+                    &emit,
+                    no_secrets()
+                )
+                .await,
+                Err(ToolError::Arguments)
+            ),
+            "{arguments}"
+        );
+    }
+    assert!(requests(&log).is_empty());
+    call(
+        &tools,
+        &directory,
+        "note",
+        json!({"id":"a"}),
+        &approvals,
+        &emit,
+        no_secrets(),
+    )
+    .await
+    .unwrap();
+    assert!(requests(&log)[0].ends_with(r#"{"id":"a"}"#));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn http_tool_text_call_confirms_as_network_and_still_shows_the_request() {
+    let (origin, log) = serve(ok("{}")).await;
+    let (tools, directory) = tool(json!({
+        "name":"lookup","description":"Look up","kind":"http","url":format!("{origin}/items/{{id}}")
+    }))
+    .await;
+    let tool = tools.get("lookup").unwrap();
+    assert_eq!(tool.approval_kind(), ApprovalKind::Network);
+    let approvals = Approvals::default();
+    let (emit, asked) = allow_all(&approvals);
+    let arguments = r#"{"id":"one"}"#;
+    assert!(approvals
+        .confirm_text_call(
+            "run",
+            tool.approval_kind(),
+            false,
+            "lookup",
+            arguments,
+            &emit
+        )
+        .await
+        .unwrap());
+    call(
+        &tools,
+        &directory,
+        "lookup",
+        json!({"id":"one"}),
+        &approvals,
+        &emit,
+        no_secrets(),
+    )
+    .await
+    .unwrap();
+    approvals.end_text_call("run");
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[0].0, ApprovalKind::Network);
+    assert!(asked[0].1.contains("wrote this tool call as text"));
+    assert_eq!(asked[1].0, ApprovalKind::Network);
+    assert!(asked[1]
+        .1
+        .contains(&format!("Request: GET {origin}/items/one")));
+    assert_eq!(requests(&log).len(), 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn http_tool_credentialed_request_needs_a_tool_rule() {
+    let (origin, log) = serve(ok("{}")).await;
+    let (tools, directory) = tool(json!({
+        "name":"post_note","description":"Post","kind":"http","method":"POST","body":"json",
+        "url":format!("{origin}/notes"),"headers":{"authorization":"{secret:NOTES_TOKEN}"}
+    }))
+    .await;
+    let secret: Lookup = Arc::new(|_: &str| Ok(Some("value".into())));
+    let owner =
+        std::env::temp_dir().join(format!("blackwall-http-rules-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&owner).unwrap();
+    let rules = |rules: Value| {
+        std::fs::write(
+            owner.join(crate::policy::POLICY_FILE),
+            json!({"rules":rules}).to_string(),
+        )
+        .unwrap();
+    };
+    // A host allow does not authorize a credentialed POST: it still asks.
+    rules(json!([{"decision":"allow","kind":"network","host":"127.0.0.1"}]));
+    let approvals = Approvals::default();
+    approvals.load_global_policy("run", &owner).await.unwrap();
+    let (emit, asked) = allow_all(&approvals);
+    call(
+        &tools,
+        &directory,
+        "post_note",
+        json!({}),
+        &approvals,
+        &emit,
+        secret.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    // An allow rule naming the tool does.
+    rules(json!([{"decision":"allow","kind":"network","tool":"post_note"}]));
+    let approvals = Approvals::default();
+    approvals.load_global_policy("run", &owner).await.unwrap();
+    let never = |_: AgentEvent| panic!("a tool rule answers without a prompt");
+    call(
+        &tools,
+        &directory,
+        "post_note",
+        json!({}),
+        &approvals,
+        &never,
+        secret.clone(),
+    )
+    .await
+    .unwrap();
+    // A host deny still blocks it.
+    rules(json!([
+        {"decision":"allow","kind":"network","tool":"post_note"},
+        {"decision":"deny","kind":"network","host":"127.0.0.1"}
+    ]));
+    let approvals = Approvals::default();
+    approvals.load_global_policy("run", &owner).await.unwrap();
+    assert!(matches!(
+        call(
+            &tools,
+            &directory,
+            "post_note",
+            json!({}),
+            &approvals,
+            &never,
+            secret
+        )
+        .await,
+        Err(ToolError::Denied)
+    ));
+    assert_eq!(requests(&log).len(), 2);
+    // A tool rule for another tool, or an invalid tool name, never matches.
+    rules(json!([{"decision":"allow","kind":"network","tool":"Bad-Name"}]));
+    assert!(crate::policy::Policy::load_global(&owner)
+        .await
+        .error
+        .is_some());
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(owner).unwrap();
+}
+
+#[tokio::test]
+async fn http_tool_resolved_url_is_capped() {
+    let (tools, directory) = tool(json!({
+        "name":"lookup","description":"Look up","kind":"http","url":"https://example.com/items/{id}"
+    }))
+    .await;
+    let approvals = Approvals::default();
+    let never = |_: AgentEvent| panic!("an oversized URL never asks");
+    // 3,000 slashes encode to 9,000 bytes, over the 8 KiB limit.
+    assert!(matches!(
+        call(
+            &tools,
+            &directory,
+            "lookup",
+            json!({"id":"/".repeat(3000)}),
+            &approvals,
+            &never,
+            no_secrets()
+        )
+        .await,
+        Err(ToolError::Arguments)
+    ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn secret_query_names_match_exactly_or_by_suffix() {
+    let url = Url::parse(
+        "https://example.com/?monkey=1&keyboard=2&Key=3&api_key=4&private_token=5&tokens=6&sig=7",
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&url),
+        "https://example.com/?monkey=1&keyboard=2&Key=[redacted]&api_key=[redacted]&private_token=[redacted]&tokens=6&sig=[redacted]"
+    );
+}
+
+#[tokio::test]
+async fn http_tool_header_names_unique_ignoring_case() {
+    let (tools, directory) = load_file(json!({"tools":[{
+        "name":"x","description":"X","kind":"http","url":"https://example.com/",
+        "headers":{"X-Token":"{secret:A}","x-token":"{secret:B}"}
+    }]}))
+    .await;
+    assert!(tools.error.is_some());
+    std::fs::remove_dir_all(directory).unwrap();
 }
