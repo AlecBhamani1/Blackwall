@@ -68,7 +68,7 @@ records acceptance approval **before** production changes. Every production prom
 increment `.github/release.json`, commit matching release notes, and belong to its version
 milestone. Follow [the repository workflow](REPOSITORY_WORKFLOW.md) for the full checklist.
 
-1. Complete applicable [native and distribution acceptance checks](NATIVE_ACCEPTANCE.md),
+1. Complete the applicable [release checklist](RELEASE_CHECKLIST.md) items,
    recording evidence and remaining limitations in the release notes. Start a preparation branch
    from `partial` and use `npm run release:prepare -- 0.1.4` to create the next release plan.
 2. Merge the preparation work into `partial`, then open a `partial` → `main` PR. Assign its
