@@ -1,6 +1,6 @@
 //! Streamable HTTP for MCP 2025-06-18: every message is a POST whose reply is JSON or a bounded
 //! event stream, inside one `Mcp-Session-Id` session.
-use super::{transport::Transport, ServerConfig, MAX_MESSAGE_BYTES};
+use super::{transport::Transport, MAX_MESSAGE_BYTES};
 use crate::tools::ToolError;
 use futures_util::future::BoxFuture;
 use reqwest::{
@@ -10,31 +10,42 @@ use reqwest::{
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};
 
-const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_SESSION_BYTES: usize = 128;
 const MAX_URL_BYTES: usize = 2048;
 const MAX_REDIRECTS: usize = 5;
+/// Messages read from one reply but not yet handled.
+const MAX_PENDING: usize = 256;
 const SESSION: &str = "mcp-session-id";
 const VERSION: &str = "mcp-protocol-version";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Headers the transport sets itself.
-const RESERVED: [&str; 9] = [
+/// Headers the transport or HTTP itself owns, and credentials meant for a proxy or a browser.
+const RESERVED: [&str; 15] = [
     "accept",
     "connection",
     "content-length",
     "content-type",
+    "cookie",
+    "expect",
     "host",
+    "keep-alive",
     "mcp-protocol-version",
     "mcp-session-id",
+    "proxy-authorization",
     "te",
+    "trailer",
     "transfer-encoding",
+    "upgrade",
 ];
 
 fn failed(text: &str) -> ToolError {
     ToolError::Execution(text.into())
 }
 
-/// https anywhere, plain http only to a literal loopback host, and never credentials in the URL.
+fn stopped() -> ToolError {
+    failed("The MCP server stopped responding.")
+}
+
+/// https anywhere, plain http only to literal loopback addresses, never credentials in the URL.
 pub(super) fn valid_url(url: &str) -> bool {
     let Ok(parsed) = Url::parse(url) else {
         return false;
@@ -45,13 +56,20 @@ pub(super) fn valid_url(url: &str) -> bool {
         && parsed.password().is_none()
         && match parsed.scheme() {
             "https" => !host.is_empty(),
-            "http" => ["127.0.0.1", "[::1]", "localhost"].contains(&host),
+            "http" => ["127.0.0.1", "[::1]"].contains(&host),
             _ => false,
         }
 }
 
+/// `scheme://host[:port]`, which header secrets are bound to.
+pub(super) fn origin(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
 /// The secret named by a `{secret:NAME}` header value.
-fn secret_reference(value: &str) -> Option<&str> {
+pub(super) fn secret_reference(value: &str) -> Option<&str> {
     let name = value.strip_prefix("{secret:")?.strip_suffix('}')?;
     ((1..=64).contains(&name.len())
         && name
@@ -69,29 +87,17 @@ pub(super) fn valid_header(name: &str, value: &str) -> bool {
         && secret_reference(value).is_some_and(super::valid_secret_name)
 }
 
-/// Resolve a server's headers from its secrets, read from the credential store.
-pub(super) fn headers(
-    config: &ServerConfig,
-    secrets: &[(String, String)],
-) -> Result<HeaderMap, ToolError> {
+/// Build headers from `(header name, value)` pairs read for the server's current origin.
+pub(super) fn headers(values: &[(String, String)]) -> Result<HeaderMap, ToolError> {
     let mut headers = HeaderMap::new();
-    for (name, reference) in &config.headers {
-        let key = secret_reference(reference).unwrap_or_default();
-        let value = secrets
-            .iter()
-            .find(|(saved, _)| saved == key)
-            .map(|(_, value)| value)
-            .ok_or_else(|| {
-                ToolError::Execution(format!(
-                    "{key} is not saved. Add it with bw mcp secret {} {key}.",
-                    config.name
-                ))
-            })?;
+    for (name, value) in values {
+        let mut value = HeaderValue::from_str(value).map_err(|_| {
+            ToolError::Execution(format!(
+                "The {name} secret cannot be sent in an HTTP header."
+            ))
+        })?;
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| failed("An MCP server header name is not valid."))?;
-        let mut value = HeaderValue::from_str(value).map_err(|_| {
-            ToolError::Execution(format!("{key} cannot be sent in an HTTP header."))
-        })?;
         value.set_sensitive(true);
         headers.insert(name, value);
     }
@@ -104,17 +110,40 @@ fn valid_session(id: &[u8]) -> bool {
         && id.iter().all(|byte| (0x21..=0x7e).contains(byte))
 }
 
-/// Follow redirects only within the server's origin, so headers never reach another host.
+/// Follow only 307 and 308, which keep the POST, and only within the server's origin, so headers
+/// never reach another host. Other redirects come back as errors.
 fn same_origin(attempt: redirect::Attempt) -> redirect::Action {
     let first = attempt.previous().first().map(Url::origin);
-    if attempt.previous().len() <= MAX_REDIRECTS && first == Some(attempt.url().origin()) {
+    let keeps_post = matches!(
+        attempt.status(),
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    );
+    if keeps_post
+        && attempt.previous().len() <= MAX_REDIRECTS
+        && first == Some(attempt.url().origin())
+    {
         attempt.follow()
     } else {
         attempt.stop()
     }
 }
 
-/// Server-sent events from one response, bounded in total and per line.
+/// Queue a JSON-RPC message or batch, keeping only objects.
+fn queue(message: Value, out: &mut VecDeque<Value>) -> bool {
+    match message {
+        Value::Array(messages) => {
+            out.extend(messages.into_iter().filter(Value::is_object));
+            true
+        }
+        message if message.is_object() => {
+            out.push_back(message);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Server-sent events from one response, bounded in total, which also bounds each line.
 #[derive(Default)]
 struct EventParser {
     line: Vec<u8>,
@@ -132,8 +161,6 @@ impl EventParser {
             if byte == b'\n' {
                 let line = std::mem::take(&mut self.line);
                 self.field(&line, out);
-            } else if self.line.len() == MAX_LINE_BYTES {
-                return Err(failed("The MCP server sent an event line over 64 KiB."));
             } else {
                 self.line.push(byte);
             }
@@ -159,9 +186,7 @@ impl EventParser {
     fn dispatch(&mut self, out: &mut VecDeque<Value>) {
         let data = std::mem::take(&mut self.data);
         if let Ok(message) = serde_json::from_slice::<Value>(&data) {
-            if message.is_object() {
-                out.push_back(message);
-            }
+            queue(message, out);
         }
     }
 
@@ -183,8 +208,12 @@ pub(super) struct HttpTransport {
     headers: HeaderMap,
     session: Option<HeaderValue>,
     version: Option<HeaderValue>,
+    /// Set when the server forgot the session, so the connection can initialize again.
+    expired: bool,
     pending: VecDeque<Value>,
-    streams: VecDeque<EventStream>,
+    /// The event stream of the request in flight. Only requests keep a reply stream open, and
+    /// each new request replaces it, so there is never more than one.
+    stream: Option<EventStream>,
 }
 
 impl HttpTransport {
@@ -206,8 +235,9 @@ impl HttpTransport {
             headers,
             session: None,
             version: None,
+            expired: false,
             pending: VecDeque::new(),
-            streams: VecDeque::new(),
+            stream: None,
         })
     }
 
@@ -236,6 +266,12 @@ impl HttpTransport {
     }
 
     async fn post(&mut self, message: &Value) -> Result<(), ToolError> {
+        let request = message.get("method").is_some() && message.get("id").is_some();
+        if request {
+            // Anything left from an earlier request is stale and must not block this one.
+            self.stream = None;
+            self.pending.clear();
+        }
         let body = serde_json::to_vec(message).map_err(|_| ToolError::Arguments)?;
         let response = self
             .client
@@ -249,9 +285,15 @@ impl HttpTransport {
             .map_err(|_| failed("The MCP server could not be reached."))?;
         self.keep_session(&response)?;
         let status = response.status();
+        if status == StatusCode::NOT_FOUND && self.session.is_some() {
+            self.session = None;
+            self.version = None;
+            self.expired = true;
+            return Err(failed("The MCP server ended the session."));
+        }
         if status.is_redirection() {
             return Err(failed(
-                "The MCP server redirected to another address, which Blackwall does not follow.",
+                "The MCP server redirected to another address or with a redirect that drops the request, which Blackwall does not follow.",
             ));
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -266,6 +308,11 @@ impl HttpTransport {
                 status.as_u16()
             )));
         }
+        // Notifications and replies expect 202 Accepted. Whatever else comes back is closed
+        // unread, so it can never pile up.
+        if !request || status == StatusCode::ACCEPTED {
+            return Ok(());
+        }
         let kind = response
             .headers()
             .get(CONTENT_TYPE)
@@ -273,32 +320,35 @@ impl HttpTransport {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if kind.starts_with("text/event-stream") {
-            self.streams.push_back(EventStream {
+            self.stream = Some(EventStream {
                 response,
                 parser: EventParser::default(),
             });
-        } else if kind.starts_with("application/json") {
-            let body = read_bounded(response).await?;
-            match serde_json::from_slice::<Value>(&body) {
-                Ok(Value::Array(messages)) => self
-                    .pending
-                    .extend(messages.into_iter().filter(Value::is_object)),
-                Ok(message) if message.is_object() => self.pending.push_back(message),
-                _ => return Err(failed("The MCP server sent a reply that is not JSON-RPC.")),
-            }
+            return Ok(());
         }
-        // 202 Accepted, for notifications and replies, carries nothing.
+        let body = read_bounded(response).await?;
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        let queued = serde_json::from_slice::<Value>(&body)
+            .is_ok_and(|message| queue(message, &mut self.pending));
+        if !queued {
+            return Err(failed("The MCP server sent a reply that is not JSON-RPC."));
+        }
+        self.bounded()
+    }
+
+    fn bounded(&self) -> Result<(), ToolError> {
+        if self.pending.len() > MAX_PENDING {
+            return Err(failed("The MCP server sent too many messages at once."));
+        }
         Ok(())
     }
 }
 
 async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, ToolError> {
     let mut body = vec![];
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| failed("The MCP server stopped responding."))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| stopped())? {
         if body.len() + chunk.len() > MAX_MESSAGE_BYTES {
             return Err(failed("The MCP server's reply exceeded 1 MiB."));
         }
@@ -318,16 +368,20 @@ impl Transport for HttpTransport {
                 if let Some(message) = self.pending.pop_front() {
                     return Ok(message);
                 }
-                let Some(stream) = self.streams.front_mut() else {
-                    return Err(failed("The MCP server stopped responding."));
+                let Some(stream) = self.stream.as_mut() else {
+                    return Err(stopped());
                 };
                 match stream.response.chunk().await {
-                    Ok(Some(chunk)) => stream.parser.feed(&chunk, &mut self.pending)?,
+                    Ok(Some(chunk)) => {
+                        stream.parser.feed(&chunk, &mut self.pending)?;
+                        self.bounded()?;
+                    }
                     Ok(None) => {
                         stream.parser.finish(&mut self.pending);
-                        self.streams.pop_front();
+                        self.stream = None;
+                        self.bounded()?;
                     }
-                    Err(_) => return Err(failed("The MCP server stopped responding.")),
+                    Err(_) => return Err(stopped()),
                 }
             }
         })
@@ -337,8 +391,12 @@ impl Transport for HttpTransport {
         self.version = HeaderValue::from_str(version).ok();
     }
 
+    fn expired(&mut self) -> bool {
+        std::mem::take(&mut self.expired)
+    }
+
     fn abandon(&mut self) {
-        self.streams.clear();
+        self.stream = None;
         self.pending.clear();
     }
 }
@@ -366,17 +424,20 @@ impl Drop for HttpTransport {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::{
-        parse, read_config, validate, validate_for, Connection, McpServers, Source, MCP_FILE,
-        PROTOCOL_VERSION,
+        header_accounts, parse, read_config, validate, validate_for, write_config, Connection,
+        McpServers, ServerConfig, Source, MAX_SERVER_REQUESTS, MCP_FILE, PROTOCOL_VERSION,
     };
     use super::*;
     use crate::{
         approvals::Approvals,
         protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
-        test_http::{response, serve_raw, Seen},
+        test_http::{open_events, response, serve_raw, Seen},
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     const SESSION_ID: &str = "session-1";
     const PROXY_CHILD: &str = "BLACKWALL_MCP_PROXY_CHILD";
@@ -465,6 +526,7 @@ mod tests {
             allow_tools: None,
             deny_tools: vec![],
             secrets: vec![],
+            secret_origins: BTreeMap::new(),
         }
     }
 
@@ -578,7 +640,6 @@ mod tests {
             "https://mcp.example.com/mcp",
             "http://127.0.0.1:8080/mcp",
             "http://[::1]:8080/mcp",
-            "http://localhost/mcp",
         ] {
             assert!(
                 validate(vec![url_server("a", allowed)]).is_ok(),
@@ -588,6 +649,7 @@ mod tests {
         for refused in [
             "http://mcp.example.com/mcp",
             "http://192.168.1.2/mcp",
+            "http://localhost/mcp",
             "http://localhost.example.com/mcp",
             "http://127.0.0.2/mcp",
             "https://user:pass@mcp.example.com/mcp",
@@ -620,16 +682,28 @@ mod tests {
             refused.err()
         );
         assert!(other.lock().unwrap().is_empty());
-        // A redirect within the origin is followed.
-        let (origin, _) = serve_raw(|seen| {
-            if seen.path == "/old" {
-                Some(response(307, &[("Location", "/mcp")], ""))
-            } else {
-                mcp(false)(seen)
-            }
-        })
-        .await;
-        assert!(connect(&format!("{origin}/old")).await.is_ok());
+        // 307 and 308 within the origin are followed; redirects that turn a POST into a GET are not.
+        for (status, followed) in [
+            (307, true),
+            (308, true),
+            (301, false),
+            (302, false),
+            (303, false),
+        ] {
+            let (origin, _) = serve_raw(move |seen| {
+                if seen.path == "/old" {
+                    Some(response(status, &[("Location", "/mcp")], ""))
+                } else {
+                    mcp(false)(seen)
+                }
+            })
+            .await;
+            assert_eq!(
+                connect(&format!("{origin}/old")).await.is_ok(),
+                followed,
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -652,6 +726,12 @@ mod tests {
             ),
             ("Mcp-Session-Id", "{secret:API_TOKEN}"),
             ("Host", "{secret:API_TOKEN}"),
+            ("Upgrade", "{secret:API_TOKEN}"),
+            ("Expect", "{secret:API_TOKEN}"),
+            ("Keep-Alive", "{secret:API_TOKEN}"),
+            ("Trailer", "{secret:API_TOKEN}"),
+            ("Proxy-Authorization", "{secret:API_TOKEN}"),
+            ("Cookie", "{secret:API_TOKEN}"),
             ("Bad Header", "{secret:API_TOKEN}"),
         ] {
             assert!(
@@ -684,12 +764,17 @@ mod tests {
         config
             .headers
             .insert("Authorization".into(), "{secret:API_TOKEN}".into());
-        config.secrets = vec!["API_TOKEN".into()];
-        let missing = super::headers(&config, &[]).unwrap_err();
+        let missing = header_accounts(&config).unwrap_err();
         assert!(
             matches!(&missing, ToolError::Execution(message) if message.contains("bw mcp secret docs API_TOKEN"))
         );
-        let environment = vec![("API_TOKEN".to_owned(), token.to_owned())];
+        config.secrets = vec!["API_TOKEN".into()];
+        config
+            .secret_origins
+            .insert("API_TOKEN".into(), origin.clone());
+        let accounts = header_accounts(&config).unwrap();
+        assert_eq!(accounts[0].2, format!("docs/{origin}/API_TOKEN"));
+        let environment = vec![("Authorization".to_owned(), token.to_owned())];
         let connection = super::super::launch(&config, &std::env::temp_dir(), environment)
             .await
             .unwrap();
@@ -738,15 +823,19 @@ mod tests {
             )
             .unwrap();
         parser
-            .feed(b"data: [1]\n\ndata: {\"b\":2}", &mut out)
+            .feed(b"data: [{\"c\":3},1]\n\ndata: {\"b\":2}", &mut out)
             .unwrap();
         parser.finish(&mut out);
-        assert_eq!(out, [json!({"a":1}), json!({"b":2})]);
+        assert_eq!(out, [json!({"a":1}), json!({"c":3}), json!({"b":2})]);
 
+        // One line may be as large as a whole message, as real tool lists are.
+        let mut out = VecDeque::new();
         let mut parser = EventParser::default();
-        let line = vec![b'x'; MAX_LINE_BYTES];
-        parser.feed(&line, &mut out).unwrap();
-        assert!(parser.feed(b"x", &mut out).is_err());
+        let big = json!({ "tools": "x".repeat(200 * 1024) });
+        parser
+            .feed(format!("data: {big}\n\n").as_bytes(), &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1);
 
         let mut parser = EventParser::default();
         let mut short = vec![b'x'; 1000];
@@ -755,6 +844,10 @@ mod tests {
             parser.feed(&short, &mut out).unwrap();
         }
         assert!(parser.feed(&short, &mut out).is_err());
+        let mut parser = EventParser::default();
+        assert!(parser
+            .feed(&vec![b'x'; MAX_MESSAGE_BYTES + 1], &mut out)
+            .is_err());
     }
 
     #[tokio::test]
@@ -843,11 +936,29 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), sent);
     }
 
-    #[test]
-    fn owner_name_with_p_prefix_rejected() {
-        let refused = validate(vec![url_server("p-docs", "https://mcp.example.com/mcp")]);
+    #[tokio::test]
+    async fn owner_name_with_p_prefix_rejected() {
+        let directory = folder("prefix");
+        let refused = super::super::add_http_server(
+            &directory,
+            "P docs",
+            "https://mcp.example.com/mcp",
+            vec![],
+        );
         assert!(refused.unwrap_err().contains("reserved"));
-        assert!(validate(vec![url_server("docs-p-1", "https://mcp.example.com/mcp")]).is_ok());
+        // An existing file with such a name still loads; only that server is skipped.
+        let (origin, _) = serve_raw(mcp(false)).await;
+        let file = json!({"servers":[
+            url_server("p-docs", &format!("{origin}/mcp")),
+            url_server("docs", &format!("{origin}/mcp"))
+        ]});
+        std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
+        assert_eq!(read_config(&directory).unwrap().len(), 2);
+        let servers = McpServers::start(&directory, &[]).await;
+        assert_eq!(servers.warnings.len(), 1);
+        assert!(servers.warnings[0].contains("p-docs") && servers.warnings[0].contains("rename"));
+        assert!(servers.handles("docs__search") && !servers.handles("p-docs__search"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -958,5 +1069,256 @@ mod tests {
         )
         .is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn secret_server(url: &str, saved_for: Option<&str>) -> ServerConfig {
+        let mut config = url_server("docs", url);
+        config
+            .headers
+            .insert("Authorization".into(), "{secret:API_TOKEN}".into());
+        config.secrets = vec!["API_TOKEN".into()];
+        if let Some(origin) = saved_for {
+            config
+                .secret_origins
+                .insert("API_TOKEN".into(), origin.into());
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn editing_the_url_sends_no_header() {
+        let (old, _) = serve_raw(mcp(false)).await;
+        let (new, log) = serve_raw(mcp(false)).await;
+        let directory = folder("moved");
+        let file = json!({"servers":[secret_server(&format!("{new}/mcp"), Some(&old))]});
+        std::fs::write(directory.join(MCP_FILE), file.to_string()).unwrap();
+        // The secret is refused before the credential store or the new address is contacted.
+        let servers = McpServers::start(&directory, &[]).await;
+        assert!(
+            servers.warnings[0].contains(&format!("was saved for {old}, not {new}")),
+            "{:?}",
+            servers.warnings
+        );
+        assert!(log.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stdio_secret_is_not_sent_as_header() {
+        let config = secret_server("https://mcp.example.com/mcp", None);
+        assert_eq!(config.account("API_TOKEN"), "docs/API_TOKEN");
+        let refused = header_accounts(&config).unwrap_err();
+        assert!(
+            matches!(&refused, ToolError::Execution(message) if message.contains("local command"))
+        );
+    }
+
+    #[test]
+    fn moving_a_server_drops_its_approval_rules() {
+        let directory = folder("rules");
+        let keep = || url_server("keep", "https://k.example.com/mcp");
+        write_config(
+            &directory,
+            vec![url_server("docs", "https://a.example.com/mcp"), keep()],
+        )
+        .unwrap();
+        crate::policy::allow_tool(&directory, "docs", None).unwrap();
+        crate::policy::allow_tool(&directory, "keep__search", None).unwrap();
+        // A new path on the same origin keeps them.
+        write_config(
+            &directory,
+            vec![url_server("docs", "https://a.example.com/v2"), keep()],
+        )
+        .unwrap();
+        assert_eq!(crate::policy::tool_rules(&directory).unwrap().len(), 2);
+        write_config(
+            &directory,
+            vec![url_server("docs", "https://b.example.com/mcp"), keep()],
+        )
+        .unwrap();
+        let rules = crate::policy::tool_rules(&directory).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "keep__search");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn descriptions_and_schemas_are_redacted() {
+        let (origin, _) = serve_raw(|seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            if request["method"] == "tools/list" {
+                return Some(json_reply(
+                    &request["id"],
+                    json!({"tools":[{
+                        "name":"search",
+                        "description":"uses token-123",
+                        "inputSchema":{"type":"object","properties":{"q":{"description":"not token-123"}}}
+                    }]}),
+                ));
+            }
+            mcp(false)(seen)
+        })
+        .await;
+        let url = format!("{origin}/mcp");
+        let transport = HttpTransport::new(&url, HeaderMap::new()).unwrap();
+        let mut connection = Connection::new(Box::new(transport), vec!["token-123".into()]);
+        connection.initialize().await.unwrap();
+        let mut servers = McpServers::default();
+        servers
+            .add(url_server("docs", &url), connection, &mut vec![])
+            .await;
+        let definition = servers.definitions()[0].to_string();
+        assert!(!definition.contains("token-123"), "{definition}");
+        assert!(definition.contains("uses [redacted]") && definition.contains("not [redacted]"));
+    }
+
+    #[tokio::test]
+    async fn server_request_flood_breaks_the_connection() {
+        let (origin, _) = serve_raw(|seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            if request["method"] == "tools/list" {
+                let asks: Vec<Value> = (0..=MAX_SERVER_REQUESTS)
+                    .map(|index| json!({"jsonrpc":"2.0","id":index,"method":"ping"}))
+                    .collect();
+                return Some(event_reply(&asks));
+            }
+            mcp(false)(seen)
+        })
+        .await;
+        let mut connection = connect(&format!("{origin}/mcp")).await.unwrap();
+        let flooded = connection.list_tools().await;
+        assert!(
+            matches!(flooded, Err(ToolError::Execution(message)) if message.contains("too many requests"))
+        );
+        assert!(connection.broken);
+    }
+
+    #[tokio::test]
+    async fn pending_messages_are_capped() {
+        let (origin, _) = serve_raw(|seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            if request["method"] == "tools/list" {
+                let many: Vec<Value> = (0..=MAX_PENDING)
+                    .map(|_| json!({"jsonrpc":"2.0","method":"notifications/message"}))
+                    .collect();
+                let body = Value::Array(many).to_string();
+                return Some(response(
+                    200,
+                    &[("Content-Type", "application/json")],
+                    &body,
+                ));
+            }
+            mcp(false)(seen)
+        })
+        .await;
+        let mut connection = connect(&format!("{origin}/mcp")).await.unwrap();
+        let flooded = connection.list_tools().await;
+        assert!(
+            matches!(flooded, Err(ToolError::Execution(message)) if message.contains("too many messages"))
+        );
+    }
+
+    /// Every reply is a live event stream that never ends, and notifications get one too.
+    #[tokio::test]
+    async fn open_event_streams_never_block_later_requests() {
+        let (origin, _) = serve_raw(|seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            let method = request["method"].as_str().unwrap_or_default();
+            let Some(result) = result_of(&request, method) else {
+                return Some(open_events(": nothing to say\n\n"));
+            };
+            let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            Some(open_events(&format!("data: {reply}\n\n")))
+        })
+        .await;
+        let transport = HttpTransport::new(&format!("{origin}/mcp"), HeaderMap::new()).unwrap();
+        let mut connection = Connection::new(Box::new(transport), vec![]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            connection.initialize().await.unwrap();
+            assert_eq!(connection.list_tools().await.unwrap().len(), 2);
+            assert_eq!(connection.list_tools().await.unwrap().len(), 2);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_or_empty_replies_to_notifications_are_fine() {
+        for reply in [
+            response(202, &[("Content-Type", "text/event-stream")], ""),
+            response(200, &[("Content-Type", "application/json")], ""),
+            response(200, &[("Content-Type", "text/event-stream")], ""),
+        ] {
+            let (origin, _) = serve_raw(move |seen| {
+                let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+                if request.get("id").is_none() {
+                    return Some(reply.clone());
+                }
+                mcp(false)(seen)
+            })
+            .await;
+            assert!(connect(&format!("{origin}/mcp")).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_session_is_initialized_again_once() {
+        let sessions = Arc::new(Mutex::new(0_u32));
+        let (origin, log) = serve_raw(move |seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            let method = request["method"].as_str().unwrap_or_default();
+            if method == "initialize" {
+                let mut count = sessions.lock().unwrap();
+                *count += 1;
+                let reply = json_reply(&request["id"], result_of(&request, method)?);
+                let header = format!("\r\nMcp-Session-Id: s{count}\r\n");
+                return Some(reply.replacen("\r\n", &header, 1));
+            }
+            // The first session is forgotten after initialization.
+            if method == "tools/list" && seen.header(SESSION) == Some("s1") {
+                return Some(response(404, &[], ""));
+            }
+            mcp(false)(seen)
+        })
+        .await;
+        let mut connection = connect(&format!("{origin}/mcp")).await.unwrap();
+        assert_eq!(connection.list_tools().await.unwrap().len(), 2);
+        assert_eq!(
+            methods(&log),
+            [
+                "POST initialize",
+                "POST notifications/initialized",
+                "POST tools/list",
+                "POST initialize",
+                "POST notifications/initialized",
+                "POST tools/list"
+            ]
+        );
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(seen[3].header(SESSION), None);
+        assert_eq!(seen[3].header(VERSION), None);
+        assert_eq!(seen[5].header(SESSION), Some("s2"));
+    }
+
+    /// A body sent back for a client reply is closed unread, so it cannot answer a request.
+    #[tokio::test]
+    async fn replies_to_server_requests_cannot_supply_answers() {
+        let (origin, _) = serve_raw(|seen| {
+            let request: Value = serde_json::from_str(&seen.body).unwrap_or_default();
+            if request["method"] == "tools/list" {
+                let ping = json!({"jsonrpc":"2.0","id":"s1","method":"ping"});
+                return Some(open_events(&format!("data: {ping}\n\n")));
+            }
+            if request["id"] == "s1" {
+                let forged = json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"forged"}]}});
+                return Some(event_reply(&[forged]));
+            }
+            mcp(false)(seen)
+        })
+        .await;
+        let mut connection = connect(&format!("{origin}/mcp")).await.unwrap();
+        let listed =
+            tokio::time::timeout(Duration::from_millis(500), connection.list_tools()).await;
+        assert!(listed.is_err(), "{listed:?}");
     }
 }

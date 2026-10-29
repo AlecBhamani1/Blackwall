@@ -23,10 +23,14 @@ const MAX_TOOLS: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+/// Requests a server may send back while answering one of ours.
+const MAX_SERVER_REQUESTS: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SECRET_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const EDIT_LOCK: &str = ".mcp.lock";
+const RESERVED_PREFIX: &str =
+    "MCP server names starting with p- are reserved for project servers; rename it.";
 
 /// One server entry in `mcp.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,6 +55,25 @@ pub struct ServerConfig {
     /// Names of environment variables the server receives from the platform credential store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// For a `url` server, the origin each secret was saved for. A header is sent only when its
+    /// secret was saved for the URL's current origin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_origins: BTreeMap<String, String>,
+}
+
+impl ServerConfig {
+    /// The credential store account of one of this server's secrets.
+    fn account(&self, key: &str) -> String {
+        match self.secret_origins.get(key) {
+            Some(origin) => format!("{}/{origin}/{key}", self.name),
+            None => format!("{}/{key}", self.name),
+        }
+    }
+
+    /// What a header secret is bound to: the URL's origin, or `None` for a local command.
+    fn endpoint(&self) -> Option<String> {
+        self.url.as_deref().and_then(http::origin)
+    }
 }
 
 fn enabled() -> bool {
@@ -90,6 +113,17 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
     let failed = "The MCP file could not be saved.";
+    // Approvals were given for a server at one address; one that moves starts asking again.
+    let moved: Vec<String> = read_config(directory)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|old| {
+            servers
+                .iter()
+                .any(|new| new.name == old.name && new.endpoint() != old.endpoint())
+        })
+        .map(|old| old.name)
+        .collect();
     let mut body = serde_json::to_vec_pretty(&McpFile {
         servers: validate(servers)?,
     })
@@ -103,7 +137,12 @@ pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), 
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("The MCP file must not be a symbolic link.");
     }
-    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)
+    crate::policy::replace_owner_file(directory, &path, &body).map_err(|_| failed)?;
+    for name in moved {
+        crate::policy::remove_server_rules(directory, &name)
+            .map_err(|_| "The MCP file was saved, but approval rules for a server whose address changed could not be removed.")?;
+    }
+    Ok(())
 }
 
 /// Owner edits shared by the CLI and desktop. Each one validates before anything is saved.
@@ -184,6 +223,9 @@ fn add(
 ) -> Result<String, String> {
     let name = saved_name(name);
     let name = name.as_str();
+    if name.starts_with("p-") {
+        return Err(RESERVED_PREFIX.into());
+    }
     let _editing = crate::policy::lock_owner_file(directory, EDIT_LOCK)
         .map_err(|_| "The MCP file could not be saved.")?;
     let mut servers = read_config(directory)?;
@@ -199,6 +241,7 @@ fn add(
         allow_tools: None,
         deny_tools: vec![],
         secrets: vec![],
+        secret_origins: BTreeMap::new(),
     });
     write_config(directory, servers)?;
     Ok(name.into())
@@ -228,7 +271,7 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
     // The removal is saved; a keychain prompt below must not hold up other processes' edits.
     drop(_editing);
     for key in &removed.secrets {
-        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
+        crate::secrets::delete(SECRET_SERVICE, &removed.account(key)).map_err(store_error)?;
     }
     crate::policy::remove_server_rules(directory, name)
 }
@@ -243,14 +286,25 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
         return Err("Provide a value of up to 16 KiB.".into());
     }
     edit(directory, name, |servers, index| {
-        crate::secrets::set(SECRET_SERVICE, &format!("{name}/{key}"), value)
-            .map_err(store_error)?;
-        if !servers[index]
+        let server = &mut servers[index];
+        // A URL server's secrets are bound to its origin, so a value saved for one address is
+        // never sent to another.
+        let previous = server
             .secrets
             .iter()
             .any(|existing| existing == key)
-        {
-            servers[index].secrets.push(key.into());
+            .then(|| server.account(key));
+        match server.endpoint() {
+            Some(origin) => server.secret_origins.insert(key.into(), origin),
+            None => server.secret_origins.remove(key),
+        };
+        let account = server.account(key);
+        crate::secrets::set(SECRET_SERVICE, &account, value).map_err(store_error)?;
+        if let Some(previous) = previous.filter(|previous| *previous != account) {
+            crate::secrets::delete(SECRET_SERVICE, &previous).map_err(store_error)?;
+        }
+        if !server.secrets.iter().any(|existing| existing == key) {
+            server.secrets.push(key.into());
         }
         Ok(())
     })
@@ -260,8 +314,10 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
 pub fn delete_secret(directory: &Path, name: &str, key: &str) -> Result<(), String> {
     let name = &saved_name(name);
     edit(directory, name, |servers, index| {
-        crate::secrets::delete(SECRET_SERVICE, &format!("{name}/{key}")).map_err(store_error)?;
-        servers[index].secrets.retain(|existing| existing != key);
+        let server = &mut servers[index];
+        crate::secrets::delete(SECRET_SERVICE, &server.account(key)).map_err(store_error)?;
+        server.secrets.retain(|existing| existing != key);
+        server.secret_origins.remove(key);
         Ok(())
     })
 }
@@ -340,6 +396,13 @@ impl McpServers {
             }
         };
         for config in configs.into_iter().filter(|config| config.enabled) {
+            if source == Source::Owner && config.name.starts_with("p-") {
+                self.warnings.push(format!(
+                    "MCP server {} was skipped: {RESERVED_PREFIX}",
+                    config.name
+                ));
+                continue;
+            }
             // A credential store prompt gets its own, longer wait than the server's startup.
             let environment =
                 match tokio::time::timeout(SECRET_TIMEOUT, read_secrets(&config)).await {
@@ -418,16 +481,23 @@ impl McpServers {
             tools.push(Tool {
                 exposed,
                 name: name.to_owned(),
-                description: tool["description"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(1024)
-                    .collect(),
+                description: redact(
+                    tool["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(1024)
+                        .collect(),
+                    &connection.secrets,
+                ),
+                // A schema is text the model reads too, so a secret echoed into it is removed.
                 input_schema: tool
                     .get("inputSchema")
                     .filter(|schema| schema.is_object())
-                    .cloned()
+                    .and_then(|schema| {
+                        serde_json::from_str(&redact(schema.to_string(), &connection.secrets)).ok()
+                    })
+                    .filter(Value::is_object)
                     .unwrap_or_else(|| json!({"type":"object","properties":{}})),
             });
             if tools.len() == MAX_TOOLS {
@@ -582,7 +652,7 @@ impl Connection {
 
     async fn initialize(&mut self) -> Result<(), ToolError> {
         let result = self
-            .request(
+            .request_once(
             "initialize",
             json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"Blackwall","version":env!("CARGO_PKG_VERSION")}}),
         )
@@ -624,7 +694,20 @@ impl Connection {
         sent
     }
 
+    /// Send one request. A server that forgot its session is initialized again, once, and the
+    /// request is retried.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
+        match self.request_once(method, params.clone()).await {
+            Err(_) if self.transport.expired() => {
+                self.broken = false;
+                self.initialize().await?;
+                self.request_once(method, params).await
+            }
+            result => result,
+        }
+    }
+
+    async fn request_once(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
         if self.broken {
             return Err(ToolError::Execution(
                 "The MCP server stopped responding.".into(),
@@ -634,6 +717,7 @@ impl Connection {
         let id = self.next_id;
         self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
+        let mut asked = 0;
         loop {
             let message = match self.transport.recv().await {
                 Ok(message) => message,
@@ -645,6 +729,13 @@ impl Connection {
             if message.get("method").is_some() {
                 // Server requests are not supported; answer so the server does not wait.
                 if let Some(request) = message.get("id") {
+                    asked += 1;
+                    if asked > MAX_SERVER_REQUESTS {
+                        self.broken = true;
+                        return Err(ToolError::Execution(
+                            "The MCP server sent too many requests of its own.".into(),
+                        ));
+                    }
                     let reply = if message["method"] == "ping" {
                         json!({"jsonrpc":"2.0","id":request,"result":{}})
                     } else {
@@ -671,12 +762,53 @@ impl Connection {
     }
 }
 
-/// Servers start in the data folder so a project cannot shadow what a package runner loads.
+/// For each header of a URL server: the header, the secret's name, and its credential store
+/// account. A secret saved for another origin, or for a local command, is never used.
+fn header_accounts(config: &ServerConfig) -> Result<Vec<(String, String, String)>, ToolError> {
+    let origin = config.endpoint().unwrap_or_default();
+    let mut accounts = vec![];
+    for (header, reference) in &config.headers {
+        let key = http::secret_reference(reference).unwrap_or_default();
+        let again = format!("Save it again with bw mcp secret {} {key}.", config.name);
+        if !config.secrets.iter().any(|saved| saved == key) {
+            return Err(ToolError::Execution(format!(
+                "{key} is not saved. Add it with bw mcp secret {} {key}.",
+                config.name
+            )));
+        }
+        match config.secret_origins.get(key) {
+            Some(saved) if *saved == origin => {}
+            Some(saved) => {
+                return Err(ToolError::Execution(format!(
+                    "{key} was saved for {saved}, not {origin}. {again}"
+                )))
+            }
+            None => {
+                return Err(ToolError::Execution(format!(
+                    "{key} was saved for a local command, not {origin}. {again}"
+                )))
+            }
+        }
+        accounts.push((header.clone(), key.to_owned(), config.account(key)));
+    }
+    Ok(accounts)
+}
+
 /// Read a server's secrets from the credential store, which may first ask the owner for access.
+/// A local server gets environment variables; a URL server gets headers. Each pair is the
+/// variable or header name and its value.
 async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, ToolError> {
-    let mut environment = vec![];
-    for name in &config.secrets {
-        let account = format!("{}/{name}", config.name);
+    let wanted = if config.url.is_some() {
+        header_accounts(config)?
+    } else {
+        config
+            .secrets
+            .iter()
+            .map(|key| (key.clone(), key.clone(), config.account(key)))
+            .collect()
+    };
+    let mut values = vec![];
+    for (target, name, account) in wanted {
         let value =
             tokio::task::spawn_blocking(move || crate::secrets::get(SECRET_SERVICE, &account))
                 .await
@@ -693,21 +825,19 @@ async fn read_secrets(config: &ServerConfig) -> Result<Vec<(String, String)>, To
                         config.name
                     ))
                 })?;
-        environment.push((name.clone(), value));
+        values.push((target, value));
     }
-    Ok(environment)
+    Ok(values)
 }
 
+/// Servers start in the data folder so a project cannot shadow what a package runner loads.
 async fn launch(
     config: &ServerConfig,
     directory: &Path,
     environment: Vec<(String, String)>,
 ) -> Result<Connection, ToolError> {
     let transport: Box<dyn Transport> = match &config.url {
-        Some(url) => Box::new(http::HttpTransport::new(
-            url,
-            http::headers(config, &environment)?,
-        )?),
+        Some(url) => Box::new(http::HttpTransport::new(url, http::headers(&environment)?)?),
         None => start_process(config, directory, &environment)?,
     };
     let secrets = environment.into_iter().map(|(_, value)| value).collect();
@@ -825,9 +955,6 @@ fn validate_for(
             return Err("Two MCP servers have the same name.");
         }
         match source {
-            Source::Owner if server.name.starts_with("p-") => {
-                return Err("MCP server names starting with p- are reserved for project servers.");
-            }
             Source::Project if !server.name.starts_with("p-") => {
                 return Err("Project MCP server names start with p-.");
             }
@@ -878,6 +1005,11 @@ fn validate_for(
             })
         {
             return Err("An MCP server has an invalid secret name.");
+        }
+        if server.secret_origins.iter().any(|(key, origin)| {
+            !server.secrets.contains(key) || http::origin(origin).as_ref() != Some(origin)
+        }) {
+            return Err("An MCP server lists a secret origin that is not valid.");
         }
     }
     Ok(servers)
@@ -973,6 +1105,7 @@ mod tests {
             allow_tools: None,
             deny_tools: vec!["delete_issue".into()],
             secrets: vec![],
+            secret_origins: BTreeMap::new(),
         };
         let mut names: Vec<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
         let mut servers = McpServers::default();
@@ -1028,6 +1161,7 @@ mod tests {
             allow_tools: Some(vec!["search".into(), "fail".into()]),
             deny_tools: vec![],
             secrets: vec!["JIRA_API_TOKEN".into()],
+            secret_origins: BTreeMap::new(),
         };
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
@@ -1133,6 +1267,7 @@ mod tests {
             allow_tools: None,
             deny_tools: vec![],
             secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
+            secret_origins: BTreeMap::new(),
         };
         assert!(validate(vec![server(&["JIRA_API_TOKEN", "JIRA_2"])]).is_ok());
         for invalid in [

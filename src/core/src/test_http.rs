@@ -112,8 +112,17 @@ pub(crate) fn response(status: u16, headers: &[(&str, &str)], body: &str) -> Str
     )
 }
 
+/// Ends a raw response that is written but never finished: the socket stays open.
+pub(crate) const KEEP_OPEN: &str = "\u{0}keep-open";
+
+/// An event stream with no length that stays open after `events`, like a live SSE reply.
+pub(crate) fn open_events(events: &str) -> String {
+    format!("HTTP/1.1 200 X\r\nContent-Type: text/event-stream\r\n\r\n{events}{KEEP_OPEN}")
+}
+
 /// Answer each request with the raw response from `route`. `None` keeps the connection open
-/// without answering, like a server that hangs.
+/// without answering, like a server that hangs; a reply ending in [`KEEP_OPEN`] is sent without
+/// that marker and the connection is then held open.
 pub(crate) async fn serve_raw(
     route: impl Fn(&Seen) -> Option<String> + Send + Sync + 'static,
 ) -> (String, Arc<Mutex<Vec<Seen>>>) {
@@ -163,10 +172,16 @@ pub(crate) async fn serve_raw(
                 seen.body = String::from_utf8_lossy(&body).into_owned();
                 requests.lock().unwrap().push(seen.clone());
                 match route(&seen) {
-                    Some(reply) => {
-                        let _ = socket.write_all(reply.as_bytes()).await;
-                        let _ = socket.shutdown().await;
-                    }
+                    Some(reply) => match reply.strip_suffix(KEEP_OPEN) {
+                        Some(reply) => {
+                            let _ = socket.write_all(reply.as_bytes()).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        }
+                        None => {
+                            let _ = socket.write_all(reply.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        }
+                    },
                     None => tokio::time::sleep(std::time::Duration::from_secs(60)).await,
                 }
             });

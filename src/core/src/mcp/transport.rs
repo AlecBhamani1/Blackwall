@@ -12,6 +12,10 @@ pub(super) trait Transport: Send {
     fn recv(&mut self) -> BoxFuture<'_, Result<Value, ToolError>>;
     /// The protocol version agreed during initialization.
     fn negotiated(&mut self, _version: &str) {}
+    /// Whether the server forgot the session since the last call, so it must be initialized again.
+    fn expired(&mut self) -> bool {
+        false
+    }
     /// A request ran out of time: stop whatever is still running for this server.
     fn abandon(&mut self) {}
 }
