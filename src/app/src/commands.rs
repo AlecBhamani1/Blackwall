@@ -1,5 +1,6 @@
 use std::{borrow::Cow, fmt, time::Duration};
 
+use blackwall_core::model::redact_key;
 use blackwall_core::protocol::{
     AgentEvent, Attachment, ChatMessage, ChatRequest, ChatResponse, MessageRole, ModelCatalog,
     ModelInfo, ProtocolError, StreamStarted, TokenUsage, DEFAULT_MODEL_ENDPOINT,
@@ -358,7 +359,7 @@ pub(crate) async fn discover_models(
     .await
     .map_err(BridgeError::Request)
     .map_err(CommandError::from)?;
-    let response = require_success(response)
+    let response = require_success(response, api_key.as_deref())
         .await
         .map_err(CommandError::from)?;
     let mut payload: ApiModelCatalog = read_json_bounded(response, MAX_MODEL_CATALOG_BYTES)
@@ -828,7 +829,7 @@ async fn complete_chat(
     .send()
     .await
     .map_err(BridgeError::Request)?;
-    let response = require_success(response).await?;
+    let response = require_success(response, api_key).await?;
     let payload: ApiCompletionResponse =
         read_json_bounded(response, MAX_MODEL_RESPONSE_BYTES).await?;
     if let Some(error) = payload.error {
@@ -1025,12 +1026,16 @@ fn authorized_request(
     }
 }
 
-async fn require_success(response: reqwest::Response) -> Result<reqwest::Response, BridgeError> {
+/// `api_key` is the request's own credential, removed from the error body.
+async fn require_success(
+    response: reqwest::Response,
+    api_key: Option<&str>,
+) -> Result<reqwest::Response, BridgeError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    let body = read_error_body(response).await;
+    let body = redact_key(read_error_body(response).await, api_key);
     Err(BridgeError::HttpStatus { status, body })
 }
 
@@ -1317,6 +1322,21 @@ mod tests {
             // The server's own words are kept apart from the message, with keys redacted.
             assert!(!error.detail.unwrap_or_default().contains("secret"));
         }
+    }
+
+    #[test]
+    fn model_failures_never_echo_the_request_key() {
+        let body = redact_key(
+            r#"{"error":{"message":"Rejected value 'review-example-0123456789'."}}"#.into(),
+            Some("review-example-0123456789"),
+        );
+        let error = CommandError::from_bridge(BridgeError::HttpStatus {
+            status: StatusCode::UNAUTHORIZED,
+            body,
+        });
+        let detail = error.detail.unwrap_or_default();
+        assert!(!detail.contains("review-example"), "{detail}");
+        assert_eq!(redact_key("no key".into(), Some("")), "no key");
     }
 
     #[test]

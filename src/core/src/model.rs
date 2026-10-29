@@ -84,6 +84,15 @@ pub fn server_error_detail(body: &[u8]) -> Option<String> {
     clean_detail(&message)
 }
 
+/// Replace every copy of the request's own `key` in an error body, so a server that echoes
+/// it back cannot get it shown, saved or exported. Done before any cleaning or clipping.
+pub fn redact_key(text: String, key: Option<&str>) -> String {
+    match key.filter(|key| !key.is_empty()) {
+        Some(key) if text.contains(key) => text.replace(key, "[redacted]"),
+        _ => text,
+    }
+}
+
 /// Collapse whitespace and control characters, redact credentials, and clip.
 fn clean_detail(text: &str) -> Option<String> {
     let flat: String = text
@@ -92,13 +101,16 @@ fn clean_detail(text: &str) -> Option<String> {
         .collect::<String>()
         .split_whitespace()
         .map(|word| {
+            // Quotes and punctuation around a key must not hide it.
+            let bare =
+                word.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'));
             // Long unbroken key-like words are access keys far more often than prose.
-            let keyish = word.len() >= 32
-                && word
+            let keyish = bare.len() >= 32
+                && bare
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if keyish || word.starts_with("sk-") || word.starts_with("bw1_") {
-                return "[redacted]".to_owned();
+            if !bare.is_empty() && (keyish || bare.starts_with("sk-") || bare.starts_with("bw1_")) {
+                return word.replace(bare, "[redacted]");
             }
             // Credentials inside an address: `https://user:pw@host` keeps only the host.
             match word.split_once("://") {
@@ -127,7 +139,12 @@ fn clean_detail(text: &str) -> Option<String> {
 
 /// [`server_error_detail`] read from a failed response, named after the server when this
 /// session already knows which kind `endpoint` is, such as `Ollama: model requires more memory`.
-pub async fn response_error_detail(endpoint: &str, response: reqwest::Response) -> Option<String> {
+/// `key`, the request's own credential, is removed first.
+pub async fn response_error_detail(
+    endpoint: &str,
+    response: reqwest::Response,
+    key: Option<&str>,
+) -> Option<String> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     let read = async {
@@ -140,7 +157,8 @@ pub async fn response_error_detail(endpoint: &str, response: reqwest::Response) 
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(5), read).await;
-    let detail = server_error_detail(&body)?;
+    let body = redact_key(String::from_utf8_lossy(&body).into_owned(), key);
+    let detail = server_error_detail(body.as_bytes())?;
     Some(match crate::connection::known_kind(endpoint) {
         Some(kind) if kind != crate::connection::ServerKind::Unknown => {
             format!("{}: {detail}", kind.display_name())
@@ -342,7 +360,7 @@ impl ModelBackend for HttpModel {
                 let status = response.status().as_u16();
                 return Err(ModelError::Http(
                     status,
-                    response_error_detail(&self.endpoint, response).await,
+                    response_error_detail(&self.endpoint, response, self.key.as_deref()).await,
                 ));
             }
             let mut stream = response.bytes_stream();
@@ -931,6 +949,34 @@ mod tests {
             assert!(!detail.contains(leaked), "{detail}");
         }
         assert!(detail.starts_with("invalid api key [redacted]"), "{detail}");
+    }
+    #[tokio::test]
+    async fn http_errors_never_echo_the_request_key() {
+        let key = "review-example-0123456789";
+        let fake = crate::test_http::serve(move |method, path, _| match (method, path) {
+            ("POST", "/v1/chat/completions") => Some((
+                401,
+                json!({"error": {"message": format!("Rejected value '{key}'. Also 'sk-quoted-abc'.")}})
+                    .to_string(),
+            )),
+            _ => None,
+        })
+        .await;
+        let endpoint = format!("{}/v1", fake.origin());
+        let model = HttpModel::new(&endpoint, "m", Some(key.to_owned())).unwrap();
+        let error = model
+            .generate(
+                &[json!({"role": "user", "content": "hi"})],
+                &[],
+                &mut |_| {},
+            )
+            .await
+            .err()
+            .unwrap();
+        let shown = error.to_string();
+        assert!(!shown.contains(key), "{shown}");
+        assert!(!shown.contains("sk-quoted"), "{shown}");
+        assert!(shown.contains("Rejected value '[redacted]'"), "{shown}");
     }
     #[tokio::test]
     async fn http_errors_carry_what_the_server_said() {
