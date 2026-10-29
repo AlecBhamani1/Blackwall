@@ -661,6 +661,18 @@ export function createChatController(
     }
   }
 
+  /** Whether a connection was ever chosen here, so startup may reconnect without asking. */
+  async function hasSavedConnection(): Promise<boolean> {
+    await initializeStorage();
+    const saved = get(preferences);
+    return Boolean(get(endpoint).trim() || saved.endpoint || saved.connections?.length);
+  }
+
+  /** Startup is waiting for the person to choose a server instead of connecting itself. */
+  function awaitConnectionChoice(): void {
+    connectionState.set('offline');
+  }
+
   async function configureEndpoint(value: string, name?: string): Promise<boolean> {
     const next = value.trim();
     if (!next) {
@@ -1321,6 +1333,8 @@ export function createChatController(
     savePreferences,
     connectionError,
     initialize,
+    hasSavedConnection,
+    awaitConnectionChoice,
     configureEndpoint,
     forgetConnection: (address: string) =>
       savePreferences({

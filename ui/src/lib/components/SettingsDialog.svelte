@@ -13,10 +13,18 @@
   import TelemetrySettings from './TelemetrySettings.svelte';
   import TrustedProjects from './TrustedProjects.svelte';
   import SavedConnections from './SavedConnections.svelte';
+  import FoundServers from './FoundServers.svelte';
   import { connectionProfiles } from '../connections';
   import PairingPanel from './PairingPanel.svelte';
   import { isPairedEndpoint } from '../pairing';
-  import { detectedServerLabel, isDesktop, normalizeEndpoint, setupClient } from '../setup';
+  import {
+    detectedServerLabel,
+    isDesktop,
+    normalizeEndpoint,
+    serviceName,
+    setupClient,
+    type LocalService,
+  } from '../setup';
   import { platform } from '../platform';
   import Icon from './Icon.svelte';
   import MemoryDialog from './MemoryDialog.svelte';
@@ -41,7 +49,10 @@
   export let endpoint = '';
   export let connectionState: ConnectionState = 'checking';
   export let connectionError = '';
-  export let onConfigureEndpoint: (endpoint: string) => Promise<boolean> = async () => false;
+  export let onConfigureEndpoint: (
+    endpoint: string,
+    name?: string,
+  ) => Promise<boolean> = async () => false;
   export let updateChannel: AppUpdateChannel = 'stable';
   export let onUpdateChannelChange: (channel: AppUpdateChannel) => Promise<void> = async () => {};
   export let updateState: AppUpdateState = 'idle';
@@ -55,6 +66,8 @@
   export let client: GuestShareClient = guestShareClient;
   export let invites = multiShareClient;
   export let detectServer = setupClient.detectServer;
+  export let discover = setupClient.discover;
+  export let desktop = isDesktop();
 
   const expiryOptions: Array<{ value: ShareExpiryMinutes; label: string }> = [
     { value: 15, label: '15 min' },
@@ -159,6 +172,27 @@
         return enabled ? { ...rest, textToolCalls: true } : rest;
       }),
     });
+  }
+  let foundServers: LocalService[] = [];
+  let foundScanning = false;
+  let foundFor = false;
+  let foundVersion = 0;
+  $: foundKey = open && selectedSetting === 'connection' && desktop;
+  $: if (foundKey !== foundFor) {
+    foundFor = foundKey;
+    if (foundKey) void refreshFound();
+  }
+  async function refreshFound(): Promise<void> {
+    const version = ++foundVersion;
+    foundScanning = true;
+    try {
+      const next = await discover();
+      if (version === foundVersion) foundServers = next;
+    } catch {
+      // Discovery is a shortcut; the address field and saved connections still work.
+    } finally {
+      if (version === foundVersion) foundScanning = false;
+    }
   }
   let detectedServer = '';
   let detectedFor = '';
@@ -317,13 +351,15 @@
     await connectSaved(candidate);
   }
 
-  async function connectSaved(candidate: string): Promise<void> {
+  async function connectSaved(candidate: string, name?: string): Promise<void> {
     if (endpointBusy) return;
     endpointBusy = true;
     endpointInputError = '';
     endpointFeedback = '';
     try {
-      const connected = await onConfigureEndpoint(candidate);
+      const connected = await (name
+        ? onConfigureEndpoint(candidate, name)
+        : onConfigureEndpoint(candidate));
       endpointFeedback = connected ? 'Connected and loaded the available models.' : '';
     } catch (cause) {
       endpointInputError = errorMessage(cause);
@@ -545,6 +581,54 @@
               </span>
             </div>
 
+            <div class="connection-start">
+              <button class="connect-button setup-button" onclick={onSetup}
+                >Set up a connection</button
+              >
+              {#if desktop}
+                <FoundServers
+                  services={foundServers}
+                  currentEndpoint={endpoint}
+                  busy={endpointBusy || connectionState === 'checking'}
+                  scanning={foundScanning}
+                  onConnect={(service) => connectSaved(service.endpoint, serviceName(service))}
+                  onRescan={refreshFound}
+                />
+              {/if}
+            </div>
+            <form class="endpoint-form address-form" onsubmit={connectEndpoint}>
+              <label for="model-endpoint">Server address</label>
+              <div class="address-row">
+                <input
+                  id="model-endpoint"
+                  bind:value={endpointDraft}
+                  placeholder="http://localhost:11434/v1"
+                  autocomplete="url"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  disabled={endpointBusy}
+                />
+                <button
+                  class="connect-button"
+                  disabled={endpointBusy || connectionState === 'checking'}
+                  type="submit"
+                >
+                  {endpointBusy || connectionState === 'checking' ? 'Checking…' : 'Connect'}
+                </button>
+              </div>
+              <p class="endpoint-hint">
+                Any Ollama or OpenAI-compatible server, such as <code
+                  >http://192.168.1.50:11434</code
+                >; Blackwall adds <code>/v1</code> automatically.
+              </p>
+            </form>
+            {#if endpointInputError}
+              <p class="connection-error" role="alert">{endpointInputError}</p>
+            {:else if endpointFeedback}
+              <p class="connection-success" role="status">{endpointFeedback}</p>
+            {:else if connectionError}
+              <p class="connection-error" role="alert">{connectionError}</p>
+            {/if}
             <SavedConnections
               connections={contextPreferences.connections ?? []}
               currentEndpoint={endpoint}
@@ -576,45 +660,6 @@
                 </span>
               </label>
             {/if}
-            {#if endpointInputError}
-              <p class="connection-error" role="alert">{endpointInputError}</p>
-            {:else if endpointFeedback}
-              <p class="connection-success" role="status">{endpointFeedback}</p>
-            {:else if connectionError}
-              <p class="connection-error" role="alert">{connectionError}</p>
-            {/if}
-            <button class="connect-button setup-button" onclick={onSetup}
-              >Set up a connection</button
-            >
-            <details class="advanced-connection">
-              <summary>Advanced · Enter a server address</summary>
-              <form class="endpoint-form" onsubmit={connectEndpoint}>
-                <label for="model-endpoint">Endpoint URL</label>
-                <input
-                  id="model-endpoint"
-                  bind:value={endpointDraft}
-                  placeholder="http://localhost:11434/v1"
-                  autocomplete="url"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  disabled={endpointBusy}
-                />
-                <p class="endpoint-hint">
-                  You can enter an origin such as <code>http://192.168.1.50:11434</code>; Blackwall
-                  adds <code>/v1</code> automatically.
-                </p>
-
-                <button
-                  class="connect-button"
-                  disabled={endpointBusy || connectionState === 'checking'}
-                  type="submit"
-                >
-                  {endpointBusy || connectionState === 'checking'
-                    ? 'Checking endpoint…'
-                    : 'Save and reconnect'}
-                </button>
-              </form>
-            </details>
           </section>
         {/if}
         {#if selectedSetting === 'sharing'}
@@ -1176,16 +1221,28 @@
     font-size: 11px;
   }
 
+  .connection-start {
+    display: grid;
+    gap: 14px;
+    margin: 16px 0 22px;
+  }
   .setup-button {
-    margin: 16px 0;
+    justify-self: start;
+    padding: 0 18px;
   }
-  .advanced-connection summary {
-    cursor: pointer;
-    font-size: 12px;
-    color: var(--text-muted);
+  .address-form {
+    margin-bottom: 22px;
   }
-  .advanced-connection[open] summary {
-    margin-bottom: 14px;
+  .address-row {
+    display: flex;
+    gap: 8px;
+  }
+  .address-row input {
+    flex: 1;
+    min-width: 0;
+  }
+  .address-row .connect-button {
+    padding: 0 16px;
   }
   .modal-layer {
     position: fixed;

@@ -237,11 +237,12 @@ describe('SettingsDialog', () => {
     });
 
     await user.click(screen.getByRole('button', { name: /Model connection/ }));
-    await user.click(screen.getByText('Advanced · Enter a server address'));
-    const input = screen.getByLabelText('Endpoint URL');
+    // The address field is in plain view, not behind an Advanced toggle.
+    const input = screen.getByLabelText('Server address');
+    expect(input).toBeVisible();
     await user.clear(input);
     await user.type(input, 'http://192.0.2.10:11434');
-    await user.click(screen.getByRole('button', { name: 'Save and reconnect' }));
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
 
     expect(onConfigureEndpoint).toHaveBeenCalledWith('http://192.0.2.10:11434');
     expect(
@@ -287,6 +288,60 @@ describe('SettingsDialog', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Forget Second service' }));
     expect(onPreferences).toHaveBeenCalledWith({ connections: [connections[0]] });
+  });
+
+  it('leads Model connection with setup and found servers, then the address, then saved ones', async () => {
+    const user = userEvent.setup();
+    const onConfigureEndpoint = vi.fn().mockResolvedValue(true);
+    const discover = vi.fn().mockResolvedValue([
+      {
+        name: 'llama.cpp',
+        endpoint: 'http://127.0.0.1:18040/v1',
+        available: true,
+        models: ['qwen3.8-flash-next-iq2_xs'],
+        supportsDownload: false,
+        kind: 'llama.cpp',
+        loaded: ['qwen3.8-flash-next-iq2_xs'],
+      },
+    ]);
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'https://first.example/v1',
+        connectionState: 'ready',
+        contextPreferences: {
+          connections: [{ endpoint: 'https://first.example/v1', name: 'First service' }],
+        },
+        onConfigureEndpoint,
+        discover,
+        desktop: true,
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    const connect = await screen.findByRole('button', {
+      name: 'Connect to llama.cpp at 127.0.0.1:18040',
+    });
+    const order = [
+      screen.getByRole('button', { name: 'Set up a connection' }),
+      screen.getByRole('region', { name: 'Found on this computer' }),
+      screen.getByLabelText('Server address'),
+      screen.getByRole('region', { name: 'Saved connections' }),
+      screen.getByRole('checkbox', { name: /writes tool calls as text/ }),
+    ];
+    for (let index = 1; index < order.length; index += 1) {
+      expect(
+        order[index - 1].compareDocumentPosition(order[index]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+    expect(screen.getByLabelText('Server address')).toBeVisible();
+    await user.click(connect);
+    expect(onConfigureEndpoint).toHaveBeenCalledWith(
+      'http://127.0.0.1:18040/v1',
+      'llama.cpp :18040',
+    );
+    expect(discover).toHaveBeenCalledOnce();
   });
 
   it('shows the detected server kind and its context window for the active connection', async () => {

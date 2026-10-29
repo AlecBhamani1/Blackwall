@@ -4,7 +4,7 @@
   import { authClient, authError, authStatus } from './lib/auth';
   import LockScreen from './lib/components/LockScreen.svelte';
   import ApprovalCard from './lib/components/ApprovalCard.svelte';
-  import { isDesktop } from './lib/setup';
+  import { isDesktop, setupClient, type LocalService } from './lib/setup';
   import ConnectionSetup from './lib/components/ConnectionSetup.svelte';
   import AppHeader from './lib/components/AppHeader.svelte';
   import ChatView from './lib/components/ChatView.svelte';
@@ -69,6 +69,19 @@
       }
       booted = true;
       startPairing();
+      // On a first launch, let the person choose among the servers found here rather than
+      // connecting to whichever answered first.
+      if (isDesktop() && !showHarnessDemo && !(await controller.hasSavedConnection())) {
+        const found = (await setupClient.discover().catch(() => [])).filter(
+          (service) => service.available,
+        );
+        if (found.length) {
+          startupServers = found;
+          controller.awaitConnectionChoice();
+          setupOpen = true;
+          return;
+        }
+      }
       const connected = await controller.initialize();
       if (!connected && !showHarnessDemo) setupOpen = true;
     } catch (cause) {
@@ -107,6 +120,8 @@
     }
   }
   let setupOpen = false;
+  let startupServers: LocalService[] | null = null;
+  $: if (!setupOpen) startupServers = null;
   let filesVisible = true;
   let sidebarVisible = typeof window === 'undefined' ? true : window.innerWidth > 760;
   const showHarnessDemo =
@@ -303,6 +318,7 @@
             onDone={() => (setupOpen = false)}
             currentEndpoint={$endpoint}
             connectionError={$connectionError}
+            found={startupServers}
           />
           {#if $connectionState === 'ready'}<button
               class="return-chat"
