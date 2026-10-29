@@ -7,10 +7,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::Mutex,
-};
+use tokio::{io::BufReader, sync::Mutex};
+use transport::{StdioTransport, Transport};
+
+mod transport;
 
 pub const MCP_FILE: &str = "mcp.json";
 /// Credential store service for server secrets; each account is `server/NAME`.
@@ -439,8 +439,7 @@ impl McpServers {
             Err(_) => {
                 // A late reply would arrive out of order, so the server is stopped and not reused.
                 connection.broken = true;
-                #[cfg(any(unix, windows))]
-                connection.process.take();
+                connection.transport.abandon();
                 return Err(ToolError::Execution(
                     "The MCP tool exceeded its time limit and was stopped.".into(),
                 ));
@@ -472,17 +471,23 @@ impl McpServers {
 }
 
 struct Connection {
-    reader: Box<dyn AsyncBufRead + Send + Unpin>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    transport: Box<dyn Transport>,
     next_id: u64,
     broken: bool,
     /// Values given to the server, removed from anything it sends back.
     secrets: Vec<String>,
-    #[cfg(any(unix, windows))]
-    process: Option<crate::tools::ServerProcess>,
 }
 
 impl Connection {
+    fn new(transport: Box<dyn Transport>, secrets: Vec<String>) -> Self {
+        Self {
+            transport,
+            next_id: 0,
+            broken: false,
+            secrets,
+        }
+    }
+
     fn redact(&self, error: ToolError) -> ToolError {
         match error {
             ToolError::Execution(text) => ToolError::Execution(redact(text, &self.secrets)),
@@ -498,13 +503,13 @@ impl Connection {
         )
         .await?;
         // Tool discovery and calls are unchanged across these versions.
-        if !["2025-06-18", "2025-03-26", "2024-11-05"]
-            .contains(&result["protocolVersion"].as_str().unwrap_or_default())
-        {
+        let version = result["protocolVersion"].as_str().unwrap_or_default();
+        if !["2025-06-18", "2025-03-26", "2024-11-05"].contains(&version) {
             return Err(ToolError::Execution(
                 "The MCP server uses an unsupported protocol version.".into(),
             ));
         }
+        self.transport.negotiated(version);
         self.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await
     }
@@ -527,31 +532,29 @@ impl Connection {
     }
 
     async fn send(&mut self, message: &Value) -> Result<(), ToolError> {
-        let unavailable = || ToolError::Execution("The MCP server stopped responding.".into());
-        let mut line = serde_json::to_vec(message).map_err(|_| ToolError::Arguments)?;
-        line.push(b'\n');
-        self.writer
-            .write_all(&line)
-            .await
-            .map_err(|_| unavailable())?;
-        self.writer.flush().await.map_err(|_| unavailable())
+        let sent = self.transport.send(message).await;
+        if sent.is_err() {
+            self.broken = true;
+        }
+        sent
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
-        let unavailable = || ToolError::Execution("The MCP server stopped responding.".into());
         if self.broken {
-            return Err(unavailable());
+            return Err(ToolError::Execution(
+                "The MCP server stopped responding.".into(),
+            ));
         }
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
         loop {
-            let message = match read_message(&mut self.reader).await {
-                Ok(Some(message)) => message,
-                _ => {
+            let message = match self.transport.recv().await {
+                Ok(message) => message,
+                Err(error) => {
                     self.broken = true;
-                    return Err(unavailable());
+                    return Err(error);
                 }
             };
             if message.get("method").is_some() {
@@ -579,39 +582,6 @@ impl Connection {
                 return Err(ToolError::Execution(text));
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-        }
-    }
-}
-
-/// One bounded line of JSON. Blank and non-JSON lines are skipped.
-async fn read_message(
-    reader: &mut (dyn AsyncBufRead + Send + Unpin),
-) -> std::io::Result<Option<Value>> {
-    loop {
-        let mut line = vec![];
-        loop {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(None);
-            }
-            let (chunk, done) = match available.iter().position(|byte| *byte == b'\n') {
-                Some(end) => (&available[..end], true),
-                None => (available, false),
-            };
-            if line.len() + chunk.len() > MAX_MESSAGE_BYTES {
-                return Err(std::io::ErrorKind::InvalidData.into());
-            }
-            line.extend_from_slice(chunk);
-            let used = chunk.len() + usize::from(done);
-            reader.consume(used);
-            if done {
-                break;
-            }
-        }
-        if let Ok(message) = serde_json::from_slice::<Value>(&line) {
-            if message.is_object() {
-                return Ok(Some(message));
-            }
         }
     }
 }
@@ -664,14 +634,13 @@ async fn launch(
             let mut stderr = stderr;
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
         });
-        let mut connection = Connection {
+        let transport = StdioTransport {
             reader: Box::new(BufReader::new(stdout)),
             writer: Box::new(stdin),
-            next_id: 0,
-            broken: false,
-            secrets: environment.into_iter().map(|(_, value)| value).collect(),
             process: Some(process),
         };
+        let secrets = environment.into_iter().map(|(_, value)| value).collect();
+        let mut connection = Connection::new(Box::new(transport), secrets);
         let initialized = connection.initialize().await;
         initialized.map_err(|error| connection.redact(error))?;
         Ok(connection)
@@ -766,6 +735,21 @@ mod tests {
     use super::*;
     use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
     use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use transport::read_message;
+
+    fn stdio(
+        reader: impl tokio::io::AsyncBufRead + Send + Unpin + 'static,
+        writer: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
+    ) -> Connection {
+        let transport = StdioTransport {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            #[cfg(any(unix, windows))]
+            process: None,
+        };
+        Connection::new(Box::new(transport), vec![])
+    }
 
     /// An in-memory MCP server: lists fixed tools and answers calls by name.
     fn fake_server(calls: Arc<StdMutex<Vec<String>>>) -> Connection {
@@ -820,15 +804,7 @@ mod tests {
                     .unwrap();
             }
         });
-        Connection {
-            reader: Box::new(BufReader::new(client_read)),
-            writer: Box::new(client_write),
-            next_id: 0,
-            broken: false,
-            secrets: vec![],
-            #[cfg(any(unix, windows))]
-            process: None,
-        }
+        stdio(BufReader::new(client_read), client_write)
     }
 
     async fn servers(calls: Arc<StdMutex<Vec<String>>>, reserved: &[&str]) -> McpServers {
@@ -1092,15 +1068,7 @@ mod tests {
     async fn unsupported_protocol_versions_are_refused() {
         let reply: &[u8] =
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"1999-01-01\"}}\n";
-        let mut connection = Connection {
-            reader: Box::new(reply),
-            writer: Box::new(tokio::io::sink()),
-            next_id: 0,
-            broken: false,
-            secrets: vec![],
-            #[cfg(any(unix, windows))]
-            process: None,
-        };
+        let mut connection = stdio(reply, tokio::io::sink());
         assert!(connection.initialize().await.is_err());
     }
 }
