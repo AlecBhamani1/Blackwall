@@ -11,12 +11,12 @@ mod traces;
 mod usage;
 
 use blackwall_core::{
-    storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
+    agent::RunReason, storage::LocalStore, tools::Workspace, ChatMessage, ChatRequest, MessageRole,
 };
 use input::Input;
 use session::Conversation;
 use settings::Settings;
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
 const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launches):
   /commands, /help           Show these commands
@@ -68,7 +68,7 @@ USAGE:
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
-  bw run [--json] <prompt>   Run one task; --json prints JSON lines and denies prompts
+  bw run [--json] [--timeout SECS] <prompt>  Run one task; --json prints JSON lines and denies prompts
   bw resume <id> [--json] [prompt]
                              Continue a saved Agent conversation
   bw sessions                List saved conversations
@@ -103,19 +103,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(run());
+    let mut reason = None;
+    let result = runtime.block_on(run(&mut reason));
     session::shutdown_telemetry();
     runtime.shutdown_background();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    // Only `bw run` and `bw resume` with a prompt set a reason; other commands exit 0 or 1.
+    let reason = match result {
+        Ok(()) => reason.unwrap_or(RunReason::Complete),
         Err(error) => {
             eprintln!("bw: {error}");
-            ExitCode::FAILURE
+            reason.unwrap_or(RunReason::Error)
         }
-    }
+    };
+    ExitCode::from(reason.exit_code())
 }
 
-async fn run() -> Result<(), String> {
+async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "chat".into());
     let arguments = arguments.collect::<Vec<_>>();
@@ -226,16 +229,42 @@ async fn run() -> Result<(), String> {
         } else {
             &arguments[..]
         };
-        let (json, prompt_arguments) = match prompt_arguments.split_first() {
-            Some((flag, rest)) if flag == "--json" => (true, rest),
-            _ => (false, prompt_arguments),
+        let (json, limit, prompt) = match run_flags(prompt_arguments) {
+            Ok(parsed) => parsed,
+            Err((json, error)) => {
+                *reason = Some(RunReason::Usage);
+                if json {
+                    let failure = session::Failure::new(RunReason::Usage, error.as_str());
+                    let line = session::result_line(
+                        None,
+                        "",
+                        Some(&failure),
+                        RunReason::Usage,
+                        0,
+                        Default::default(),
+                    );
+                    println!("{line}");
+                }
+                return Err(error);
+            }
         };
-        let prompt = required_prompt(prompt_arguments)?;
         // A headless run never reads standard input, so it cannot take a script's later input.
         let mut input = (!json).then(Input::stdin);
-        return conversation
-            .turn(&store, &directory, &settings, &prompt, input.as_mut())
+        let outcome = conversation
+            .run(
+                &store,
+                &directory,
+                &settings,
+                &prompt,
+                input.as_mut(),
+                limit,
+            )
             .await;
+        *reason = Some(match &outcome {
+            Ok(done) => *done,
+            Err(failure) => failure.reason,
+        });
+        return outcome.map(|_| ()).map_err(|failure| failure.message);
     }
     if command == "chat" {
         require_no_arguments(&arguments)?;
@@ -256,6 +285,64 @@ fn require_no_arguments(arguments: &[String]) -> Result<(), String> {
     } else {
         Err("Unexpected arguments. Run bw --help.".into())
     }
+}
+
+/// Shortest and longest whole-run time limits for `--timeout`, in seconds.
+const RUN_TIMEOUT: std::ops::RangeInclusive<u64> = 10..=86_400;
+
+/// Leading `--json` and `--timeout SECS` (or `--timeout=SECS`) flags, each at most once, then the
+/// prompt; `--` ends the flags. A failure is a usage error and says whether `--json` was given, so
+/// the caller can still print a result line.
+#[allow(clippy::type_complexity)]
+fn run_flags(arguments: &[String]) -> Result<(bool, Option<Duration>, String), (bool, String)> {
+    let mut json = false;
+    let mut limit = None;
+    // The first problem is reported, after every flag is read so `--json` is known.
+    let mut failure = None;
+    let mut index = 0;
+    while let Some(flag) = arguments.get(index).filter(|flag| flag.starts_with("--")) {
+        index += 1;
+        let value = match flag.split_once('=') {
+            Some(("--timeout", value)) => Some(value),
+            _ if flag == "--timeout" => {
+                index += 1;
+                Some(arguments.get(index - 1).map_or("", String::as_str))
+            }
+            _ => None,
+        };
+        let problem = if let Some(value) = value {
+            let seconds = value
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| RUN_TIMEOUT.contains(seconds));
+            match (limit.replace(seconds), seconds) {
+                (Some(_), _) => Some("Give --timeout only once.".into()),
+                (None, None) => Some(format!(
+                    "Use --timeout <seconds> with a whole number from {} to {}.",
+                    RUN_TIMEOUT.start(),
+                    RUN_TIMEOUT.end()
+                )),
+                (None, Some(_)) => None,
+            }
+        } else if flag == "--json" {
+            let repeated = json;
+            json = true;
+            repeated.then(|| "Give --json only once.".into())
+        } else if flag == "--" {
+            break;
+        } else {
+            Some(format!(
+                "Unknown option {flag}. Use --json, --timeout <seconds>, or -- before a prompt that starts with --."
+            ))
+        };
+        failure = failure.or(problem);
+    }
+    if let Some(failure) = failure {
+        return Err((json, failure));
+    }
+    required_prompt(arguments.get(index..).unwrap_or_default())
+        .map(|prompt| (json, limit.flatten().map(Duration::from_secs), prompt))
+        .map_err(|error| (json, error))
 }
 
 fn required_prompt(arguments: &[String]) -> Result<String, String> {

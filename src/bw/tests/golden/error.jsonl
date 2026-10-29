@@ -1,0 +1,1 @@
+{"answer":"","denied":0,"error":"Use review [--uncommitted | --commit <ref> | --base <ref>]; targets are mutually exclusive.","reason":"error","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

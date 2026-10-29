@@ -1,0 +1,3 @@
+{"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
+{"report":"<report>","requestId":"<requestId>","type":"context_report"}
+{"answer":"","denied":0,"error":"The model service rejected this request (HTTP 500). Check the model and access key.","reason":"model","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

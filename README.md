@@ -127,7 +127,9 @@ value piped on stdin in the credential store, and `bw telemetry test` sends a te
 For development, `npm run cli -- setup` and `npm run cli` run the CLI without installing it.
 `bw run "prompt"` runs one task; `bw sessions` lists conversations; `bw resume <id>` continues
 an Agent conversation in its saved project. Add `--json` to `bw run` or `bw resume` for scripts and
-CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied. See
+CI: events print as JSON lines, and anything owner rules leave to an approval prompt is denied.
+`--timeout SECS` limits the whole run, and the exit code says why it ended (0 complete, 3 an
+approval was denied, 4 step limit, 5 model error, 6 context budget, 7 timeout, 130 interrupted). See
 the [CLI guide](docs/RUNTIME_GUIDE.md#cli) for credentials, approvals, and configuration precedence.
 
 Use `bw review` or `/review` in CLI or desktop Agent chat to inspect Git changes without agent tools. Choose `--uncommitted`,

@@ -542,7 +542,11 @@ fn a_write_requires_explicit_yes_and_is_denied_when_stdin_ends() {
         fs::write(&protected, "original\n").unwrap();
         let model = ModelServer::start(vec![proposed_write(), answer("approval handled")]);
         fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
-        let transcript = fixture.success(&["run", "change protected.txt"], decision);
+        let output = fixture.run(&["run", "change protected.txt"], decision);
+        // A run that completes after a denied approval exits 3.
+        let code = if decision.is_empty() { 3 } else { 0 };
+        assert_eq!(output.status.code(), Some(code));
+        let transcript = String::from_utf8(output.stdout).unwrap();
         assert!(
             transcript.contains("Fixture approval handled"),
             "{transcript}"
@@ -567,8 +571,10 @@ fn json_runs_print_events_and_deny_prompts_even_when_stdin_says_yes() {
     fs::write(&protected, "original\n").unwrap();
     let model = ModelServer::start(vec![proposed_write(), answer("approval handled")]);
     fixture.success(&["config", "set", "endpoint", &model.endpoint], "");
-    let output = fixture.success(&["run", "--json", "change protected.txt"], "yes\n");
-    let events: Vec<serde_json::Value> = output
+    let output = fixture.run(&["run", "--json", "change protected.txt"], "yes\n");
+    assert_eq!(output.status.code(), Some(3), "A denied approval exits 3");
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
@@ -580,6 +586,8 @@ fn json_runs_print_events_and_deny_prompts_even_when_stdin_says_yes() {
     let result = events.last().unwrap();
     assert_eq!(result["type"], "result");
     assert_eq!(result["status"], "complete");
+    assert_eq!(result["reason"], "denied");
+    assert_eq!(result["denied"], 1);
     assert!(result["answer"]
         .as_str()
         .unwrap()
@@ -940,7 +948,7 @@ fn reviewed_facts_never_bypass_tool_approval() {
     let server = ModelServer::start(vec![proposed_write(), answer("write denied")]);
     fixture.success(&["config", "set", "endpoint", &server.endpoint], "");
     let output = fixture.run(&["run", "Write a file"], "no\n");
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(3), "A denied approval exits 3");
     assert!(String::from_utf8_lossy(&output.stderr).contains("Allow this action once?"));
     let requests = server.finish();
     assert!(message_contents(&requests[0], "system")

@@ -406,8 +406,10 @@ async fn export_off_by_default() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_span_reports_http_status() {
-    let (base, seen) =
-        serve("HTTP/1.1 401 Unauthorized\r\ncontent-length: 6\r\n\r\nsecret".into()).await;
+    let (base, seen) = serve(
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecret".into(),
+    )
+    .await;
     let error = send_test_span_with(
         &config(&base, Protocol::HttpProtobuf),
         &HeaderMap::new(),
@@ -460,7 +462,7 @@ async fn test_span_reports_http_status() {
 async fn export_does_not_follow_redirects() {
     let (target, followed) = serve(OK.into()).await;
     let (base, seen) = serve(format!(
-        "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}/v1/traces\r\ncontent-length: 0\r\n\r\n"
+        "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}/v1/traces\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
     ))
     .await;
     let error = send_test_span_with(&config(&base, Protocol::HttpJson), &HeaderMap::new(), "cli")

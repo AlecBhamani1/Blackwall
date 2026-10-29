@@ -106,6 +106,32 @@ describe('native chat failure boundary', () => {
     expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
   });
 
+  it('ignores per-call model usage events without breaking the stream', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    const onDelta = vi.fn();
+    const onComplete = vi.fn();
+    const usage = { promptTokens: 120, completionTokens: 30, totalTokens: 150 };
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({ payload: { type: 'assistant_delta', requestId: 'usage', delta: 'Hello ' } });
+      listener({ payload: { type: 'model_usage', requestId: 'usage', usage } });
+      listener({ payload: { type: 'assistant_delta', requestId: 'usage', delta: 'world' } });
+      listener({ payload: { type: 'turn_complete', requestId: 'usage', usage } });
+      return { requestId: 'usage' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'usage', model: 'model', messages: [] },
+      { onDelta, onEvent, onComplete },
+      new AbortController().signal,
+    );
+    expect(onDelta.mock.calls.map(([delta]) => delta).join('')).toBe('Hello world');
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'model_usage' }));
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'turn_complete', usage }));
+  });
+
   it('passes reasoning and its duration through with the completed turn', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

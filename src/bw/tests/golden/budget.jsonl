@@ -1,0 +1,2 @@
+{"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
+{"answer":"","denied":0,"error":"The estimated request exceeds the model context budget. Use /compact, increase the configured limit, or shorten the task.","reason":"budget","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

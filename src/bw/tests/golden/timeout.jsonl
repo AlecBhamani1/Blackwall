@@ -1,0 +1,3 @@
+{"requestId":"<requestId>","sources":[],"type":"instructions_loaded","warnings":[]}
+{"report":"<report>","requestId":"<requestId>","type":"context_report"}
+{"answer":"","denied":0,"error":"The run reached its 10-second time limit and was stopped. You can continue this conversation.","reason":"timeout","sessionId":"<sessionId>","status":"error","type":"result","usage":{"input":0,"output":0}}

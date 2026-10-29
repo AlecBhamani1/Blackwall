@@ -10,6 +10,47 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Why a headless run ended. Each reason has its own process exit code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunReason {
+    /// Completed with nothing denied.
+    Complete,
+    /// Any other failure.
+    Error,
+    /// Invalid command-line flags or arguments.
+    Usage,
+    /// Completed, but at least one approval was denied.
+    Denied,
+    /// The step limit was reached.
+    Iterations,
+    /// The model service failed or could not be reached.
+    Model,
+    /// The context budget was exceeded.
+    Budget,
+    /// The whole-run time limit was reached.
+    Timeout,
+    /// The run was interrupted.
+    Interrupted,
+}
+
+impl RunReason {
+    /// The process exit code for this reason.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Complete => 0,
+            Self::Error => 1,
+            Self::Usage => 2,
+            Self::Denied => 3,
+            Self::Iterations => 4,
+            Self::Model => 5,
+            Self::Budget => 6,
+            Self::Timeout => 7,
+            Self::Interrupted => 130,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(transparent)]
@@ -38,6 +79,20 @@ impl AgentError {
             Self::Context => "context",
             Self::Instructions => "instructions",
             Self::Tool(error) => error.kind(),
+        }
+    }
+
+    /// Why a headless run that failed with this error ended.
+    pub fn reason(&self) -> RunReason {
+        use crate::context::ContextError;
+        match self {
+            Self::Budget(ContextError::Limit) | Self::Context => RunReason::Budget,
+            Self::Budget(ContextError::Iterations) | Self::Iterations => RunReason::Iterations,
+            Self::Budget(ContextError::Model(_)) | Self::Model(_) => RunReason::Model,
+            // `Denied` is only a run that completed after a denial; a run that fails is an error.
+            Self::Budget(_) | Self::Review(_) | Self::Instructions | Self::Tool(_) => {
+                RunReason::Error
+            }
         }
     }
 
@@ -455,6 +510,10 @@ impl Agent<'_> {
             reasoning.add(&turn);
             state.server_usage = turn.usage;
             if let Some(count) = turn.usage {
+                (self.emit)(AgentEvent::ModelUsage {
+                    request_id: request_id.into(),
+                    usage: count,
+                });
                 usage.prompt_tokens = usage.prompt_tokens.saturating_add(count.prompt_tokens);
                 usage.completion_tokens = usage
                     .completion_tokens
@@ -845,6 +904,50 @@ mod tests {
     use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
     use futures_util::future::BoxFuture;
     use std::sync::Mutex;
+
+    #[test]
+    fn run_reasons_come_from_typed_errors_and_have_distinct_exit_codes() {
+        use crate::context::ContextError;
+        let cases = [
+            (AgentError::Iterations, RunReason::Iterations),
+            (
+                AgentError::Budget(ContextError::Iterations),
+                RunReason::Iterations,
+            ),
+            (AgentError::Model(ModelError::Network), RunReason::Model),
+            (AgentError::Model(ModelError::Http(500)), RunReason::Model),
+            (
+                AgentError::Budget(ContextError::Model(ModelError::Invalid)),
+                RunReason::Model,
+            ),
+            (AgentError::Budget(ContextError::Limit), RunReason::Budget),
+            (AgentError::Context, RunReason::Budget),
+            (AgentError::Tool(tools::ToolError::Denied), RunReason::Error),
+            (AgentError::Model(ModelError::Limit), RunReason::Model),
+            (AgentError::Tool(tools::ToolError::File), RunReason::Error),
+            (AgentError::Budget(ContextError::History), RunReason::Error),
+            (AgentError::Instructions, RunReason::Error),
+        ];
+        for (error, reason) in cases {
+            assert_eq!(error.reason(), reason, "{error:?}");
+        }
+        let codes = [
+            (RunReason::Complete, 0, "complete"),
+            (RunReason::Error, 1, "error"),
+            (RunReason::Usage, 2, "usage"),
+            (RunReason::Denied, 3, "denied"),
+            (RunReason::Iterations, 4, "iterations"),
+            (RunReason::Model, 5, "model"),
+            (RunReason::Budget, 6, "budget"),
+            (RunReason::Timeout, 7, "timeout"),
+            (RunReason::Interrupted, 130, "interrupted"),
+        ];
+        for (reason, code, name) in codes {
+            assert_eq!(reason.exit_code(), code);
+            assert_eq!(serde_json::to_value(reason).unwrap(), json!(name));
+        }
+    }
+
     struct Scripted {
         step: Mutex<usize>,
     }
