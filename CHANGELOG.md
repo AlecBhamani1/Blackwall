@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Distinct exit codes for `bw run` and `bw resume` with a prompt: 0 complete, 1 error, 2 usage,
+  3 completed with a denied approval, 4 step limit, 5 model or network error, 6 context budget,
+  7 time limit, 130 interrupted. The `--json` result line adds `reason`, `denied` and
+  `usage {input, output}`, and `--timeout SECS` (10–86400) bounds the whole run. A run that
+  completes after denying an approval now exits 3 instead of 0.
 - Detect the context window of any local server, not only Ollama on port 11434: Ollama on any port,
   llama.cpp (`/props`), vLLM (`max_model_len`), and LM Studio (`loaded_context_length`). The
   detected server shows in **Settings → Model connection**, `bw status`, and `/context`.

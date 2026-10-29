@@ -628,11 +628,28 @@ Never put a key in an endpoint URL. `bw request "prompt"` prints a protocol prev
 
 `bw run --json "prompt"` and `bw resume SESSION_ID --json "prompt"` run without prompting, for scripts
 and CI. Each agent event except context snapshots is printed to standard output as one JSON object
-per line, ending with a `result` line that has the session ID, `status`, the answer, and any error.
-Standard input is not read: actions that owner rules allow run, and anything that would show an
-approval prompt is denied.
-The command exits with a nonzero status when the run fails; errors before the run starts, such as
-invalid settings, are reported only on standard error.
+per line, ending with a `result` line that has the session ID, `status`, the answer, any error,
+`reason`, `denied` (how many approvals were denied) and `usage` (`input` and `output` tokens the
+server reported for the run's completed turns). Standard input is not read: actions that owner
+rules allow run, and anything that would show an approval prompt is denied. Add `--timeout SECS`
+(10–86400) to stop the whole run after that many seconds.
+
+The exit code says why the run ended, with or without `--json`:
+
+| Exit | Meaning | `reason` |
+|---|---|---|
+| 0 | Completed, nothing denied | `complete` |
+| 1 | Other error | `error` |
+| 2 | Usage error, such as a missing prompt or a `--timeout` outside 10–86400 | `usage` |
+| 3 | Completed, but at least one approval was denied | `denied` |
+| 4 | Step limit (`iterations`) reached | `iterations` |
+| 5 | Model or network error | `model` |
+| 6 | Context budget exceeded | `budget` |
+| 7 | Whole-run time limit (`--timeout`) reached | `timeout` |
+| 130 | Interrupted (Ctrl+C), on every platform | `interrupted` |
+
+A usage error with `--json` still prints a `result` line, with a null session ID. Other errors
+before the run starts, such as invalid settings, exit 1 and are reported only on standard error.
 
 The CLI shares core tools, approval rules, enabled memory, skills, and native sessions with desktop.
 Type `yes` to authorize the displayed action once; other input or EOF denies it. Web tools are off
