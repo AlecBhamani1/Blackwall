@@ -16,7 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Review and trust with `bw project status|trust|untrust` or the desktop banner and dialog, which
   shows a diff when the file changed; untrust from **Settings → Security → Trusted projects**.
   The file must be a regular file of at most 64 KiB, never a symbolic link; an unusable file
-  makes every action ask.
+  makes every action ask. The review lists each rule with badges for broad ones and shows
+  invisible Unicode format characters as `\u{XXXX}`; project allow rules for the owner's MCP
+  servers or for every file are refused, and edits under `.blackwall/` always ask.
 - `"mode": "ordered"` for rules files: the first matching rule in the file decides. The default
   `strictest` keeps today's meaning, and across files a deny or ask always beats an allow.
 - Policy audit records gain `rule`: the deciding rule's source, index and mode, or `null`.

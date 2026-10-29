@@ -389,16 +389,25 @@ lets it add permissions on its own:
 ```
 
 Every section is optional, and unknown fields make the file invalid. `policy` uses the same rule
-format as `policy.json`, except that a project rule cannot name a `project`.
+format as `policy.json`, except that a project rule cannot name a `project`, and a project allow
+rule can neither name one of your MCP servers (only the project's own `p-` servers) nor match every
+file (a `path` of `.` or anything that resolves to the project root).
 
 **Trust.** Until you trust the file, only its `deny` and `ask` rules apply, because they can only
 tighten. Its `allow` rules and every other section wait. To trust it:
 
 - Desktop: when the selected project has an untrusted or changed file, a banner appears under the
-  project bar. **Review project settings** shows the file (or, when it changed, the diff from the
-  version you trusted) and what applies now. Choose **Trust** or **Not now**.
-- CLI: `bw project status` shows the file's path, its trust, what applies now, and what waits.
-  `bw project trust` prints the file (or the diff) and asks `y/N`. Without a terminal it refuses
+  project bar. **Review project settings** lists the file's rules (decision, kind, and what each
+  matches), marks broad ones ("matches every file", "any host", "your MCP server"), and shows the
+  file (or, when it changed, the diff from the version you trusted). Choose **Trust** or **Not
+  now**; Not now hides the banner for that version of the file. If the file changes while the
+  dialog is open, Trust is turned off until you reload and review it again.
+- Invisible characters that can disguise text (bidi controls, zero-width characters, the byte
+  order mark, and other Unicode format characters) are shown as `\u{XXXX}`, and long runs of blank
+  lines are collapsed with a note, in both the desktop and the CLI. A diff over 5,000 lines is
+  replaced by the whole file.
+- CLI: `bw project status` shows the file's path, its trust, its rules, what applies now, and
+  what waits. `bw project trust` prints the rules and the file (or the diff) and asks `y/N`. Without a terminal it refuses
   unless you pass `--yes`.
 
 Trust is saved in `trusted-projects.json` in the data folder as the project's canonical folder path
@@ -408,9 +417,16 @@ are trusted: if the file changes between showing and trusting, trusting is refus
 project with `bw project untrust` in it, or from **Settings → General → Security → Trusted
 projects**; its deny and ask rules keep applying.
 
+Like `policy.json`, the trust list is an ordinary file in your data folder. Anything you let run
+commands as your user, including an agent command you approve, could change it; that is an accepted
+local risk, the same as for your own rules. If the list cannot be read, Blackwall treats that as a
+sign of tampering: every action asks until it is fixed or removed.
+
 **What applies.** Rules load at the start of every run, from the owner's file and then the
 project's. Across files, a deny or ask from either file beats an allow from either file, whatever
-the mode. Writes to the data folder always ask. The file must be a regular file of at most 64 KiB in
+the mode. Writes to the data folder and to the project's own `.blackwall` folder (in any letter
+case) always ask. When an untrusted project's deny or ask rules apply, the run's warnings say how
+many. The file must be a regular file of at most 64 KiB in
 a real `.blackwall` folder; symbolic links are refused. It is read once, and its hash and settings
 come from those same bytes. If it cannot be read or is invalid, every action asks for approval
 until it is fixed, and the run's warnings and `bw project status` say why.
