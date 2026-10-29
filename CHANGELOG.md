@@ -205,6 +205,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `bw` no longer prints terminal escape codes from model or tool text. Approval prompts, streamed answers, tool errors, instruction warnings and subagent summaries drop control characters and show bidi characters as `\u{XXXX}`, so a delegate request can't repaint the approval prompt.
 - A model server's error message can no longer show your API key: the key sent with the request
   is removed from the error before it is shown, saved or exported, and quoted keys are caught too.
+- An MCP tool whose name contains one of its server's secrets (for example a saved header value)
+  is now skipped with a warning that does not repeat the name, so the secret never reaches the
+  model, traces or metrics.
 - A trusted project's `command` allow rule (for example `"command": "github__delete_repository"`)
   could allow one of your own MCP or command tools. A project's allow rules now only ever allow
   its own `p-` servers.

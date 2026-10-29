@@ -506,6 +506,15 @@ impl McpServers {
             let Some(name) = tool["name"].as_str() else {
                 continue;
             };
+            // A name carrying a secret would reach the model and telemetry, so it is never
+            // offered, and the warning does not repeat it.
+            if redact(name.to_owned(), &connection.secrets) != name {
+                self.warnings.push(format!(
+                    "A tool from MCP server {} was skipped because its name contains one of the server's secrets.",
+                    config.name
+                ));
+                continue;
+            }
             let allowed = config
                 .allow_tools
                 .as_ref()
@@ -1229,6 +1238,36 @@ mod tests {
         assert!(servers.warnings.iter().any(|w| w.contains("bad name!")));
         assert!(servers.warnings.iter().any(|w| w.contains("tool fail ")));
         assert!(servers.handles("jira__search") && !servers.handles("search"));
+    }
+
+    #[tokio::test]
+    async fn tools_named_with_a_secret_are_skipped_without_naming_them() {
+        let mut connection = fake_server(Arc::default());
+        connection.initialize().await.unwrap();
+        connection.secrets = vec!["slow".into()];
+        let config = ServerConfig {
+            name: "jira".into(),
+            command: vec!["jira-mcp".into()],
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
+            allow_tools: None,
+            deny_tools: vec![],
+            secrets: vec!["JIRA_API_TOKEN".into()],
+            secret_origins: BTreeMap::new(),
+        };
+        let mut servers = McpServers::default();
+        servers.add(config, connection, &mut vec![]).await;
+        let names = servers.definitions();
+        assert!(names
+            .iter()
+            .all(|definition| !definition.to_string().contains("slow")));
+        assert!(servers.handles("jira__search") && !servers.handles("jira__slow"));
+        assert!(servers.warnings.iter().all(|w| !w.contains("slow")));
+        assert!(servers
+            .warnings
+            .iter()
+            .any(|w| w.contains("one of the server's secrets")));
     }
 
     #[tokio::test]
