@@ -85,7 +85,8 @@ chunks. Reasoning that never closes is not shown as answer text. Reasoning is ne
 the model. The desktop shows it collapsed above the answer as **Thought for Ns**; the CLI prints
 `[Thought for Ns]`, and `bw run --json` includes `reasoning` and `reasoningMs` on `turn_complete`.
 Traces record it only when prompt and output capture is on, as a `reasoning` part of
-`gen_ai.output.messages`. It is limited to the same 8 MiB as the rest of a reply.
+`gen_ai.output.messages`. Each reply's reasoning is limited to the same 8 MiB as the rest of the
+reply, and a run keeps at most 256 KiB of it, ending with "[Reasoning truncated]" when cut.
 
 **Tool calls written as text.** Some models reply with `<tool_call>{"name":…,"arguments":{…}}</tool_call>`
 blocks instead of structured tool calls. Blackwall reads them only when you turn on **This model

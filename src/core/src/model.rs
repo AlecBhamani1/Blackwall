@@ -68,22 +68,42 @@ pub struct ModelTurn {
     /// The calls were written as text, not sent as structured calls. They always ask.
     pub text_calls: bool,
 }
-/// Reasoning gathered across the model calls of one run, for `TurnComplete`.
+/// The most reasoning kept for one run, across all its model calls.
+pub const MAX_RUN_REASONING: usize = 256 * 1024;
+const TRUNCATED: &str = "\n\n[Reasoning truncated]";
+
+/// Reasoning gathered across the model calls of one run, for `TurnComplete`, up to
+/// [`MAX_RUN_REASONING`] bytes.
 #[derive(Default)]
 pub struct Reasoning {
     text: String,
     ms: u64,
+    truncated: bool,
 }
 impl Reasoning {
     pub fn add(&mut self, turn: &ModelTurn) {
         if turn.reasoning.is_empty() {
             return;
         }
+        self.ms = self.ms.saturating_add(turn.reasoning_ms);
+        if self.truncated {
+            return;
+        }
         if !self.text.is_empty() {
             self.text.push_str("\n\n");
         }
-        self.text.push_str(&turn.reasoning);
-        self.ms = self.ms.saturating_add(turn.reasoning_ms);
+        let room = MAX_RUN_REASONING.saturating_sub(self.text.len());
+        if turn.reasoning.len() <= room {
+            self.text.push_str(&turn.reasoning);
+            return;
+        }
+        let end = (0..=room)
+            .rev()
+            .find(|&index| turn.reasoning.is_char_boundary(index))
+            .unwrap_or(0);
+        self.text.push_str(&turn.reasoning[..end]);
+        self.text.push_str(TRUNCATED);
+        self.truncated = true;
     }
     /// The text and duration, or nothing when the model did not reason.
     pub fn take(&mut self) -> (Option<String>, Option<u64>) {
@@ -709,6 +729,33 @@ mod tests {
         );
         assert!(turn.calls.is_empty());
         assert_eq!((shown.as_str(), turn.content.as_str()), (reply, reply));
+    }
+    #[test]
+    fn reasoning_is_bounded_across_a_run() {
+        let mut run = Reasoning::default();
+        let turn = |text: String| ModelTurn {
+            reasoning: text,
+            reasoning_ms: 1000,
+            ..Default::default()
+        };
+        // Many calls, each under the per-call limit, add up past the run's limit.
+        for _ in 0..10 {
+            run.add(&turn("é".repeat(40 * 1024)));
+        }
+        let (text, ms) = run.take();
+        let text = text.unwrap();
+        assert!(
+            text.len() <= MAX_RUN_REASONING + TRUNCATED.len(),
+            "{}",
+            text.len()
+        );
+        assert!(text.ends_with("[Reasoning truncated]"));
+        assert_eq!(text.matches("[Reasoning truncated]").count(), 1);
+        assert_eq!(ms, Some(10_000));
+        let mut short = Reasoning::default();
+        short.add(&turn("a".into()));
+        short.add(&turn("b".into()));
+        assert_eq!(short.take().0.as_deref(), Some("a\n\nb"));
     }
     #[test]
     fn truncated_stream_is_an_error() {
