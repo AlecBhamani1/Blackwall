@@ -8,7 +8,7 @@ on this computer or on another machine you control through any OpenAI-compatible
 > memory, skills, and an interruptible agent runtime are implemented in this checkout. These changes
 > are available in the 0.1.3 development build. Release acceptance remains incomplete.
 > Persistent pairing is implemented with a configured relay;
-> native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in [the delivery plan](docs/DELIVERY_PLAN.md).
+> native two-computer acceptance, a default hosted relay, and macOS distribution checks remain open in the [release checklist](docs/RELEASE_CHECKLIST.md).
 > Linux and Windows builds are new and still need physical-device acceptance.
 
 ## Download
@@ -111,7 +111,7 @@ Setup asks for an existing OpenAI-compatible service address and its model ID, t
 choices. Type `/commands` during chat to see the available controls. Change settings with
 `/model <id>`, `/endpoint <url>`, `/web on|off`, `/memory on|off`, or `/settings <name> <value>`.
 Use `bw memory pending` (or `/memory pending`) to review agent suggestions, then approve,
-reject, edit, or forget them. See [reviewed learning](docs/MEMORY.md) for scopes and controls.
+reject, edit, or forget them. See [reviewed learning](docs/RUNTIME_GUIDE.md#reviewed-learning) for scopes and controls.
 Use `bw project status` to see a project's `.blackwall/project.json`, whether it is trusted, and
 what applies now; `bw project trust` shows it and asks before trusting, and `bw project untrust`
 undoes that. See [Project settings](docs/RUNTIME_GUIDE.md#project-settings).
@@ -270,8 +270,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the [repository workflow](docs/REPOSI
 `blackwall-core` stays independent of Tauri so the desktop, CLI, and tests share the same runtime. The current desktop bridge validates and bounds requests, rejects unsafe endpoint
 forms, and streams typed events back to the UI. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for context and container diagrams, including command tools, MCP servers, and telemetry export, and
-the implemented boundaries and [`docs/PLAN.md`](docs/PLAN.md) for the full agent and sharing
-roadmap.
+the implemented boundaries. The original plans are kept in [`docs/archive/`](docs/archive/).
 
 ## First guest-sharing slice
 
