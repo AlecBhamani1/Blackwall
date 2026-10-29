@@ -26,6 +26,7 @@ pub mod instructions;
 pub mod mcp;
 pub mod model;
 pub mod policy;
+pub mod project;
 pub mod secrets;
 pub mod telemetry;
 pub mod tools;

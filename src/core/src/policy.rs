@@ -23,29 +23,174 @@ pub enum Decision {
     Deny,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+/// One allow, ask, or deny rule in the owner's `policy.json` or a project's `project.json`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Rule {
-    decision: Decision,
-    kind: ApprovalKind,
+pub struct Rule {
+    pub(crate) decision: Decision,
+    pub(crate) kind: ApprovalKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
+    pub(crate) command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
+    pub(crate) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    host: Option<String>,
+    pub(crate) host: Option<String>,
     /// An MCP server name, matching all of its tools, or one `server__tool` name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool: Option<String>,
-    /// Limits the rule to runs in this project folder.
+    pub(crate) tool: Option<String>,
+    /// Limits the rule to runs in this project folder. Owner rules only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
+    pub(crate) project: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+/// How the rules inside one file rank against each other. Across files, a deny or ask from any
+/// file always beats an allow from any other file.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleMode {
+    /// Deny outranks ask, and ask outranks allow: today's behaviour.
+    #[default]
+    Strictest,
+    /// The first matching rule in the file decides that file's answer, so an earlier allow can
+    /// make an exception to a later ask or deny in the same file.
+    Ordered,
+}
+
+/// Which file a rule came from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    User,
+    Project,
+}
+
+/// The rule that decided an action, as recorded in the audit log.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MatchedRule {
+    pub source: Source,
+    /// The rule's position in its file's `rules` list, from 0.
+    pub index: usize,
+    pub mode: RuleMode,
+}
+
+/// A decision and the rule that made it; `matched` is `None` for the default Ask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Verdict {
+    pub decision: Decision,
+    pub matched: Option<MatchedRule>,
+}
+
+/// The contents of a rules file: `policy.json`, or the `policy` part of a project file.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RuleFile {
-    rules: Vec<Rule>,
+pub struct RulesFile {
+    #[serde(default, skip_serializing_if = "is_strictest")]
+    pub mode: RuleMode,
+    pub rules: Vec<Rule>,
+    /// Each kept rule's position in the file as written, when some rules were dropped.
+    #[serde(skip)]
+    positions: Option<Vec<usize>>,
+}
+
+fn is_strictest(mode: &RuleMode) -> bool {
+    *mode == RuleMode::Strictest
+}
+
+impl RulesFile {
+    pub(crate) fn validate(self) -> Result<Self, &'static str> {
+        let mode = self.mode;
+        validate(self.rules).map(|rules| Self {
+            mode,
+            rules,
+            positions: None,
+        })
+    }
+
+    /// Keep only deny and ask rules, which can only tighten, remembering their positions.
+    pub(crate) fn keep_restricting(&mut self) {
+        let positions = self.positions();
+        let (positions, rules) = std::mem::take(&mut self.rules)
+            .into_iter()
+            .zip(positions)
+            .filter(|(rule, _)| rule.decision != Decision::Allow)
+            .map(|(rule, index)| (index, rule))
+            .unzip();
+        self.rules = rules;
+        self.positions = Some(positions);
+    }
+
+    /// Count the rules of each decision: (allow, ask, deny).
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.rules
+            .iter()
+            .fold((0, 0, 0), |(allow, ask, deny), rule| match rule.decision {
+                Decision::Allow => (allow + 1, ask, deny),
+                Decision::Ask => (allow, ask + 1, deny),
+                Decision::Deny => (allow, ask, deny + 1),
+            })
+    }
+
+    fn positions(&self) -> Vec<usize> {
+        self.positions
+            .clone()
+            .unwrap_or_else(|| (0..self.rules.len()).collect())
+    }
+
+    fn layer(self, source: Source) -> Layer {
+        let positions = self.positions();
+        Layer {
+            source,
+            mode: self.mode,
+            rules: positions.into_iter().zip(self.rules).collect(),
+        }
+    }
+}
+
+/// One file's rules, each with its position in that file.
+#[derive(Debug)]
+struct Layer {
+    source: Source,
+    mode: RuleMode,
+    rules: Vec<(usize, Rule)>,
+}
+
+impl Layer {
+    /// This file's answer for an action, or `None` when none of its rules match.
+    fn verdict(&self, applies: &dyn Fn(&Rule) -> bool) -> Option<(Decision, MatchedRule)> {
+        let mut matching = self.rules.iter().filter(|(_, rule)| applies(rule));
+        let (index, rule) = match self.mode {
+            RuleMode::Ordered => matching.next()?,
+            RuleMode::Strictest => strictest(matching, |(_, rule)| rule.decision)?,
+        };
+        Some((
+            rule.decision,
+            MatchedRule {
+                source: self.source,
+                index: *index,
+                mode: self.mode,
+            },
+        ))
+    }
+}
+
+/// Raise an Allow to Ask. The rule no longer decided, so none is recorded.
+fn floor_at_ask(verdict: Verdict) -> Verdict {
+    if verdict.decision < Decision::Ask {
+        Verdict {
+            decision: Decision::Ask,
+            matched: None,
+        }
+    } else {
+        verdict
+    }
+}
+
+/// The first item with the highest decision.
+fn strictest<T>(items: impl Iterator<Item = T>, decision: impl Fn(&T) -> Decision) -> Option<T> {
+    items.fold(None, |best, item| match best {
+        Some(best) if decision(&best) >= decision(&item) => Some(best),
+        _ => Some(item),
+    })
 }
 
 /// A saved rule that allows an MCP server or tool, as listed for the owner.
@@ -56,28 +201,42 @@ pub struct ToolRule {
     pub project: Option<String>,
 }
 
-/// Rules loaded for one run. A missing file has no rules; an invalid file has no rules and an
-/// error, so every action keeps asking.
+/// Rules loaded for one run: the owner's file, then the project's. A missing file has no rules;
+/// an invalid owner file has no rules and an error, and an unusable project file makes every
+/// action ask, so nothing loosens by accident.
 #[derive(Debug)]
 pub struct Policy {
-    rules: Vec<Rule>,
+    layers: Vec<Layer>,
     pub error: Option<String>,
+    /// Notes about the project's settings file, shown with the run's other warnings.
+    pub warnings: Vec<String>,
+    /// Set when the project file could not be used: nothing is allowed without asking.
+    ask_all: bool,
     audit: PathBuf,
     /// The data folder relative to the workspace, when the workspace contains it.
     protected: Option<PathBuf>,
     directory: PathBuf,
     workspace: PathBuf,
+    with_project: bool,
 }
 
 impl Policy {
     /// Chat has no project scope. Only the owner's global rules may authorize web requests.
     pub async fn load_global(directory: &Path) -> Self {
-        let mut policy = Self::load(directory, directory).await;
-        policy.rules.retain(|rule| rule.project.is_none());
+        let mut policy = Self::read(directory, directory, false).await;
+        for layer in &mut policy.layers {
+            layer.rules.retain(|(_, rule)| rule.project.is_none());
+        }
         policy
     }
 
+    /// The owner's rules plus the project's `.blackwall/project.json` rules. An untrusted project
+    /// contributes only its deny and ask rules.
     pub async fn load(directory: &Path, workspace: &Path) -> Self {
+        Self::read(directory, workspace, true).await
+    }
+
+    async fn read(directory: &Path, workspace: &Path, with_project: bool) -> Self {
         let audit = directory.join(AUDIT_FILE);
         let protected = tokio::fs::canonicalize(directory)
             .await
@@ -91,23 +250,24 @@ impl Policy {
             .await
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RulesFile::default()),
             Err(_) => Err("The policy file could not be read."),
             Ok(body) if body.len() > MAX_POLICY_BYTES => Err("The policy file is too large."),
-            Ok(body) => serde_json::from_slice::<RuleFile>(&body)
+            Ok(body) => serde_json::from_slice::<RulesFile>(&body)
                 .map_err(|_| "The policy file is not valid.")
-                .and_then(|file| validate(file.rules)),
+                .and_then(RulesFile::validate),
         };
-        let (rules, error) = match parsed {
-            Ok(rules) => (rules, None),
+        let (file, mut error) = match parsed {
+            Ok(file) => (file, None),
             Err(error) => (
-                vec![],
+                RulesFile::default(),
                 Some(format!("{error} Every action will ask for approval.")),
             ),
         };
+        let mut user = file.layer(Source::User);
         // Project rules apply only in their own folder. The workspace path is already canonical.
-        let mut kept = Vec::with_capacity(rules.len());
-        for rule in rules {
+        let mut kept = Vec::with_capacity(user.rules.len());
+        for (index, rule) in user.rules {
             if let Some(project) = &rule.project {
                 let folder =
                     tokio::time::timeout(IO_TIMEOUT, tokio::fs::canonicalize(project)).await;
@@ -115,21 +275,54 @@ impl Policy {
                     continue;
                 }
             }
-            kept.push(rule);
+            kept.push((index, rule));
+        }
+        user.rules = kept;
+        let mut layers = vec![user];
+        let mut warnings = vec![];
+        let mut ask_all = false;
+        if with_project {
+            let (data, folder) = (directory.to_path_buf(), workspace.to_path_buf());
+            let loaded = tokio::time::timeout(
+                IO_TIMEOUT,
+                tokio::task::spawn_blocking(move || crate::project::try_load(&folder, &data)),
+            )
+            .await;
+            match loaded {
+                Ok(Ok(Ok((config, _, notes)))) => {
+                    warnings = notes;
+                    layers.extend(config.policy.map(|rules| rules.layer(Source::Project)));
+                }
+                Ok(Ok(Err(problem))) => {
+                    ask_all = true;
+                    let message = format!("{problem} Every action will ask for approval.");
+                    warnings.push(message.clone());
+                    error.get_or_insert(message);
+                }
+                _ => {
+                    ask_all = true;
+                    let message = "The project settings file could not be read in time. Every action will ask for approval.".to_owned();
+                    warnings.push(message.clone());
+                    error.get_or_insert(message);
+                }
+            }
         }
         Self {
-            rules: kept,
+            layers,
             error,
+            warnings,
+            ask_all,
             audit,
             protected,
             directory: directory.into(),
             workspace: workspace.into(),
+            with_project,
         }
     }
 
-    /// Reload the owner's rules for the same data folder and workspace.
+    /// Reload the rules for the same data folder and workspace.
     pub async fn reload(&self) -> Self {
-        Self::load(&self.directory, &self.workspace).await
+        Self::read(&self.directory, &self.workspace, self.with_project).await
     }
 
     /// The owner's data folder and the run's workspace, for saving a rule from an approval.
@@ -137,49 +330,73 @@ impl Policy {
         (&self.directory, &self.workspace)
     }
 
-    /// Deny outranks ask, and ask outranks allow. Unmatched actions ask, and so do writes to the
-    /// data folder, so the agent cannot change its own rules.
-    pub fn decide(&self, kind: ApprovalKind, subject: &str) -> Decision {
-        let decision = self
-            .rules
-            .iter()
-            .filter(|rule| rule.kind == kind && matches(rule, subject))
-            .map(|rule| rule.decision)
-            .max()
-            .unwrap_or(Decision::Ask);
+    /// Each file gives its own answer (see [`RuleMode`]); across files deny outranks ask and ask
+    /// outranks allow, and on a tie the owner's rule is the one recorded.
+    fn verdict(&self, applies: &dyn Fn(&Rule) -> bool) -> Verdict {
+        let verdict = strictest(
+            self.layers
+                .iter()
+                .filter_map(|layer| layer.verdict(applies)),
+            |(decision, _)| *decision,
+        )
+        .map_or(
+            Verdict {
+                decision: Decision::Ask,
+                matched: None,
+            },
+            |(decision, matched)| Verdict {
+                decision,
+                matched: Some(matched),
+            },
+        );
+        if self.ask_all {
+            floor_at_ask(verdict)
+        } else {
+            verdict
+        }
+    }
+
+    /// Unmatched actions ask, and so do writes to the data folder, so the agent cannot change
+    /// its own rules.
+    pub fn evaluate(&self, kind: ApprovalKind, subject: &str) -> Verdict {
+        let verdict = self.verdict(&|rule| rule.kind == kind && matches(rule, subject));
         let protected = kind == ApprovalKind::File
             && self.protected.as_ref().is_some_and(|data| {
                 normalize(&subject.to_lowercase()).is_none_or(|path| path.starts_with(data))
             });
         if protected {
-            decision.max(Decision::Ask)
+            floor_at_ask(verdict)
         } else {
-            decision
+            verdict
         }
+    }
+
+    pub fn decide(&self, kind: ApprovalKind, subject: &str) -> Decision {
+        self.evaluate(kind, subject).decision
     }
 
     /// MCP calls match `tool` rules by server or exact name, and `command` rules by the namespaced
     /// name. `tool` rules never match shell commands, which `decide` handles.
-    pub fn decide_tool(&self, exposed: &str) -> Decision {
+    pub fn evaluate_tool(&self, exposed: &str) -> Verdict {
         let server = exposed
             .split_once("__")
             .map_or(exposed, |(server, _)| server);
-        self.rules
-            .iter()
-            .filter(|rule| {
-                rule.kind == ApprovalKind::Exec
-                    && match rule.tool.as_deref() {
-                        Some(tool) => tool == exposed || tool == server,
-                        None => matches(rule, exposed),
-                    }
-            })
-            .map(|rule| rule.decision)
-            .max()
-            .unwrap_or(Decision::Ask)
+        self.verdict(&|rule| {
+            rule.kind == ApprovalKind::Exec
+                && match rule.tool.as_deref() {
+                    Some(tool) => tool == exposed || tool == server,
+                    None => matches(rule, exposed),
+                }
+        })
+    }
+
+    pub fn decide_tool(&self, exposed: &str) -> Decision {
+        self.evaluate_tool(exposed).decision
     }
 
     /// Append a bounded, redacted record. Audit failures never change the decision.
-    /// `saved` is the rule the owner saved from this approval, if any.
+    /// `saved` is the rule the owner saved from this approval, if any; `rule` is the rule that
+    /// decided, or `None` for the default Ask.
     pub async fn record(
         &self,
         kind: ApprovalKind,
@@ -187,10 +404,11 @@ impl Policy {
         decision: Decision,
         allowed: bool,
         saved: Option<&ToolRule>,
+        rule: Option<MatchedRule>,
     ) {
         let _ = tokio::time::timeout(
             IO_TIMEOUT,
-            self.append(kind, subject, decision, allowed, saved),
+            self.append(kind, subject, decision, allowed, saved, rule),
         )
         .await;
     }
@@ -202,12 +420,13 @@ impl Policy {
         decision: Decision,
         allowed: bool,
         saved: Option<&ToolRule>,
+        rule: Option<MatchedRule>,
     ) {
         let path = &self.audit;
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed});
+        let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed,"rule":rule});
         if let Some(rule) = saved {
             entry["saved"] = json!(rule);
         }
@@ -340,11 +559,17 @@ pub fn remove_tool_rule(directory: &Path, rule: &ToolRule) -> Result<(), String>
 }
 
 fn read_rules(directory: &Path) -> Result<Vec<Rule>, String> {
+    read_file(directory).map(|file| file.rules)
+}
+
+fn read_file(directory: &Path) -> Result<RulesFile, String> {
     use std::io::Read;
     let unusable = "The policy file could not be read or is not valid, so it was left unchanged. Fix or remove policy.json in the Blackwall data folder, then try again.";
     let mut body = vec![];
     match std::fs::File::open(directory.join(POLICY_FILE)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RulesFile::default())
+        }
         Err(_) => return Err(unusable.into()),
         Ok(file) => file
             .take(MAX_POLICY_BYTES as u64 + 1)
@@ -354,9 +579,9 @@ fn read_rules(directory: &Path) -> Result<Vec<Rule>, String> {
     if body.len() > MAX_POLICY_BYTES {
         return Err(unusable.into());
     }
-    serde_json::from_slice::<RuleFile>(&body)
+    serde_json::from_slice::<RulesFile>(&body)
         .ok()
-        .and_then(|file| validate(file.rules).ok())
+        .and_then(|file| file.validate().ok())
         .ok_or_else(|| unusable.into())
 }
 
@@ -367,16 +592,17 @@ fn edit_rules(directory: &Path, change: impl FnOnce(&mut Vec<Rule>)) -> Result<(
     let _edit = EDITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut rules = read_rules(directory)?;
-    let before = rules.len();
-    change(&mut rules);
-    if rules.len() == before && !directory.join(POLICY_FILE).exists() {
+    let mut file = read_file(directory)?;
+    let before = file.rules.len();
+    change(&mut file.rules);
+    if file.rules.len() == before && !directory.join(POLICY_FILE).exists() {
         // Nothing to save, so a missing file stays missing.
         return Ok(());
     }
-    let rules = validate(rules)?;
-    let mut body = serde_json::to_vec_pretty(&RuleFile { rules })
-        .map_err(|_| "The policy file could not be saved.")?;
+    // The owner's mode is kept as written.
+    let file = file.validate()?;
+    let mut body =
+        serde_json::to_vec_pretty(&file).map_err(|_| "The policy file could not be saved.")?;
     body.push(b'\n');
     if body.len() > MAX_POLICY_BYTES {
         return Err("The policy file is too large.".into());
@@ -577,8 +803,15 @@ mod tests {
 
     fn policy(body: &str) -> Policy {
         Policy {
-            rules: validate(serde_json::from_str::<RuleFile>(body).unwrap().rules).unwrap(),
+            layers: vec![serde_json::from_str::<RulesFile>(body)
+                .unwrap()
+                .validate()
+                .unwrap()
+                .layer(Source::User)],
             error: None,
+            warnings: vec![],
+            ask_all: false,
+            with_project: false,
             audit: std::env::temp_dir().join(AUDIT_FILE),
             protected: Some(PathBuf::from(".blackwall")),
             directory: std::env::temp_dir(),
@@ -897,6 +1130,182 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    #[test]
+    fn ordered_mode_first_match_wins() {
+        let rules = r#"[
+            {"decision":"allow","kind":"exec","command":"git status"},
+            {"decision":"ask","kind":"exec","command":"git"},
+            {"decision":"allow","kind":"exec","command":"git log"},
+            {"decision":"deny","kind":"exec","command":"git push"}
+        ]"#;
+        let ordered = policy(&format!(r#"{{"mode":"ordered","rules":{rules}}}"#));
+        assert_eq!(
+            ordered.decide(ApprovalKind::Exec, "git status -s"),
+            Decision::Allow
+        );
+        // The earlier ask decides before the later allow and deny.
+        assert_eq!(ordered.decide(ApprovalKind::Exec, "git log"), Decision::Ask);
+        assert_eq!(
+            ordered.decide(ApprovalKind::Exec, "git push"),
+            Decision::Ask
+        );
+        assert_eq!(
+            ordered.evaluate(ApprovalKind::Exec, "git status").matched,
+            Some(MatchedRule {
+                source: Source::User,
+                index: 0,
+                mode: RuleMode::Ordered
+            })
+        );
+        // An allow still never matches control syntax, so it cannot shadow a later rule that way.
+        assert_eq!(
+            ordered.decide(ApprovalKind::Exec, "git status; rm -rf ."),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn strictest_mode_unchanged() {
+        let strictest = policy(
+            r#"{"mode":"strictest","rules":[
+                {"decision":"allow","kind":"exec","command":"git status"},
+                {"decision":"ask","kind":"exec","command":"git"},
+                {"decision":"deny","kind":"exec","command":"git push"}
+            ]}"#,
+        );
+        assert_eq!(
+            strictest.decide(ApprovalKind::Exec, "git status"),
+            Decision::Ask
+        );
+        assert_eq!(
+            strictest.decide(ApprovalKind::Exec, "git push"),
+            Decision::Deny
+        );
+        assert_eq!(
+            strictest.evaluate(ApprovalKind::Exec, "git push").matched,
+            Some(MatchedRule {
+                source: Source::User,
+                index: 2,
+                mode: RuleMode::Strictest
+            })
+        );
+        assert_eq!(strictest.evaluate(ApprovalKind::Exec, "ls").matched, None);
+    }
+
+    #[test]
+    fn legacy_policy_loads_unchanged() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-legacy-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let legacy = r#"{"rules":[{"decision":"deny","kind":"file","path":".git"},{"decision":"allow","kind":"exec","command":"cargo test"}]}"#;
+        std::fs::write(directory.join(POLICY_FILE), legacy).unwrap();
+        let file = read_file(&directory).unwrap();
+        assert_eq!(file.mode, RuleMode::Strictest);
+        assert_eq!(file.counts(), (1, 0, 1));
+        // Saving keeps the file free of a mode, and an ordered owner file keeps its mode.
+        allow_tool(&directory, "docs", None).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join(POLICY_FILE)).unwrap()).unwrap();
+        assert!(saved.get("mode").is_none(), "{saved}");
+        std::fs::write(
+            directory.join(POLICY_FILE),
+            r#"{"mode":"ordered","rules":[]}"#,
+        )
+        .unwrap();
+        allow_tool(&directory, "docs", None).unwrap();
+        assert_eq!(read_file(&directory).unwrap().mode, RuleMode::Ordered);
+        std::fs::write(
+            directory.join(POLICY_FILE),
+            r#"{"mode":"loose","rules":[]}"#,
+        )
+        .unwrap();
+        assert!(read_file(&directory).is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn data_folder_writes_still_floor_at_ask() {
+        for mode in ["strictest", "ordered"] {
+            let rules = policy(&format!(
+                r#"{{"mode":"{mode}","rules":[{{"decision":"allow","kind":"file","path":"."}}]}}"#
+            ));
+            let verdict = rules.evaluate(ApprovalKind::File, ".blackwall/policy.json");
+            assert_eq!(verdict.decision, Decision::Ask, "{mode}");
+            assert_eq!(verdict.matched, None, "{mode}");
+            assert_eq!(
+                rules.decide(ApprovalKind::File, "src/main.rs"),
+                Decision::Allow
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_records_deciding_rule() {
+        let root = std::env::temp_dir().join(format!("blackwall-audit-{}", rand::random::<u64>()));
+        let (data, work) = (root.join("data"), root.join("work"));
+        std::fs::create_dir_all(work.join(".blackwall")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let work = std::fs::canonicalize(work).unwrap();
+        std::fs::write(
+            data.join(POLICY_FILE),
+            json!({"rules":[
+                {"decision":"ask","kind":"exec","command":"npm"},
+                {"decision":"allow","kind":"exec","command":"cat"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            work.join(".blackwall").join("project.json"),
+            json!({"policy":{"rules":[
+                {"decision":"allow","kind":"exec","command":"ls"},
+                {"decision":"deny","kind":"exec","command":"cat secret.txt"}
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        let approvals = crate::approvals::Approvals::default();
+        approvals.load_policy("run", &data, &work).await.unwrap();
+        let never = |_| panic!("a matched rule must not prompt");
+        for (subject, allowed) in [("cat secret.txt", false), ("cat notes.txt", true)] {
+            assert_eq!(
+                approvals
+                    .request("run", ApprovalKind::Exec, subject, "detail".into(), &never)
+                    .await
+                    .unwrap(),
+                allowed
+            );
+        }
+        let policy = Policy::load(&data, &work).await;
+        let unmatched = policy.evaluate(ApprovalKind::Exec, "make");
+        policy
+            .record(
+                ApprovalKind::Exec,
+                "make",
+                unmatched.decision,
+                false,
+                None,
+                unmatched.matched,
+            )
+            .await;
+        let audit = std::fs::read_to_string(data.join(AUDIT_FILE)).unwrap();
+        let records: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records[0]["rule"],
+            json!({"source":"project","index":1,"mode":"strictest"})
+        );
+        assert_eq!(
+            records[1]["rule"],
+            json!({"source":"user","index":1,"mode":"strictest"})
+        );
+        assert_eq!(records[2]["rule"], serde_json::Value::Null);
+        assert!(records[2].as_object().unwrap().contains_key("rule"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     async fn record_secret(policy: &Policy) {
         policy
             .record(
@@ -909,6 +1318,7 @@ mod tests {
                  https://me:hunter2@host API_TOKEN=hunter2",
                 Decision::Ask,
                 false,
+                None,
                 None,
             )
             .await;
