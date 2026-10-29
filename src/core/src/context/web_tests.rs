@@ -89,6 +89,7 @@ fn run() -> ContextRun {
         compact: false,
         trace: Default::default(),
         subagents: Default::default(),
+        instruction_settings: Default::default(),
     }
 }
 

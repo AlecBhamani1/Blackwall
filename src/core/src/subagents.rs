@@ -193,7 +193,7 @@ pub async fn run(
 ) -> Result<String, String> {
     let project = workspace.clone();
     let instructions = crate::agent::instruction_task(move || {
-        crate::instructions::Instructions::discover(&project, None)
+        crate::instructions::Instructions::discover(&project, None, &Default::default())
     })
     .await
     .map_err(|error| error.to_string())?;

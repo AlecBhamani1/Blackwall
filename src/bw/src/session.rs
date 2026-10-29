@@ -200,8 +200,11 @@ impl Conversation {
             .map_err(|e| e.to_string())?;
         let mut messages = instructions;
         let workspace = execution_workspace(&self.workspace, directory, settings)?;
-        let guidance =
-            blackwall_core::instructions::Instructions::discover(&workspace, Some(directory));
+        let guidance = blackwall_core::instructions::Instructions::discover(
+            &workspace,
+            Some(directory),
+            &Default::default(),
+        );
         if !guidance.prompt().is_empty() {
             messages.insert(0, json!({"role":"system","content":guidance.prompt()}));
         }
@@ -273,6 +276,7 @@ impl Conversation {
                 compact: true,
                 trace: None,
                 subagents: settings.subagents.clone(),
+                instruction_settings: Default::default(),
             },
             settings.trace,
             Some(input),
@@ -374,6 +378,7 @@ impl Conversation {
                 compact: false,
                 trace: None,
                 subagents: settings.subagents.clone(),
+                instruction_settings: Default::default(),
             },
             settings.trace,
             input,

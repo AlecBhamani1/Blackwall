@@ -12,8 +12,8 @@
 //! The `mcp` section is applied by [`crate::mcp`] as `p-` servers, and `limits` by
 //! [`crate::agent`] through [`trusted_limits`], with the owner's own values as a ceiling: a
 //! project can only lower the output cap and subagent steps and narrow subagent tools. It can
-//! never choose where subagents run. The `instructions` section is parsed and validated so the
-//! file format is fixed, but nothing applies it yet; it may only lower instruction caps.
+//! never choose where subagents run. The `instructions` section, also through [`trusted_limits`],
+//! can only lower instruction caps and keep fewer of the owner's extra files.
 use crate::policy::{Decision, RuleMode, RulesFile};
 use crate::protocol::ApprovalKind;
 use cap_std::fs::{Dir, OpenOptions};
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -33,7 +33,6 @@ pub const MAX_PROJECT_BYTES: usize = 64 * 1024;
 const MAX_TRUSTED: usize = 100;
 const MAX_TRUST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SERVERS: usize = 16;
-const MAX_EXTRA_FILES: usize = 8;
 const MAX_MESSAGE_CHARS: usize = 200;
 /// A diff longer than this is not shown; the whole file is shown instead.
 const MAX_DIFF_LINES: usize = 5000;
@@ -108,7 +107,7 @@ pub struct ProjectConfig {
     /// Applied as ceilings once the file is trusted; see [`trusted_limits`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ProjectLimits>,
-    /// Not applied yet.
+    /// Applied once the file is trusted, only lowering the owner's caps and extra files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<InstructionSettings>,
 }
@@ -189,7 +188,8 @@ impl ProjectLimits {
     }
 }
 
-/// Instruction caps a project can lower, and extra guidance files inside the project.
+/// Instruction caps a project can lower, and which of the owner's extra guidance files it keeps.
+/// A project never adds an extra file the owner did not choose.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstructionSettings {
@@ -282,9 +282,12 @@ pub struct ProjectStatus {
     pub error: Option<String>,
 }
 
-/// A trusted project's `limits` for a run. An untrusted, changed or unusable file has none; its
-/// warnings are reported by the run's policy.
-pub async fn trusted_limits(data_dir: &Path, workspace: &Path) -> Option<ProjectLimits> {
+/// A trusted project's `limits` and `instructions` for a run. An untrusted, changed or unusable
+/// file has neither; its warnings are reported by the run's policy.
+pub async fn trusted_limits(
+    data_dir: &Path,
+    workspace: &Path,
+) -> (Option<ProjectLimits>, Option<InstructionSettings>) {
     let (data, folder) = (data_dir.to_path_buf(), workspace.to_path_buf());
     let loaded = tokio::time::timeout(
         Duration::from_secs(5),
@@ -292,11 +295,12 @@ pub async fn trusted_limits(data_dir: &Path, workspace: &Path) -> Option<Project
     )
     .await;
     let Ok(Ok(Ok(loaded))) = loaded else {
-        return None;
+        return (None, None);
     };
-    (loaded.trust == Trust::Trusted)
-        .then_some(loaded.config.limits)
-        .flatten()
+    if loaded.trust != Trust::Trusted {
+        return (None, None);
+    }
+    (loaded.config.limits, loaded.config.instructions)
 }
 
 /// Load the project's settings for a run. When the file is not trusted, the config holds only its
@@ -523,7 +527,6 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
             }
         }
     }
-    let later = " (accepted; not used by this version yet)";
     let mut other = vec![];
     if let Some(mcp) = &config.mcp {
         other.push(format!(
@@ -535,7 +538,7 @@ fn summary(config: &ProjectConfig, trusted: bool) -> (Vec<String>, Vec<String>) 
         other.push("limits, which can only lower yours".to_owned());
     }
     if config.instructions.is_some() {
-        other.push(format!("instruction settings{later}"));
+        other.push("instruction limits, which can only lower yours".to_owned());
     }
     if trusted {
         applies.extend(other);
@@ -746,15 +749,10 @@ fn validate_instructions(settings: &InstructionSettings) -> Result<(), ProjectEr
         return Err(invalid("instructions.max_total_kib must be 8 to 256"));
     }
     let files = settings.extra_files.as_deref().unwrap_or_default();
-    if files.len() > MAX_EXTRA_FILES
-        || files.iter().any(|file| {
-            file.is_empty()
-                || file.len() > 256
-                || file.contains('\\')
-                || !Path::new(file)
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_)))
-        })
+    if files.len() > crate::instructions::MAX_EXTRA_FILES
+        || !files
+            .iter()
+            .all(|file| crate::instructions::valid_extra_file(file))
     {
         return Err(invalid(
             "instructions.extra_files must be up to 8 relative paths inside the project",
