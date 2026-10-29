@@ -270,6 +270,75 @@ against the configured command, so `{"decision":"allow","kind":"exec","command":
 it without a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
 owner tools are offered and the run shows a warning.
 
+There is no `bw` or desktop editor for `tools.json`; edit the file, and changes apply from the next
+run. Tools without the fields below load and behave exactly as before.
+
+**Standard input.** `"stdin":"json"` writes `{"arguments":{…}}`, the call's arguments, to the
+program's standard input and then closes it, so long text such as a prompt is not limited by the
+8,000-byte argument cap or the option check (up to 256 KiB of JSON). The approval prompt shows the
+input's size, its SHA-256, and its first 2,000 characters. For example, a small wrapper lets
+`claude -p` read its prompt from stdin JSON:
+
+```sh
+#!/bin/sh
+# ~/bin/ask-claude: read {"arguments":{"prompt":…}} and pass the prompt to Claude on stdin.
+python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"]["prompt"])' \
+  | exec claude -p --permission-mode plan
+```
+
+```json
+{"tools":[
+  {"name":"ask_claude","description":"Ask Claude a question","command":["/Users/me/bin/ask-claude"],
+   "stdin":"json",
+   "parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The question"}},"required":["prompt"]}}
+]}
+```
+
+**Argument schemas.** Without `parameters`, each placeholder is a required text parameter. With
+`parameters`, the tool declares its own schema, a subset of JSON Schema: `"type":"object"` with up
+to 64 `properties`, each of `type` `string`, `number`, `integer` or `boolean`, with an optional
+`description` and `enum` list, plus `required`. `additionalProperties` may only be `false`, which is
+also the default. Arguments that are not an object, miss a required name, add a name the schema does
+not list, or have the wrong type or a value outside `enum` are refused before any approval. Every
+placeholder must be a required parameter; numbers and booleans fill a placeholder as JSON writes
+them.
+
+**HTTP tools.** `"kind":"http"` sends one request instead of running a program:
+
+```json
+{"tools":[
+  {"name":"gitlab_issue","description":"Read a GitLab issue","kind":"http",
+   "url":"https://gitlab.example.com/api/v4/projects/{project}/issues/{iid}",
+   "headers":{"PRIVATE-TOKEN":"{secret:GITLAB_TOKEN}"},
+   "parameters":{"type":"object","properties":{"project":{"type":"integer"},"iid":{"type":"integer"}},"required":["project","iid"]}},
+  {"name":"jira_comment","description":"Comment on a Jira issue","kind":"http","method":"POST","body":"json",
+   "url":"https://example.atlassian.net/rest/api/2/issue/{key}/comment",
+   "headers":{"Authorization":"{secret:JIRA_AUTH}"},
+   "parameters":{"type":"object","properties":{"key":{"type":"string"},"body":{"type":"string"}},"required":["key","body"]}}
+]}
+```
+
+- `url` must be `https`, or plain `http` only to the literal `127.0.0.1` or `[::1]`, with no
+  sign-in part or `#fragment`. Placeholders may appear only in path segments and query values,
+  never in the scheme, host, port or a query name, and each value is percent-encoded; a whole
+  segment of `.` or `..` is refused.
+- `method` is `GET` (the default) or `POST`. `"body":"json"` (POST only) sends the arguments as a
+  JSON object.
+- `headers` values may only be `{secret:NAME}`. Save the value, piped so it is never shown, with
+  `op read "op://Private/GitLab/token" | bw tools secret gitlab_issue GITLAB_TOKEN` (`--delete`
+  removes it). It is stored in the credential store under `com.blackwall.tools` for the URL's origin
+  (`scheme://host:port`), so pointing the tool at another host never sends it; save it again for
+  the new origin. Put any scheme in the value itself, such as `Bearer …` or `Basic …`. Saved values
+  are replaced with `[redacted]` in responses.
+- Every call asks for Network approval. The prompt shows the method and resolved URL, with
+  secret-looking query values hidden, the header names, any body, and a SHA-256 of the request;
+  Network rules match the URL's host, so
+  `{"decision":"allow","kind":"network","host":"gitlab.example.com"}` allows it without a prompt.
+- Proxy variables are ignored, redirects are not followed, and compressed responses are refused
+  (Blackwall asks for `identity`). The response is capped at 64 KiB, counted as it streams, and
+  must be UTF-8. A response that is not 2xx is an error with the status and at most 200 characters
+  of the body, with saved values redacted. Calls use the command time limit.
+
 Local MCP servers that use standard input and output can be listed in `mcp.json` in the same data
 folder:
 

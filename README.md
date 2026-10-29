@@ -51,8 +51,9 @@ a SmartScreen or Gatekeeper warning.
 - Per-project `.blackwall/project.json` settings: deny and ask rules apply right away, and allow
   rules wait until you trust the file's exact contents; any edit asks again
   ([Project settings](docs/RUNTIME_GUIDE.md#project-settings))
-- Owner-defined command tools and local MCP servers behind the same approvals, with MCP secrets
-  kept in the platform credential store
+- Owner-defined command tools (argv or JSON on stdin, with typed argument schemas), HTTP tools,
+  and local MCP servers behind the same approvals, with their secrets kept in the platform
+  credential store ([Runtime guide](docs/RUNTIME_GUIDE.md))
 - Opt-in approved web reads/search and up to three concurrent read-only child investigations
 - Local OpenTelemetry traces and usage metrics (tokens, durations, tool and run outcomes) for Chat,
   Agent, and subagent runs, kept in the data folder ([Telemetry](docs/TELEMETRY.md))
@@ -112,6 +113,8 @@ Servers can be local commands or streamable HTTP addresses:
 `bw mcp add docs --url https://mcp.example.com/mcp --header Authorization=DOCS_TOKEN`, then
 `pbpaste | bw mcp secret docs DOCS_TOKEN`. Header values always come from saved secrets.
 In the desktop app, open **Settings → AI capabilities → MCP servers** to manage them.
+Command and HTTP tools are edited in `tools.json`; `bw tools secret <tool> <NAME>` saves an HTTP
+tool header value, piped on stdin, for that tool's origin.
 Settings groups related tools together; search by purpose or choose **Sort by → Name (A–Z)**.
 `/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending
 proposals with a diff, and `bw skills approve <id>` or `bw skills reject <id>` decides each one.

@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Command tools in `tools.json` can take JSON on stdin (`"stdin":"json"` writes
+  `{"arguments":{…}}`), declare a typed argument schema (`parameters`: string, number, integer or
+  boolean properties with `enum`, `description` and `required`), or send an HTTP request
+  (`"kind":"http"` with `url`, `method`, `headers` and `"body":"json"`). HTTP tools ask for Network
+  approval, matched on the URL's host; values fill only the path or query, percent-encoded; header
+  values come only from the credential store as `{secret:NAME}`, saved with
+  `bw tools secret <tool> <NAME>` for the URL's origin; responses are capped at 64 KiB with no
+  redirects, proxies or compression. Existing `tools.json` files load unchanged.
 - Project settings in `.blackwall/project.json`. A project's deny and ask rules apply right away;
   its allow rules (and its `mcp`, `limits` and `instructions` sections, validated now; `mcp` is
   used from this release) wait until the owner trusts the file. Trust is saved in `trusted-projects.json`
