@@ -108,6 +108,9 @@ Use `bw project status` to see a project's `.blackwall/project.json`, whether it
 what applies now; `bw project trust` shows it and asks before trusting, and `bw project untrust`
 undoes that. See [Project settings](docs/RUNTIME_GUIDE.md#project-settings).
 Use `bw mcp` to add, list, enable, disable, or remove MCP servers and save their secrets.
+Servers can be local commands or streamable HTTP addresses:
+`bw mcp add docs --url https://mcp.example.com/mcp --header Authorization=DOCS_TOKEN`, then
+`pbpaste | bw mcp secret docs DOCS_TOKEN`. Header values always come from saved secrets.
 In the desktop app, open **Settings → AI capabilities → MCP servers** to manage them.
 Settings groups related tools together; search by purpose or choose **Sort by → Name (A–Z)**.
 `/learn` asks the agent to propose a skill from the conversation; `bw skills` shows pending

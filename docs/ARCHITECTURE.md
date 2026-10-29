@@ -208,8 +208,10 @@ is loaded until the owner approves it, and approval refuses a skill that changed
 `policy.json`, `tools.json`, and `mcp.json` in the data folder hold owner rules, command tools, and
 MCP servers. A project's `.blackwall/project.json` (`core/src/project.rs`) can add rules: its deny
 and ask rules apply at once, and the rest waits until the owner trusts the file's SHA-256, recorded
-in `trusted-projects.json`; `policy.rs` merges each file's answer, strictest across files. Only
-user-saved facts enter memory; automatic learning
+in `trusted-projects.json`; `policy.rs` merges each file's answer, strictest across files. An MCP
+server is reached through a `Transport` (`core/src/mcp/transport.rs`): a newline-framed stdio
+process, or streamable HTTP (`core/src/mcp/http.rs`) with no proxy, same-origin redirects only, and
+bounded replies. Only user-saved facts enter memory; automatic learning
 and the optional Postgres adapter are not implemented. Guests never receive owner memory, skills,
 workspace tools, or conversation history.
 

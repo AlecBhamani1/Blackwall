@@ -23,6 +23,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `strictest` keeps today's meaning, and across files a deny or ask always beats an allow.
 - Policy audit records gain `rule`: the deciding rule's source, index and mode, or `null`.
 
+- Connect to MCP servers over streamable HTTP (protocol 2025-06-18). A server in `mcp.json` takes a
+  `url` instead of a `command`, plus `headers` whose values name saved secrets as `{secret:NAME}`;
+  literal values are refused. Add one with `bw mcp add NAME --url URL [--header NAME=SECRET]` or the
+  new **Command | URL** switch in the desktop MCP screen. URLs must be https (http only on
+  127.0.0.1, ::1 or localhost), redirects stay on the server's origin, proxies are never used, and
+  replies are capped at 1 MiB (64 KiB per event line). OAuth sign-in is not supported yet. Server
+  names starting with `p-` are now reserved for project servers.
 - Distinct exit codes for `bw run` and `bw resume` with a prompt: 0 complete, 1 error, 2 usage,
   3 completed with a denied approval, 4 step limit, 5 model or network error, 6 context budget,
   7 time limit, 130 interrupted. The `--json` result line adds `reason`, `denied` and

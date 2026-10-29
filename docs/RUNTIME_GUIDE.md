@@ -296,8 +296,37 @@ variable name under `secrets`; the value lives only in the platform credential s
 that server's process when it starts. If the file is invalid, a secret is missing, or a server does
 not start, the run continues without those tools and shows a warning.
 
+A server offered as a web address uses MCP streamable HTTP (protocol 2025-06-18) instead of a
+command. Give it a `url`, and `headers` whose values each name a saved secret:
+
+```json
+{"servers":[
+  {"name":"docs","url":"https://mcp.example.com/mcp","headers":{"Authorization":"{secret:DOCS_TOKEN}"},"secrets":["DOCS_TOKEN"]}
+]}
+```
+
+Each entry has exactly one of `command` and `url`. The URL must use https; plain http is allowed only
+for `127.0.0.1`, `::1`, and `localhost`, and a URL may not contain a user name or password. A header
+value must be exactly `{secret:NAME}`: the header is sent with that secret's saved value, so save the
+whole value, such as `Bearer <token>` for `Authorization`. Literal header values are refused, and
+the protocol's own headers (`Accept`, `Content-Type`, `Mcp-Session-Id`, `MCP-Protocol-Version`,
+`Host` and similar) cannot be set. Secret values are removed from tool results and errors.
+
+Blackwall posts each JSON-RPC message with `Accept: application/json, text/event-stream`, reads a
+JSON or event-stream reply, keeps the `Mcp-Session-Id` from initialization, and sends `DELETE` to end
+the session when the run ends. It never uses a proxy from `HTTPS_PROXY` or similar variables and
+follows redirects only within the server's origin. Limits: a reply is at most 1 MiB in total, an
+event-stream line at most 64 KiB, and a session id at most 128 visible ASCII characters. Requests
+the server sends on a reply stream are answered "method not found" (ping is answered). Startup has
+15 seconds and calls use the command time limit, as for local servers; a server that times out or
+fails is not used again in that run. Servers that need OAuth sign-in are not supported yet; bearer
+tokens and API-key headers cover most hosted servers.
+
+Server names that start with `p-` are reserved for project servers and are refused in `mcp.json`.
+
 In the desktop app, **Settings → AI capabilities → MCP servers** lists the servers with enable and
-disable toggles, adds a server from its command line, removes one, and saves or removes its secrets through a
+disable toggles, adds a server from its command line or, with the **Command | URL** switch, from
+its address with header rows that each name a secret, removes one, and saves or removes its secrets through a
 password field. It uses the same validation and credential store as the CLI. **Add server** offers
 suggested general-purpose servers (Chrome DevTools, Playwright, Context7, filesystem, sequential
 thinking, Git, and `mcp-remote` for servers offered only as a web address). Picking one fills in the
@@ -307,7 +336,8 @@ package from npm the first time the server starts, without asking again. Suggest
 `npx`, so they are not offered on Windows.
 
 The CLI can edit the file without starting a server. `bw mcp add <name> <command> [arguments]` adds
-an enabled server, `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
+an enabled server, `bw mcp add <name> --url <url> [--header <Header>=<SECRET_NAME>]...` adds an HTTP
+server whose headers come from those secrets (save each with `bw mcp secret`), `bw mcp list` shows each server and its command, and `bw mcp enable <name>`,
 `bw mcp disable <name>`, and `bw mcp remove <name>` change one entry. Changes are validated before
 they are saved, apply from the next Agent run, and an invalid or linked file is reported rather than
 replaced.
