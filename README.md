@@ -33,7 +33,9 @@ a SmartScreen or Gatekeeper warning.
 ## What works now
 
 - Guided setup for local models, another computer, or a browser invitation
-- Detection of local Ollama and LM Studio; explicit starter-model downloads through Ollama
+- Detection of every model server on this computer, such as Ollama, LM Studio, llama.cpp and vLLM on
+  any loopback port, chosen in setup rather than connected automatically; explicit starter-model
+  downloads through Ollama; the server's own explanation when a request fails
 - Context-window detection for Ollama (any port), llama.cpp, vLLM, and LM Studio; model reasoning
   kept out of answers and shown collapsed; opt-in reading of tool calls a model writes as text,
   which always ask first ([Local models](docs/RUNTIME_GUIDE.md#local-models))
