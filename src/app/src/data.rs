@@ -116,10 +116,22 @@ pub async fn reject_memory_proposal(app: AppHandle, id: String) -> Result<(), St
     with_store(&app, move |store| store.reject_memory(&id)).await
 }
 
+/// The desktop's saved telemetry settings: traces, export (off unless set), and retention.
+pub(crate) struct TelemetrySettings {
+    pub trace: blackwall_core::trace::TraceOptions,
+    pub export: blackwall_core::telemetry::ExportConfig,
+    pub retention: blackwall_core::telemetry::Retention,
+}
+
 /// Desktop trace settings: on unless turned off, with prompts and outputs off unless turned on.
 pub(crate) async fn trace_options(
     directory: std::path::PathBuf,
 ) -> blackwall_core::trace::TraceOptions {
+    telemetry_settings(directory).await.trace
+}
+
+/// Telemetry settings from the saved preferences; anything missing or unreadable is the default.
+pub(crate) async fn telemetry_settings(directory: std::path::PathBuf) -> TelemetrySettings {
     let saved = tokio::task::spawn_blocking(move || {
         LocalStore::open(&directory)
             .ok()?
@@ -132,9 +144,13 @@ pub(crate) async fn trace_options(
     .ok()
     .flatten()
     .unwrap_or_default();
-    blackwall_core::trace::TraceOptions {
-        enabled: saved["tracesEnabled"].as_bool().unwrap_or(true),
-        content: saved["traceContent"].as_bool().unwrap_or(false),
+    TelemetrySettings {
+        trace: blackwall_core::trace::TraceOptions {
+            enabled: saved["tracesEnabled"].as_bool().unwrap_or(true),
+            content: saved["traceContent"].as_bool().unwrap_or(false),
+        },
+        export: serde_json::from_value(saved["telemetryExport"].clone()).unwrap_or_default(),
+        retention: serde_json::from_value(saved["usageRetention"].clone()).unwrap_or_default(),
     }
 }
 
@@ -162,25 +178,133 @@ pub(crate) async fn run_scope(
     compact: bool,
     labels: (Option<&std::path::Path>, Option<&str>),
 ) -> Option<blackwall_core::telemetry::RunScope> {
-    let directory = crate::identity::data_directory(app).ok()?;
-    let options = trace_options(directory.clone()).await;
-    let state = app.state::<TelemetryState>();
-    let telemetry = state.0.get_or_init(|| {
-        blackwall_core::telemetry::Telemetry::start(
-            &directory,
-            blackwall_core::telemetry::TelemetryOptions::from_trace(
-                options,
-                blackwall_core::telemetry::Surface::Desktop,
-            ),
-        )
-    });
-    telemetry.set_options(options);
+    let telemetry = telemetry(app).await?;
     let scope = if compact {
         telemetry.compaction(mode)
     } else {
         telemetry.run(request_id, mode)
     };
     Some(scope.labelled(labels.0, labels.1))
+}
+
+/// The desktop's telemetry with the owner's current settings applied, started on first use.
+/// `None` only when the data folder cannot be found.
+async fn telemetry(app: &AppHandle) -> Option<blackwall_core::telemetry::Telemetry> {
+    let directory = crate::identity::data_directory(app).ok()?;
+    let settings = telemetry_settings(directory.clone()).await;
+    let state = app.state::<TelemetryState>();
+    let telemetry = state
+        .0
+        .get_or_init(|| {
+            blackwall_core::telemetry::Telemetry::start(
+                &directory,
+                blackwall_core::telemetry::TelemetryOptions {
+                    retention: settings.retention,
+                    ..blackwall_core::telemetry::TelemetryOptions::from_trace(
+                        settings.trace,
+                        blackwall_core::telemetry::Surface::Desktop,
+                    )
+                },
+            )
+        })
+        .clone();
+    telemetry.set_options(settings.trace);
+    // Reads header values from the credential store only when the settings changed.
+    let applied = telemetry.clone();
+    let _ = tokio::task::spawn_blocking(move || applied.set_export(&settings.export)).await;
+    Some(telemetry)
+}
+
+/// Settings → Security → Telemetry: export settings (header names only) and usage retention.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TelemetryPreferences {
+    export: blackwall_core::telemetry::ExportConfig,
+    retention: blackwall_core::telemetry::Retention,
+}
+
+#[tauri::command]
+pub async fn load_telemetry(app: AppHandle) -> Result<TelemetryPreferences, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let settings = telemetry_settings(directory).await;
+    Ok(TelemetryPreferences {
+        export: settings.export,
+        retention: settings.retention,
+    })
+}
+
+/// Validate and save the export and retention settings, and apply export to new data now.
+/// Retention applies from the next start.
+#[tauri::command]
+pub async fn save_telemetry(app: AppHandle, settings: TelemetryPreferences) -> Result<(), String> {
+    let export = settings.export.validated().map_err(|e| e.to_string())?;
+    let patch = serde_json::json!({
+        "telemetryExport": export,
+        "usageRetention": settings.retention,
+    });
+    with_store(&app, move |store| store.patch_preferences(&patch)).await?;
+    if let Some(telemetry) = app.state::<TelemetryState>().0.get().cloned() {
+        tokio::task::spawn_blocking(move || {
+            telemetry.reload_export(&export, &blackwall_core::telemetry::export::keychain_header)
+        })
+        .await
+        .map_err(|_| "The export settings could not be applied.")?;
+    }
+    Ok(())
+}
+
+/// Save one export header value in the credential store; the settings keep only its name.
+#[tauri::command]
+pub async fn save_telemetry_header(
+    app: AppHandle,
+    name: String,
+    value: String,
+) -> Result<String, String> {
+    crate::auth::require_unlocked(&app).await?;
+    tokio::task::spawn_blocking(move || {
+        blackwall_core::telemetry::export::save_header(&name, &value)
+    })
+    .await
+    .map_err(|_| "The credential store did not respond.")?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_telemetry_header(app: AppHandle, name: String) -> Result<(), String> {
+    crate::auth::require_unlocked(&app).await?;
+    tokio::task::spawn_blocking(move || blackwall_core::telemetry::export::delete_header(&name))
+        .await
+        .map_err(|_| "The credential store did not respond.")?
+        .map_err(|error| error.to_string())
+}
+
+/// The export card: endpoint, last success, last error (kind and HTTP status), and counts.
+#[tauri::command]
+pub async fn telemetry_status(
+    app: AppHandle,
+) -> Result<blackwall_core::telemetry::ExportStatus, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let telemetry = telemetry(&app)
+        .await
+        .ok_or("The application's data folder could not be found.")?;
+    Ok(telemetry.export_status())
+}
+
+/// Send one test span with `export` (saved or not) and return the HTTP status.
+#[tauri::command]
+pub async fn test_telemetry(
+    app: AppHandle,
+    export: blackwall_core::telemetry::ExportConfig,
+) -> Result<u16, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let telemetry = telemetry(&app)
+        .await
+        .ok_or("The application's data folder could not be found.")?;
+    telemetry
+        .send_test_span(&export)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -329,7 +453,27 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
             }
         }
     }
-    with_store(&app, move |store| store.patch_preferences(&preferences)).await
+    let directory = crate::identity::data_directory(&app)?;
+    with_store(&app, move |store| {
+        let recording = |text: Option<String>| {
+            text.and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|saved| saved["tracesEnabled"].as_bool())
+                .unwrap_or(true)
+        };
+        let before = recording(store.setting("preferences")?);
+        store.patch_preferences(&preferences)?;
+        let after = recording(store.setting("preferences")?);
+        // Turning recording on or off is marked for the Usage page's gaps.
+        if before != after {
+            blackwall_core::usage::mark_recording(
+                &directory,
+                after,
+                blackwall_core::telemetry::Surface::Desktop,
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 pub async fn with_skills<T: Send + 'static>(
@@ -789,5 +933,50 @@ mod pairing_commit_tests {
                 .unwrap()
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod telemetry_settings_tests {
+    use super::*;
+    use blackwall_core::telemetry::{ExportConfig, Protocol, Retention};
+
+    #[tokio::test]
+    async fn legacy_preferences_load_unchanged() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-app-telemetry-{}-{unique}",
+            std::process::id()
+        ));
+        let store = LocalStore::open(&directory).unwrap();
+        // Preferences saved before export existed: export stays off, retention is 400 days.
+        store
+            .save_setting(
+                "preferences",
+                r#"{"endpoint":"http://localhost:11434/v1","tracesEnabled":false,"traceContent":true}"#,
+            )
+            .unwrap();
+        let settings = telemetry_settings(directory.clone()).await;
+        assert!(!settings.trace.enabled && settings.trace.content);
+        assert_eq!(settings.export, ExportConfig::default());
+        assert_eq!(settings.retention, Retention::Days(400));
+        store
+            .save_setting(
+                "preferences",
+                r#"{"telemetryExport":{"endpoint":"https://otel.example.com/","protocol":"http/json","headers":["x-api-key"]},"usageRetention":"forever"}"#,
+            )
+            .unwrap();
+        let settings = telemetry_settings(directory.clone()).await;
+        assert!(settings.trace.enabled);
+        assert_eq!(settings.export.protocol, Protocol::HttpJson);
+        assert_eq!(settings.export.headers, vec!["x-api-key"]);
+        assert!(settings.export.traces && settings.export.metrics);
+        assert_eq!(settings.retention, Retention::Forever);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
