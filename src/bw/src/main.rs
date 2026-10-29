@@ -1,6 +1,7 @@
 mod input;
 mod mcp;
 mod memory;
+mod project;
 mod recall;
 mod review;
 mod session;
@@ -84,6 +85,9 @@ USAGE:
   bw telemetry header <name> [--delete]
                              Save an export header (value piped on stdin) in the credential store
   bw mcp <action>            Add, list, enable, disable, or remove MCP servers
+  bw project [status]        Show this project's .blackwall/project.json, its trust, and what applies
+  bw project trust [--yes]   Review and trust it (asks y/N; --yes when there is no terminal)
+  bw project untrust         Stop trusting it; only its deny and ask rules apply until trusted
   bw review [--json] [--uncommitted | --commit <ref> | --base <ref>]
                              Review Git changes without agent tools
   bw request <prompt>        Print a request preview without a model call
@@ -136,7 +140,8 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "status" | "run" | "resume" | "sessions" | "request"
-        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" | "telemetry" => {}
+        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" | "telemetry" | "project" => {
+        }
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -147,6 +152,10 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
     };
     if command == "memory" {
         return memory::run(&directory, &arguments);
+    }
+    if command == "project" {
+        let workspace = env::current_dir().map_err(|_| "The current folder is unavailable.")?;
+        return project::run(&directory, &workspace, &arguments);
     }
     if command == "skills" {
         return skills::run(&directory, &arguments).await;
