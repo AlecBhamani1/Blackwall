@@ -224,12 +224,24 @@ async fn probe_kind(
                 )
             }
             ServerKind::LmStudio => {
-                let mut url = Url::parse(origin?).ok()?;
+                let origin = origin?;
+                let mut url = Url::parse(origin).ok()?;
                 url.path_segments_mut()
                     .ok()?
                     .pop_if_empty()
                     .extend(["api", "v0", "models", model]);
-                let item = fetch_json(url.as_str()).await.ok()?;
+                // Some versions do not route an id containing `/`; the list always works.
+                let item = match fetch_json(url.as_str()).await {
+                    Ok(item) => item,
+                    Err(_) => fetch_json(&format!("{origin}/api/v0/models"))
+                        .await
+                        .ok()?
+                        .get("data")?
+                        .as_array()?
+                        .iter()
+                        .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(model))?
+                        .clone(),
+                };
                 item.get("state")?.as_str()?;
                 Some(item.get("loaded_context_length").and_then(|v| v.as_u64()))
             }
@@ -242,17 +254,29 @@ async fn probe_kind(
         .flatten()
 }
 
-/// Find which server answers at `endpoint` and the context window it serves `model` with.
-/// Every kind is asked at once, 3 s each, without credentials; when several answer, the first
-/// in Ollama, llama.cpp, vLLM, LM Studio order wins. The kind is remembered for the session.
-pub async fn probe_server(endpoint: &Url, model: &str) -> (ServerKind, Option<u64>) {
-    let endpoint = endpoint.as_str().trim_end_matches('/');
+/// Whether requests may probe `endpoint` on their own. A cloud service over HTTPS is not asked;
+/// it keeps the configured budget, and Settings can still detect it on demand.
+fn probed_automatically(endpoint: &Url) -> bool {
+    endpoint.scheme() != "https"
+        || endpoint.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+/// Ask `endpoint` which server it is, given what this session already knows.
+async fn identify(
+    endpoint: &str,
+    model: &str,
+    cached: Option<ServerKind>,
+) -> (ServerKind, Option<u64>) {
     let origin = endpoint.strip_suffix("/v1");
-    let cached = known_kinds()
-        .lock()
-        .ok()
-        .and_then(|kinds| kinds.get(endpoint).copied());
     let kinds = match cached {
+        Some(ServerKind::Unknown) => return (ServerKind::Unknown, None),
         Some(kind) => vec![kind],
         None => ServerKind::PROBED.to_vec(),
     };
@@ -266,19 +290,60 @@ pub async fn probe_server(endpoint: &Url, model: &str) -> (ServerKind, Option<u6
         .into_iter()
         .zip(answers)
         .find_map(|(kind, answer)| answer.map(|window| (kind, window)));
-    if let Ok(mut known) = known_kinds().lock() {
-        match found {
-            Some((kind, _)) => known.insert(endpoint.to_owned(), kind),
-            None => known.remove(endpoint),
-        };
+    match (found, cached) {
+        (Some(found), _) => found,
+        // A known server that failed to answer once is still that server.
+        (None, Some(kind)) => (kind, None),
+        (None, None) => (ServerKind::Unknown, None),
     }
-    found.unwrap_or((ServerKind::Unknown, None))
+}
+
+fn remember(endpoint: &str, kind: ServerKind) {
+    if let Ok(mut known) = known_kinds().lock() {
+        known.insert(endpoint.to_owned(), kind);
+    }
+}
+
+/// Find which server answers at `endpoint` and the context window it serves `model` with.
+/// Every kind is asked at once, 3 s each, without credentials; when several answer, the first
+/// in Ollama, llama.cpp, vLLM, LM Studio order wins. The kind, including unknown, is remembered
+/// for the session, so later calls ask only that server's route, or nothing for an unknown one.
+/// HTTPS hosts other than this computer are not asked; see [`detect_server`].
+pub async fn probe_server(endpoint: &Url, model: &str) -> (ServerKind, Option<u64>) {
+    if !probed_automatically(endpoint) {
+        return (ServerKind::Unknown, None);
+    }
+    let endpoint = endpoint.as_str().trim_end_matches('/');
+    let cached = known_kinds()
+        .lock()
+        .ok()
+        .and_then(|kinds| kinds.get(endpoint).copied());
+    let (kind, window) = identify(endpoint, model, cached).await;
+    remember(endpoint, kind);
+    (kind, window)
+}
+
+/// The on-demand Settings check: forget what this session knew about `endpoint` and ask every
+/// kind again, cloud HTTPS hosts included.
+pub async fn detect_server(endpoint: &Url, model: &str) -> (ServerKind, Option<u64>) {
+    let endpoint = endpoint.as_str().trim_end_matches('/');
+    let (kind, window) = identify(endpoint, model, None).await;
+    remember(endpoint, kind);
+    (kind, window)
 }
 
 /// [`probe_server`] for an endpoint string; an address that does not parse is unknown.
 pub async fn probe_endpoint(endpoint: &str, model: &str) -> (ServerKind, Option<u64>) {
     match Url::parse(endpoint) {
         Ok(url) => probe_server(&url, model).await,
+        Err(_) => (ServerKind::Unknown, None),
+    }
+}
+
+/// [`detect_server`] for an endpoint string; an address that does not parse is unknown.
+pub async fn detect_endpoint(endpoint: &str, model: &str) -> (ServerKind, Option<u64>) {
+    match Url::parse(endpoint) {
+        Ok(url) => detect_server(&url, model).await,
         Err(_) => (ServerKind::Unknown, None),
     }
 }
@@ -663,6 +728,85 @@ mod tests {
             served_budget("http://127.0.0.1:9/v1", "gpt", configured).await,
             configured
         );
+    }
+    #[tokio::test]
+    async fn unknown_server_is_probed_once_per_session() {
+        let fake = server(&[("/v1/models", serde_json::json!({"data": [{"id": "m"}]}))]).await;
+        assert_eq!(probe(&fake, "m").await, (ServerKind::Unknown, None));
+        let first = fake.requests().len();
+        assert!(first >= 3, "{:?}", fake.requests());
+        assert_eq!(probe(&fake, "m").await, (ServerKind::Unknown, None));
+        assert_eq!(fake.requests().len(), first);
+        // Detecting on demand asks again.
+        let endpoint = format!("{}/v1", fake.origin());
+        assert_eq!(detect_endpoint(&endpoint, "m").await.0, ServerKind::Unknown);
+        assert!(fake.requests().len() > first);
+    }
+    #[tokio::test]
+    async fn cloud_https_host_is_not_probed() {
+        for (address, probed) in [
+            ("https://api.example.com/v1", false),
+            ("https://10.0.0.5:8443/v1", false),
+            ("https://localhost:8443/v1", true),
+            ("https://127.0.0.1:8443/v1", true),
+            ("https://[::1]:8443/v1", true),
+            ("http://gpu-box:11434/v1", true),
+        ] {
+            assert_eq!(
+                probed_automatically(&Url::parse(address).unwrap()),
+                probed,
+                "{address}"
+            );
+        }
+        let configured = ContextBudget::default();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            served_budget("https://api.invalid/v1", "m", configured).await,
+            configured
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(known_kinds()
+            .lock()
+            .unwrap()
+            .get("https://api.invalid/v1")
+            .is_none());
+    }
+    #[tokio::test]
+    async fn known_kind_survives_a_transient_probe_failure() {
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let serving = up.clone();
+        let fake = crate::test_http::serve(move |_, path, _| {
+            (path == "/props" && serving.load(std::sync::atomic::Ordering::SeqCst)).then(|| {
+                (
+                    200,
+                    serde_json::json!({"default_generation_settings": {"n_ctx": 4096}}).to_string(),
+                )
+            })
+        })
+        .await;
+        assert_eq!(probe(&fake, "m").await, (ServerKind::LlamaCpp, Some(4096)));
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(probe(&fake, "m").await, (ServerKind::LlamaCpp, None));
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(probe(&fake, "m").await, (ServerKind::LlamaCpp, Some(4096)));
+    }
+    #[tokio::test]
+    async fn lm_studio_ids_with_a_slash_fall_back_to_the_model_list() {
+        let fake = server(&[(
+            "/api/v0/models",
+            serde_json::json!({"data": [
+                {"id": "other", "state": "not-loaded", "max_context_length": 4096},
+                {"id": "qwen/qwen3-8b", "state": "loaded", "max_context_length": 40_960, "loaded_context_length": 8192}
+            ]}),
+        )])
+        .await;
+        assert_eq!(
+            probe(&fake, "qwen/qwen3-8b").await,
+            (ServerKind::LmStudio, Some(8192))
+        );
+        assert!(fake
+            .requests()
+            .contains(&"GET /api/v0/models/qwen%2Fqwen3-8b".to_owned()));
     }
     #[tokio::test]
     async fn probe_remembers_the_server_kind() {

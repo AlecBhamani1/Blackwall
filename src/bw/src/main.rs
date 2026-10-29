@@ -165,7 +165,7 @@ async fn run() -> Result<(), String> {
         require_no_arguments(&arguments)?;
         println!(
             "{}\n{}",
-            session::server_status(&settings).await,
+            session::server_status(&settings, true).await,
             settings.describe()
         );
         return Ok(());

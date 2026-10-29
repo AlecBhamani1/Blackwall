@@ -38,7 +38,7 @@ pub struct DetectedServer {
 #[tauri::command]
 pub async fn detect_server(endpoint: String, model: String) -> Result<DetectedServer, String> {
     let endpoint = connection::normalize_endpoint(&endpoint).map_err(|e| e.to_string())?;
-    let (kind, context_window) = connection::probe_endpoint(&endpoint, model.trim()).await;
+    let (kind, context_window) = connection::detect_endpoint(&endpoint, model.trim()).await;
     Ok(DetectedServer {
         kind,
         context_window: context_window.map(|window| window.min(1_000_000)),

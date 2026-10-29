@@ -65,13 +65,17 @@ context window the selected model is loaded with. The probes send no access key 
 | Ollama (any port) | `/api/version`, then `/api/ps` | the loaded model's `context_length` |
 | llama.cpp `llama-server` | `/props` | `default_generation_settings.n_ctx` |
 | vLLM | `/v1/models` | the model's `max_model_len` |
-| LM Studio | `/api/v0/models/{id}` | `loaded_context_length` |
+| LM Studio | `/api/v0/models/{id}` (or the `/api/v0/models` list) | `loaded_context_length` |
 
 A reported window replaces the configured limit (capped at 1,000,000 tokens), and a quarter of it
 (up to 32,768 tokens) is reserved for output. The server sets the window itself, for example with
 Ollama's `OLLAMA_CONTEXT_LENGTH` or llama.cpp's `--ctx-size`; requests cannot change it. A model that
 is not loaded, an unknown server, or an unreachable one keeps your configured limit. The detected
-server kind is remembered for the rest of the session. **Settings → Model connection** shows it,
+server kind, including "unknown", is remembered for the rest of the session, so later requests ask
+only that server's route, or nothing; a known server that misses one answer keeps its kind. HTTPS
+services on other computers, such as cloud APIs, are never probed by requests and keep your
+configured limit. Opening **Settings → Model connection** or running `bw status` detects again,
+cloud services included. **Settings → Model connection** shows it,
 for example "Detected llama.cpp · 131,072-token context"; in the CLI, `bw status` and `/context`
 print it.
 

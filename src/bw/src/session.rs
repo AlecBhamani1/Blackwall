@@ -182,7 +182,7 @@ impl Conversation {
         let report = settings
             .budget
             .report(&messages, &definitions, state.server_usage);
-        println!("{}", server_status(settings).await);
+        println!("{}", server_status(settings, false).await);
         println!("Estimated prompt: {} tokens; tools: {}; output reserve: {}; safety reserve: {}; configured context: {}.\nServer-reported last request: {}.\nCheckpoints: {}. Estimates use UTF-8 text bytes / 3 plus framing and 4,096 tokens per image; server counts are separate.", report.estimated_prompt_tokens, report.tool_tokens, report.output_tokens, report.safety_tokens, report.context_window, report.server_usage.map_or_else(|| "unavailable".into(), |u| format!("{} prompt, {} generated", u.prompt_tokens, u.completion_tokens)), state.checkpoints.len());
         Ok(())
     }
@@ -506,9 +506,13 @@ async fn execute(
 }
 
 /// The server kind found at the configured endpoint and the context window it reports.
-pub async fn server_status(settings: &Settings) -> String {
-    let (kind, window) =
-        blackwall_core::connection::probe_endpoint(&settings.endpoint, &settings.model).await;
+/// `detect` asks afresh, including a cloud HTTPS service that requests never probe.
+pub async fn server_status(settings: &Settings, detect: bool) -> String {
+    let (kind, window) = if detect {
+        blackwall_core::connection::detect_endpoint(&settings.endpoint, &settings.model).await
+    } else {
+        blackwall_core::connection::probe_endpoint(&settings.endpoint, &settings.model).await
+    };
     format!(
         "server: {}\ndetected context: {}",
         kind.name(),
