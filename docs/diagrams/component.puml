@@ -1,0 +1,32 @@
+@startuml component
+!include <C4/C4_Component>
+!include style.puml
+LAYOUT_TOP_DOWN()
+title One agent run in src/core
+
+Container(adapter, "Desktop or bw", "src/app or src/bw", "Discovers guidance and the served budget, starts the run")
+Container_Boundary(core, "src/core") {
+  Component(agent, "agent", "agent.rs", "Model and tool loop; RunReason at the end")
+  Component(model, "model", "model.rs, model/", "Streaming, reasoning filter, opt-in text tool calls")
+  Component(approvals, "approvals + policy", "approvals.rs, policy.rs", "Owner and project rules, prompts, policy-audit.jsonl")
+  Component(project, "project", "project.rs", "project.json hash and settings from the same bytes; trust; lower-only limits")
+  Component(tools, "tools", "tools.rs", "Files, shell, web; output cap")
+  Component(ctools, "command_tools", "command_tools.rs", "Programs (argv or stdin JSON) and HTTP tools")
+  Component(mcp, "mcp", "mcp.rs, mcp/", "stdio and streamable HTTP transports")
+  Component(subagents, "subagents", "subagents.rs", "Children on this model or on one command tool")
+  Component(telemetry, "telemetry", "telemetry/", "Run spans and metrics, bounded run buffer")
+}
+Rel_D(adapter, agent, "run")
+Rel_L(agent, model, "each turn")
+Rel_R(agent, approvals, "every action")
+Rel_D(approvals, project, "project rules")
+Rel_D(agent, tools, "built-in tools")
+Rel_D(agent, ctools, "owner tools")
+Rel_D(agent, mcp, "MCP tools")
+Rel_D(agent, subagents, "spawn_agent")
+Rel_R(subagents, ctools, "delegate, always asks")
+Rel_U(telemetry, agent, "spans and metrics")
+Lay_R(tools, ctools)
+Lay_R(ctools, mcp)
+$BwLegend()
+@enduml

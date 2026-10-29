@@ -1,0 +1,33 @@
+@startuml container
+!include <C4/C4_Container>
+!include style.puml
+LAYOUT_TOP_DOWN()
+title Blackwall containers
+
+Person(owner, "Owner")
+System_Boundary(blackwall, "Blackwall") {
+  Container(ui, "Desktop UI", "Svelte 5, ui/", "Chat, Agent, Settings, Runs, Usage")
+  Container(cli, "bw CLI", "Rust, src/bw", "REPL, bw run --json, bw usage, bw project, bw mcp")
+  Container(app, "Tauri adapter", "Rust, src/app", "Typed commands, preferences, app lock, pairing")
+  Container(core, "Core runtime", "Rust, src/core", "Agent loop, tools, approvals, policy, MCP, telemetry, usage")
+  ContainerDb(data, "Data folder", "~~/.blackwall", "blackwall.sqlite3, policy.json, policy-audit.jsonl, tools.json, mcp.json, trusted-projects.json, skills/, traces/, metrics/")
+}
+ContainerDb_Ext(proj, "Project file", "<project>/.blackwall/project.json", "Deny and ask rules apply at once; the rest after trust")
+Container_Ext(relay, "Relay", "Rust, src/relay", "Guest and pairing edge")
+System_Ext(llm, "Model server")
+System_Ext(otel, "OTLP receiver")
+
+Rel_D(owner, ui, "Uses")
+Rel_D(owner, cli, "Uses")
+Rel_D(ui, app, "Tauri invoke, blackwall://event")
+Rel_D(app, core, "Rust calls")
+Rel_D(cli, core, "Rust calls")
+Rel_D(core, data, "Reads and writes")
+Rel_R(core, proj, "Reads each run; trust by SHA-256")
+Rel_D(core, llm, "OpenAI-compatible HTTP")
+Rel_D(core, otel, "OTLP/HTTP, JSON or protobuf")
+Rel_L(app, relay, "Outbound WSS")
+Lay_R(ui, cli)
+Lay_R(llm, otel)
+$BwLegend()
+@enduml
