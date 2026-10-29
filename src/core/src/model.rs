@@ -21,8 +21,10 @@ const MAX_STREAM: usize = 8 * 1024 * 1024;
 pub enum ModelError {
     #[error("The model service could not be reached. Check your connection and try again.")]
     Network,
-    #[error("The model service rejected this request (HTTP {0}). Check the model and access key.")]
-    Http(u16),
+    /// The status, and what the server said about it when it explained, cleaned by
+    /// [`server_error_detail`].
+    #[error("{}", http_message(*.0, .1.as_deref()))]
+    Http(u16, Option<String>),
     #[error("The model returned an incomplete or invalid response.")]
     Invalid,
     #[error(
@@ -35,12 +37,118 @@ impl ModelError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Network => "network",
-            Self::Http(_) => "http",
+            Self::Http(..) => "http",
             Self::Invalid => "invalid_response",
             Self::Limit => "limit",
         }
     }
 }
+fn http_message(status: u16, detail: Option<&str>) -> String {
+    match detail {
+        Some(detail) => format!("The model service returned HTTP {status}. {detail}"),
+        None => format!(
+            "The model service rejected this request (HTTP {status}). Check the model and access key."
+        ),
+    }
+}
+
+/// The most characters of a server's own error message that are shown.
+const MAX_DETAIL: usize = 300;
+/// The most bytes of an error response that are read.
+pub const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// What a model server said in an error response, safe to show: the `error` text or
+/// `error.message` of Ollama, llama.cpp and OpenAI bodies, vLLM's top-level `message`, a
+/// FastAPI `detail`, or short plain text. Control characters are removed, credentials
+/// redacted, and the result clipped to 300 characters. HTML pages and empty bodies give `None`.
+pub fn server_error_detail(body: &[u8]) -> Option<String> {
+    let body = body.get(..MAX_ERROR_BODY).unwrap_or(body);
+    let text = String::from_utf8_lossy(body);
+    let message = match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => {
+            let error = value.get("error");
+            [
+                error.and_then(Value::as_str),
+                error.and_then(|e| e.get("message")).and_then(Value::as_str),
+                value.get("message").and_then(Value::as_str),
+                value.get("detail").and_then(Value::as_str),
+            ]
+            .into_iter()
+            .flatten()
+            .next()?
+            .to_owned()
+        }
+        Err(_) if text.trim_start().starts_with('<') => return None,
+        Err(_) => text.into_owned(),
+    };
+    clean_detail(&message)
+}
+
+/// Collapse whitespace and control characters, redact credentials, and clip.
+fn clean_detail(text: &str) -> Option<String> {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|word| {
+            // Long unbroken key-like words are access keys far more often than prose.
+            let keyish = word.len() >= 32
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if keyish || word.starts_with("sk-") || word.starts_with("bw1_") {
+                return "[redacted]".to_owned();
+            }
+            // Credentials inside an address: `https://user:pw@host` keeps only the host.
+            match word.split_once("://") {
+                Some((scheme, rest)) if rest.split('/').next().is_some_and(|a| a.contains('@')) => {
+                    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+                    format!("{scheme}://[redacted]@{host}")
+                }
+                _ => word.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let redacted = crate::policy::redact_text(&flat);
+    let redacted = redacted.trim();
+    if redacted.is_empty() {
+        return None;
+    }
+    Some(if redacted.chars().count() > MAX_DETAIL {
+        let mut clipped: String = redacted.chars().take(MAX_DETAIL - 1).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        redacted.to_owned()
+    })
+}
+
+/// [`server_error_detail`] read from a failed response, named after the server when this
+/// session already knows which kind `endpoint` is, such as `Ollama: model requires more memory`.
+pub async fn response_error_detail(endpoint: &str, response: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let room = MAX_ERROR_BODY.saturating_sub(body.len());
+            body.extend_from_slice(chunk.get(..room).unwrap_or(&chunk));
+            if body.len() >= MAX_ERROR_BODY {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), read).await;
+    let detail = server_error_detail(&body)?;
+    Some(match crate::connection::known_kind(endpoint) {
+        Some(kind) if kind != crate::connection::ServerKind::Unknown => {
+            format!("{}: {detail}", kind.display_name())
+        }
+        _ => detail,
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ToolFunction {
     pub name: String,
@@ -231,7 +339,11 @@ impl ModelBackend for HttpModel {
             }
             let response = request.send().await.map_err(|_| ModelError::Network)?;
             if !response.status().is_success() {
-                return Err(ModelError::Http(response.status().as_u16()));
+                let status = response.status().as_u16();
+                return Err(ModelError::Http(
+                    status,
+                    response_error_detail(&self.endpoint, response).await,
+                ));
             }
             let mut stream = response.bytes_stream();
             let mut decoder = if self.text_tool_calls && !tools.is_empty() {
@@ -767,5 +879,111 @@ mod tests {
             )
             .unwrap();
         assert!(decoder.finish(&mut |_| {}).is_err());
+    }
+    #[test]
+    fn server_error_details_read_every_common_shape() {
+        let memory = "model requires more system memory (24.1 GiB) than is available (12.0 GiB)";
+        for body in [
+            json!({ "error": memory }).to_string(),
+            json!({"error": {"code": 500, "message": memory, "type": "server_error"}}).to_string(),
+            json!({"object": "error", "message": memory, "type": "BadRequestError", "code": 400})
+                .to_string(),
+            json!({"error": {"message": memory, "type": "invalid_request_error", "param": null}})
+                .to_string(),
+            json!({ "detail": memory }).to_string(),
+            format!("  {memory}\n"),
+        ] {
+            assert_eq!(
+                server_error_detail(body.as_bytes()).as_deref(),
+                Some(memory),
+                "{body}"
+            );
+        }
+        for silent in [
+            "",
+            "   ",
+            "<html><body>502 Bad Gateway</body></html>",
+            "{}",
+            r#"{"error": {"code": 1}}"#,
+        ] {
+            assert_eq!(server_error_detail(silent.as_bytes()), None, "{silent}");
+        }
+    }
+    #[test]
+    fn server_error_details_are_clipped_cleaned_and_redacted() {
+        let huge = json!({ "error": "x ".repeat(100_000) }).to_string();
+        let detail = server_error_detail(huge.as_bytes());
+        // Past the 64 KiB read limit the JSON is cut, so the text is shown clipped.
+        let detail = detail.unwrap();
+        assert!(detail.chars().count() <= 300 && detail.ends_with('…'));
+        let long = json!({ "error": "word ".repeat(200) }).to_string();
+        let detail = server_error_detail(long.as_bytes()).unwrap();
+        assert_eq!(detail.chars().count(), 300);
+        assert!(detail.ends_with('…'));
+        let controls = json!({"error": "bad\u{1b}[31m model\r\nname\u{0}\t here"}).to_string();
+        assert_eq!(
+            server_error_detail(controls.as_bytes()).unwrap(),
+            "bad [31m model name here"
+        );
+        let secret = json!({"error": "invalid api key sk-abc123 for https://user:pw@host/v1?api_key=hunter2 Authorization: Bearer abcdef0123456789abcdef0123456789ab"}).to_string();
+        let detail = server_error_detail(secret.as_bytes()).unwrap();
+        for leaked in ["sk-abc123", "hunter2", "user:pw", "abcdef0123456789"] {
+            assert!(!detail.contains(leaked), "{detail}");
+        }
+        assert!(detail.starts_with("invalid api key [redacted]"), "{detail}");
+    }
+    #[tokio::test]
+    async fn http_errors_carry_what_the_server_said() {
+        let fake = crate::test_http::serve(|method, path, _| match (method, path) {
+            ("POST", "/v1/chat/completions") => Some((
+                500,
+                json!({"error": "model requires more system memory (24 GiB) than is available (12 GiB)"})
+                    .to_string(),
+            )),
+            ("GET", "/props") => Some((
+                200,
+                json!({"default_generation_settings": {"n_ctx": 4096}}).to_string(),
+            )),
+            _ => None,
+        })
+        .await;
+        let endpoint = format!("{}/v1", fake.origin());
+        let model = HttpModel::new(&endpoint, "big", None).unwrap();
+        let error = model
+            .generate(
+                &[json!({"role": "user", "content": "hi"})],
+                &[],
+                &mut |_| {},
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), "http");
+        assert!(matches!(error, ModelError::Http(500, Some(_))));
+        assert_eq!(
+            error.to_string(),
+            "The model service returned HTTP 500. model requires more system memory (24 GiB) than is available (12 GiB)"
+        );
+        // Once the session knows the server, the detail names it.
+        crate::connection::probe_endpoint(&endpoint, "big").await;
+        let error = model
+            .generate(
+                &[json!({"role": "user", "content": "hi"})],
+                &[],
+                &mut |_| {},
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .ends_with("HTTP 500. llama.cpp: model requires more system memory (24 GiB) than is available (12 GiB)"),
+            "{error}"
+        );
+        assert_eq!(
+            ModelError::Http(404, None).to_string(),
+            "The model service rejected this request (HTTP 404). Check the model and access key."
+        );
     }
 }

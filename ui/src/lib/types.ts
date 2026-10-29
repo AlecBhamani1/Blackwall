@@ -140,7 +140,7 @@ export type AgentEvent =
       reasoning?: string;
       reasoningMs?: number;
     }
-  | { type: 'error'; requestId: string; message: string; code?: string }
+  | { type: 'error'; requestId: string; message: string; code?: string; detail?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }
   | {

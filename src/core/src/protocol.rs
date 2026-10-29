@@ -559,6 +559,9 @@ pub enum AgentEvent {
         message: String,
         /// Whether retrying without changing the request may succeed.
         retryable: bool,
+        /// What the model server said about the failure, already cleaned and redacted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// Notification that the agent's local memory changed.
     MemoryUpdated {
@@ -848,6 +851,7 @@ mod tests {
                 code: "model_unavailable".to_owned(),
                 message: "Ollama is not running".to_owned(),
                 retryable: true,
+                detail: None,
             },
             AgentEvent::MemoryUpdated {
                 request_id: "r1".to_owned(),

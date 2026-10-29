@@ -264,6 +264,26 @@ describe('native chat failure boundary', () => {
     );
     expect(nativeModelError('private key').message).not.toContain('private');
   });
+
+  it('shows what the model server said about a failure', () => {
+    const memory =
+      'Ollama: model requires more system memory (24.1 GiB) than is available (12.0 GiB)';
+    expect(
+      nativeModelError({ code: 'model_http_error', message: 'generic', detail: memory }).message,
+    ).toBe(memory);
+    expect(
+      nativeModelError({ code: 'model_unavailable', detail: 'llama.cpp: Loading model' }).message,
+    ).toMatch(/^The model computer is unavailable\..*\(llama\.cpp: Loading model\)$/);
+    const noisy = nativeModelError({
+      code: 'model_http_error',
+      detail: `bad\u001b[31m\nline ${'x'.repeat(500)}`,
+    }).message;
+    expect(noisy).not.toMatch(/[\u0000-\u001f]/);
+    expect(noisy.length).toBe(300);
+    expect(nativeModelError({ code: 'model_http_error', detail: 42 }).message).toBe(
+      'The model could not complete the request. Try again or check the model service.',
+    );
+  });
 });
 
 describe('browser model discovery', () => {

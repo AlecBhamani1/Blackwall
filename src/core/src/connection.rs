@@ -297,6 +297,14 @@ async fn identify(
     }
 }
 
+/// The kind this session already recognised at `endpoint`, without asking it.
+pub fn known_kind(endpoint: &str) -> Option<ServerKind> {
+    known_kinds()
+        .lock()
+        .ok()
+        .and_then(|kinds| kinds.get(endpoint.trim_end_matches('/')).copied())
+}
+
 fn remember(endpoint: &str, kind: ServerKind) {
     if let Ok(mut known) = known_kinds().lock() {
         known.insert(endpoint.to_owned(), kind);
