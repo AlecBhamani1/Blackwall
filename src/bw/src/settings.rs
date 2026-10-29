@@ -34,9 +34,10 @@ fn telemetry_options(
     object: &serde_json::Map<String, Value>,
     invalid: &str,
 ) -> Result<(ExportConfig, Retention), String> {
+    // Fields from a newer version are ignored; a field that could hold a header value is not.
     let export = object
         .get("telemetryExport")
-        .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid.to_owned()))
+        .map(|value| ExportConfig::from_saved(value).map_err(|_| invalid.to_owned()))
         .transpose()?
         .unwrap_or_default();
     let retention = object
@@ -214,6 +215,21 @@ impl Settings {
     }
 }
 
+/// A warning when export would send prompts and outputs, or `None`.
+pub fn content_warning(settings: &Settings) -> Option<String> {
+    let export = &settings.export;
+    (export.is_on() && export.traces && settings.trace.enabled && settings.trace.content).then(
+        || {
+            format!(
+                "Warning: trace content is on, so prompts, outputs, and tool data are sent to {}.",
+                export
+                    .origin()
+                    .unwrap_or_else(|_| "the OTLP endpoint".into())
+            )
+        },
+    )
+}
+
 /// One line for the export settings; header names only, never values.
 fn describe_export(export: &ExportConfig) -> String {
     let Some(endpoint) = export
@@ -227,10 +243,25 @@ fn describe_export(export: &ExportConfig) -> String {
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect();
-    let headers = if export.headers.is_empty() {
+    let origin = export.origin().ok();
+    let names: Vec<String> = export
+        .headers
+        .iter()
+        .map(|header| {
+            if Some(&header.origin) == origin.as_ref() {
+                header.name.clone()
+            } else {
+                format!(
+                    "{} (saved for {}: export is paused until you enter it again or remove it)",
+                    header.name, header.origin
+                )
+            }
+        })
+        .collect();
+    let headers = if names.is_empty() {
         String::new()
     } else {
-        format!("; headers: {}", export.headers.join(", "))
+        format!("; headers: {}", names.join(", "))
     };
     format!(
         "{endpoint} ({}; {}{headers}; project names: {})",
@@ -902,5 +933,42 @@ mod tests {
             .save_setting("preferences", r#"{"usageRetention":30}"#)
             .unwrap();
         assert_eq!(defaults(&store).retention, Retention::Days(30));
+    }
+
+    #[test]
+    fn newer_export_fields_are_ignored_but_header_values_are_refused() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        store
+            .save_setting(
+                SETTINGS_KEY,
+                r#"{"endpoint":"http://localhost:11434/v1","model":"m","webEnabled":false,"memoryEnabled":false,"telemetryExport":{"endpoint":"https://otel.example.com/","compression":"gzip","headers":[{"name":"x-api-key","origin":"https://other.example:443"}]}}"#,
+            )
+            .unwrap();
+        let loaded = defaults(&store);
+        assert_eq!(
+            loaded.export.endpoint.as_deref(),
+            Some("https://otel.example.com/")
+        );
+        assert!(loaded
+            .describe()
+            .contains("x-api-key (saved for https://other.example:443: export is paused"));
+    }
+
+    #[test]
+    fn content_warning_only_when_content_would_leave() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        settings.set(&store, "trace-content", "on").unwrap();
+        assert_eq!(content_warning(&settings), None);
+        settings
+            .set(&store, "otlp-endpoint", "https://otel.example.com")
+            .unwrap();
+        assert!(content_warning(&settings)
+            .unwrap()
+            .contains("prompts, outputs, and tool data are sent to https://otel.example.com:443"));
+        settings.set(&store, "otlp-signals", "metrics").unwrap();
+        assert_eq!(content_warning(&settings), None);
     }
 }

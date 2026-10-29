@@ -1302,6 +1302,13 @@ fn telemetry_test_span_reports_the_collector_status_and_config_round_trips() {
     );
     assert!(!insecure.status.success());
     assert!(String::from_utf8_lossy(&insecure.stderr).contains("Use https"));
+    // Turning content capture on while export is on warns that prompts will leave.
+    let content = fixture.run(&["config", "set", "trace-content", "on"], "");
+    assert!(String::from_utf8_lossy(&content.stderr)
+        .contains("Warning: trace content is on, so prompts, outputs, and tool data are sent to"));
+    // A header needs a value on standard input (here, empty) and is not saved without one.
+    let header = fixture.run(&["telemetry", "header", "x-api-key"], "");
+    assert!(!header.status.success());
     // Recording off and on again is marked for the Usage page's gaps.
     fixture.run(&["config", "set", "traces", "off"], "");
     fixture.run(&["config", "set", "traces", "on"], "");

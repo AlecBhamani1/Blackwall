@@ -8,7 +8,9 @@
 //! spans): a full queue drops and counts, so export never blocks or fails a run.
 //!
 //! Header values (such as an API key) live only in the credential store, service
-//! [`SECRET_SERVICE`], account = the lower-case header name. Settings files hold only the names.
+//! [`SECRET_SERVICE`], account `{origin}|{name}`: each value is bound to the endpoint origin
+//! (`scheme://host:port`) it was entered for, and is only ever read for that origin. Settings
+//! files hold only each header's name and origin.
 use super::names;
 use opentelemetry_proto::tonic::{
     collector::{metrics::v1::ExportMetricsServiceRequest, trace::v1::ExportTraceServiceRequest},
@@ -93,11 +95,30 @@ pub struct ExportConfig {
     pub protocol: Protocol,
     pub traces: bool,
     pub metrics: bool,
-    /// Header names only; each value is in the credential store.
-    pub headers: Vec<String>,
+    /// Header names and the origin each was saved for; values are in the credential store.
+    pub headers: Vec<SavedHeader>,
     /// Keep `blackwall.project` and `blackwall.session` on exported metrics.
     pub include_project: bool,
 }
+
+/// One export header: its lower-case name and the endpoint origin its value was saved for.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SavedHeader {
+    pub name: String,
+    pub origin: String,
+}
+
+/// Saved export fields; anything else in a saved settings object is ignored, except a field that
+/// could hold a header value, which is refused.
+const SAVED_FIELDS: [&str; 6] = [
+    "endpoint",
+    "protocol",
+    "traces",
+    "metrics",
+    "headers",
+    "includeProject",
+];
 
 impl Default for ExportConfig {
     fn default() -> Self {
@@ -133,7 +154,36 @@ impl ExportConfig {
         self.endpoint.is_some() && (self.traces || self.metrics)
     }
 
-    /// The settings with a normalized endpoint and lower-case, de-duplicated header names, or the
+    /// Settings read back from a settings file. Fields written by a newer version are ignored,
+    /// but a `headerValues` field (or any key mentioning a value or secret) is refused, so a
+    /// header value can never be loaded from a file.
+    pub fn from_saved(value: &serde_json::Value) -> Result<Self, ExportError> {
+        let Some(object) = value.as_object() else {
+            return Err(ExportError::InvalidSettings);
+        };
+        if object.keys().any(|key| {
+            let key = key.to_ascii_lowercase();
+            key.contains("value") || key.contains("secret")
+        }) {
+            return Err(ExportError::InvalidSettings);
+        }
+        let known: serde_json::Map<_, _> = object
+            .iter()
+            .filter(|(key, _)| SAVED_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        serde_json::from_value(serde_json::Value::Object(known))
+            .map_err(|_| ExportError::InvalidSettings)
+    }
+
+    /// The endpoint's origin, `scheme://host:port`, that header values are bound to.
+    pub fn origin(&self) -> Result<String, ExportError> {
+        origin_of(&normalize_endpoint(
+            self.endpoint.as_deref().ok_or(ExportError::Off)?,
+        )?)
+    }
+
+    /// The settings with a normalized endpoint and lower-case, de-duplicated headers, or the
     /// first problem found.
     pub fn validated(&self) -> Result<Self, ExportError> {
         let endpoint = self
@@ -141,11 +191,14 @@ impl ExportConfig {
             .as_deref()
             .map(|text| normalize_endpoint(text).map(String::from))
             .transpose()?;
-        let mut headers: Vec<String> = vec![];
-        for name in &self.headers {
-            let name = header_name(name)?;
-            if !headers.contains(&name) {
-                headers.push(name);
+        let mut headers: Vec<SavedHeader> = vec![];
+        for header in &self.headers {
+            let header = SavedHeader {
+                name: header_name(&header.name)?,
+                origin: normalize_origin(&header.origin)?,
+            };
+            if !headers.contains(&header) {
+                headers.push(header);
             }
         }
         if headers.len() > MAX_HEADERS {
@@ -200,6 +253,28 @@ pub fn normalize_endpoint(text: &str) -> Result<Url, ExportError> {
     Ok(url)
 }
 
+/// `scheme://host:port` of a validated endpoint, with the port always written out.
+fn origin_of(url: &Url) -> Result<String, ExportError> {
+    let host = url.host_str().ok_or(ExportError::InvalidEndpoint)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(ExportError::InvalidEndpoint)?;
+    Ok(format!("{}://{host}:{port}", url.scheme()))
+}
+
+/// A saved origin, checked: it must be the origin of an endpoint export would accept.
+pub fn normalize_origin(text: &str) -> Result<String, ExportError> {
+    let origin = origin_of(&normalize_endpoint(text)?)?;
+    if origin != text {
+        return Err(ExportError::InvalidEndpoint);
+    }
+    Ok(origin)
+}
+
+fn account(origin: &str, name: &str) -> String {
+    format!("{origin}|{name}")
+}
+
 /// A header name as saved: lower case letters, digits, and hyphens, not one the exporter sets.
 pub fn header_name(name: &str) -> Result<String, ExportError> {
     let name = name.trim().to_ascii_lowercase();
@@ -240,6 +315,10 @@ pub enum ExportError {
     TooManyHeaders,
     #[error("The value of the {0} header is not in {store}. Add it again.", store = crate::secrets::STORE)]
     MissingHeader(String),
+    #[error("The {0} header was saved for {1}, not this endpoint. Remove it or enter it again.")]
+    HeaderOtherOrigin(String, String),
+    #[error("The saved export settings are invalid.")]
+    InvalidSettings,
     #[error(
         "{} could not be read. {}, then try again.",
         crate::secrets::STORE,
@@ -269,6 +348,8 @@ impl ExportError {
             Self::InvalidHeaderValue => "invalid_header_value",
             Self::TooManyHeaders => "too_many_headers",
             Self::MissingHeader(_) => "missing_header",
+            Self::HeaderOtherOrigin(..) => "header_other_origin",
+            Self::InvalidSettings => "invalid_settings",
             Self::CredentialStore => "credential_store",
             Self::Off => "off",
             Self::Connect => "connect",
@@ -288,41 +369,52 @@ impl ExportError {
     }
 }
 
-/// Reads one header value by its saved (lower-case) name.
+/// Reads one header value by its credential-store account, `{origin}|{name}`.
 pub type HeaderLookup<'a> =
     dyn Fn(&str) -> Result<Option<String>, crate::secrets::SecretError> + 'a;
 
-/// A header value from the credential store. Blocking.
-pub fn keychain_header(name: &str) -> Result<Option<String>, crate::secrets::SecretError> {
-    crate::secrets::get(SECRET_SERVICE, name)
+/// A header value from the credential store, by account. Blocking.
+pub fn keychain_header(account: &str) -> Result<Option<String>, crate::secrets::SecretError> {
+    crate::secrets::get(SECRET_SERVICE, account)
 }
 
-/// Save a header value in the credential store. Blocking. Returns the saved name.
-pub fn save_header(name: &str, value: &str) -> Result<String, ExportError> {
+/// Save a header value for the origin of `endpoint`. Blocking. Returns the header to list in the
+/// settings.
+pub fn save_header(endpoint: &str, name: &str, value: &str) -> Result<SavedHeader, ExportError> {
+    let origin = origin_of(&normalize_endpoint(endpoint)?)?;
     let name = header_name(name)?;
     let value = header_value(value)?;
     let text = value
         .to_str()
         .map_err(|_| ExportError::InvalidHeaderValue)?;
-    crate::secrets::set(SECRET_SERVICE, &name, text).map_err(|_| ExportError::CredentialStore)?;
-    Ok(name)
+    crate::secrets::set(SECRET_SERVICE, &account(&origin, &name), text)
+        .map_err(|_| ExportError::CredentialStore)?;
+    Ok(SavedHeader { name, origin })
 }
 
-/// Remove a header value from the credential store. Blocking; a missing value succeeds.
-pub fn delete_header(name: &str) -> Result<(), ExportError> {
-    let name = header_name(name)?;
-    crate::secrets::delete(SECRET_SERVICE, &name).map_err(|_| ExportError::CredentialStore)
+/// Remove a saved header value. Blocking; a missing value succeeds.
+pub fn delete_header(header: &SavedHeader) -> Result<(), ExportError> {
+    let name = header_name(&header.name)?;
+    let origin = normalize_origin(&header.origin)?;
+    crate::secrets::delete(SECRET_SERVICE, &account(&origin, &name))
+        .map_err(|_| ExportError::CredentialStore)
 }
 
-/// Every configured header with its value from `lookup`. Blocking when `lookup` is.
+/// Every configured header with its value from `lookup`, read only for the endpoint's own
+/// origin. A header saved for another origin refuses the settings: its value is never sent to a
+/// different endpoint. Blocking when `lookup` is.
 pub fn resolve_headers(
     config: &ExportConfig,
     lookup: &HeaderLookup<'_>,
 ) -> Result<HeaderMap, ExportError> {
+    let origin = config.origin()?;
     let mut headers = HeaderMap::new();
-    for name in &config.headers {
-        let name = header_name(name)?;
-        let value = lookup(&name)
+    for header in &config.headers {
+        let name = header_name(&header.name)?;
+        if header.origin != origin {
+            return Err(ExportError::HeaderOtherOrigin(name, header.origin.clone()));
+        }
+        let value = lookup(&account(&origin, &name))
             .map_err(|_| ExportError::CredentialStore)?
             .ok_or_else(|| ExportError::MissingHeader(name.clone()))?;
         let key =
@@ -332,9 +424,22 @@ pub fn resolve_headers(
     Ok(headers)
 }
 
+/// Headers for a test span: only those saved for the endpoint's own origin; others are left
+/// out, so a draft endpoint never receives another origin's values.
+pub fn resolve_test_headers(
+    config: &ExportConfig,
+    lookup: &HeaderLookup<'_>,
+) -> Result<HeaderMap, ExportError> {
+    let origin = config.origin()?;
+    let mut matching = config.clone();
+    matching.headers.retain(|header| header.origin == origin);
+    resolve_headers(&matching, lookup)
+}
+
 /// The HTTP client for export: no redirects, a 10 s limit per request.
 fn client() -> Result<reqwest::Client, ExportError> {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .timeout(TIMEOUT)
         .connect_timeout(TIMEOUT)
@@ -468,9 +573,10 @@ pub async fn send_test_span_with(
 pub async fn send_test_span(config: &ExportConfig, surface: &str) -> Result<u16, ExportError> {
     let validated = config.validated()?;
     let lookup = validated.clone();
-    let headers = tokio::task::spawn_blocking(move || resolve_headers(&lookup, &keychain_header))
-        .await
-        .map_err(|_| ExportError::CredentialStore)??;
+    let headers =
+        tokio::task::spawn_blocking(move || resolve_test_headers(&lookup, &keychain_header))
+            .await
+            .map_err(|_| ExportError::CredentialStore)??;
     send_test_span_with(&validated, &headers, surface).await
 }
 
@@ -662,7 +768,8 @@ impl Exporter {
     pub(super) fn refuse(&self, config: &ExportConfig, error: &ExportError) {
         self.configure(None);
         self.state.status(|status| {
-            status.endpoint = config.endpoint.clone();
+            // Only a validated endpoint is shown; a refused one may not be a clean URL.
+            status.endpoint = config.validated().ok().and_then(|config| config.endpoint);
             status.protocol = config.protocol;
             status.record("traces", &Err(error.clone()));
         });
@@ -788,6 +895,12 @@ fn strip(attributes: &mut Vec<KeyValue>) {
     attributes.sort_by(|a, b| a.key.cmp(&b.key));
 }
 
+fn strip_exemplars(exemplars: &mut [opentelemetry_proto::tonic::metrics::v1::Exemplar]) {
+    for exemplar in exemplars {
+        exemplar.filtered_attributes.retain(|pair| !is_label(pair));
+    }
+}
+
 /// Remove `blackwall.project` and `blackwall.session` from every data point, then merge points
 /// whose attributes became equal so each series appears once.
 pub(super) fn strip_labels(request: &mut ExportMetricsServiceRequest) {
@@ -809,11 +922,13 @@ pub(super) fn strip_labels(request: &mut ExportMetricsServiceRequest) {
             Some(Data::Gauge(gauge)) => {
                 for point in &mut gauge.data_points {
                     point.attributes.retain(|pair| !is_label(pair));
+                    strip_exemplars(&mut point.exemplars);
                 }
             }
             Some(Data::ExponentialHistogram(histogram)) => {
                 for point in &mut histogram.data_points {
                     point.attributes.retain(|pair| !is_label(pair));
+                    strip_exemplars(&mut point.exemplars);
                 }
             }
             Some(Data::Summary(summary)) => {
@@ -831,6 +946,7 @@ fn merge_numbers(points: Vec<NumberDataPoint>) -> Vec<NumberDataPoint> {
     let mut merged: Vec<NumberDataPoint> = vec![];
     for mut point in points {
         strip(&mut point.attributes);
+        strip_exemplars(&mut point.exemplars);
         let same = merged.iter_mut().find(|other| {
             other.attributes == point.attributes
                 && matches!(
@@ -861,6 +977,7 @@ fn merge_histograms(points: Vec<HistogramDataPoint>) -> Vec<HistogramDataPoint> 
     let mut merged: Vec<HistogramDataPoint> = vec![];
     for mut point in points {
         strip(&mut point.attributes);
+        strip_exemplars(&mut point.exemplars);
         let same = merged.iter_mut().find(|other| {
             other.attributes == point.attributes
                 && other.explicit_bounds == point.explicit_bounds

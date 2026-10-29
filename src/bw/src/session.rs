@@ -397,6 +397,18 @@ static TELEMETRY_SETTINGS: std::sync::Mutex<
     )>,
 > = std::sync::Mutex::new(None);
 
+/// Apply changed export settings, reading every header value again, such as after a header was
+/// saved or removed.
+pub fn reload_telemetry(settings: &crate::settings::Settings) {
+    configure_telemetry(settings);
+    if let Some(telemetry) = TELEMETRY.get() {
+        telemetry.reload_export(
+            &settings.export,
+            &blackwall_core::telemetry::export::keychain_header,
+        );
+    }
+}
+
 /// Use these export and retention settings for runs from now on.
 pub fn configure_telemetry(settings: &crate::settings::Settings) {
     if let Ok(mut saved) = TELEMETRY_SETTINGS.lock() {

@@ -143,6 +143,13 @@ fn config(endpoint: &str, protocol: Protocol) -> ExportConfig {
     }
 }
 
+fn header(name: &str, base: &str) -> SavedHeader {
+    SavedHeader {
+        name: name.into(),
+        origin: base.trim_end_matches('/').to_owned(),
+    }
+}
+
 fn no_secrets(_: &str) -> Result<Option<String>, crate::secrets::SecretError> {
     Ok(None)
 }
@@ -249,9 +256,10 @@ async fn export_headers_come_from_credential_store() {
     let directory = folder();
     let telemetry = start(&directory, false);
     let mut settings = config(&base, Protocol::HttpProtobuf);
-    settings.headers = vec!["X-Api-Key".into(), "authorization".into()];
+    settings.headers = vec![header("X-Api-Key", &base), header("authorization", &base)];
     let saved = serde_json::to_string(&settings.validated().unwrap()).unwrap();
     assert!(saved.contains("x-api-key"), "{saved}");
+    assert!(saved.contains(&format!(r#""origin":"{base}""#)), "{saved}");
     // A missing value turns export off and says which header, with no request sent.
     telemetry.reload_export(&settings, &no_secrets);
     let status = telemetry.export_status();
@@ -261,11 +269,16 @@ async fn export_headers_come_from_credential_store() {
     flush(&telemetry).await;
     assert!(seen.lock().unwrap().is_empty());
 
-    let lookup = |name: &str| -> Result<Option<String>, crate::secrets::SecretError> {
-        Ok(match name {
-            "x-api-key" => Some("key-from-store-123".into()),
-            "authorization" => Some("Bearer token-456".into()),
-            _ => None,
+    // Values are stored per origin: the account is `{origin}|{name}`.
+    let key = format!("{base}|x-api-key");
+    let auth = format!("{base}|authorization");
+    let lookup = |account: &str| -> Result<Option<String>, crate::secrets::SecretError> {
+        Ok(if account == key {
+            Some("key-from-store-123".into())
+        } else if account == auth {
+            Some("Bearer token-456".into())
+        } else {
+            None
         })
     };
     telemetry.reload_export(&settings, &lookup);
@@ -691,13 +704,27 @@ fn header_names_are_checked_and_values_never_print() {
     for bad in ["", "content-type", "Host", "x api", "x:y", &"a".repeat(65)] {
         assert_eq!(header_name(bad), Err(ExportError::InvalidHeader), "{bad}");
     }
+    let origin = "https://otel.example.com:443";
     let mut settings = ExportConfig {
-        headers: (0..17).map(|n| format!("x-{n}")).collect(),
+        endpoint: Some("https://otel.example.com".into()),
+        headers: (0..17).map(|n| header(&format!("x-{n}"), origin)).collect(),
         ..Default::default()
     };
     assert_eq!(settings.validated(), Err(ExportError::TooManyHeaders));
-    settings.headers = vec!["X-A".into(), "x-a".into()];
-    assert_eq!(settings.validated().unwrap().headers, vec!["x-a"]);
+    settings.headers = vec![header("X-A", origin), header("x-a", origin)];
+    assert_eq!(
+        settings.validated().unwrap().headers,
+        vec![header("x-a", origin)]
+    );
+    for bad in [
+        "https://otel.example.com",
+        "http://otel.example.com:80",
+        "https://a:443/x",
+    ] {
+        let mut bad_origin = settings.clone();
+        bad_origin.headers = vec![header("x-a", bad)];
+        assert!(bad_origin.validated().is_err(), "{bad}");
+    }
     let lookup = |_: &str| -> Result<Option<String>, crate::secrets::SecretError> {
         Ok(Some("bad\nvalue".into()))
     };
@@ -713,4 +740,201 @@ fn header_names_are_checked_and_values_never_print() {
     })
     .unwrap();
     assert!(!format!("{headers:?}").contains("visible-value"));
+}
+
+const PROXY_CHILD: &str = "BLACKWALL_OTEL_EXPORT_PROXY_CHILD";
+
+/// Runs in a child process with proxy variables pointing at a listener.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_proxy_env_child() {
+    let Some(endpoint) = std::env::var_os(PROXY_CHILD) else {
+        return;
+    };
+    let settings = config(&endpoint.to_string_lossy(), Protocol::HttpJson);
+    let _ = send_test_span_with(&settings, &HeaderMap::new(), "cli").await;
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    telemetry.reload_export(&settings, &no_secrets);
+    run_one(&telemetry, "proxy", "hello");
+    flush(&telemetry).await;
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_ignores_proxy_env_vars() {
+    let (base, seen) = serve(OK.into()).await;
+    let (proxy, proxied) = serve(OK.into()).await;
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telemetry::export::tests::export_proxy_env_child",
+            "--test-threads=1",
+        ])
+        .env(PROXY_CHILD, &base)
+        .env("HTTPS_PROXY", &proxy)
+        .env("HTTP_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("https_proxy", &proxy)
+        .env("http_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        child.wait()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status.success());
+    assert!(until(|| trace_requests(&seen).len() >= 2).await);
+    assert!(proxied.lock().unwrap().is_empty());
+}
+
+/// Records every credential-store account read, answering for any of them.
+fn recording_lookup(
+    asked: &Mutex<Vec<String>>,
+) -> impl Fn(&str) -> Result<Option<String>, crate::secrets::SecretError> + '_ {
+    move |account: &str| {
+        asked.lock().unwrap().push(account.to_owned());
+        Ok(Some(format!("value-for-{account}")))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn draft_endpoint_on_other_origin_gets_no_stored_headers() {
+    let (saved_base, _) = serve(OK.into()).await;
+    let (draft_base, seen) = serve(OK.into()).await;
+    let asked = Mutex::new(vec![]);
+    let lookup = recording_lookup(&asked);
+    // The saved settings hold a header for the saved endpoint's origin; the draft points elsewhere.
+    let mut draft = config(&draft_base, Protocol::HttpJson);
+    draft.headers = vec![header("authorization", &saved_base)];
+    let headers = resolve_test_headers(&draft, &lookup).unwrap();
+    assert!(headers.is_empty());
+    send_test_span_with(&draft, &headers, "desktop")
+        .await
+        .unwrap();
+    let request = seen.lock().unwrap().remove(0);
+    assert_eq!(request.header("authorization"), None);
+    assert!(asked.lock().unwrap().is_empty());
+    // A header claiming the draft's origin is read only from that origin's account.
+    draft.headers = vec![header("authorization", &draft_base)];
+    resolve_test_headers(&draft, &lookup).unwrap();
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec![format!("{draft_base}|authorization")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_headers_do_not_follow_a_changed_endpoint() {
+    let (old, old_seen) = serve(OK.into()).await;
+    let (new, new_seen) = serve(OK.into()).await;
+    let asked = Mutex::new(vec![]);
+    let lookup = recording_lookup(&asked);
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let mut settings = config(&old, Protocol::HttpJson);
+    settings.headers = vec![header("x-api-key", &old)];
+    telemetry.reload_export(&settings, &lookup);
+    run_one(&telemetry, "old", "hello");
+    flush(&telemetry).await;
+    assert!(until(|| !trace_requests(&old_seen).is_empty()).await);
+    // The owner changes only the endpoint: the old origin's header is not sent anywhere.
+    settings.endpoint = Some(new.clone());
+    asked.lock().unwrap().clear();
+    telemetry.reload_export(&settings, &lookup);
+    let failure = telemetry.export_status().last_error.unwrap();
+    assert_eq!(failure.kind, "header_other_origin");
+    assert!(asked.lock().unwrap().is_empty());
+    run_one(&telemetry, "new", "hello");
+    flush(&telemetry).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(new_seen.lock().unwrap().is_empty());
+    let error = ExportError::HeaderOtherOrigin("x-api-key".into(), old.clone());
+    assert!(error.to_string().contains(&old));
+    telemetry.shutdown();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn refused_settings_show_only_a_clean_endpoint() {
+    let directory = folder();
+    let telemetry = start(&directory, false);
+    let settings = config("http://evil.example/\u{1b}[31m", Protocol::HttpJson);
+    telemetry.reload_export(&settings, &no_secrets);
+    let status = telemetry.export_status();
+    assert_eq!(status.endpoint, None);
+    assert_eq!(status.last_error.unwrap().kind, "invalid_endpoint");
+    telemetry.shutdown();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn saved_settings_ignore_new_fields_but_never_load_values() {
+    let saved = serde_json::json!({
+        "endpoint": "https://otel.example.com/",
+        "protocol": "http/json",
+        "compression": "gzip",
+        "headers": [{"name": "x-api-key", "origin": "https://otel.example.com:443"}],
+    });
+    let config = ExportConfig::from_saved(&saved).unwrap();
+    assert_eq!(config.protocol, Protocol::HttpJson);
+    assert_eq!(config.headers.len(), 1);
+    for bad in [
+        serde_json::json!({"headerValues": {"x-api-key": "secret"}}),
+        serde_json::json!({"apiSecret": "secret"}),
+        serde_json::json!([]),
+        serde_json::json!({"headers": ["x-api-key"]}),
+    ] {
+        assert_eq!(
+            ExportConfig::from_saved(&bad),
+            Err(ExportError::InvalidSettings)
+        );
+    }
+}
+
+#[test]
+fn exemplar_labels_are_stripped() {
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Exemplar, Metric, ResourceMetrics, ScopeMetrics, Sum,
+    };
+    let label = |key: &str| KeyValue {
+        key: key.into(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue("secret-project".into())),
+        }),
+        ..Default::default()
+    };
+    let mut request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "m".into(),
+                    data: Some(Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            exemplars: vec![Exemplar {
+                                filtered_attributes: vec![
+                                    label(names::PROJECT),
+                                    label(names::SESSION),
+                                ],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    strip_labels(&mut request);
+    assert!(!format!("{request:?}").contains("secret-project"));
 }

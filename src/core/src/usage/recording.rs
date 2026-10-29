@@ -13,6 +13,8 @@ use std::{
 };
 
 pub const RECORDING_FILE: &str = "recording.jsonl";
+/// At most this much of the marker file is read.
+const MAX_FILE: u64 = 1024 * 1024;
 /// The most off periods listed for one range; the newest are kept.
 const MAX_PERIODS: usize = 20;
 
@@ -86,10 +88,12 @@ pub(crate) fn off_periods(data_dir: &Path, from_ms: u64, to_ms: u64) -> Vec<OffP
     let Ok(file) = std::fs::File::open(path) else {
         return vec![];
     };
-    let mut markers: Vec<Marker> = std::io::BufReader::new(file)
+    let surfaces = [Surface::Desktop.as_str(), Surface::Cli.as_str()];
+    let mut markers: Vec<Marker> = std::io::BufReader::new(std::io::Read::take(file, MAX_FILE))
         .lines()
         .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str(&line).ok())
+        .filter_map(|line| serde_json::from_str::<Marker>(&line).ok())
+        .filter(|marker| surfaces.contains(&marker.surface.as_str()))
         .collect();
     markers.sort_by_key(|marker| marker.unix_ms);
     let mut surfaces: Vec<String> = markers.iter().map(|m| m.surface.clone()).collect();

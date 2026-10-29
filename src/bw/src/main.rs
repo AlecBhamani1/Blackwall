@@ -306,6 +306,14 @@ fn set_setting(
             blackwall_core::telemetry::Surface::Cli,
         );
     }
+    if matches!(
+        key,
+        "otlp-endpoint" | "otlp-signals" | "traces" | "trace-content"
+    ) {
+        if let Some(warning) = settings::content_warning(settings) {
+            eprintln!("{warning}");
+        }
+    }
     session::configure_telemetry(settings);
     Ok(())
 }

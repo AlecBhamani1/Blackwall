@@ -592,6 +592,11 @@ fn recording_off_periods_listed_in_gaps() {
     let markers = directory.join(METRICS_DIRECTORY).join(RECORDING_FILE);
     let mut body = std::fs::read_to_string(&markers).unwrap();
     body.push_str("not json\n");
+    // A marker from an unknown surface is ignored.
+    body.push_str(&format!(
+        "{{\"unixMs\":{},\"recording\":false,\"surface\":\"<b>x</b>\"}}\n",
+        day_ms(D + 2, 1)
+    ));
     std::fs::write(&markers, body).unwrap();
     let summary = summary(&directory, Day(D), Day(D + 4), 0);
     assert_eq!(
@@ -634,6 +639,21 @@ fn recording_off_periods_listed_in_gaps() {
     let both = super::summary(&directory, Day(D + 3), Day(D + 3), 0);
     assert_eq!(both.gaps.off_periods.len(), 2);
     assert_eq!(both.gaps.off_periods[1].to_unix_ms, None);
+    // Only the first 1 MiB is read: markers past it are ignored.
+    let big = folder();
+    recording::mark_at(&big, false, DESKTOP, day_ms(D + 1, 1));
+    let path = big.join(METRICS_DIRECTORY).join(RECORDING_FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("{}\n", " ".repeat(1024 * 1024)));
+    text.push_str(&format!(
+        "{{\"unixMs\":{},\"recording\":true,\"surface\":\"desktop\"}}\n",
+        day_ms(D + 1, 2)
+    ));
+    std::fs::write(&path, text).unwrap();
+    let capped = super::summary(&big, Day(D), Day(D + 1), 0);
+    assert_eq!(capped.gaps.off_periods.len(), 1);
+    assert_eq!(capped.gaps.off_periods[0].to_unix_ms, None);
+    std::fs::remove_dir_all(big).unwrap();
     let json = serde_json::to_value(&summary.gaps).unwrap();
     assert_eq!(json["offPeriods"][1]["toUnixMs"], serde_json::Value::Null);
     std::fs::remove_dir_all(directory).unwrap();
