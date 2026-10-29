@@ -146,3 +146,58 @@ it('sends the selected command boundary and resets full access on a new session'
   expect(profile).toHaveValue('read-only');
   expect(network).not.toBeChecked();
 });
+
+it('asks which server to use on a first launch instead of connecting on its own', async () => {
+  const user = userEvent.setup();
+  const discoverModels = vi.spyOn(localModelClient, 'discoverModels');
+  discoverModels.mockClear();
+  const found = [
+    {
+      name: 'Ollama',
+      endpoint: 'http://127.0.0.1:11434/v1',
+      available: true,
+      models: ['qwen3.6:35b-a3b-nvfp4'],
+      supportsDownload: true,
+      kind: 'ollama',
+    },
+    {
+      name: 'llama.cpp',
+      endpoint: 'http://127.0.0.1:18040/v1',
+      available: true,
+      models: ['qwen3.8-flash-next-iq2_xs'],
+      supportsDownload: false,
+      kind: 'llama.cpp',
+      loaded: ['qwen3.8-flash-next-iq2_xs'],
+    },
+  ];
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'discover_local_services' ? found : fallback?.(command, args),
+  );
+  render(App);
+  const list = within(await screen.findByRole('region', { name: 'Found on this computer' }));
+  expect(list.getByRole('button', { name: 'Connect to Ollama at 127.0.0.1:11434' })).toBeVisible();
+  expect(
+    list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }),
+  ).toBeVisible();
+  expect(discoverModels).not.toHaveBeenCalled();
+  await user.click(list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }));
+  expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
+  expect(discoverModels).toHaveBeenCalledWith('http://127.0.0.1:18040/v1');
+});
+
+it('reconnects a saved connection at startup without asking again', async () => {
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === 'load_preferences')
+      return {
+        endpoint: 'https://model.example/v1',
+        connections: [{ endpoint: 'https://model.example/v1', name: 'Saved' }],
+      };
+    if (command === 'discover_local_services') throw new Error('discovery must not run');
+    return fallback?.(command, args);
+  });
+  render(App);
+  expect(await screen.findByRole('textbox', { name: 'Message Blackwall' })).toBeVisible();
+  expect(screen.queryByRole('region', { name: 'Found on this computer' })).not.toBeInTheDocument();
+});

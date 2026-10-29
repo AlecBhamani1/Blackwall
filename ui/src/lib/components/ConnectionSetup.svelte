@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import {
     setupClient,
     STARTER_MODELS,
     connectionHelp,
     invitationUrl,
     isDesktop,
+    serviceAddress,
+    serviceName,
     type SetupClient,
     type LocalService,
     type DownloadProgress,
@@ -15,6 +17,7 @@
   import Icon from './Icon.svelte';
   import PairingPanel from './PairingPanel.svelte';
   import SavedConnections from './SavedConnections.svelte';
+  import FoundServers from './FoundServers.svelte';
   import { connectionName as profileName } from '../connections';
   import { credentialStoreError, platform } from '../platform';
 
@@ -27,6 +30,8 @@
   export let desktop = isDesktop();
   export let currentEndpoint = '';
   export let connectionError = '';
+  /** Servers startup already found; `null` looks for them when setup opens. */
+  export let found: LocalService[] | null = null;
 
   type Step = 'choose' | 'local' | 'remote' | 'invite' | 'advanced' | 'success';
   let step: Step = 'choose';
@@ -49,6 +54,30 @@
   let heading: HTMLHeadingElement;
   let errorMessage: HTMLDivElement | undefined;
   let connectedName = '';
+  let foundServices: LocalService[] = found ?? [];
+  let foundScanning = false;
+  let foundVersion = 0;
+
+  async function refreshFound() {
+    const version = ++foundVersion;
+    foundScanning = true;
+    try {
+      const next = await client.discover();
+      if (version === foundVersion) foundServices = next;
+    } catch {
+      // The other connection choices stay available.
+    } finally {
+      if (version === foundVersion) foundScanning = false;
+    }
+  }
+  onMount(() => {
+    if (desktop && found === null) void refreshFound();
+  });
+  function connectFound(service: LocalService) {
+    // A server with nothing installed continues in the download flow.
+    if (!service.models.length) void navigate('local');
+    else void connect(service.endpoint, serviceName(service));
+  }
 
   async function navigate(next: Step) {
     if (busy) return;
@@ -170,6 +199,7 @@
     return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
   }
   $: available = services.filter((service) => service.available);
+  $: foundAvailable = foundServices.filter((service) => service.available);
   $: percent =
     progress && progress.total > 0
       ? Math.min(100, Math.round((progress.completed / progress.total) * 100))
@@ -194,7 +224,14 @@
 
     {#if step === 'choose'}
       <h1 bind:this={heading} tabindex="-1">Your AI. Your choice.</h1>
-      <p class="intro">Choose where your model runs.<br />We’ll help you get connected.</p>
+      {#if foundAvailable.length}
+        <p class="intro">
+          Blackwall found {foundAvailable.length === 1 ? 'a model server' : 'model servers'} on this computer.<br
+          />Choose one to connect, or pick another way below.
+        </p>
+      {:else}
+        <p class="intro">Choose where your model runs.<br />We’ll help you get connected.</p>
+      {/if}
       {#if error}
         <div class="error" role="alert" tabindex="-1" bind:this={errorMessage}>{error}</div>
       {/if}
@@ -210,6 +247,18 @@
                 connections.find((profile) => profile.endpoint === endpoint)?.name ?? '',
               )}
             {onForget}
+          />
+        </div>
+      {/if}
+      {#if foundAvailable.length}
+        <div class="remembered">
+          <FoundServers
+            services={foundAvailable}
+            {currentEndpoint}
+            {busy}
+            scanning={foundScanning}
+            onConnect={connectFound}
+            onRescan={refreshFound}
           />
         </div>
       {/if}
@@ -267,11 +316,14 @@
         </button>
       </div>
       <button class="text-button advanced-link" onclick={() => navigate('advanced')}
-        >Advanced connection settings</button
+        >Enter a server address</button
       >
     {:else if step === 'local'}
       <h1 bind:this={heading} tabindex="-1">Let’s find your local model.</h1>
-      <p class="intro">Blackwall checks for Ollama and LM Studio on this computer.</p>
+      <p class="intro">
+        Blackwall looks for Ollama, LM Studio, llama.cpp, vLLM, and other model servers on this
+        computer.
+      </p>
       {#if !desktop}
         <div class="info">
           <strong>Open the Blackwall desktop app</strong>
@@ -306,7 +358,7 @@
           <div class="service">
             <div class="service-heading">
               <strong>{service.name}</strong><span class="found"
-                ><span></span>Found on this computer</span
+                ><span></span>Found at {serviceAddress(service)}</span
               >
             </div>
             {#if service.models.length > 0}

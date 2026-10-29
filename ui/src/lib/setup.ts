@@ -9,6 +9,30 @@ export interface LocalService {
   available: boolean;
   models: string[];
   supportsDownload: boolean;
+  kind?: ServerKind;
+  /** Models the server has in memory now. */
+  loaded?: string[];
+  contextWindow?: number;
+}
+
+/** `127.0.0.1:11434` for `http://127.0.0.1:11434/v1`. */
+export function serviceAddress(service: Pick<LocalService, 'endpoint'>): string {
+  try {
+    return new URL(service.endpoint).host;
+  } catch {
+    return service.endpoint;
+  }
+}
+
+/** A saved-connection name that tells servers of one kind apart, such as `llama.cpp :18040`. */
+export function serviceName(service: Pick<LocalService, 'name' | 'endpoint'>): string {
+  let port = '';
+  try {
+    port = new URL(service.endpoint).port;
+  } catch {
+    /* The name alone still works. */
+  }
+  return port ? `${service.name} :${port}` : service.name;
 }
 export interface DownloadProgress {
   status: string;
@@ -130,7 +154,8 @@ export const setupClient = {
   },
   async discover(): Promise<LocalService[]> {
     if (!isDesktop()) return [];
-    return invoke<LocalService[]>('discover_local_services');
+    const found = await invoke<LocalService[] | null>('discover_local_services');
+    return Array.isArray(found) ? found : [];
   },
   async openLink(kind: 'download' | 'invitation', invitation?: string): Promise<void> {
     const target =

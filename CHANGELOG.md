@@ -25,6 +25,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limit and fewer subagent tools. A project can never choose where subagents run.
 - Settings saved by this version carry `subagents` and `contextBudget.maxOutputBytes`, which an
   earlier `bw` rejects; to go back, remove those keys from the CLI settings file.
+- Setup, **Settings → Model connection** and `bw setup` find every model server on this computer:
+  the common model server ports plus every port listening on loopback (Linux `/proc/net/tcp`, macOS
+  `lsof`, Windows `netstat`), at most 64, asked at once for 1.5 s each with credential-free GETs.
+  Each is listed with its kind (Ollama, llama.cpp, vLLM, LM Studio or OpenAI-compatible), address,
+  models, loaded model and context window. Only loopback is asked. `bw setup --list` prints the list.
 
 - Command tools in `tools.json` can take JSON on stdin (`"stdin":"json"` writes
   `{"arguments":{…}}`), declare a typed argument schema (`parameters`: string, number, integer or
@@ -139,6 +144,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
 ### Changed
+
+- A first launch with no saved connection lists the servers found on this computer and connects
+  only to the one chosen, instead of connecting to the first that answered.
+
+- **Settings → Model connection** starts with **Set up a connection** and the servers found on this
+  computer, then a visible **Server address** field with **Connect** (no longer under Advanced),
+  then saved connections and their options.
+
+- When a model server rejects a request with an explanation, such as Ollama running out of memory
+  to load a model, the chat error shows it, clipped to 300 characters with control characters
+  removed and credentials redacted. Error kinds in traces are unchanged.
 
 - Write traces through the OpenTelemetry SDK. A run's spans are held until it ends, then filtered
   or scrubbed as a whole before they are written, so a secret seen late in a run is removed from

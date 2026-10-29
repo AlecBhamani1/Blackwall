@@ -958,7 +958,10 @@ mod tests {
                 RunReason::Iterations,
             ),
             (AgentError::Model(ModelError::Network), RunReason::Model),
-            (AgentError::Model(ModelError::Http(500)), RunReason::Model),
+            (
+                AgentError::Model(ModelError::Http(500, None)),
+                RunReason::Model,
+            ),
             (
                 AgentError::Budget(ContextError::Model(ModelError::Invalid)),
                 RunReason::Model,

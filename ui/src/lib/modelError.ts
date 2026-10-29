@@ -58,10 +58,29 @@ export function nativeModelError(cause: unknown): ModelRequestError {
     invalid_model_response:
       'The model returned an unreadable response. Try again or check the model service.',
   };
+  const detail = serverDetail(record.detail);
+  const known = Object.hasOwn(messages, code);
   return new ModelRequestError(
-    Object.hasOwn(messages, code)
-      ? messages[code]
-      : 'The model could not complete the request. Try again or check the model service.',
+    // The server's own explanation, such as a model too large for memory, says more than the
+    // generic text; a known category keeps its recovery advice and adds the explanation.
+    detail
+      ? known
+        ? `${messages[code]} (${detail})`
+        : detail
+      : known
+        ? messages[code]
+        : 'The model could not complete the request. Try again or check the model service.',
     code,
   );
+}
+
+/** A native build already cleans this; bound and flatten it again in case an older one did not. */
+function serverDetail(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  // eslint-disable-next-line no-control-regex
+  const flat = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return flat.length > 300 ? `${flat.slice(0, 299)}…` : flat;
 }

@@ -1,3 +1,4 @@
+mod discovery;
 mod input;
 mod mcp;
 mod memory;
@@ -61,7 +62,9 @@ const HELP: &str = "bw — Blackwall project assistant
 USAGE:
   bw                         Start interactive chat in the current project
   bw chat                    Start interactive chat
-  bw setup                   Configure endpoint, model, web, and memory
+  bw setup                   Configure endpoint, model, web, and memory; in a terminal,
+                             lists the model servers found on this computer to choose from
+  bw setup --list            List the model servers found on this computer
   bw config [show]           Show effective settings
   bw config set <name> <value>
                              Includes otlp-endpoint <url|off>, otlp-protocol <json|protobuf>,
@@ -220,6 +223,11 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
         return Ok(());
     }
     if command == "setup" {
+        if arguments == ["--list"] {
+            let found = blackwall_core::connection::discover_local_services().await;
+            println!("{}", discovery::describe(&found));
+            return Ok(());
+        }
         require_no_arguments(&arguments)?;
         return setup(&store, &mut settings, &mut Input::stdin()).await;
     }
@@ -439,6 +447,17 @@ async fn setup(
     println!(
         "Blackwall setup. Enter keeps the displayed value. Use an already-running model service."
     );
+    // Only an interactive setup looks around, so scripted setup never touches other ports.
+    let found = if input.is_terminal() {
+        let found = blackwall_core::connection::discover_local_services().await;
+        println!("{}", discovery::describe(&found));
+        if !found.is_empty() {
+            println!("Type a number at the endpoint prompt to use that server.");
+        }
+        found
+    } else {
+        vec![]
+    };
     let mut candidate = settings.clone();
     for key in ["endpoint", "model", "web", "memory"] {
         let current = match key {
@@ -463,7 +482,13 @@ async fn setup(
             value.trim().into()
         };
         match key {
-            "endpoint" => candidate.endpoint = value,
+            "endpoint" => match discovery::chosen(&found, &value) {
+                Some(service) => {
+                    candidate.endpoint = service.endpoint.clone();
+                    candidate.model = discovery::offered_model(service, &candidate.model);
+                }
+                None => candidate.endpoint = value,
+            },
             "model" => candidate.model = value,
             "web" => candidate.web_enabled = parse_switch(&value)?,
             _ => candidate.memory_enabled = parse_switch(&value)?,

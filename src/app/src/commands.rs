@@ -64,6 +64,7 @@ pub(crate) async fn scoped_api_key(
             code: "credential_error",
             message,
             retryable: true,
+            detail: None,
         })?
     {
         return Ok(Some(key));
@@ -85,6 +86,7 @@ async fn require_unlocked(app: &AppHandle) -> Result<(), CommandError> {
             code: "app_locked",
             message,
             retryable: false,
+            detail: None,
         })
 }
 
@@ -96,6 +98,10 @@ pub(crate) struct CommandError {
     code: &'static str,
     message: String,
     retryable: bool,
+    /// What the model server itself said, cleaned by `server_error_detail`; shown with the
+    /// message so people see why a request failed, such as a model too large for memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 impl CommandError {
@@ -150,6 +156,12 @@ impl CommandError {
                 _ => "The model could not complete the request. Try again or check the model service.",
             }.into(),
             retryable,
+            detail: match &error {
+                BridgeError::HttpStatus { body, .. } => {
+                    blackwall_core::model::server_error_detail(body.as_bytes())
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -158,24 +170,30 @@ impl From<blackwall_core::model::ModelError> for CommandError {
     fn from(error: blackwall_core::model::ModelError) -> Self {
         use blackwall_core::model::ModelError;
         match error {
-            ModelError::Http(code) => Self::from_bridge(BridgeError::HttpStatus {
-                status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
-                body: String::new(),
-            }),
+            ModelError::Http(code, detail) => Self {
+                detail,
+                ..Self::from_bridge(BridgeError::HttpStatus {
+                    status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                    body: String::new(),
+                })
+            },
             ModelError::Network => Self {
                 code: "model_unavailable",
                 message: error.to_string(),
                 retryable: true,
+                detail: None,
             },
             ModelError::Invalid => Self {
                 code: "invalid_model_response",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
             ModelError::Limit => Self {
                 code: "context_limit",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
         }
     }
@@ -197,6 +215,7 @@ impl From<blackwall_core::context::ContextError> for CommandError {
             code,
             message: error.to_string(),
             retryable: false,
+            detail: None,
         }
     }
 }
@@ -211,21 +230,25 @@ impl From<blackwall_core::agent::AgentError> for CommandError {
                 code: "review_error",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
             AgentError::Iterations => Self {
                 code: "agent_iteration_limit",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
             AgentError::Instructions | AgentError::Tool(_) => Self {
                 code: "agent_error",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
             AgentError::Context => Self {
                 code: "context_limit",
                 message: error.to_string(),
                 retryable: false,
+                detail: None,
             },
         }
     }
@@ -249,6 +272,7 @@ impl From<ShareError> for CommandError {
             code: "sharing_error",
             message: error.to_string(),
             retryable: false,
+            detail: None,
         }
     }
 }
@@ -383,6 +407,7 @@ async fn inject_memory(
         code: "storage_error",
         message,
         retryable: true,
+        detail: None,
     })?;
     if !memory.is_empty() {
         request
@@ -409,6 +434,7 @@ pub(crate) async fn chat(
             code: "request_stopped",
             message,
             retryable: false,
+            detail: None,
         })?;
     inject_memory(&app, &mut request, None).await?;
     validate_attachment_target(&request).map_err(CommandError::from)?;
@@ -469,6 +495,7 @@ pub(crate) async fn chat(
             code: "request_stopped",
             message: "Response stopped.".into(),
             retryable: false,
+            detail: None,
         }),
     }
 }
@@ -523,6 +550,7 @@ pub(crate) async fn stream_chat(
             code: "request_stopped",
             message,
             retryable: false,
+            detail: None,
         })?;
     request.context_budget = blackwall_core::connection::served_budget(
         &selected,
@@ -542,6 +570,7 @@ pub(crate) async fn stream_chat(
         code: "request_stopped",
         message: "Response stopped.".into(),
         retryable: false,
+        detail: None,
     };
     let options = options.unwrap_or_default();
     let session_id = options.session_id.clone();
@@ -553,6 +582,7 @@ pub(crate) async fn stream_chat(
                 code: "workspace_required",
                 message: "Choose a project folder before starting an agent task.".into(),
                 retryable: false,
+                detail: None,
             })
             .and_then(|expected| {
                 crate::agent_commands::selected_workspace(&agent, expected).map_err(|_| {
@@ -560,6 +590,7 @@ pub(crate) async fn stream_chat(
                         code: "workspace_required",
                         message: "Reopen this conversation to restore its project folder.".into(),
                         retryable: false,
+                        detail: None,
                     }
                 })
             })?;
@@ -571,6 +602,7 @@ pub(crate) async fn stream_chat(
                         code: "storage_error",
                         message,
                         retryable: true,
+                        detail: None,
                     }
                 })?,
                 client: blackwall_core::memory::MemoryClient::Desktop,
@@ -590,6 +622,7 @@ pub(crate) async fn stream_chat(
             code: "skills_error",
             message,
             retryable: true,
+            detail: None,
         })?;
         if !skill_context.is_empty() {
             request
@@ -607,6 +640,7 @@ pub(crate) async fn stream_chat(
                 code: "storage_error",
                 message,
                 retryable: false,
+                detail: None,
             })?;
         #[cfg(target_os = "macos")]
         crate::lifecycle::login_path_settled().await;
@@ -628,6 +662,7 @@ pub(crate) async fn stream_chat(
             .map_err(|message| CommandError {
                 code: "settings_error",
                 message,
+                detail: None,
                 retryable: false,
             })?;
         let runner = blackwall_core::agent::Agent {
@@ -693,6 +728,7 @@ pub(crate) async fn start_share(
                         code: "keychain_error",
                         message,
                         retryable: true,
+                        detail: None,
                     })?;
         }
     }
@@ -712,6 +748,7 @@ pub(crate) async fn start_share(
                 code: "keychain_error",
                 message,
                 retryable: true,
+                detail: None,
             });
         }
     }
@@ -866,6 +903,7 @@ async fn stream_chat_events(
                     code: "storage_error",
                     message,
                     retryable: false,
+                    detail: None,
                 })?;
             blackwall_core::context::chat_with_web(
                 &backend,
@@ -892,6 +930,7 @@ fn emit_command_error(app: &AppHandle, request_id: String, error: CommandError) 
         code: error.code.to_owned(),
         message: error.message.clone(),
         retryable: error.retryable,
+        detail: error.detail.clone(),
     };
     let _emit_result = app.emit(EVENT_CHANNEL, event);
     error
@@ -1266,7 +1305,35 @@ mod tests {
             assert_eq!(error.retryable, retryable);
             assert!(!error.message.contains("private"));
             assert!(!error.message.contains("secret"));
+            // The server's own words are kept apart from the message, with keys redacted.
+            assert!(!error.detail.unwrap_or_default().contains("secret"));
         }
+    }
+
+    #[test]
+    fn model_failures_carry_the_servers_own_explanation() {
+        let error = CommandError::from_bridge(BridgeError::HttpStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: r#"{"error":"model requires more system memory (24 GiB) than is available\u001b (12 GiB) api_key=hunter2"}"#.into(),
+        });
+        assert_eq!(error.code, "model_http_error");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("model requires more system memory (24 GiB) than is available (12 GiB) api_key=[redacted]")
+        );
+        let core = CommandError::from(blackwall_core::model::ModelError::Http(
+            500,
+            Some("Ollama: model failed to load".into()),
+        ));
+        assert_eq!(core.code, "model_http_error");
+        assert!(core.retryable);
+        assert_eq!(core.detail.as_deref(), Some("Ollama: model failed to load"));
+        let json = serde_json::to_value(&core).unwrap();
+        assert_eq!(json["detail"], "Ollama: model failed to load");
+        let plain =
+            serde_json::to_value(CommandError::from_bridge(BridgeError::EmptyModelResponse))
+                .unwrap();
+        assert!(plain.get("detail").is_none());
     }
 
     #[test]

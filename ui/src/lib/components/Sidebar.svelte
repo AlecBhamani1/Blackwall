@@ -37,7 +37,7 @@
   export let onNewChat: () => void;
   export let onOpenSession: (sessionId: string) => void;
   export let onRemoveSession: (sessionId: string) => void;
-  export let onConfigureEndpoint: (endpoint: string) => Promise<boolean>;
+  export let onConfigureEndpoint: (endpoint: string, name?: string) => Promise<boolean>;
   export let onCheckForUpdates: () => Promise<boolean>;
   export let onInstallUpdate: () => Promise<void>;
   export let onClose: () => void;

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ConnectionSetup from './ConnectionSetup.svelte';
@@ -35,7 +35,7 @@ describe('guided model setup', () => {
       .mockResolvedValue(undefined);
     const onConnect = vi.fn().mockResolvedValue(true);
     render(ConnectionSetup, { props: { desktop: true, onConnect } });
-    await user.click(screen.getByRole('button', { name: 'Advanced connection settings' }));
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
     await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
     await user.click(screen.getByText('Access key (if your service requires one)'));
     const input = screen.getByLabelText('Access key');
@@ -71,7 +71,7 @@ describe('guided model setup', () => {
         .compareDocumentPosition(screen.getByRole('button', { name: /Use this computer/ })) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Advanced connection settings' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Enter a server address' })).toBeEnabled();
   });
   it('focuses Keychain recovery guidance and allows an explicit connection retry', async () => {
     const user = userEvent.setup();
@@ -114,7 +114,7 @@ describe('guided model setup', () => {
         connections: [{ endpoint: 'https://relay.example/s/saved/v1', name: 'Home Mac' }],
       },
     });
-    await user.click(screen.getByRole('button', { name: 'Advanced connection settings' }));
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
     await user.click(screen.getByText('Access key (if your service requires one)'));
     await user.type(screen.getByLabelText('Access key'), 'unfinished-manual-key');
     await user.click(screen.getByRole('button', { name: 'All connection options' }));
@@ -132,7 +132,8 @@ describe('guided model setup', () => {
     await user.click(await screen.findByRole('button', { name: /Get Ollama/ }));
     expect(mock.openLink).toHaveBeenCalledWith('download');
     await user.click(screen.getByRole('button', { name: /Check again/ }));
-    expect(mock.discover).toHaveBeenCalledTimes(2);
+    // Once when setup opened, once for this step, and once more for the recheck.
+    expect(mock.discover).toHaveBeenCalledTimes(3);
   });
   it('only downloads after explicit action and connects the chosen model', async () => {
     const mock = client();
@@ -165,6 +166,63 @@ describe('guided model setup', () => {
       expect.any(AbortSignal),
     );
     expect(choose).toHaveBeenCalledWith('llama3.2:1b');
+  });
+  it('lists every server found on this computer with its own Connect button', async () => {
+    const user = userEvent.setup();
+    const onConnect = vi.fn().mockResolvedValue(true);
+    const found = [
+      {
+        name: 'Ollama',
+        endpoint: 'http://127.0.0.1:11434/v1',
+        available: true,
+        models: ['qwen3.6:35b-a3b-nvfp4'],
+        supportsDownload: true,
+        kind: 'ollama' as const,
+        loaded: ['qwen3.6:35b-a3b-nvfp4'],
+        contextWindow: 65_536,
+      },
+      {
+        name: 'llama.cpp',
+        endpoint: 'http://127.0.0.1:18040/v1',
+        available: true,
+        models: ['qwen3.8-flash-next-iq2_xs'],
+        supportsDownload: false,
+        kind: 'llama.cpp' as const,
+        loaded: ['qwen3.8-flash-next-iq2_xs'],
+      },
+    ];
+    const mock = client();
+    render(ConnectionSetup, { props: { client: mock, desktop: true, onConnect, found } });
+    const list = within(screen.getByRole('region', { name: 'Found on this computer' }));
+    expect(list.getByText('127.0.0.1:11434')).toBeVisible();
+    expect(list.getByText(/Loaded: qwen3\.6:35b-a3b-nvfp4 · 65,536-token context/)).toBeVisible();
+    expect(list.getByText('127.0.0.1:18040')).toBeVisible();
+    expect(list.getByText(/Loaded: qwen3\.8-flash-next-iq2_xs/)).toBeVisible();
+    // Servers found at startup are not looked up again.
+    expect(mock.discover).not.toHaveBeenCalled();
+    await user.click(list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }));
+    expect(onConnect).toHaveBeenCalledWith('http://127.0.0.1:18040/v1', 'llama.cpp :18040');
+    expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
+  });
+  it('looks for servers when it opens and sends an empty Ollama to the download step', async () => {
+    const user = userEvent.setup();
+    const mock = client();
+    mock.discover = vi.fn().mockResolvedValue([
+      {
+        name: 'Ollama',
+        endpoint: 'http://127.0.0.1:11434/v1',
+        available: true,
+        models: [],
+        supportsDownload: true,
+      },
+    ]);
+    const onConnect = vi.fn();
+    render(ConnectionSetup, { props: { client: mock, desktop: true, onConnect } });
+    await user.click(
+      await screen.findByRole('button', { name: 'Connect to Ollama at 127.0.0.1:11434' }),
+    );
+    expect(await screen.findByRole('button', { name: 'Download and connect' })).toBeVisible();
+    expect(onConnect).not.toHaveBeenCalled();
   });
   it('keeps invalid invitation secrets out of navigation', async () => {
     const user = userEvent.setup();

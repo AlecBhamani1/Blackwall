@@ -12,9 +12,11 @@ lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows
 
 ## Connect a model
 
-1. Open **Settings → Model connection → Set up a connection**. First launch opens setup automatically when no working
-   model connection is found.
-2. Choose **Use this computer**. Blackwall checks fixed loopback addresses for Ollama and LM Studio.
+1. Open **Settings → Model connection → Set up a connection**. First launch opens setup automatically when no
+   connection is saved: it lists every model server found on this computer, with its address, models
+   and loaded model, and connects only to the one you choose (see [Finding servers on this
+   computer](#finding-servers-on-this-computer)). A saved connection is reconnected without asking.
+2. Choose **Connect** on a found server, or **Use this computer** for guided setup.
 3. If a model is installed, choose **Use these models**. If Ollama is missing, choose **Get Ollama**,
    install and open it, then return and choose **Check again**. Blackwall does not install or start
    the model service itself.
@@ -31,10 +33,11 @@ credential. The host and client may run different operating systems; pairing use
 protocol everywhere. Keep Blackwall open, unlocked, and awake on the host with its model service running.
 A configured relay is currently required; no default Blackwall-operated relay is provided yet.
 
-Direct model access remains under advanced setup. Enter a reachable OpenAI-compatible address and
-an optional friendly name. Every successful connection is saved, including addresses entered in
-Settings' advanced form. **Settings → Model connection** lists saved services with their addresses;
-choose **Connect** to switch. Each connection remembers its selected model, including after restarting
+For direct model access, choose **Enter a server address** in setup, or type the address in the
+**Server address** field of **Settings → Model connection** and choose **Connect**. Enter a reachable
+Ollama or OpenAI-compatible address and an optional friendly name. Every successful connection is
+saved. **Settings → Model connection** starts with **Set up a connection** and the servers found on
+this computer, then the address field, then saved services with their addresses; choose **Connect** to switch. Each connection remembers its selected model, including after restarting
 the desktop app or browser. Failed switches keep the working connection available. Save up to 20
 connections; forget one before adding another when the list is full. Forgetting removes the profile
 and keeps its access key. Pairing and direct connections do not start or reconfigure the model service
@@ -55,6 +58,31 @@ save the invite secret or add a permanent computer. An expired or revoked invita
 by the sender. Guest sharing requires a configured relay; see [sharing](SHARING.md).
 
 ## Local models
+
+### Finding servers on this computer
+
+Setup, **Settings → Model connection** and `bw setup` look for model servers on this computer only.
+Blackwall asks the ports model servers commonly use (11434 Ollama, 1234 LM Studio, 8080 and 8081
+llama.cpp, 8000 vLLM, 5000 and 5001 text-generation-webui and koboldcpp, 18040, 4891 GPT4All, 1337
+Jan) and every other port listening on a loopback or all-interfaces address, read from
+`/proc/net/tcp` and `/proc/net/tcp6` on Linux, `lsof` on macOS and `netstat` on Windows (2 seconds at
+most). Ports below 1024 are skipped and at most 64 ports are asked. Each is asked at once, within 1.5
+seconds, with GET requests only and no access key, on `127.0.0.1` (or `[::1]` for a port bound only
+there). Responses are read up to 1 MiB. The network is never scanned, and servers on other computers
+are added by address.
+
+A server is listed when it answers Ollama's `/api/version` (its models from `/api/tags`, loaded
+models from `/api/ps`) or an OpenAI-compatible `/v1/models`; its kind, loaded model and context
+window are then detected as in the table below. Ollama's own per-model runner processes are not
+listed separately. If the listening-port table is unavailable, the common ports are still asked.
+`bw setup --list` prints what was found without changing settings; interactive `bw setup` shows the
+list first and accepts a number at the endpoint prompt.
+
+**Errors from the server.** When a model server rejects a request with an explanation, such as
+Ollama's "model requires more system memory than is available", the chat error shows it, named after
+the server when known. Ollama, llama.cpp, vLLM and OpenAI error bodies are read; control characters
+are removed, access keys and credentials in addresses are redacted, and the text is clipped to 300
+characters.
 
 **Context window.** Before each request, Blackwall asks the service which server it is and what
 context window the selected model is loaded with. The probes send no access key and take at most
