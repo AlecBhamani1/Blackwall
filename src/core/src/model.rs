@@ -9,6 +9,12 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 
+mod think;
+pub use think::ThinkFilter;
+
+/// The most bytes one streamed response may carry, answer and reasoning together.
+const MAX_STREAM: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("The model service could not be reached. Check your connection and try again.")]
@@ -53,6 +59,37 @@ pub struct ModelTurn {
     pub content: String,
     pub calls: Vec<ToolCall>,
     pub usage: Option<TokenUsage>,
+    /// The model's reasoning, kept apart from `content`. It is never sent back to the model.
+    pub reasoning: String,
+    /// How long the model spent reasoning, in milliseconds.
+    pub reasoning_ms: u64,
+}
+/// Reasoning gathered across the model calls of one run, for `TurnComplete`.
+#[derive(Default)]
+pub struct Reasoning {
+    text: String,
+    ms: u64,
+}
+impl Reasoning {
+    pub fn add(&mut self, turn: &ModelTurn) {
+        if turn.reasoning.is_empty() {
+            return;
+        }
+        if !self.text.is_empty() {
+            self.text.push_str("\n\n");
+        }
+        self.text.push_str(&turn.reasoning);
+        self.ms = self.ms.saturating_add(turn.reasoning_ms);
+    }
+    /// The text and duration, or nothing when the model did not reason.
+    pub fn take(&mut self) -> (Option<String>, Option<u64>) {
+        let text = std::mem::take(&mut self.text);
+        if text.is_empty() {
+            (None, None)
+        } else {
+            (Some(text), Some(self.ms))
+        }
+    }
 }
 pub trait ModelBackend: Send + Sync {
     fn context_budget(&self) -> crate::context::ContextBudget {
@@ -188,6 +225,9 @@ pub struct StreamDecoder {
     calls: BTreeMap<usize, ToolCall>,
     done: bool,
     finished: bool,
+    think: ThinkFilter,
+    /// When reasoning started and when its latest part arrived.
+    thinking: Option<(std::time::Instant, std::time::Instant)>,
 }
 impl StreamDecoder {
     pub fn push(
@@ -196,7 +236,7 @@ impl StreamDecoder {
         delta: &mut (dyn FnMut(String) + Send),
     ) -> Result<(), ModelError> {
         self.received += bytes.len();
-        if self.received > 8 * 1024 * 1024 {
+        if self.received > MAX_STREAM {
             return Err(ModelError::Limit);
         }
         for byte in bytes {
@@ -254,9 +294,16 @@ impl StreamDecoder {
             self.finished = true;
         }
         let update = &choice["delta"];
+        // Servers name the separate reasoning field differently.
+        for field in ["reasoning_content", "reasoning"] {
+            if let Some(text) = update.get(field).and_then(Value::as_str) {
+                self.reason(text)?;
+            }
+        }
         if let Some(text) = update.get("content").and_then(Value::as_str) {
-            self.turn.content.push_str(text);
-            delta(text.into());
+            let (answer, reasoning) = self.think.push(text);
+            self.reason(&reasoning)?;
+            self.answer(answer, delta);
         }
         if let Some(calls) = update.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -287,6 +334,26 @@ impl StreamDecoder {
         }
         Ok(())
     }
+    /// Keep reasoning out of the answer, within the same limit as the whole stream.
+    fn reason(&mut self, text: &str) -> Result<(), ModelError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.turn.reasoning.len() + text.len() > MAX_STREAM {
+            return Err(ModelError::Limit);
+        }
+        self.turn.reasoning.push_str(text);
+        let now = std::time::Instant::now();
+        let started = self.thinking.map_or(now, |(started, _)| started);
+        self.thinking = Some((started, now));
+        Ok(())
+    }
+    fn answer(&mut self, text: String, delta: &mut (dyn FnMut(String) + Send)) {
+        if !text.is_empty() {
+            self.turn.content.push_str(&text);
+            delta(text);
+        }
+    }
     pub fn finish(
         mut self,
         delta: &mut (dyn FnMut(String) + Send),
@@ -298,6 +365,13 @@ impl StreamDecoder {
         if !self.done && !self.finished {
             return Err(ModelError::Invalid);
         }
+        let (answer, reasoning) = std::mem::take(&mut self.think).finish();
+        self.reason(&reasoning)?;
+        self.answer(answer, delta);
+        self.turn.reasoning = self.turn.reasoning.trim().to_owned();
+        self.turn.reasoning_ms = self.thinking.map_or(0, |(started, last)| {
+            u64::try_from(last.duration_since(started).as_millis()).unwrap_or(u64::MAX)
+        });
         self.turn.calls = self.calls.into_values().collect();
         let mut ids = std::collections::HashSet::new();
         for call in &self.turn.calls {
@@ -422,6 +496,103 @@ mod tests {
         let single = [messages[0].clone(), messages[2].clone()];
         assert_eq!(one_system_message(&single), single);
         assert!(one_system_message(&[]).is_empty());
+    }
+    fn decode(frames: &[Value]) -> (String, ModelTurn) {
+        let mut bytes = String::new();
+        for frame in frames {
+            bytes.push_str(&format!("data: {frame}\n\n"));
+        }
+        bytes.push_str("data: [DONE]\n\n");
+        let mut decoder = StreamDecoder::default();
+        let mut text = String::new();
+        for chunk in bytes.as_bytes().chunks(5) {
+            decoder
+                .push(chunk, &mut |delta| text.push_str(&delta))
+                .unwrap();
+        }
+        let turn = decoder.finish(&mut |delta| text.push_str(&delta)).unwrap();
+        (text, turn)
+    }
+    #[test]
+    fn reasoning_content_field_is_separate() {
+        let (shown, turn) = decode(&[
+            json!({"choices":[{"delta":{"reasoning_content":"llama.cpp thinks. "}}]}),
+            json!({"choices":[{"delta":{"reasoning":"Ollama thinks."}}]}),
+            json!({"choices":[{"delta":{"content":"<think>inline</think>\n\nAnswer"}}]}),
+            json!({"choices":[{"delta":{"content":" here."},"finish_reason":"stop"}]}),
+        ]);
+        assert_eq!(shown, "Answer here.");
+        assert_eq!(turn.content, "Answer here.");
+        assert_eq!(turn.reasoning, "llama.cpp thinks. Ollama thinks.inline");
+    }
+    #[test]
+    fn unclosed_think_never_reaches_the_answer() {
+        let (shown, turn) = decode(&[
+            json!({"choices":[{"delta":{"content":"<think>still going"},"finish_reason":"length"}]}),
+        ]);
+        assert_eq!(shown, "");
+        assert_eq!(turn.content, "");
+        assert_eq!(turn.reasoning, "still going");
+    }
+    #[test]
+    fn reasoning_is_bounded_like_content() {
+        let mut decoder = StreamDecoder::default();
+        let part = "r".repeat(512 * 1024);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":part}}]})
+        );
+        let mut result = Ok(());
+        for _ in 0..20 {
+            result = decoder.push(frame.as_bytes(), &mut |_| {});
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(matches!(result, Err(ModelError::Limit)));
+    }
+    #[test]
+    fn reasoning_reaches_traces_only_with_content_capture() {
+        use crate::telemetry::{Mode, ModelReply, RunOutcome, Telemetry, TelemetryOptions};
+        for content in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "blackwall-reasoning-trace-{}",
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let telemetry = Telemetry::start(
+                &directory,
+                TelemetryOptions {
+                    traces: true,
+                    content,
+                    ..Default::default()
+                },
+            );
+            let trace = telemetry.run("thinking", Mode::Agent);
+            let call = trace.begin_model_call(&trace.root(), "m");
+            let turn = ModelTurn {
+                content: "ANSWER-SENTINEL".into(),
+                reasoning: "REASONING-SENTINEL".into(),
+                ..Default::default()
+            };
+            trace.end_model_call(call, Mode::Agent, "", Ok(ModelReply::of(&turn)));
+            trace.finish(RunOutcome::Complete);
+            telemetry.flush();
+            drop(telemetry);
+            let id = crate::trace::list(&directory, 1).remove(0).id;
+            let body = std::fs::read_to_string(
+                directory
+                    .join(crate::trace::TRACE_DIRECTORY)
+                    .join(format!("{id}.json")),
+            )
+            .unwrap();
+            assert_eq!(body.contains("REASONING-SENTINEL"), content, "{body}");
+            assert_eq!(body.contains("ANSWER-SENTINEL"), content, "{body}");
+            if content {
+                assert!(body.contains(r#"\"type\":\"reasoning\""#), "{body}");
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
     #[test]
     fn truncated_stream_is_an_error() {

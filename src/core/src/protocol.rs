@@ -507,6 +507,17 @@ pub enum AgentEvent {
         /// Token usage when supplied by the endpoint.
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        /// The model's reasoning for this turn, shown apart from the answer and never sent back
+        /// to the model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        /// How long the model reasoned, in milliseconds.
+        #[serde(
+            rename = "reasoningMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        reasoning_ms: Option<u64>,
     },
     /// Recoverable or terminal failure associated with a request.
     Error {
@@ -760,6 +771,8 @@ mod tests {
                     total_tokens: 6,
                     ..Default::default()
                 }),
+                reasoning: Some("Checked the plan.".to_owned()),
+                reasoning_ms: Some(1500),
             },
             AgentEvent::Error {
                 request_id: "r1".to_owned(),

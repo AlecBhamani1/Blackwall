@@ -62,6 +62,7 @@ fn research(calls: Vec<ToolCall>) -> ModelTurn {
             total_tokens: 12,
             ..Default::default()
         }),
+        ..Default::default()
     }
 }
 

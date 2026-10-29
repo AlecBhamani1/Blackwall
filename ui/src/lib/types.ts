@@ -31,6 +31,9 @@ export interface ChatMessage {
   children?: ChildEntry[];
   /** Restored tool activity is inert history, never live approval state. */
   historical?: boolean;
+  /** The model's reasoning, shown collapsed; never sent back to the model. */
+  reasoning?: string;
+  reasoningMs?: number;
 }
 
 export interface ModelInfo {
@@ -125,7 +128,14 @@ export type AgentEvent =
   | { type: 'context_report'; requestId: string; report: ContextReport }
   | { type: 'context_updated'; requestId: string; state: ContextState }
   | { type: 'assistant_delta'; requestId: string; delta: string }
-  | { type: 'turn_complete'; requestId: string; finishReason?: string; usage?: TokenUsage }
+  | {
+      type: 'turn_complete';
+      requestId: string;
+      finishReason?: string;
+      usage?: TokenUsage;
+      reasoning?: string;
+      reasoningMs?: number;
+    }
   | { type: 'error'; requestId: string; message: string; code?: string }
   | { type: 'subagent_status'; requestId: string; agentId: string; state: string; summary?: string }
   | { type: 'tool_call'; requestId: string; toolCallId: string; name: string; arguments: string }

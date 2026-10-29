@@ -25,6 +25,9 @@ import type {
   ContextState,
 } from './types';
 
+/** The most reasoning text kept for one reply. */
+const MAX_REASONING_CHARS = 200_000;
+
 const MODEL_DISCOVERY_TIMEOUT_MS = 4_000;
 
 interface OllamaTag {
@@ -475,6 +478,13 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       type,
       requestId,
       usage: event.usage as TokenUsage | undefined,
+      ...(typeof event.reasoning === 'string' && event.reasoning
+        ? {
+            // Kept with the saved conversation, so it is bounded like other saved text.
+            reasoning: event.reasoning.slice(0, MAX_REASONING_CHARS),
+            reasoningMs: typeof event.reasoningMs === 'number' ? event.reasoningMs : undefined,
+          }
+        : {}),
       finishReason:
         typeof (event.finishReason ?? event.finish_reason) === 'string'
           ? String(event.finishReason ?? event.finish_reason)

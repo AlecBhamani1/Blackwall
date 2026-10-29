@@ -85,6 +85,32 @@ describe('native chat failure boundary', () => {
     });
   });
 
+  it('passes reasoning and its duration through with the completed turn', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          type: 'turn_complete',
+          requestId: 'thinking',
+          reasoning: 'Checked the plan.',
+          reasoningMs: 2600,
+        },
+      });
+      return { requestId: 'thinking' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'thinking', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ reasoning: 'Checked the plan.', reasoningMs: 2600 }),
+    );
+  });
+
   it('keeps the MCP tool an approval can be saved for and drops malformed ones', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

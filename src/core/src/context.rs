@@ -592,6 +592,7 @@ async fn chat_traced(
     };
     let mut answer = String::new();
     let mut usage = None::<TokenUsage>;
+    let mut reasoning = crate::model::Reasoning::default();
     for iteration in 0..budget.max_iterations {
         let mut messages = instructions.to_vec();
         messages.extend(state.effective());
@@ -667,6 +668,7 @@ async fn chat_traced(
             total.total_tokens = total.total_tokens.saturating_add(count.total_tokens);
         }
         answer.push_str(&turn.content);
+        reasoning.add(&turn);
         if !turn.calls.is_empty() {
             let approvals = approvals.ok_or(ContextError::History)?;
             state.transcript.push(json!({"role":"assistant","content":turn.content,"tool_calls":turn.calls.iter().map(|call| call.as_json()).collect::<Vec<_>>()}));
@@ -755,6 +757,7 @@ async fn chat_traced(
             request_id: request_id.into(),
             state,
         });
+        let (reasoning_text, reasoning_ms) = reasoning.take();
         emit(AgentEvent::TurnComplete {
             request_id: request_id.into(),
             message: crate::protocol::ChatMessage::new(
@@ -763,6 +766,8 @@ async fn chat_traced(
             ),
             finish_reason: Some("stop".into()),
             usage,
+            reasoning: reasoning_text,
+            reasoning_ms,
         });
         return Ok(answer);
     }
@@ -833,6 +838,7 @@ mod tests {
                         total_tokens: 37,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 })
             })
         }

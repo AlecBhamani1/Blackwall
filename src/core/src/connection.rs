@@ -545,7 +545,7 @@ mod tests {
             .iter()
             .map(|(path, body)| ((*path).to_owned(), body.to_string()))
             .collect();
-        crate::test_http::serve(move |method, path| {
+        crate::test_http::serve(move |method, path, _| {
             routes
                 .iter()
                 .find(|(route, _)| method == "GET" && route == path)

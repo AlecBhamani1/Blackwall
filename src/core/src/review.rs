@@ -637,6 +637,7 @@ mod tests {
                     content: self.content.clone(),
                     calls: self.calls.clone(),
                     usage: None,
+                    ..Default::default()
                 })
             })
         }

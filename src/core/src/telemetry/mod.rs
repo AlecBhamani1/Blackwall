@@ -469,6 +469,8 @@ pub struct ModelReply<'a> {
     pub usage: Option<&'a TokenUsage>,
     pub tool_calls: bool,
     pub content: &'a str,
+    /// Kept apart from `content`; recorded only with content capture on.
+    pub reasoning: &'a str,
 }
 
 /// A failed model call: its error class and message.
@@ -492,6 +494,7 @@ impl<'a> ModelReply<'a> {
             usage: turn.usage.as_ref(),
             tool_calls: !turn.calls.is_empty(),
             content: &turn.content,
+            reasoning: &turn.reasoning,
         }
     }
 }
@@ -814,8 +817,20 @@ impl RunScope {
                         Value::from(usage.completion_tokens),
                     ));
                 }
-                if self.content() && !call.compaction && !reply.content.is_empty() {
-                    let parts = serde_json::json!([{"role":"assistant","parts":[{"type":"text","content":self.clip(reply.content)}]}]);
+                if self.content()
+                    && !call.compaction
+                    && !(reply.content.is_empty() && reply.reasoning.is_empty())
+                {
+                    let mut parts = Vec::new();
+                    if !reply.reasoning.is_empty() {
+                        parts.push(serde_json::json!({"type":"reasoning","content":self.clip(reply.reasoning)}));
+                    }
+                    if !reply.content.is_empty() {
+                        parts.push(
+                            serde_json::json!({"type":"text","content":self.clip(reply.content)}),
+                        );
+                    }
+                    let parts = serde_json::json!([{"role":"assistant","parts":parts}]);
                     attributes.push((
                         names::GEN_AI_OUTPUT_MESSAGES.into(),
                         Value::from(parts.to_string()),

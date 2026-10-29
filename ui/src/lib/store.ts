@@ -920,6 +920,14 @@ export function createChatController(
                   ),
                 );
               if (event.type === 'approval_request') approval.set(event);
+              if (event.type === 'turn_complete' && event.reasoning)
+                messages.update((current) =>
+                  current.map((message) =>
+                    message.id === assistantId
+                      ? { ...message, reasoning: event.reasoning, reasoningMs: event.reasoningMs }
+                      : message,
+                  ),
+                );
               if (event.type === 'tool_call')
                 messages.update((current) =>
                   current.map((message) =>

@@ -517,6 +517,11 @@ pub async fn server_status(settings: &Settings) -> String {
     )
 }
 
+/// "Thought for 3s", rounded to whole seconds and never below one.
+fn thought_for(ms: u64) -> String {
+    format!("Thought for {}s", (ms.saturating_add(500) / 1000).max(1))
+}
+
 fn render_event(
     event: AgentEvent,
     answer: &mut String,
@@ -600,6 +605,12 @@ fn render_event(
         AgentEvent::SubagentStatus { state, summary, .. } => {
             eprintln!("\n[agent {state:?}] {}", summary.unwrap_or_default())
         }
+        // Reasoning stays collapsed: only how long it took is shown.
+        AgentEvent::TurnComplete {
+            reasoning: Some(_),
+            reasoning_ms,
+            ..
+        } => eprintln!("\n[{}]", thought_for(reasoning_ms.unwrap_or(0))),
         _ => {}
     }
 }
@@ -621,6 +632,12 @@ fn execution_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_is_shown_only_as_its_duration() {
+        assert_eq!(thought_for(0), "Thought for 1s");
+        assert_eq!(thought_for(2_600), "Thought for 3s");
+    }
 
     #[test]
     fn environment_credentials_stay_at_their_origin() {

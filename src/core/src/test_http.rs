@@ -23,10 +23,10 @@ impl Fake {
     }
 }
 
-/// Answer each request with `route(method, path)`; `None` is a 404. A body starting with
+/// Answer each request with `route(method, path, body)`; `None` is a 404. A body starting with
 /// `data:` is sent as an event stream, anything else as JSON.
 pub(crate) async fn serve(
-    route: impl Fn(&str, &str) -> Option<(u16, String)> + Send + Sync + 'static,
+    route: impl Fn(&str, &str, &str) -> Option<(u16, String)> + Send + Sync + 'static,
 ) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,7 +63,8 @@ pub(crate) async fn serve(
                 let method = parts.next().unwrap_or_default().to_owned();
                 let path = parts.next().unwrap_or_default().to_owned();
                 requests.lock().unwrap().push(format!("{method} {path}"));
-                let (status, body) = route(&method, &path).unwrap_or((404, "{}".into()));
+                let body = String::from_utf8_lossy(&body).into_owned();
+                let (status, body) = route(&method, &path, &body).unwrap_or((404, "{}".into()));
                 let kind = if body.starts_with("data:") {
                     "text/event-stream"
                 } else {

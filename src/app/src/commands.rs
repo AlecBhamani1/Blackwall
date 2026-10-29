@@ -447,6 +447,7 @@ pub(crate) async fn chat(
                     usage: response.usage.as_ref(),
                     tool_calls: false,
                     content: &response.message.content,
+                    reasoning: "",
                 }),
                 (Err(error), message) => Err(blackwall_core::telemetry::ModelFailure {
                     kind: error.kind(),
@@ -791,11 +792,19 @@ async fn complete_chat(
         model: payload.model.unwrap_or(request.model),
         message: ChatMessage::new(
             choice.message.role.unwrap_or(MessageRole::Assistant),
-            choice.message.content.unwrap_or_default(),
+            answer_only(&choice.message.content.unwrap_or_default()),
         ),
         finish_reason: choice.finish_reason,
         usage: payload.usage,
     })
+}
+
+/// A complete reply without its `<think>` reasoning.
+fn answer_only(content: &str) -> String {
+    let mut filter = blackwall_core::model::ThinkFilter::default();
+    let (mut answer, _) = filter.push(content);
+    answer.push_str(&filter.finish().0);
+    answer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,6 +1208,13 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn complete_replies_drop_think_blocks() {
+        assert_eq!(answer_only("<think>plan</think>\n\nHi"), "Hi");
+        assert_eq!(answer_only("<think>never closed"), "");
+        assert_eq!(answer_only("plain <b>"), "plain <b>");
+    }
 
     #[test]
     fn one_shot_chat_errors_use_the_model_error_vocabulary() {

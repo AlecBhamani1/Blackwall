@@ -206,6 +206,8 @@ impl Agent<'_> {
                         message: ChatMessage::new(MessageRole::Assistant, &answer),
                         finish_reason: Some("stop".into()),
                         usage: None,
+                        reasoning: None,
+                        reasoning_ms: None,
                     });
                     return Ok(answer);
                 }
@@ -273,6 +275,8 @@ impl Agent<'_> {
                 message: ChatMessage::new(MessageRole::Assistant, &answer),
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning: None,
+                reasoning_ms: None,
             });
             return Ok(answer);
         }
@@ -325,6 +329,8 @@ impl Agent<'_> {
                         message: ChatMessage::new(MessageRole::Assistant, &answer),
                         finish_reason: Some("stop".into()),
                         usage: None,
+                        reasoning: None,
+                        reasoning_ms: None,
                     });
                     return Ok(answer);
                 }
@@ -355,6 +361,7 @@ impl Agent<'_> {
         }
         let mut answer = String::new();
         let mut usage = TokenUsage::default();
+        let mut reasoning = crate::model::Reasoning::default();
         let mcp = match (&mcp_directory, compact) {
             (Some(directory), false) => {
                 crate::mcp::McpServers::start(directory, &definitions).await
@@ -445,6 +452,7 @@ impl Agent<'_> {
             }
             let turn = turn?;
             answer.push_str(&turn.content);
+            reasoning.add(&turn);
             state.server_usage = turn.usage;
             if let Some(count) = turn.usage {
                 usage.prompt_tokens = usage.prompt_tokens.saturating_add(count.prompt_tokens);
@@ -466,11 +474,14 @@ impl Agent<'_> {
                     request_id: request_id.into(),
                     report: budget.report(&messages, &definitions, state.server_usage),
                 });
+                let (reasoning, reasoning_ms) = reasoning.take();
                 (self.emit)(AgentEvent::TurnComplete {
                     request_id: request_id.into(),
                     message: ChatMessage::new(MessageRole::Assistant, &answer),
                     finish_reason: Some("stop".into()),
                     usage: Some(usage),
+                    reasoning,
+                    reasoning_ms,
                 });
                 return Ok(answer);
             }
@@ -808,6 +819,9 @@ pub(crate) async fn instruction_task<T: Send + 'static>(
 }
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod local_model_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::model::{ModelTurn, ToolCall, ToolFunction};
@@ -846,6 +860,7 @@ mod tests {
                             },
                         }],
                         usage: None,
+                        ..Default::default()
                     })
                 } else {
                     assert!(messages.last().unwrap()["content"]
@@ -902,6 +917,7 @@ mod tests {
                             total_tokens: 110,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }
                 } else {
                     ModelTurn {
@@ -913,6 +929,7 @@ mod tests {
                             total_tokens: 125,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }
                 })
             })
@@ -1116,16 +1133,19 @@ mod tests {
                             },
                         ],
                         usage,
+                        ..Default::default()
                     },
                     2 => ModelTurn {
                         content: "Child found notes.txt with api_key=supersecret1.".into(),
                         calls: vec![],
                         usage,
+                        ..Default::default()
                     },
                     _ => ModelTurn {
                         content: "Done.".into(),
                         calls: vec![],
                         usage,
+                        ..Default::default()
                     },
                 })
             })
