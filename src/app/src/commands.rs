@@ -599,6 +599,7 @@ pub(crate) async fn stream_chat(
         let backend = blackwall_core::model::HttpModel::new(&selected, &request.model, api_key)
             .and_then(|model| model.with_budget(request.context_budget))
             .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+            .map(|model| model.with_text_tool_calls(request.text_tool_calls))
             .map_err(CommandError::from)?;
         let event_app = app.clone();
         let instruction_directory =
@@ -826,6 +827,7 @@ async fn stream_chat_events(
     )
     .and_then(|model| model.with_budget(request.context_budget))
     .map(|model| model.with_sampling(request.temperature, request.max_tokens))
+    .map(|model| model.with_text_tool_calls(request.text_tool_calls))
     .map_err(CommandError::from)?;
     let instructions: Vec<_> = blackwall_core::model::messages(&request)
         .into_iter()
@@ -1317,6 +1319,7 @@ mod tests {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         };
 
         let messages = build_api_messages(&request).unwrap();

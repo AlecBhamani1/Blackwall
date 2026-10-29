@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 
+mod text_tools;
 mod think;
+pub use text_tools::{parse_text_tool_calls, MAX_TEXT_CALLS};
 pub use think::ThinkFilter;
 
 /// The most bytes one streamed response may carry, answer and reasoning together.
@@ -63,6 +65,8 @@ pub struct ModelTurn {
     pub reasoning: String,
     /// How long the model spent reasoning, in milliseconds.
     pub reasoning_ms: u64,
+    /// The calls were written as text, not sent as structured calls. They always ask.
+    pub text_calls: bool,
 }
 /// Reasoning gathered across the model calls of one run, for `TurnComplete`.
 #[derive(Default)]
@@ -118,6 +122,7 @@ pub struct HttpModel {
     budget: crate::context::ContextBudget,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    text_tool_calls: bool,
 }
 impl HttpModel {
     pub fn new(endpoint: &str, model: &str, key: Option<String>) -> Result<Self, ModelError> {
@@ -133,6 +138,7 @@ impl HttpModel {
             budget: Default::default(),
             temperature: None,
             max_tokens: None,
+            text_tool_calls: false,
         })
     }
 }
@@ -140,6 +146,11 @@ impl HttpModel {
     pub fn with_sampling(mut self, temperature: Option<f32>, max_tokens: Option<u32>) -> Self {
         self.temperature = temperature;
         self.max_tokens = max_tokens;
+        self
+    }
+    /// Read `<tool_call>` blocks from replies with no structured calls. Off by default.
+    pub fn with_text_tool_calls(mut self, enabled: bool) -> Self {
+        self.text_tool_calls = enabled;
         self
     }
     pub fn with_budget(
@@ -203,7 +214,16 @@ impl ModelBackend for HttpModel {
                 return Err(ModelError::Http(response.status().as_u16()));
             }
             let mut stream = response.bytes_stream();
-            let mut decoder = StreamDecoder::default();
+            let mut decoder = if self.text_tool_calls && !tools.is_empty() {
+                StreamDecoder::with_text_tools(
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                        .collect(),
+                )
+            } else {
+                StreamDecoder::default()
+            };
             while let Some(chunk) = tokio::time::timeout(Duration::from_secs(180), stream.next())
                 .await
                 .map_err(|_| ModelError::Network)?
@@ -228,8 +248,21 @@ pub struct StreamDecoder {
     think: ThinkFilter,
     /// When reasoning started and when its latest part arrived.
     thinking: Option<(std::time::Instant, std::time::Instant)>,
+    /// Offered tool names, when calls written as text are accepted.
+    offered: Option<Vec<String>>,
+    scan: text_tools::TagScan,
+    /// Bytes of `turn.content` already streamed to the caller.
+    emitted: usize,
 }
 impl StreamDecoder {
+    /// Also accept `<tool_call>` blocks for `offered` tools. Text from the first block on is
+    /// held back until the reply ends, so a call is never shown as answer text.
+    pub fn with_text_tools(offered: Vec<String>) -> Self {
+        Self {
+            offered: Some(offered),
+            ..Default::default()
+        }
+    }
     pub fn push(
         &mut self,
         bytes: &[u8],
@@ -349,9 +382,19 @@ impl StreamDecoder {
         Ok(())
     }
     fn answer(&mut self, text: String, delta: &mut (dyn FnMut(String) + Send)) {
-        if !text.is_empty() {
-            self.turn.content.push_str(&text);
-            delta(text);
+        self.turn.content.push_str(&text);
+        let shown = match self.offered {
+            Some(_) => self.scan.shown(&self.turn.content),
+            None => self.turn.content.len(),
+        };
+        self.show(shown, delta);
+    }
+    fn show(&mut self, upto: usize, delta: &mut (dyn FnMut(String) + Send)) {
+        if let Some(text) = self.turn.content.get(self.emitted..upto) {
+            if !text.is_empty() {
+                delta(text.to_owned());
+                self.emitted = upto;
+            }
         }
     }
     pub fn finish(
@@ -372,7 +415,16 @@ impl StreamDecoder {
         self.turn.reasoning_ms = self.thinking.map_or(0, |(started, last)| {
             u64::try_from(last.duration_since(started).as_millis()).unwrap_or(u64::MAX)
         });
-        self.turn.calls = self.calls.into_values().collect();
+        self.turn.calls = std::mem::take(&mut self.calls).into_values().collect();
+        // Text is read for calls only when the reply sent none of its own.
+        if let Some(offered) = self.offered.take().filter(|_| self.turn.calls.is_empty()) {
+            if let Some((calls, remaining)) = parse_text_tool_calls(&self.turn.content, &offered) {
+                self.turn.calls = calls;
+                self.turn.content = remaining;
+                self.turn.text_calls = true;
+            }
+        }
+        self.show(self.turn.content.len(), delta);
         let mut ids = std::collections::HashSet::new();
         for call in &self.turn.calls {
             if call.id.is_empty()
@@ -593,6 +645,70 @@ mod tests {
             }
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+    fn decode_with(decoder: StreamDecoder, frames: &[Value]) -> (String, ModelTurn) {
+        let mut bytes: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+        bytes.push_str("data: [DONE]\n\n");
+        let mut decoder = decoder;
+        let mut text = String::new();
+        for chunk in bytes.as_bytes().chunks(4) {
+            decoder
+                .push(chunk, &mut |delta| text.push_str(&delta))
+                .unwrap();
+        }
+        let turn = decoder.finish(&mut |delta| text.push_str(&delta)).unwrap();
+        (text, turn)
+    }
+    const BLOCK: &str = r#"<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>"#;
+    #[test]
+    fn text_tool_call_off_by_default() {
+        let frames = [
+            json!({"choices":[{"delta":{"content":format!("Reading.\n{BLOCK}")},"finish_reason":"stop"}]}),
+        ];
+        let (shown, turn) = decode_with(StreamDecoder::default(), &frames);
+        assert!(turn.calls.is_empty() && !turn.text_calls);
+        assert_eq!(shown, format!("Reading.\n{BLOCK}"));
+        assert!(
+            !HttpModel::new("http://127.0.0.1:1/v1", "m", None)
+                .unwrap()
+                .text_tool_calls
+        );
+        // Turned on, the same reply is a call and the block is never shown.
+        let (shown, turn) = decode_with(
+            StreamDecoder::with_text_tools(vec!["read_file".into()]),
+            &frames,
+        );
+        assert!(turn.text_calls);
+        assert_eq!(turn.calls[0].function.name, "read_file");
+        assert_eq!(
+            (shown.as_str(), turn.content.as_str()),
+            ("Reading.\n", "Reading.")
+        );
+    }
+    #[test]
+    fn structured_tool_calls_disable_text_parsing() {
+        let (shown, turn) = decode_with(
+            StreamDecoder::with_text_tools(vec!["read_file".into(), "list_files".into()]),
+            &[
+                json!({"choices":[{"delta":{"content":BLOCK}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"list_files","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+            ],
+        );
+        assert!(!turn.text_calls);
+        assert_eq!(turn.calls.len(), 1);
+        assert_eq!(turn.calls[0].function.name, "list_files");
+        assert_eq!(turn.content, BLOCK);
+        assert_eq!(shown, BLOCK);
+    }
+    #[test]
+    fn unmatched_text_tool_call_is_shown_once_at_the_end() {
+        let reply = r#"Try <tool_call>{"name":"shell","arguments":{}}</tool_call> later."#;
+        let (shown, turn) = decode_with(
+            StreamDecoder::with_text_tools(vec!["read_file".into()]),
+            &[json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})],
+        );
+        assert!(turn.calls.is_empty());
+        assert_eq!((shown.as_str(), turn.content.as_str()), (reply, reply));
     }
     #[test]
     fn truncated_stream_is_an_error() {

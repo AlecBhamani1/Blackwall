@@ -42,6 +42,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings profile <read-only|workspace-write|unsandboxed>  Set command access (default read-only)
   /settings command-network on|off  Command network access (default off; unsandboxed always on)
   /settings timeout <n>     Limit each shell command in seconds
+  /settings text-tool-calls on|off  Read tool calls the model writes as text (default off; always asks)
   /new                      Start a new conversation in this project
   /sessions                 List saved conversations
   /resume <session-id>      Resume an Agent conversation and its project
@@ -267,7 +268,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.".into(),
             )
         }
     }
@@ -460,7 +461,7 @@ fn slash(
         ),
         "settings" => {
             let (key, value) = value.split_once(char::is_whitespace).ok_or(
-                "Use /settings <model|endpoint|profile|command-network|web|memory|recall|context|output|compact|iterations|timeout> <value>.",
+                "Use /settings <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|compact|iterations|timeout> <value>.",
             )?;
             settings.set(store, key, value.trim())?;
             println!("{}", settings.describe());

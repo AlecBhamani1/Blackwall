@@ -529,6 +529,7 @@ impl Agent<'_> {
             } else {
                 1
             };
+            let text_calls = turn.text_calls;
             let mut outputs = stream::iter(turn.calls.into_iter().enumerate())
                 .map(|(index, call)| {
                     let definitions = &definitions;
@@ -598,7 +599,19 @@ impl Agent<'_> {
                             name: call.function.name.clone(),
                             arguments: call.function.arguments.clone(),
                         });
-                        let result = if !permitted {
+                        let confirmed = !text_calls
+                            || !permitted
+                            || self
+                                .approvals
+                                .confirm_text_call(
+                                    request_id,
+                                    &call.function.name,
+                                    &call.function.arguments,
+                                    &emit,
+                                )
+                                .await
+                                .unwrap_or(false);
+                        let result = if !permitted || !confirmed {
                             Err(tools::ToolError::Denied)
                         } else if deferred.contains(&index) {
                             Err(tools::ToolError::Execution("New directory instructions were loaded. Review them before proposing this edit again.".into()))

@@ -705,7 +705,18 @@ async fn chat_traced(
                         attributes,
                     )
                 });
-                let result = if offered {
+                // A call written as text always asks first.
+                let confirmed = !turn.text_calls
+                    || approvals
+                        .confirm_text_call(
+                            request_id,
+                            &call.function.name,
+                            &call.function.arguments,
+                            emit,
+                        )
+                        .await
+                        .unwrap_or(false);
+                let result = if offered && confirmed {
                     crate::web::execute(call, request_id, approvals, emit).await
                 } else {
                     Err(crate::tools::ToolError::Denied)

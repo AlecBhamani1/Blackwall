@@ -17,6 +17,8 @@ pub struct Settings {
     pub budget: blackwall_core::context::ContextBudget,
     /// Local run traces; on by default, with prompts and outputs off by default.
     pub trace: blackwall_core::trace::TraceOptions,
+    /// Read `<tool_call>` blocks the model writes as text. Off by default; such calls always ask.
+    pub text_tool_calls: bool,
 }
 
 /// Traces are on unless the owner turned them off.
@@ -66,6 +68,7 @@ impl Settings {
             "contextBudget": validated.budget,
             "tracesEnabled": validated.trace.enabled,
             "traceContent": validated.trace.content,
+            "textToolCalls": validated.text_tool_calls,
         });
         store
             .save_setting(SETTINGS_KEY, &body.to_string())
@@ -93,6 +96,7 @@ impl Settings {
             "recall" => updated.recall_enabled = on_or_off(value)?,
             "traces" => updated.trace.enabled = on_or_off(value)?,
             "trace-content" => updated.trace.content = on_or_off(value)?,
+            "text-tool-calls" => updated.text_tool_calls = on_or_off(value)?,
             "context" => {
                 updated.budget.context_window = value
                     .parse()
@@ -119,7 +123,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, context, output, compact, iterations, or timeout."
+                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, compact, iterations, or timeout."
                     .into(),
             ),
         }
@@ -136,12 +140,13 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\nexecution profile: {}\ncommand network: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
             if self.trace.enabled { "on" } else { "off" },
             if self.trace.content { "on" } else { "off" },
+            if self.text_tool_calls { "on (always ask)" } else { "off" },
             self.budget.context_window, self.budget.output_tokens,
             if self.budget.auto_compact { "on" } else { "off" },
             self.budget.max_iterations, self.budget.command_timeout_seconds,
@@ -202,6 +207,7 @@ fn load_with_environment(
             .transpose()?
             .unwrap_or(false),
         trace: trace_options(object, "Invalid trace setting.")?,
+        text_tool_calls: false,
         budget: blackwall_core::context::ContextBudget {
             context_window: object
                 .get("contextWindow")
@@ -266,6 +272,7 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
                 | "contextBudget"
                 | "tracesEnabled"
                 | "traceContent"
+                | "textToolCalls"
         )
     }) {
         return Err(invalid.into());
@@ -310,6 +317,11 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .and_then(Value::as_bool)
             .ok_or(invalid)?,
         trace: trace_options(object, invalid)?,
+        text_tool_calls: object
+            .get("textToolCalls")
+            .map(|v| v.as_bool().ok_or(invalid))
+            .transpose()?
+            .unwrap_or(false),
     };
     settings
         .validate()
@@ -409,9 +421,35 @@ mod tests {
                     enabled: true,
                     content: false,
                 },
+                text_tool_calls: false,
             }
         );
         assert!(store.setting(SETTINGS_KEY).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_cli_settings_load_unchanged_with_text_tool_calls_off() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        // A beta.73 CLI settings file, written before the text tool call setting existed.
+        let legacy = json!({
+            "endpoint": "http://127.0.0.1:11434/v1",
+            "model": "qwen3.6:35b",
+            "webEnabled": false,
+            "memoryEnabled": false,
+            "contextBudget": blackwall_core::context::ContextBudget::default(),
+        });
+        store
+            .save_setting(SETTINGS_KEY, &legacy.to_string())
+            .unwrap();
+        let mut settings = defaults(&store);
+        assert!(!settings.text_tool_calls);
+        assert!(settings.describe().contains("text tool calls: off"));
+        settings.set(&store, "text-tool-calls", "on").unwrap();
+        assert!(defaults(&store).text_tool_calls);
+        assert!(settings.set(&store, "text-tool-calls", "maybe").is_err());
+        settings.set(&store, "text-tool-calls", "off").unwrap();
+        assert!(!defaults(&store).text_tool_calls);
     }
 
     #[test]
@@ -503,7 +541,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 10);
+        assert_eq!(saved.as_object().unwrap().len(), 11);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -654,6 +692,7 @@ mod tests {
             recall_enabled: false,
             budget: Default::default(),
             trace: Default::default(),
+            text_tool_calls: false,
         };
         let before = settings.clone();
         assert!(settings.validate().is_err());

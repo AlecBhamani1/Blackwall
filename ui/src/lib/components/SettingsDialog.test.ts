@@ -329,6 +329,35 @@ describe('SettingsDialog', () => {
     ).toBeInTheDocument();
   });
 
+  it('turns on text tool calls for the active connection only, off by default', async () => {
+    const user = userEvent.setup();
+    const connections = [
+      { endpoint: 'http://127.0.0.1:18040/v1', name: 'Strata' },
+      { endpoint: 'https://other.example/v1', name: 'Other', textToolCalls: true },
+    ];
+    const onPreferences = vi.fn();
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        endpoint: 'http://127.0.0.1:18040/v1',
+        connectionState: 'ready',
+        contextPreferences: { connections },
+        onPreferences,
+        detectServer: vi.fn().mockResolvedValue(null),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    const toggle = screen.getByRole('checkbox', { name: /This model writes tool calls as text/ });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText(/always asks before running one/)).toBeInTheDocument();
+    await user.click(toggle);
+    expect(onPreferences).toHaveBeenCalledWith({
+      connections: [{ ...connections[0], textToolCalls: true }, connections[1]],
+    });
+  });
+
   it('manages a saved service key without changing the active connection', async () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});

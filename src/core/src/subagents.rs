@@ -169,7 +169,8 @@ pub(crate) async fn run_with_instructions(
                     }
                     trace.begin(parent, &format!("execute_tool {tool_name}"), 1, attributes)
                 });
-                let result=match call.function.name.as_str(){"read_file"=>workspace.read(path),"list_files"=>workspace.list(path),_=>Err(crate::tools::ToolError::Denied)};
+                // A child has no way to ask, so calls it wrote as text never run.
+                let result=match call.function.name.as_str(){_ if turn.text_calls=>Err(crate::tools::ToolError::Denied),"read_file"=>workspace.read(path),"list_files"=>workspace.list(path),_=>Err(crate::tools::ToolError::Denied)};
                 if let (Some((trace, _)), Some(span)) = (&traced, &tool) {
                     trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                     if let Err(error) = &result {

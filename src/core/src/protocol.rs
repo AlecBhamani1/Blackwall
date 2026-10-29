@@ -133,6 +133,10 @@ pub struct ChatRequest {
     /// Request summary-only compaction, without executing tools.
     #[serde(default)]
     pub compact: bool,
+    /// The connection's "This model writes tool calls as text" setting. Off by default; calls
+    /// read from text always ask for approval.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_tool_calls: bool,
 }
 
 impl ChatRequest {
@@ -153,6 +157,7 @@ impl ChatRequest {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         }
     }
 
@@ -657,7 +662,25 @@ mod tests {
             context_budget: Default::default(),
             context_state: None,
             compact: false,
+            text_tool_calls: false,
         }
+    }
+
+    #[test]
+    fn text_tool_calls_are_off_unless_a_request_asks() {
+        let request: ChatRequest =
+            serde_json::from_value(serde_json::json!({"requestId":"r","model":"m","messages":[]}))
+                .unwrap();
+        assert!(!request.text_tool_calls);
+        assert!(serde_json::to_value(&request)
+            .unwrap()
+            .get("textToolCalls")
+            .is_none());
+        let on: ChatRequest = serde_json::from_value(
+            serde_json::json!({"requestId":"r","model":"m","messages":[],"textToolCalls":true}),
+        )
+        .unwrap();
+        assert!(on.text_tool_calls);
     }
 
     #[test]

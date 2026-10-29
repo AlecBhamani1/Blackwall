@@ -12,6 +12,7 @@ import { connectionName, connectionProfiles, MAX_CONNECTIONS } from './connectio
 import { agentClient } from './agent';
 import {
   persistence,
+  type ConnectionProfile,
   type Persistence,
   type Preferences,
   type RecallQuery,
@@ -616,7 +617,12 @@ export function createChatController(
           ...(remember
             ? {
                 connections: [
-                  { endpoint: normalized, name: label, model: choice },
+                  {
+                    endpoint: normalized,
+                    name: label,
+                    model: choice,
+                    ...(existing?.textToolCalls ? { textToolCalls: true } : {}),
+                  },
                   ...(settings.connections ?? []).filter(
                     (profile) => profile.endpoint !== normalized,
                   ),
@@ -685,6 +691,18 @@ export function createChatController(
       return false;
     }
     return initialize(next, name);
+  }
+
+  /** The saved profile for the connection in use, if there is one. */
+  function activeProfile(): ConnectionProfile | undefined {
+    const address = get(endpoint);
+    if (!address) return undefined;
+    try {
+      const normalized = normalizeEndpoint(address);
+      return get(preferences).connections?.find((profile) => profile.endpoint === normalized);
+    } catch {
+      return undefined;
+    }
   }
 
   function chooseModel(modelId: string): void {
@@ -855,6 +873,7 @@ export function createChatController(
             commandNetwork: get(commandNetwork),
             endpoint: get(endpoint) || undefined,
             model: get(selectedModel),
+            ...(activeProfile()?.textToolCalls ? { textToolCalls: true } : {}),
             messages: asModelMessages(nextMessages.filter((message) => message.id !== assistantId)),
           },
           {

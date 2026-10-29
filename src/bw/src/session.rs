@@ -201,6 +201,7 @@ impl Conversation {
             environment_key(&settings.endpoint),
         )
         .and_then(|m| m.with_budget(budget))
+        .map(|m| m.with_text_tool_calls(settings.text_tool_calls))
         .map_err(|e| e.to_string())?;
         let messages = context(store, directory, settings, &self.session)?;
         let (instructions, source): (Vec<_>, Vec<_>) =
@@ -258,6 +259,7 @@ impl Conversation {
             environment_key(&settings.endpoint),
         )
         .and_then(|backend| backend.with_budget(budget))
+        .map(|backend| backend.with_text_tool_calls(settings.text_tool_calls))
         .map_err(|error| error.to_string())?;
         let workspace = execution_workspace(&self.workspace, directory, settings)?;
         let timestamp = now()?;

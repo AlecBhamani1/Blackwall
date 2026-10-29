@@ -117,7 +117,7 @@ impl Approvals {
             .cloned();
         let Some(policy) = policy else {
             // Without the owner's data folder there is nowhere to save a rule.
-            let answer = self.ask(request_id, kind, None, detail, emit).await?;
+            let answer = self.ask(request_id, kind, None, detail, emit, true).await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
         let decision = match tool {
@@ -134,7 +134,7 @@ impl Approvals {
                     None => detail,
                 };
                 let answer = self
-                    .ask(request_id, kind, tool.clone(), detail, emit)
+                    .ask(request_id, kind, tool.clone(), detail, emit, true)
                     .await?;
                 if let Some(tool) = tool.filter(|_| answer != ApprovalDecision::Deny) {
                     match self.save_tool_rule(request_id, &policy, tool, answer).await {
@@ -196,6 +196,25 @@ impl Approvals {
         }
         Ok(Some(saved))
     }
+    /// A tool call the model wrote as text always asks, whatever rules are saved, and the
+    /// answer is never remembered, not even for an identical call later in the run. The tool's
+    /// own checks still apply after this.
+    pub async fn confirm_text_call(
+        &self,
+        request_id: &str,
+        name: &str,
+        arguments: &str,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<bool, String> {
+        let detail = format!(
+            "The model wrote this tool call as text, so Blackwall asks before running it.\n\nTool: {name}\nArguments: {arguments}"
+        );
+        let answer = self
+            .ask(request_id, ApprovalKind::Exec, None, detail, emit, false)
+            .await?;
+        Ok(answer != ApprovalDecision::Deny)
+    }
+    /// `remember` lets "allow identical action this run" skip later identical prompts.
     async fn ask(
         &self,
         request_id: &str,
@@ -203,6 +222,7 @@ impl Approvals {
         tool: Option<ApprovalTool>,
         detail: String,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        remember: bool,
     ) -> Result<ApprovalDecision, String> {
         let (sender, receiver) = oneshot::channel();
         let id = format!("approval_{:016x}", UnwrapErr(SysRng).next_u64());
@@ -211,9 +231,10 @@ impl Approvals {
                 .0
                 .lock()
                 .map_err(|_| "The approval registry is unavailable.")?;
-            if state
-                .allowed
-                .contains(&(request_id.to_owned(), detail.clone()))
+            if remember
+                && state
+                    .allowed
+                    .contains(&(request_id.to_owned(), detail.clone()))
             {
                 return Ok(ApprovalDecision::Allow);
             }
@@ -244,7 +265,7 @@ impl Approvals {
             .await
             .map_err(|_| "Approval expired. Ask Blackwall to try again.")?
             .map_err(|_| "Approval was cancelled.")?;
-        if decision == ApprovalDecision::AlwaysAllow {
+        if remember && decision == ApprovalDecision::AlwaysAllow {
             self.0
                 .lock()
                 .map_err(|_| "The approval registry is unavailable.")?

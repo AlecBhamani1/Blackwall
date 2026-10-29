@@ -115,6 +115,8 @@ export interface ChatRequest {
   contextBudget?: ContextBudget;
   contextState?: ContextState;
   compact?: boolean;
+  /** The active connection reads tool calls the model writes as text. */
+  textToolCalls?: boolean;
 }
 
 export type AgentEvent =
