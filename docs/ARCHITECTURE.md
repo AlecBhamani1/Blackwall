@@ -168,9 +168,15 @@ relay, and signing secrets are removed from the inherited environment. Other acc
 possible and is covered by the explicit command approval.
 
 `core::approvals` binds decisions to an active request and exact action. “Allow identical action this
-run” expires when the run ends. Dropping a pending action invalidates its decision handle. Child
-investigations are read-only, limited to eight turns, and cannot execute commands, browse, edit, or
-spawn more children. Pure child batches run up to three concurrently; mutations remain sequential.
+run” expires when the run ends. Dropping a pending action invalidates its decision handle.
+`core::subagents` runs children with the owner's `SubagentSettings`: a step limit (eight by default)
+and a subset of the built-in tools (read-only by default), whose edits, commands and web requests go
+through the same `tools::execute`, approvals and policy as the parent's. Children never spawn more
+children. With `RunsOn::Tool`, a child instead hands its prompt to one owner command tool as stdin
+JSON through `CommandTool::delegate` and `Approvals::request_delegate`, which always asks, is never
+remembered, and marks the prompt off-device. Read-only child batches run up to three concurrently;
+anything else runs one at a time. `tools::OutputCap` trims command output to
+`ContextBudget::max_output_bytes`; trusted `project.json` limits only lower these values.
 
 Web access is disabled by default. Every request and redirect needs approval. The client disables
 proxies and automatic redirects, validates all resolved IPs, pins DNS results, rejects private and
