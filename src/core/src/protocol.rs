@@ -468,6 +468,9 @@ pub enum AgentEvent {
         /// Whether command output over the cap was trimmed to its start and end.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// Whether a rule or the user denied the action, so it did not run.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        denied: bool,
     },
     /// A gated operation waiting for a user decision.
     ApprovalRequest {
@@ -795,6 +798,7 @@ mod tests {
                 output: "# Blackwall".to_owned(),
                 success: true,
                 truncated: false,
+                denied: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
