@@ -360,7 +360,7 @@
           >
             <code>{header}</code> from secret <code>{secretOf(reference)}</code>{#if missingSecrets(
               server,
-            ).includes(secretOf(reference))}<span class="missing"> · not saved yet</span>{/if}
+            ).includes(secretOf(reference))}<span class="missing">{' · not saved yet'}</span>{/if}
           </p>{/each}
       {:else}<code>{JSON.stringify(server.command ?? [])}</code>{/if}
       <h3>Allowed without asking</h3>
