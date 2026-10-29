@@ -20,9 +20,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   goal and context as `{"arguments":{"prompt":…}}` on stdin to a `"stdin":"json"` tool with a
   `prompt` parameter; each delegation always asks, cannot be remembered, shows the whole prompt
   and is marked "Sends data off this device". The docs give read-only flags for Claude Code, Codex
-  and Copilot.
+  and Copilot. The model is not offered that tool directly.
 - A trusted project's `limits` now apply, and only lower yours: a smaller output cap and step
   limit and fewer subagent tools. A project can never choose where subagents run.
+- Settings saved by this version carry `subagents` and `contextBudget.maxOutputBytes`, which an
+  earlier `bw` rejects; to go back, remove those keys from the CLI settings file.
 
 - Command tools in `tools.json` can take JSON on stdin (`"stdin":"json"` writes
   `{"arguments":{…}}`), declare a typed argument schema (`parameters`: string, number, integer or

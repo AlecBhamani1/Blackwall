@@ -415,7 +415,9 @@ impl Agent<'_> {
 
         let mut definitions = tools::definitions(self.web_enabled, false);
         definitions.push(subagents.definition());
-        definitions.extend(command_tools.definitions());
+        // A tool not offered here is denied without a prompt, so the delegate tool is
+        // reachable only through `spawn_agent`.
+        definitions.extend(subagents.parent_tools(&command_tools));
         if let Some(memory) = memory {
             if memory.available().await.unwrap_or(false) {
                 definitions.extend(crate::memory::definitions());

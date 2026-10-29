@@ -532,7 +532,8 @@ the `Exit: 0` line) is the child's answer. The tool must:
 `bw config set subagent-runs-on` and the desktop check this when you choose the tool, and every
 run checks again. Each delegation **always asks**: an allow rule never skips the prompt (a deny
 rule still denies), "allow identical action this run" is not offered, and the prompt shows the
-whole text being sent, marked **Sends data off this device**. The delegation is traced as
+whole text being sent, marked **Sends data off this device**. The model is not offered that tool
+directly, so it can reach it only this way. The delegation is traced as
 `invoke_agent subagent` with `blackwall.mode` `subagent`.
 
 Delegate CLIs can act on their own, so give them read-only flags. A wrapper that reads the prompt

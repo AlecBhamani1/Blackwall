@@ -116,6 +116,16 @@ impl SubagentSettings {
         }
     }
 
+    /// The owner command tools offered to the parent model. The tool subagents run on is left
+    /// out, so the parent can reach it only through `spawn_agent`, which always asks.
+    pub fn parent_tools(&self, tools: &crate::command_tools::CommandTools) -> Vec<Value> {
+        let mut definitions = tools.definitions();
+        if let RunsOn::Tool(name) = &self.runs_on {
+            definitions.retain(|definition| definition["function"]["name"] != name.as_str());
+        }
+        definitions
+    }
+
     /// Whether children can only read, so several may run at once.
     pub fn read_only(&self) -> bool {
         self.runs_on == RunsOn::Local
@@ -965,6 +975,26 @@ mod settings_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn runs_on_tool_hidden_from_parent() {
+        let folder = Folder::new();
+        let tools = folder.tools(json!([review_tool(&folder.script())])).await;
+        let names = |settings: &SubagentSettings| -> Vec<String> {
+            settings
+                .parent_tools(&tools)
+                .iter()
+                .map(|definition| definition["function"]["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&SubagentSettings::default()), ["review"]);
+        let delegated = SubagentSettings {
+            runs_on: RunsOn::Tool("review".into()),
+            ..Default::default()
+        };
+        assert!(names(&delegated).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn runs_on_tool_always_asks_and_never_remembered() {
         let folder = Folder::new();
         let script = folder.script();
@@ -1053,6 +1083,7 @@ mod settings_tests {
         approvals.clear_run("parent");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_on_tool_without_stdin_json_rejected() {
         let folder = Folder::new();
