@@ -661,6 +661,7 @@ mod settings_tests {
             self.0.join("data")
         }
         /// An executable script that echoes its standard input and then ` ANSWER`.
+        #[cfg_attr(not(unix), allow(dead_code))]
         fn script(&self) -> String {
             // Inside the project, which the default sandbox lets programs read.
             let path = self.project().join("review.sh");
@@ -672,6 +673,7 @@ mod settings_tests {
             }
             path.to_string_lossy().into_owned()
         }
+        #[cfg_attr(not(unix), allow(dead_code))]
         async fn tools(&self, tools: Value) -> CommandTools {
             std::fs::write(
                 self.data().join(crate::command_tools::COMMAND_TOOLS_FILE),
@@ -927,6 +929,7 @@ mod settings_tests {
         approvals.clear_run("parent");
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn review_tool(script: &str) -> Value {
         json!({"name":"review","description":"Review with another assistant","command":[script],"stdin":"json",
                "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}})

@@ -1603,6 +1603,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
     /// Runs one shell command that prints 10,000 bytes, then finishes.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct LargeOutput;
     impl ModelBackend for LargeOutput {
         fn generate<'a>(
