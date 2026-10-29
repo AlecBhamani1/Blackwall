@@ -8,6 +8,7 @@ mod session;
 mod settings;
 mod skills;
 mod telemetry;
+mod tools;
 mod traces;
 mod usage;
 
@@ -85,6 +86,8 @@ USAGE:
   bw telemetry header <name> [--delete]
                              Save an export header (value piped on stdin) in the credential store
   bw mcp <action>            Add (by command or --url), list, enable, disable, or remove MCP servers
+  bw tools secret <tool> <NAME> [--delete]
+                             Save an HTTP tool header value (piped on stdin) for the tool's origin
   bw project [status]        Show this project's .blackwall/project.json, its trust, and what applies
   bw project trust [--yes]   Review and trust it (asks y/N; --yes when there is no terminal)
   bw project untrust         Stop trusting it; only its deny and ask rules apply until trusted
@@ -140,8 +143,8 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
             return Ok(());
         }
         "chat" | "setup" | "config" | "status" | "run" | "resume" | "sessions" | "request"
-        | "memory" | "mcp" | "review" | "skills" | "traces" | "usage" | "telemetry" | "project" => {
-        }
+        | "memory" | "mcp" | "tools" | "review" | "skills" | "traces" | "usage" | "telemetry"
+        | "project" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
     let directory = match env::var_os("BLACKWALL_DATA_DIR") {
@@ -162,6 +165,9 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
     }
     if command == "traces" {
         return traces::run(&directory, &arguments);
+    }
+    if command == "tools" {
+        return tools::run(&directory, &arguments);
     }
     let store = LocalStore::open(&directory).map_err(|error| error.to_string())?;
     if command == "mcp" {
