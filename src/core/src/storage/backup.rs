@@ -145,11 +145,60 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+// ---- cleanup of what this run created ----
+
+/// Removes a file this run created, and (for a backup's partial) SQLite's sidecars for it, when
+/// dropped, including on a panic. Armed only after the create succeeded, so a name that was
+/// already there is never touched. `keep` disarms it.
+struct Created {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Created {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            armed: true,
+        }
+    }
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+            for sidecar in SIDECARS {
+                let mut path = self.path.as_os_str().to_owned();
+                path.push(sidecar);
+                let _ = fs::remove_file(PathBuf::from(path));
+            }
+        }
+    }
+}
+
 // ---- the folder ----
 
-/// `<data>/backups`: a real directory (never a link), private and ours. On unix it is created
-/// 0700, and one that already exists must be exactly 0700 and owned by the database file's owner.
+/// `<data>/backups`: a real directory (never a link), private and ours. On unix the data folder
+/// itself must be owned by this user and closed to group and other writers (anyone who can write
+/// there could swap `backups` for a link between our checks and our opens), and `backups` is
+/// created 0700 or, if it exists, must be exactly 0700 and owned by this user.
 pub(crate) fn backups_dir(data: &Path) -> Result<PathBuf, StorageError> {
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(data)?;
+        if !meta.file_type().is_dir() || !data_folder_is_private(&meta, euid()) {
+            eprintln!(
+                "warn: backup: the data folder {} must be a real folder that is private to this user \
+                 (owned by you, not writable by group or others). Fix its owner or permissions, then try again.",
+                data.display()
+            );
+            return Err(StorageError::BackupFailed);
+        }
+    }
     let dir = data.join(BACKUPS_DIR);
     match fs::symlink_metadata(&dir) {
         Ok(_) => {}
@@ -161,16 +210,34 @@ pub(crate) fn backups_dir(data: &Path) -> Result<PathBuf, StorageError> {
         return Err(StorageError::BackupFailed);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let owner = fs::metadata(data.join(super::DATABASE_FILE))
-            .or_else(|_| fs::symlink_metadata(data))?
-            .uid();
-        if meta.permissions().mode() & 0o7777 != 0o700 || meta.uid() != owner {
-            return Err(StorageError::BackupFailed);
-        }
+    if !backups_folder_is_private(&meta, euid()) {
+        eprintln!(
+            "warn: backup: the backups folder {} must be private to this user (owned by you, mode 0700).",
+            dir.display()
+        );
+        return Err(StorageError::BackupFailed);
     }
     Ok(dir)
+}
+
+/// The effective user id. `rustix` has it safely; the workspace forbids `unsafe`.
+#[cfg(unix)]
+fn euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// Owned by `euid` and not writable by group or other.
+#[cfg(unix)]
+fn data_folder_is_private(meta: &Metadata, euid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    meta.uid() == euid && meta.permissions().mode() & 0o022 == 0
+}
+
+/// Owned by `euid` and exactly 0700.
+#[cfg(unix)]
+fn backups_folder_is_private(meta: &Metadata, euid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    meta.uid() == euid && meta.permissions().mode() & 0o7777 == 0o700
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), StorageError> {
@@ -263,18 +330,15 @@ pub(crate) fn read_state(dir: &Path) -> Option<UpgradeState> {
 pub(crate) fn write_state(dir: &Path, state: &UpgradeState) -> Result<(), StorageError> {
     let bytes = serde_json::to_vec(state)?;
     let temp = dir.join(format!("{STATE_FILE}.tmp-{:016x}", rand::random::<u64>()));
-    let write = || -> io::Result<()> {
-        let mut file = create_private(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, dir.join(STATE_FILE))?;
-        sync_dir(dir)
-    };
-    write().map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        StorageError::from(error)
-    })
+    let mut file = create_private(&temp)?;
+    let cleanup = Created::new(&temp);
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, dir.join(STATE_FILE))?;
+    cleanup.keep();
+    sync_dir(dir)?;
+    Ok(())
 }
 
 impl UpgradeState {
@@ -392,24 +456,31 @@ pub(crate) fn create_backup(
     dir: &Path,
     expected_version: i64,
 ) -> Result<String, StorageError> {
-    let name = backup_name(SystemTime::now(), rand::random());
-    let finished = dir.join(&name);
-    let partial = dir.join(format!("{name}{PARTIAL_SUFFIX}"));
-    match copy_and_verify(source, dir, &partial, &finished, expected_version) {
-        Ok(()) => Ok(name),
-        Err(_) => {
-            remove_partial(&partial);
-            Err(StorageError::BackupFailed)
-        }
-    }
+    create_named_backup(
+        source,
+        dir,
+        &backup_name(SystemTime::now(), rand::random()),
+        expected_version,
+    )
 }
 
-fn remove_partial(partial: &Path) {
-    let _ = fs::remove_file(partial);
-    for sidecar in SIDECARS {
-        let mut path = partial.as_os_str().to_owned();
-        path.push(sidecar);
-        let _ = fs::remove_file(PathBuf::from(path));
+fn create_named_backup(
+    source: &Connection,
+    dir: &Path,
+    name: &str,
+    expected_version: i64,
+) -> Result<String, StorageError> {
+    let finished = dir.join(name);
+    let partial = dir.join(format!("{name}{PARTIAL_SUFFIX}"));
+    match copy_and_verify(source, dir, &partial, &finished, expected_version) {
+        Ok(()) => Ok(name.to_owned()),
+        Err(error) => {
+            eprintln!(
+                "warn: backup: could not make a verified backup in {}: {error:?}",
+                dir.display()
+            );
+            Err(StorageError::BackupFailed)
+        }
     }
 }
 
@@ -421,6 +492,8 @@ fn copy_and_verify(
     expected_version: i64,
 ) -> Result<(), StorageError> {
     create_private(partial)?;
+    // From here the partial and its sidecars are ours, and go on any exit, even a panic.
+    let _partial = Created::new(partial);
     #[cfg(test)]
     inject(dir, Fault::BackupWrite)?;
     // Not `SQLITE_OPEN_NOFOLLOW`: SQLite applies it to every path component, and a data folder
@@ -430,7 +503,14 @@ fn copy_and_verify(
     let mut copy = Connection::open_with_flags(partial, flags)?;
     super::configure(&copy, super::BUSY_TIMEOUT)?;
     // All pages in one step; `run_to_completion` insists on a positive count.
-    Backup::new(source, &mut copy)?.run_to_completion(i32::MAX, Duration::ZERO, None)?;
+    let backup = Backup::new(source, &mut copy)?;
+    #[cfg(test)]
+    {
+        inject(dir, Fault::BackupCopy)?;
+        inject(dir, Fault::BackupPanic)?;
+    }
+    backup.run_to_completion(i32::MAX, Duration::ZERO, None)?;
+    drop(backup);
     // The copy inherits the source's journal mode; make the file self-contained.
     let mode: String =
         copy.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
@@ -452,13 +532,13 @@ fn copy_and_verify(
         return Err(StorageError::BackupFailed);
     }
     open_plain(partial, true)?.sync_all()?;
-    if fs::symlink_metadata(finished).is_ok() {
-        return Err(StorageError::BackupFailed);
-    }
-    fs::rename(partial, finished)?;
-    sync_dir(dir).inspect_err(|_| {
-        let _ = fs::remove_file(finished);
-    })?;
+    // A hard link fails if `finished` exists, so nothing is ever overwritten.
+    fs::hard_link(partial, finished)?;
+    fs::remove_file(partial)
+        .and_then(|()| sync_dir(dir))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(finished);
+        })?;
     Ok(())
 }
 
@@ -471,7 +551,7 @@ fn inject(dir: &Path, point: Fault) -> Result<(), StorageError> {
 // ---- pruning ----
 
 /// Deletes the backups beyond the newest [`KEEP_BACKUPS`] by name timestamp, always keeping
-/// `current`, and any stale `.partial`. With `max_age` set and `upgraded_at + max_age <= now`
+/// `current`, and any stale `.partial` with its crash sidecars. With `max_age` set and `upgraded_at + max_age <= now`
 /// it deletes every backup, `current` too. It touches only plain files whose names match the
 /// exact pattern; everything else in the folder is left alone. Returns how many it deleted.
 pub(crate) fn prune(
@@ -497,10 +577,7 @@ pub(crate) fn prune(
         }
         if let Some(stamp) = parse_backup_name(&name) {
             backups.push((stamp, name));
-        } else if name
-            .strip_suffix(PARTIAL_SUFFIX)
-            .is_some_and(|whole| parse_backup_name(whole).is_some())
-        {
+        } else if is_partial_or_sidecar(&name) {
             partials.push(name);
         }
     }
@@ -526,6 +603,18 @@ pub(crate) fn prune(
     Ok(removed)
 }
 
+/// `<exact backup name>.partial`, or SQLite's `-journal`, `-wal` or `-shm` file beside one,
+/// which a crash can leave behind.
+fn is_partial_or_sidecar(name: &str) -> bool {
+    let partial = SIDECARS
+        .iter()
+        .find_map(|sidecar| name.strip_suffix(sidecar))
+        .unwrap_or(name);
+    partial
+        .strip_suffix(PARTIAL_SUFFIX)
+        .is_some_and(|whole| parse_backup_name(whole).is_some())
+}
+
 // ---- test faults ----
 
 /// Where the tests make the upgrade fail, slow down or die. Test-only, and armed per data
@@ -533,8 +622,12 @@ pub(crate) fn prune(
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
-    /// The backup copy fails after its partial file exists.
+    /// The backup fails after its partial file exists.
     BackupWrite,
+    /// The backup fails while the SQLite copy is set up and about to run.
+    BackupCopy,
+    /// The same point, but the thread panics.
+    BackupPanic,
     /// The conversion with this number (from 0) hits an SQL error after writing its rows.
     ConvertError(usize),
     /// The whole-session check reports a difference.
@@ -586,6 +679,7 @@ pub(crate) fn fault(data_directory: &Path, point: Fault) -> Result<(), StorageEr
             Ok(())
         }
         (Some(Fault::Abort(at)), Fault::Abort(here)) if at == here => std::process::abort(),
+        (Some(Fault::BackupPanic), Fault::BackupPanic) => panic!("injected test panic"),
         (Some(armed), point) if armed == point => {
             Err(StorageError::Invalid("An injected test fault."))
         }
@@ -731,7 +825,7 @@ mod tests {
 
     #[test]
     fn a_failed_backup_leaves_no_partial_and_no_bak() {
-        for point in [Fault::BackupWrite, Fault::IntegrityCheck] {
+        for point in [Fault::BackupWrite, Fault::BackupCopy, Fault::IntegrityCheck] {
             let data = Data::new();
             let dir = backups_dir(&data.0).unwrap();
             set_fault(&data.0, Some(point));
@@ -964,5 +1058,133 @@ mod tests {
         let all = prune(&dir, Some(&aged(1)), at(NOW), due, Some(30 * day)).unwrap();
         assert_eq!(all, 4);
         assert!(names(&dir).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_folder_others_can_write_is_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for (mode, ok) in [
+            (0o700, true),
+            (0o755, true),
+            (0o770, false),
+            (0o720, false),
+            (0o707, false),
+            (0o777, false),
+        ] {
+            let data = Data::new();
+            fs::set_permissions(&data.0, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                backups_dir(&data.0).is_ok(),
+                ok,
+                "data folder mode {mode:o}"
+            );
+        }
+        // Another owner cannot be made without root, so the ownership rule is tested directly.
+        let data = Data::new();
+        fs::create_dir(data.0.join(BACKUPS_DIR)).unwrap();
+        fs::set_permissions(data.0.join(BACKUPS_DIR), fs::Permissions::from_mode(0o700)).unwrap();
+        let data_meta = fs::metadata(&data.0).unwrap();
+        let backups_meta = fs::metadata(data.0.join(BACKUPS_DIR)).unwrap();
+        let me = data_meta.uid();
+        assert_eq!(me, euid());
+        assert!(data_folder_is_private(&data_meta, me));
+        assert!(!data_folder_is_private(&data_meta, me + 1));
+        assert!(backups_folder_is_private(&backups_meta, me));
+        assert!(!backups_folder_is_private(&backups_meta, me + 1));
+    }
+
+    #[test]
+    fn an_existing_backup_name_is_never_overwritten() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        let taken = backup_name(at(NOW), 7);
+        fs::write(dir.join(&taken), b"precious").unwrap();
+        let error = create_named_backup(&data.source(), &dir, &taken, 5).unwrap_err();
+        assert!(matches!(error, StorageError::BackupFailed));
+        assert_eq!(fs::read(dir.join(&taken)).unwrap(), b"precious");
+        assert_eq!(names(&dir), [taken], "and no partial is left");
+    }
+
+    #[test]
+    fn a_panic_during_the_copy_still_removes_the_partial() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        set_fault(&data.0, Some(Fault::BackupPanic));
+        let source = data.source();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = create_backup(&source, &dir, 5);
+        }));
+        assert!(outcome.is_err(), "the fault panicked");
+        assert!(names(&dir).is_empty(), "left {:?}", names(&dir));
+    }
+
+    #[test]
+    fn a_leftover_partial_name_is_not_ours_to_remove() {
+        // A name that already exists is not something this run created, so a failed create
+        // leaves it alone.
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        let taken = backup_name(at(NOW), 9);
+        let partial = format!("{taken}{PARTIAL_SUFFIX}");
+        fs::write(dir.join(&partial), b"someone else's").unwrap();
+        assert!(create_named_backup(&data.source(), &dir, &taken, 5).is_err());
+        assert_eq!(fs::read(dir.join(&partial)).unwrap(), b"someone else's");
+    }
+
+    #[test]
+    fn prune_also_removes_the_crash_sidecars_of_a_partial() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        let backup = aged(1);
+        touch(&dir, &backup);
+        let partial = format!("{}{PARTIAL_SUFFIX}", aged(2));
+        let mut ours = vec![partial.clone()];
+        ours.extend(SIDECARS.iter().map(|sidecar| format!("{partial}{sidecar}")));
+        // A sidecar whose partial is already gone is still ours: it names an exact stem.
+        ours.push(format!("{}{PARTIAL_SUFFIX}-wal", aged(3)));
+        let others = [
+            format!("{}-wal", aged(4)),
+            format!("{partial}-wal.old"),
+            format!("{partial}-other"),
+            "notes.partial-wal".to_owned(),
+            "upgrade-state.json".to_owned(),
+        ];
+        for name in ours.iter().chain(&others) {
+            touch(&dir, name);
+        }
+        let removed = prune(&dir, None, at(NOW), None, None).unwrap();
+        assert_eq!(removed, ours.len());
+        let mut left = others.to_vec();
+        left.push(backup);
+        left.sort();
+        assert_eq!(names(&dir), left);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_where_the_state_file_belongs_is_refused_without_blocking() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("upgrade-state.json"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(read_state(&dir), None);
+    }
+
+    #[test]
+    fn the_state_file_limit_is_exactly_4_kib() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        let file = dir.join("upgrade-state.json");
+        let body = serde_json::to_string(&state(GOOD)).unwrap();
+        for (size, ok) in [(4095, true), (4096, true), (4097, false)] {
+            let padded = format!("{body}{}", " ".repeat(size - body.len()));
+            assert_eq!(padded.len(), size);
+            fs::write(&file, padded).unwrap();
+            assert_eq!(read_state(&dir).is_some(), ok, "{size} bytes");
+        }
     }
 }
