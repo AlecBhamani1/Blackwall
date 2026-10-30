@@ -1100,7 +1100,7 @@ mod tests {
             );
         }
 
-        let long = format!(r"\\?\C:\{}", "a".repeat(256));
+        let long = format!(r"\\?\C:\{}\{}", "a".repeat(200), "b".repeat(100));
         assert_eq!(child_current_dir(Path::new(&long)), Path::new(&long));
     }
 
