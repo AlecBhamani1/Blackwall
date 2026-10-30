@@ -2,21 +2,27 @@
 //!
 //! It closes local IPC that the mount view alone can't: a sandboxed command can't create an
 //! `AF_UNIX` socket with `socket()` (so it can't connect to the session bus, docker.sock or an
-//! abstract socket on a shared network namespace), and can't use io_uring, whose operations
-//! bypass seccomp.
+//! abstract socket on a shared network namespace), can't open a datagram-capable socketpair that
+//! could `sendto()` one, can't reach the hypervisor or host over vsock (which no network namespace
+//! isolates), and can't use io_uring, whose operations bypass seccomp.
 //!
 //! Rules, in order:
 //! - a syscall from any architecture other than the native one (i386 on x86-64, arm32 on arm64)
 //!   kills the process, since its numbers mean different syscalls;
-//! - on x86-64, any x32 syscall (`nr & 0x4000_0000`) kills the process, for the same reason
-//!   (this includes nr -1, which only a ptrace tracer sets to skip a syscall);
-//! - `socket(AF_UNIX, …)` fails with `EPERM`, other socket families are allowed;
+//! - on x86-64, nr -1 is allowed (a ptrace tracer sets it to skip a syscall, and the kernel then
+//!   returns ENOSYS; libseccomp does the same), and any other x32 syscall (`nr & 0x4000_0000`)
+//!   kills the process, since x32 numbers mean different syscalls too;
+//! - `socket(AF_UNIX, …)` and `socket(AF_VSOCK, …)` fail with `EPERM`; other families are allowed;
+//! - `socketpair` is allowed only for `SOCK_STREAM` (with any of `SOCK_NONBLOCK`/`SOCK_CLOEXEC`);
+//!   every other type fails with `EPERM`. A `SOCK_DGRAM` pair can `sendto()` any datagram socket
+//!   it can name, `SOCK_RAW` is turned into `SOCK_DGRAM` by the kernel, and `SOCK_SEQPACKET` is
+//!   refused too because nothing needs it. A stream pair is already connected and can't connect
+//!   anywhere else. One of its ends can still `bind()` an abstract name in the host network
+//!   namespace under `--share-net`, but a connected socket can't `listen()`, so no host process
+//!   can connect through it;
 //! - `io_uring_setup`, `io_uring_enter` and `io_uring_register` fail with `ENOSYS`, which programs
 //!   treat as "no io_uring here" and fall back;
-//! - everything else is allowed. `socketpair` stays allowed, because many programs need it. Its
-//!   stream and seqpacket sockets are already connected and can't connect anywhere else, but a
-//!   `SOCK_DGRAM` pair can still `sendto()` any datagram socket the sandbox can name: a pathname
-//!   one inside the project, or (only with the network on) an abstract one on the host.
+//! - everything else is allowed.
 //!
 //! Only x86-64 and arm64 are supported. On any other architecture [`program`] returns `None` and
 //! the Linux sandbox is unavailable there.
@@ -49,27 +55,38 @@ pub(crate) const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 // struct seccomp_data { int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6]; }
 const OFFSET_NR: u32 = 0;
 const OFFSET_ARCH: u32 = 4;
-/// The low 32 bits of args[0]. The kernel reads `socket`'s domain as an `int`, so the high bits
-/// are ignored there and must be ignored here too.
-const OFFSET_ARG0_LOW: u32 = 16 + if cfg!(target_endian = "big") { 4 } else { 0 };
+/// The low 32 bits of args[0] and args[1]. The kernel reads `socket`'s domain and
+/// `socketpair`'s type as an `int`, so the high bits are ignored there and must be ignored here too.
+const OFFSET_ARG_LOW: [u32; 2] = {
+    let low = if cfg!(target_endian = "big") { 4 } else { 0 };
+    [16 + low, 24 + low]
+};
+/// The socket type without `SOCK_NONBLOCK`/`SOCK_CLOEXEC` (include/linux/net.h).
+const SOCK_TYPE_MASK: u32 = 0xf;
 
 /// The filter for this build's architecture, or `None` where the Linux sandbox is unsupported.
 pub(crate) fn program() -> Option<Vec<sock_filter>> {
     NATIVE_ARCH.map(|arch| build(arch, cfg!(target_arch = "x86_64")))
 }
 
-/// Layout (x86-64; arm64 has no x32 check):
+/// Layout (x86-64; arm64 has neither the nr -1 nor the x32 check):
 /// ```text
-///  0  ld  arch          ; native? else KILL
+///  0  ld  arch               ; native? else KILL
 ///  1  jeq native
 ///  2  ld  nr
-///  3  jset X32_BIT      ; KILL
-///  4  jeq socket        ; to SOCKET
-///  5  jeq io_uring_setup / 6 enter / 7 register ; to ENOSYS
-///  8  ret ALLOW
-///  9  SOCKET: ld args[0] (low 32 bits)
-/// 10  jeq AF_UNIX       ; EPERM else ALLOW
-/// 11  ret ERRNO(EPERM)  / 12 ret ERRNO(ENOSYS) / 13 ret KILL_PROCESS / 14 ret ALLOW
+///  3  jeq 0xffffffff         ; ALLOW
+///  4  jset X32_BIT           ; KILL
+///  5  jeq socket             ; to SOCKET
+///  6  jeq socketpair         ; to PAIR
+///  7  jeq io_uring_setup / 8 enter / 9 register ; to ENOSYS
+/// 10  ret ALLOW
+/// 11  SOCKET: ld args[0] (low 32 bits)
+/// 12  jeq AF_UNIX            ; EPERM
+/// 13  jeq AF_VSOCK           ; EPERM else ALLOW
+/// 14  PAIR: ld args[1] (low 32 bits)
+/// 15  and SOCK_TYPE_MASK (0xf)
+/// 16  jeq SOCK_STREAM        ; ALLOW else EPERM
+/// 17  ret ERRNO(EPERM) / 18 ret ERRNO(ENOSYS) / 19 ret KILL_PROCESS / 20 ret ALLOW
 /// ```
 fn build(native: u32, x86_64: bool) -> Vec<sock_filter> {
     let uring = [
@@ -77,43 +94,41 @@ fn build(native: u32, x86_64: bool) -> Vec<sock_filter> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
     ];
-    let socket = 3 + usize::from(x86_64) + 1 + uring.len() + 1;
-    let eperm = socket + 2;
+    let socket = 3 + 2 * usize::from(x86_64) + 2 + uring.len() + 1;
+    let pair = socket + 3;
+    let eperm = pair + 3;
     let (enosys, kill, allow) = (eperm + 1, eperm + 2, eperm + 3);
+    let jeq = |k: u32, jt: usize, jf: usize, at: usize| jump(libc::BPF_JEQ, k, jt, jf, at);
 
     let mut p = Vec::with_capacity(allow + 1);
     p.push(load(OFFSET_ARCH));
-    p.push(jump(libc::BPF_JEQ, native, p.len() + 1, kill, p.len()));
+    p.push(jeq(native, p.len() + 1, kill, p.len()));
     p.push(load(OFFSET_NR));
     if x86_64 {
-        p.push(jump(
-            libc::BPF_JSET,
-            X32_SYSCALL_BIT,
-            kill,
-            p.len() + 1,
-            p.len(),
-        ));
+        p.push(jeq(u32::MAX, allow, p.len() + 1, p.len()));
+        let at = p.len();
+        p.push(jump(libc::BPF_JSET, X32_SYSCALL_BIT, kill, at + 1, at));
     }
-    p.push(jump(
-        libc::BPF_JEQ,
-        libc::SYS_socket as u32,
-        socket,
-        p.len() + 1,
-        p.len(),
-    ));
+    p.push(jeq(libc::SYS_socket as u32, socket, p.len() + 1, p.len()));
+    p.push(jeq(libc::SYS_socketpair as u32, pair, p.len() + 1, p.len()));
     for nr in uring {
-        p.push(jump(libc::BPF_JEQ, nr as u32, enosys, p.len() + 1, p.len()));
+        p.push(jeq(nr as u32, enosys, p.len() + 1, p.len()));
     }
     p.push(ret(libc::SECCOMP_RET_ALLOW));
     debug_assert_eq!(p.len(), socket);
-    p.push(load(OFFSET_ARG0_LOW));
-    p.push(jump(
-        libc::BPF_JEQ,
-        libc::AF_UNIX as u32,
-        eperm,
-        allow,
-        p.len(),
+    p.push(load(OFFSET_ARG_LOW[0]));
+    p.push(jeq(libc::AF_UNIX as u32, eperm, p.len() + 1, p.len()));
+    p.push(jeq(libc::AF_VSOCK as u32, eperm, allow, p.len()));
+    debug_assert_eq!(p.len(), pair);
+    p.push(load(OFFSET_ARG_LOW[1]));
+    p.push(instruction(
+        libc::BPF_ALU | libc::BPF_AND | libc::BPF_K,
+        SOCK_TYPE_MASK,
+        0,
+        0,
     ));
+    p.push(jeq(libc::SOCK_STREAM as u32, allow, eperm, p.len()));
+    debug_assert_eq!(p.len(), eperm);
     p.push(ret(errno(libc::EPERM)));
     p.push(ret(errno(libc::ENOSYS)));
     p.push(ret(libc::SECCOMP_RET_KILL_PROCESS));
@@ -218,6 +233,7 @@ mod tests {
                 c if c == libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K => branch(a & i.k != 0),
                 c if c == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K => branch(a >= i.k),
                 c if c == libc::BPF_JMP | libc::BPF_JGT | libc::BPF_K => branch(a > i.k),
+                c if c == libc::BPF_ALU | libc::BPF_AND | libc::BPF_K => a &= i.k,
                 c if c == libc::BPF_RET | libc::BPF_K => return i.k,
                 other => panic!("unsupported opcode {other:#x}"),
             }
@@ -270,7 +286,15 @@ mod tests {
         ] {
             assert_eq!(eval(&p, NATIVE, nr, &[0]), enosys());
         }
-        assert_eq!(eval(&p, NATIVE, libc::SYS_socketpair, &[unix]), ALLOW);
+        assert_eq!(
+            eval(
+                &p,
+                NATIVE,
+                libc::SYS_socketpair,
+                &[unix, libc::SOCK_STREAM as u64]
+            ),
+            ALLOW
+        );
         assert_eq!(eval(&p, NATIVE, libc::SYS_read, &[0]), ALLOW);
         // i386 socket() is 359 and socketcall() is 102; arm32 socket() is 281. Every syscall from
         // a foreign ABI dies, whatever its number.
@@ -285,6 +309,49 @@ mod tests {
     }
 
     #[test]
+    fn socketpair_allows_only_stream_and_socket_refuses_vsock() {
+        for (arch, p) in [
+            (NATIVE, program().unwrap()),
+            (AUDIT_ARCH_X86_64, build(AUDIT_ARCH_X86_64, true)),
+            (AUDIT_ARCH_AARCH64, build(AUDIT_ARCH_AARCH64, false)),
+        ] {
+            let pair = |ty: i32| eval(&p, arch, libc::SYS_socketpair, &[1, ty as u64]);
+            assert_eq!(pair(libc::SOCK_STREAM), ALLOW);
+            assert_eq!(pair(libc::SOCK_STREAM | libc::SOCK_CLOEXEC), ALLOW);
+            assert_eq!(pair(libc::SOCK_STREAM | libc::SOCK_NONBLOCK), ALLOW);
+            // High bits of the int don't count, as in the kernel.
+            assert_eq!(
+                eval(&p, arch, libc::SYS_socketpair, &[1, 1 << 32 | 1]),
+                ALLOW
+            );
+            for ty in [
+                libc::SOCK_DGRAM,
+                libc::SOCK_RAW,
+                libc::SOCK_SEQPACKET,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::SOCK_RAW | libc::SOCK_NONBLOCK,
+                0,
+            ] {
+                assert_eq!(pair(ty), eperm(), "type {ty:#x}");
+            }
+            let socket = |family: i32| eval(&p, arch, libc::SYS_socket, &[family as u64]);
+            assert_eq!(socket(libc::AF_VSOCK), eperm());
+            assert_eq!(socket(libc::AF_UNIX), eperm());
+            assert_eq!(socket(libc::AF_INET), ALLOW);
+        }
+    }
+
+    #[test]
+    fn x86_64_skipped_syscall_is_allowed_not_killed() {
+        // A tracer sets nr to -1 to skip a syscall; the kernel then returns ENOSYS. Allowing it
+        // matches libseccomp instead of killing the tracee with SIGSYS.
+        let p = build(AUDIT_ARCH_X86_64, true);
+        assert_eq!(eval(&p, AUDIT_ARCH_X86_64, u32::MAX, &[]), ALLOW);
+        assert_eq!(eval(&p, AUDIT_ARCH_X86_64, u32::MAX - 1, &[]), KILL);
+        assert_eq!(eval(&p, AUDIT_ARCH_I386, u32::MAX, &[]), KILL);
+    }
+
+    #[test]
     fn x86_64_layout_kills_every_x32_syscall() {
         // Checked on every build host, not only x86-64 ones. The syscall numbers are this host's,
         // which is fine: this test is about the x32 check and the jump layout around it.
@@ -296,7 +363,6 @@ mod tests {
                 KILL
             );
         }
-        assert_eq!(eval(&p, AUDIT_ARCH_X86_64, u32::MAX, &[]), KILL);
         assert_eq!(
             eval(&p, AUDIT_ARCH_X86_64, libc::SYS_socket, &[unix]),
             eperm()
@@ -306,7 +372,7 @@ mod tests {
             enosys()
         );
         assert_eq!(
-            eval(&p, AUDIT_ARCH_X86_64, libc::SYS_socketpair, &[unix]),
+            eval(&p, AUDIT_ARCH_X86_64, libc::SYS_socketpair, &[unix, 1]),
             ALLOW
         );
         assert_eq!(eval(&p, AUDIT_ARCH_I386, 359, &[unix]), KILL);
@@ -316,7 +382,7 @@ mod tests {
         );
         // The arm64 layout has no x32 check but the same rules otherwise.
         let p = build(AUDIT_ARCH_AARCH64, false);
-        assert_eq!(p.len(), build(AUDIT_ARCH_X86_64, true).len() - 1);
+        assert_eq!(p.len(), build(AUDIT_ARCH_X86_64, true).len() - 2);
         assert_eq!(
             eval(&p, AUDIT_ARCH_AARCH64, libc::SYS_socket, &[unix]),
             eperm()

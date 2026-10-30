@@ -170,6 +170,11 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
     push(&[
         s("--die-with-parent"),
         s("--new-session"),
+        // No user namespaces inside, so no nested sandbox, mount or capability games. The
+        // AppImage has no AppArmor child profile to forbid them. --disable-userns needs an
+        // explicit --unshare-user: --unshare-all only tries one, and skips it when run as root.
+        s("--unshare-user"),
+        s("--disable-userns"),
         s("--cap-drop"),
         s("ALL"),
         s("--seccomp"),
@@ -243,6 +248,9 @@ pub(crate) fn args_file(args: &[OsString]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// `None` unless `bwrap`, `seccomp_file` and `args_file` are all absolute: bubblewrap is never
+/// found through PATH, and the shell runs in `/`.
+///
 /// `/bin/sh` opens the seccomp file on fd 3 and the args file on fd 4, then execs bubblewrap:
 /// `/bin/sh -c 'exec 3<"$1" 4<"$2" && shift 2 && exec "$@"' blackwall-sandbox <seccomp_file>
 /// <args_file> <bwrap> --args 4 -- <program> <program args>`.
@@ -258,7 +266,13 @@ pub(crate) fn launcher(
     args_file: &Path,
     program: &OsStr,
     program_args: &[OsString],
-) -> tokio::process::Command {
+) -> Option<tokio::process::Command> {
+    if ![bwrap, seccomp_file, args_file]
+        .iter()
+        .all(|path| path.is_absolute())
+    {
+        return None;
+    }
     let mut command = tokio::process::Command::new("/bin/sh");
     command
         .env_clear()
@@ -272,7 +286,7 @@ pub(crate) fn launcher(
         .args(["--args", "4", "--"])
         .arg(program)
         .args(program_args);
-    command
+    Some(command)
 }
 
 #[cfg(test)]
@@ -344,11 +358,13 @@ mod tests {
             .any(|x| x == "--share-net" || x == "--bind" || x == "--dev-bind"));
         assert!(!a.windows(2).any(|w| w[1] == "/home/u" && w[0] != "--dir"));
         assert_eq!(
-            a[..8],
+            a[..10],
             [
                 "--unshare-all",
                 "--die-with-parent",
                 "--new-session",
+                "--unshare-user",
+                "--disable-userns",
                 "--cap-drop",
                 "ALL",
                 "--seccomp",
@@ -518,7 +534,8 @@ mod tests {
             Path::new("/d/args"),
             OsStr::new("/bin/sh"),
             &["-c".into(), "echo hi".into()],
-        );
+        )
+        .unwrap();
         let std = command.as_std();
         assert_eq!(std.get_program(), "/bin/sh");
         let argv: Vec<&OsStr> = std.get_args().collect();
@@ -548,6 +565,16 @@ mod tests {
             "{std:?}"
         );
         assert_eq!(std.get_current_dir(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn launcher_refuses_relative_paths() {
+        let abs = Path::new("/a");
+        let rel = Path::new("bwrap");
+        for (bwrap, seccomp, args) in [(rel, abs, abs), (abs, rel, abs), (abs, abs, rel)] {
+            assert!(launcher(bwrap, seccomp, args, OsStr::new("/bin/true"), &[]).is_none());
+        }
+        assert!(launcher(Path::new(""), abs, abs, OsStr::new("/bin/true"), &[]).is_none());
     }
 
     #[test]
@@ -622,7 +649,8 @@ mod tests {
                 &args_path,
                 OsStr::new("/bin/sh"),
                 &["-c".into(), script.into()],
-            );
+            )
+            .unwrap();
             command.env("PATH", "/usr/bin:/bin").env("LANG", "C.UTF-8");
             let out = command.output().await.unwrap();
             Output {
@@ -673,7 +701,27 @@ mod tests {
         let off = sb.run(false, &connect).await;
         assert_ne!(off.code, Some(0), "connected with the network off");
 
-        // socketpair stays allowed.
+        // Only a stream socketpair is allowed; datagram, raw (which becomes datagram) and
+        // seqpacket pairs fail with EPERM.
+        for ty in ["SOCK_DGRAM", "SOCK_RAW", "SOCK_SEQPACKET"] {
+            let out = sb
+                .run(
+                    true,
+                    &format!("python3 -c 'import socket; socket.socketpair(socket.AF_UNIX, socket.{ty})'"),
+                )
+                .await;
+            assert_eq!(out.code, Some(1), "{ty}: {}", out.stderr);
+            assert!(
+                out.stderr
+                    .contains("PermissionError: [Errno 1] Operation not permitted"),
+                "{ty}: {}",
+                out.stderr
+            );
+        }
+        // No new user namespace inside (--disable-userns), so no nested sandbox or mount.
+        let userns = sb.run(false, "unshare -U true").await;
+        assert_ne!(userns.code, Some(0), "unshare -U succeeded");
+
         let pair = sb
             .run(false, "python3 -c 'import socket; a, b = socket.socketpair(); a.send(b\"x\"); print(b.recv(1).decode())'")
             .await;
