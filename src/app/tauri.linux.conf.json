@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/blackwall/bwrap": "resources/linux/bwrap",
+          "/usr/share/doc/blackwall/bubblewrap/COPYING": "resources/linux/COPYING"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/lib/blackwall/bwrap": "resources/linux/bwrap",
+          "/usr/share/doc/blackwall/bubblewrap/COPYING": "resources/linux/COPYING"
+        }
+      }
+    }
+  }
+}

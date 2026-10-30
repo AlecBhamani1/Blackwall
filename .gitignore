@@ -21,6 +21,9 @@ coverage/
 .vscode/
 *.swp
 
+# Linux desktop bundle inputs built by scripts/build-bwrap.sh
+src/app/resources/linux/
+
 # Relay runtime ownership database
 blackwall-relay-data/
 

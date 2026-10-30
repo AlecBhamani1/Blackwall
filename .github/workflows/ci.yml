@@ -173,6 +173,9 @@ jobs:
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
         run: ./scripts/install-linux-deps.sh
+      - name: Build bubblewrap
+        if: runner.os == 'Linux'
+        run: ./scripts/build-bwrap.sh src/app/resources/linux
       - run: npm ci --prefix ui
       - name: Verify every desktop target without publication credentials
         shell: bash
