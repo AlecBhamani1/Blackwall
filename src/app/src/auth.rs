@@ -1,15 +1,21 @@
 //! Native lock enforcement and passphrase verification data kept in the credential store.
 use serde::Serialize;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 const LOCK_ACCOUNT: &str = "passphrase-v1";
+/// Empty, non-secret file in the data folder: an app lock exists, even when the keyring cannot say so.
+pub(crate) const LOCK_MARKER: &str = "app-lock-enabled";
+pub(crate) const KEYRING_NEEDED: &str = "Your app lock is stored in the system keyring, which isn't available. Start your keyring (GNOME Keyring or KWallet), then try again.";
 #[derive(Default)]
 struct Inner {
     initialized: bool,
     unlocked: bool,
     locking: bool,
     hash: Option<String>,
+    keyring: bool,
+    keyring_needed: bool,
     failures: u8,
     retry_after: Option<Instant>,
 }
@@ -23,13 +29,42 @@ pub(crate) struct CommitAuthorization {
 pub struct AuthStatus {
     pub locked: bool,
     pub enabled: bool,
+    pub keyring: bool,
+    #[serde(rename = "keyringNeeded")]
+    pub keyring_needed: bool,
 }
 impl Inner {
     fn status(&self) -> AuthStatus {
         AuthStatus {
             locked: !self.unlocked,
-            enabled: self.hash.is_some(),
+            // A stored lock the keyring cannot show us is still a lock.
+            enabled: self.hash.is_some() || self.keyring_needed,
+            keyring: self.keyring,
+            keyring_needed: self.keyring_needed,
         }
+    }
+}
+enum LockRead {
+    Found(String),
+    Missing,
+    Unavailable,
+    Failed(String),
+}
+#[derive(Debug, PartialEq)]
+enum Startup {
+    Open { keyring: bool },
+    Locked(String),
+    KeyringNeeded,
+    Retry(String),
+}
+/// Only a fresh data folder (no marker, no conversations) may open without a keyring.
+fn startup(read: LockRead, marker: bool, has_sessions: bool) -> Startup {
+    match read {
+        LockRead::Found(hash) => Startup::Locked(hash),
+        LockRead::Missing => Startup::Open { keyring: true },
+        LockRead::Unavailable if marker || has_sessions => Startup::KeyringNeeded,
+        LockRead::Unavailable => Startup::Open { keyring: false },
+        LockRead::Failed(message) => Startup::Retry(message),
     }
 }
 
@@ -85,6 +120,9 @@ impl AuthState {
         if inner.locking {
             return Err("Blackwall is still stopping active connections. Please wait.".into());
         }
+        if inner.keyring_needed {
+            return Err(KEYRING_NEEDED.into());
+        }
         check(&mut inner, passphrase).await?;
         inner.unlocked = true;
         Ok(inner.status())
@@ -94,22 +132,28 @@ impl AuthState {
         Self(std::sync::Arc::new(Mutex::new(Inner {
             initialized: true,
             unlocked: true,
+            keyring: true,
             hash: Some("test verifier".into()),
             ..Default::default()
         })))
     }
 }
 
-fn read_hash() -> Result<Option<String>, String> {
+fn read_hash() -> LockRead {
     let service = crate::identity::keychain_service("com.blackwall.lock");
-    crate::secrets::get(&service, LOCK_ACCOUNT).map_err(|error| match error {
-        crate::secrets::SecretError::Invalid => "The saved app lock is damaged.".into(),
-        error => error.explain(format!(
+    match crate::secrets::get(&service, LOCK_ACCOUNT) {
+        Ok(Some(hash)) => LockRead::Found(hash),
+        Ok(None) => LockRead::Missing,
+        Err(crate::secrets::SecretError::Unavailable) => LockRead::Unavailable,
+        Err(crate::secrets::SecretError::Invalid) => {
+            LockRead::Failed("The saved app lock is damaged.".into())
+        }
+        Err(error) => LockRead::Failed(error.explain(format!(
             "Blackwall could not read its app lock from {}. {}, then reopen Blackwall.",
             crate::secrets::STORE,
             crate::secrets::RECOVER
-        )),
-    })
+        ))),
+    }
 }
 fn write_hash(hash: Option<&str>) -> Result<(), String> {
     let service = crate::identity::keychain_service("com.blackwall.lock");
@@ -124,12 +168,81 @@ fn write_hash(hash: Option<&str>) -> Result<(), String> {
         ))
     })
 }
+fn write_marker(directory: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    std::fs::write(directory.join(LOCK_MARKER), b"")
+}
+fn remove_marker(directory: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(directory.join(LOCK_MARKER)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+/// Keep the marker in step with the stored lock. The marker changes first, so a failure
+/// to remove it leaves the lock in place rather than an unlocked app that still looks locked.
+fn change_lock(
+    directory: &Path,
+    hash: Option<&str>,
+    store: impl FnOnce(Option<&str>) -> Result<(), String>,
+) -> Result<(), String> {
+    match hash {
+        Some(_) => write_marker(directory),
+        None => remove_marker(directory),
+    }
+    .map_err(|_| "The app lock marker could not be updated in your data folder.".to_string())?;
+    store(hash)
+}
+fn has_sessions(directory: &Path) -> bool {
+    // If the data cannot be inspected, assume conversations exist and stay locked.
+    blackwall_core::storage::LocalStore::open(directory)
+        .and_then(|store| store.has_sessions())
+        .unwrap_or(true)
+}
 #[tauri::command]
-pub async fn auth_status(state: State<'_, AuthState>) -> Result<AuthStatus, String> {
+pub async fn auth_status(
+    app: AppHandle,
+    state: State<'_, AuthState>,
+) -> Result<AuthStatus, String> {
     let mut inner = state.0.lock().await;
     if !inner.initialized {
-        inner.hash = crate::keychain::read(read_hash).await?;
-        inner.unlocked = inner.hash.is_none();
+        let directory = crate::identity::data_directory(&app)?;
+        let read = crate::keychain::read(|| Ok(read_hash())).await?;
+        let dir = directory.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let marker = dir.join(LOCK_MARKER).exists();
+            // Best effort: a stale marker only matters once the keyring is gone.
+            match &read {
+                LockRead::Found(_) => drop(write_marker(&dir)),
+                LockRead::Missing => drop(remove_marker(&dir)),
+                _ => {}
+            }
+            let sessions = matches!(read, LockRead::Unavailable) && !marker && has_sessions(&dir);
+            startup(read, marker, sessions)
+        })
+        .await
+        .map_err(|_| "Blackwall could not read its app lock.")?;
+        // Only Locked and Open are settled; the other outcomes read the keyring again next time.
+        match outcome {
+            Startup::Retry(message) => return Err(message),
+            Startup::KeyringNeeded => {
+                inner.keyring_needed = true;
+                inner.keyring = false;
+                inner.unlocked = false;
+                inner.hash = None;
+                return Ok(inner.status());
+            }
+            Startup::Locked(hash) => {
+                inner.hash = Some(hash);
+                inner.unlocked = false;
+                inner.keyring = true;
+            }
+            Startup::Open { keyring } => {
+                inner.hash = None;
+                inner.unlocked = true;
+                inner.keyring = keyring;
+            }
+        }
+        inner.keyring_needed = false;
         inner.initialized = true;
     }
     Ok(inner.status())
@@ -172,6 +285,7 @@ pub async fn unlock_app(
 
 #[tauri::command]
 pub async fn set_passphrase(
+    app: AppHandle,
     current: String,
     passphrase: String,
     state: State<'_, AuthState>,
@@ -183,13 +297,14 @@ pub async fn set_passphrase(
     if inner.hash.is_some() {
         check(&mut inner, current).await?;
     }
+    let directory = crate::identity::data_directory(&app)?;
     let hash = tokio::task::spawn_blocking(move || {
         let hash = if passphrase.is_empty() {
             None
         } else {
             Some(blackwall_core::auth::hash(&passphrase).map_err(|e| e.to_string())?)
         };
-        write_hash(hash.as_deref())?;
+        change_lock(&directory, hash.as_deref(), write_hash)?;
         Ok::<_, String>(hash)
     })
     .await
@@ -257,5 +372,80 @@ mod tests {
         // Cleanup completion does not itself unlock the app.
         assert!(state.ensure_unlocked().await.is_err());
         assert!(!state.0.lock().await.locking);
+    }
+    #[test]
+    fn startup_opens_only_fresh_data_without_keyring() {
+        assert_eq!(
+            startup(LockRead::Unavailable, false, false),
+            Startup::Open { keyring: false }
+        );
+        assert_eq!(
+            startup(LockRead::Unavailable, true, false),
+            Startup::KeyringNeeded
+        );
+    }
+    #[test]
+    fn startup_dismissed_prompt_retries_and_existing_data_without_marker_stays_locked() {
+        assert!(matches!(
+            startup(LockRead::Failed("dismissed".into()), false, false),
+            Startup::Retry(_)
+        ));
+        assert_eq!(
+            startup(LockRead::Unavailable, false, true),
+            Startup::KeyringNeeded
+        );
+    }
+    #[test]
+    fn found_lock_is_locked_and_missing_lock_opens() {
+        assert_eq!(
+            startup(LockRead::Found("h".into()), false, true),
+            Startup::Locked("h".into())
+        );
+        assert_eq!(
+            startup(LockRead::Missing, true, true),
+            Startup::Open { keyring: true }
+        );
+    }
+    fn data_folder(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-auth-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+    #[test]
+    fn marker_tracks_lock_and_failed_removal_keeps_lock() {
+        use std::cell::Cell;
+        let directory = data_folder("marker");
+        let marker = directory.join(LOCK_MARKER);
+        let stored = Cell::new(0);
+        let store = |_: Option<&str>| {
+            stored.set(stored.get() + 1);
+            Ok(())
+        };
+        change_lock(&directory, Some("hash"), store).unwrap();
+        assert!(marker.exists());
+        assert_eq!(stored.get(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+            // A directory that is still writable here (running as root) cannot prove failure.
+            if std::fs::File::create(directory.join("probe")).is_err() {
+                assert!(change_lock(&directory, None, store).is_err());
+                assert!(marker.exists());
+                assert_eq!(stored.get(), 1, "the lock must stay when the marker stays");
+            }
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        change_lock(&directory, None, store).unwrap();
+        assert!(!marker.exists());
+        assert_eq!(stored.get(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
