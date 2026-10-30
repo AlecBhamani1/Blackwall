@@ -21,7 +21,7 @@ use crate::{
     context::{ContextRun, ContextState},
     model::{ModelError, ModelTurn, ToolCall, ToolFunction},
     protocol::{AgentEvent, TokenUsage},
-    run_fold::{run_source, AssistantShape, RunEnd, RunFold, SourceRule},
+    run_fold::{model_error_text, run_source, AssistantShape, RunEnd, RunFold, SourceRule},
     tools::Workspace,
 };
 use futures_util::future::{AbortHandle, Abortable};
@@ -60,6 +60,13 @@ struct Markers {
 }
 
 impl Markers {
+    /// A unique text that is not made of a flavor, such as a data URL.
+    fn raw(&mut self, text: String) -> String {
+        assert!(text.len() >= MIN_MARKER_BYTES, "{text}");
+        self.all.push(text.clone());
+        text
+    }
+
     fn make(&mut self, rng: &mut StdRng) -> String {
         let flavor = FLAVORS[rng.random_range(0..FLAVORS.len())];
         let marker = format!(
@@ -95,6 +102,48 @@ enum Ending {
     Stop(usize),
     Crash(usize),
     Fail,
+    /// The run completed, but its trailing events (from the last `ContextUpdated` on) never
+    /// reached the webview, which stops listening when the invoke resolves (`ipc.ts`). The row is
+    /// `complete` while the saved context is an earlier snapshot. Desktop only.
+    Lost,
+}
+
+/// Which shapes a session actually reached, for the coverage floors.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    stop: bool,
+    fail: bool,
+    crash: bool,
+    lost: bool,
+    empty_final: bool,
+    text_attachment: bool,
+    image_attachment: bool,
+}
+
+/// `store.ts` `loadSession`: opening a saved chat rewrites every row. A `streaming` row is
+/// `stopped` with its content as it was, running tools are `stopped`, running children are
+/// `interrupted`, and every row is `historical`.
+fn reopen(messages: &mut [Value]) {
+    for message in messages {
+        message["historical"] = json!(true);
+        if message["status"] == "streaming" {
+            message["status"] = json!("stopped");
+        }
+        if let Some(tools) = message.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools.iter_mut().filter(|tool| tool["status"] == "running") {
+                tool["status"] = json!("stopped");
+            }
+        }
+        if let Some(children) = message.get_mut("children").and_then(Value::as_array_mut) {
+            for child in children
+                .iter_mut()
+                .filter(|child| child["state"] == "running")
+            {
+                child["state"] = json!("interrupted");
+                child["summary"] = json!("Interrupted before this conversation was saved.");
+            }
+        }
+    }
 }
 
 /// What a driven run produced.
@@ -113,6 +162,12 @@ struct Simulation {
     saved: Saved,
     ids: u64,
     files: u64,
+    images: u32,
+    /// The desktop crashed in the last run, so it reopens the chat before sending again.
+    crashed: bool,
+    /// v5 cannot continue this chat (an empty answer it already covered became an error row).
+    stuck: bool,
+    tally: Tally,
 }
 
 impl Simulation {
@@ -163,9 +218,11 @@ impl Simulation {
         }
     }
 
-    /// The scripted turns of one run: tool turns that read marker files, then a final answer, cut
-    /// short by the failing step when the run is to fail. Returns the files the turns read.
-    fn script(&mut self, ending: Ending, directory: &Path) -> Vec<Step> {
+    /// The scripted turns of one run: tool turns that read marker files (and now and then delegate
+    /// to a subagent, whose one scripted answer follows its parent turn), then a final answer, cut
+    /// short by the failing step when the run is to fail. An `empty_final` run ends on a turn with
+    /// no text.
+    fn script(&mut self, ending: Ending, empty_final: bool, directory: &Path) -> Vec<Step> {
         let tool_turns = self.rng.random_range(0..=3);
         let fail_at = matches!(ending, Ending::Fail).then(|| self.rng.random_range(0..=tool_turns));
         let mut steps = vec![];
@@ -184,8 +241,9 @@ impl Simulation {
                 break;
             }
             let last = turn == tool_turns;
-            // An empty turn is legal between tool batches; the final answer always has text.
-            let content = if !last && self.rng.random_range(0..4) == 0 {
+            // An empty turn is legal between tool batches; the final answer has text unless the
+            // run is the empty-answer case.
+            let content = if (!last && self.rng.random_range(0..4) == 0) || (last && empty_final) {
                 String::new()
             } else {
                 self.markers.make(&mut self.rng)
@@ -195,6 +253,7 @@ impl Simulation {
                 usage: self.usage(),
                 ..Default::default()
             };
+            let mut child = false;
             if !last {
                 for call in 0..self.rng.random_range(1..=3) {
                     // A file with a marker, or now and then a path that is not there.
@@ -212,9 +271,29 @@ impl Simulation {
                         },
                     });
                 }
+                // One delegation at most per turn keeps the order of the children fixed.
+                child = self.rng.random_range(0..5) == 0;
+                if child {
+                    model.calls.push(ToolCall {
+                        id: format!("call_{turn}_child"),
+                        function: ToolFunction {
+                            name: "spawn_agent".into(),
+                            arguments: json!({"goal": "Look through the project notes"})
+                                .to_string(),
+                        },
+                    });
+                }
             }
             self.reasoning(&mut model);
             steps.push(Step::Say(model));
+            if child {
+                // The child asks the same backend for its one answer. Its text becomes both the
+                // tool output and the child's summary, so it is not a marker.
+                steps.push(Step::Say(ModelTurn {
+                    content: "The child found nothing unusual in the notes.".into(),
+                    ..Default::default()
+                }));
+            }
         }
         steps
     }
@@ -276,31 +355,78 @@ impl Simulation {
         }
     }
 
+    /// The ending of a run, by chance. The empty-answer flavor of a complete run is separate.
+    fn ending(&mut self) -> (Ending, bool) {
+        let desktop = self.shape == AssistantShape::Desktop;
+        match self.rng.random_range(0..100) {
+            0..=43 => (Ending::Complete, false),
+            44..=48 => (Ending::Complete, true),
+            49..=66 => (Ending::Stop(self.rng.random_range(0..16)), false),
+            67..=80 => (Ending::Fail, false),
+            81..=94 => (Ending::Crash(self.rng.random_range(0..16)), false),
+            _ if desktop => (Ending::Lost, false),
+            _ => (Ending::Complete, false),
+        }
+    }
+
+    /// The attachments of a desktop prompt, now and then: a text file, a small image, or both.
+    fn attachments(&mut self) -> Vec<Value> {
+        let mut attachments = vec![];
+        if self.shape != AssistantShape::Desktop || self.rng.random_range(0..5) > 0 {
+            return attachments;
+        }
+        let kinds = self.rng.random_range(1..=3);
+        if kinds & 1 != 0 {
+            let text = self.markers.make(&mut self.rng);
+            self.tally.text_attachment = true;
+            attachments.push(json!({
+                "id": format!("attachment_{}", attachments.len() + 1),
+                "name": format!("notes_{}.txt", self.ids), "mimeType": "text/plain",
+                "sizeBytes": text.len(), "kind": "text", "textContent": text,
+            }));
+        }
+        if kinds & 2 != 0 && self.images < 3 {
+            self.images += 1;
+            let url = self.markers.raw(format!(
+                "data:image/png;base64,iVBORw0KGgo{:016x}AAAA",
+                self.rng.random::<u64>()
+            ));
+            self.tally.image_attachment = true;
+            attachments.push(json!({
+                "id": format!("attachment_{}", attachments.len() + 1),
+                "name": format!("pixel_{}.png", self.ids), "mimeType": "image/png",
+                "sizeBytes": url.len(), "kind": "image", "dataUrl": url,
+            }));
+        }
+        attachments
+    }
+
+    /// The saved rows as the client holds them when it sends again: a desktop that crashed, and
+    /// now and then one that was simply reopened, has rewritten every row.
+    fn reopened(&self, messages: &mut [Value], draw: bool) {
+        if self.shape == AssistantShape::Desktop && (self.crashed || draw) {
+            reopen(messages);
+        }
+    }
+
     /// A run of the agent for a new prompt.
     fn prompt_run(&mut self, runtime: &tokio::runtime::Runtime) {
         let prompt = self.markers.make(&mut self.rng);
+        let attachments = self.attachments();
         let created = self.tick();
         let user = json!({
-            "id": self.id("user"), "role": "user", "content": prompt, "attachments": [],
+            "id": self.id("user"), "role": "user", "content": prompt, "attachments": attachments,
             "status": "complete", "createdAt": created,
         });
-        let ending = match self.rng.random_range(0..20) {
-            0..=9 => Ending::Complete,
-            10..=13 => Ending::Stop(self.rng.random_range(0..14)),
-            14..=16 => Ending::Fail,
-            _ => Ending::Crash(self.rng.random_range(0..14)),
-        };
+        let (ending, empty_final) = self.ending();
         let desktop = self.shape == AssistantShape::Desktop;
-        if desktop && self.rng.random_range(0..4) == 0 {
-            // The desktop reopened the chat: every saved row is historical.
-            for message in &mut self.saved.messages {
-                message["historical"] = json!(true);
-            }
-        }
+        let draw = self.rng.random_range(0..4) == 0;
+        let mut messages = self.saved.messages.clone();
+        self.reopened(&mut messages, draw);
+        self.crashed = false;
         let created = self.tick();
         let assistant = self.id("assistant");
         let mut fold = RunFold::new(&assistant, created as i64, self.shape);
-        let mut messages = self.saved.messages.clone();
         messages.push(user);
         let source_messages = messages.clone();
         if desktop {
@@ -310,14 +436,25 @@ impl Simulation {
         self.saved.messages = messages.clone();
 
         let directory = self.directory.clone();
-        let steps = self.script(ending, &directory);
+        let steps = self.script(ending, empty_final, &directory);
         let backend = ScriptedBackend::new(steps);
         let run = self.context_run(&source_messages, false);
         let stop_at = match ending {
             Ending::Stop(at) | Ending::Crash(at) => Some(at),
             _ => None,
         };
-        let driven = self.drive(runtime, &backend, run, stop_at);
+        let mut driven = self.drive(runtime, &backend, run, stop_at);
+        if matches!(ending, Ending::Lost) {
+            // Everything from the last `ContextUpdated` on never arrived.
+            let last = driven
+                .events
+                .iter()
+                .rposition(|event| matches!(event, AgentEvent::ContextUpdated { .. }));
+            if let Some(last) = last {
+                driven.events.truncate(last);
+                self.tally.lost = true;
+            }
+        }
 
         let mut context = self.saved.context.clone();
         let mut report = self.saved.report.clone();
@@ -342,11 +479,22 @@ impl Simulation {
             }
         }
         let end = match (&driven.result, ending) {
-            // The process died: the client keeps what it last saved.
-            (None, Ending::Crash(_)) => return,
-            (None, _) => RunEnd::Stopped,
-            (Some(Ok(_)), _) => RunEnd::Complete,
+            // The process died: the client keeps what it last saved, and reopens it later.
+            (None, Ending::Crash(_)) => {
+                self.crashed = true;
+                self.tally.crash = true;
+                return;
+            }
+            (None, _) => {
+                self.tally.stop = true;
+                RunEnd::Stopped
+            }
+            (Some(Ok(_)), _) => {
+                self.tally.empty_final |= empty_final;
+                RunEnd::Complete
+            }
             (Some(Err(error)), _) => {
+                self.tally.fail = true;
                 let code = ["model_unavailable", "model_busy", "model_timeout"]
                     [self.rng.random_range(0..3)];
                 let detail = self
@@ -371,6 +519,10 @@ impl Simulation {
             }
         };
         fold.finish(&end);
+        // A completed run the webview turned into an error (no answer) covered an assistant row
+        // that is no longer part of the source: v5 cannot continue the chat.
+        self.stuck |=
+            desktop && matches!(end, RunEnd::Complete) && fold.message()["status"] == "error";
         if desktop {
             *messages.last_mut().unwrap() = fold.message().clone();
         } else {
@@ -396,12 +548,17 @@ impl Simulation {
             content: summary.to_string(),
             ..Default::default()
         })]);
-        let messages = self.saved.messages.clone();
+        let draw = self.rng.random_range(0..4) == 0;
+        let mut messages = self.saved.messages.clone();
+        self.reopened(&mut messages, draw);
         let run = self.context_run(&messages, true);
         let driven = self.drive(runtime, &backend, run, None);
         if !matches!(driven.result, Some(Ok(_))) {
             return;
         }
+        // Compacting saves the chat, reopened rows and all.
+        self.saved.messages = messages;
+        self.crashed = false;
         for event in driven.events {
             match event {
                 AgentEvent::ContextReport { report, .. } => self.saved.report = Some(json!(report)),
@@ -445,7 +602,26 @@ impl Simulation {
     }
 }
 
-fn simulate(seed: u64) -> (Value, Vec<String>) {
+/// A subagent's id is random. Numbering the ids in the order they appear makes the chat the
+/// same for the same seed.
+fn normalize_children(body: &mut Value) {
+    let mut seen: Vec<String> = vec![];
+    let messages = body["messages"].as_array_mut().unwrap();
+    for child in messages
+        .iter_mut()
+        .filter_map(|message| message.get_mut("children")?.as_array_mut())
+        .flatten()
+    {
+        let old = child["id"].as_str().unwrap().to_owned();
+        let position = seen.iter().position(|id| *id == old).unwrap_or_else(|| {
+            seen.push(old);
+            seen.len() - 1
+        });
+        child["id"] = json!(format!("child_{position:016x}"));
+    }
+}
+
+fn simulate(seed: u64) -> (Value, Vec<String>, Tally) {
     let mut rng = StdRng::seed_from_u64(seed);
     let shape = if rng.random_range(0..5) == 0 {
         AssistantShape::Cli
@@ -474,19 +650,27 @@ fn simulate(seed: u64) -> (Value, Vec<String>) {
         saved: Saved::default(),
         ids: 0,
         files: 0,
+        images: 0,
+        crashed: false,
+        stuck: false,
+        tally: Tally::default(),
     };
     let id = match shape {
         AssistantShape::Desktop => format!("session_{seed:016x}"),
         AssistantShape::Cli => format!("cli_{}_{seed}_0", sim.clock),
     };
-    for run in 0..sim.rng.random_range(1..=6) {
+    for run in 0..sim.rng.random_range(1..=10) {
+        if sim.stuck {
+            break;
+        }
         if run % 4 == 3 {
             sim.compact_run(&runtime);
         } else {
             sim.prompt_run(&runtime);
         }
     }
-    let body = sim.body(&id);
+    let mut body = sim.body(&id);
+    normalize_children(&mut body);
     drop(runtime);
     std::fs::remove_dir_all(&directory).unwrap();
     // A marker whose text never reached the chat (the run stopped first) is not the chat's.
@@ -497,13 +681,18 @@ fn simulate(seed: u64) -> (Value, Vec<String>) {
         .into_iter()
         .filter(|marker| text.contains(&escaped(marker)))
         .collect();
-    (body, markers)
+    (body, markers, sim.tally)
+}
+
+fn simulate_tallied(seed: u64) -> (Value, Vec<String>, Tally) {
+    std::thread::scope(|scope| scope.spawn(|| simulate(seed)).join().unwrap())
 }
 
 /// A v5 chat produced by the real agent for `seed`, and the unique texts (each at least 24 bytes)
 /// the chat holds. It runs on its own thread, so it is safe to call from any test.
 pub(crate) fn simulate_v5(seed: u64) -> (Value, Vec<String>) {
-    std::thread::scope(|scope| scope.spawn(|| simulate(seed)).join().unwrap())
+    let (body, markers, _) = simulate_tallied(seed);
+    (body, markers)
 }
 
 /// `text` as it appears inside a JSON string.
@@ -566,45 +755,130 @@ fn upgrade_and_check(store: &LocalStore, body: &Value, markers: &[String]) -> Re
     Ok(())
 }
 
+/// Whether v5 can continue this chat: a desktop run that covered an empty answer and then showed
+/// it as an error leaves a context that covers a row the next source drops.
+fn v5_can_continue(body: &Value) -> bool {
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let empty = model_error_text("empty_model_response", None);
+    !(last["status"] == "error" && last["content"] == "" && last["error"] == empty.as_str())
+}
+
+/// The shapes a session reached, as named flags.
+fn shapes(body: &Value, tally: Tally) -> Vec<&'static str> {
+    let rows = body["messages"].as_array().unwrap();
+    let tools = || {
+        rows.iter()
+            .filter_map(|row| row["tools"].as_array())
+            .flatten()
+    };
+    let checkpoints = body["contextState"]["checkpoints"]
+        .as_array()
+        .map_or(0, Vec::len);
+    [
+        ("stop", tally.stop),
+        ("fail", tally.fail),
+        ("crash", tally.crash),
+        ("lost trailing events", tally.lost),
+        ("empty final turn", tally.empty_final),
+        ("cli", body["id"].as_str().unwrap().starts_with("cli_")),
+        ("checkpoints", checkpoints > 0),
+        ("several checkpoints", checkpoints > 1),
+        ("read_file", tools().any(|tool| tool["name"] == "read_file")),
+        (
+            "tool cut mid-call",
+            tools().any(|tool| tool["status"] == "stopped"),
+        ),
+        ("text attachment", tally.text_attachment),
+        ("image attachment", tally.image_attachment),
+        (
+            "attachments",
+            tally.text_attachment || tally.image_attachment,
+        ),
+        (
+            "children",
+            rows.iter()
+                .any(|row| row["children"].as_array().is_some_and(|c| !c.is_empty())),
+        ),
+        (
+            "trailing streaming row",
+            rows.last().is_some_and(|row| row["status"] == "streaming"),
+        ),
+        (
+            "error rows",
+            rows.iter().any(|row| row["status"] == "error"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, seen)| seen.then_some(name))
+    .collect()
+}
+
+/// A saved chat has at most one `streaming` row, and only the last: reopening a chat after a
+/// crash rewrites it (`store.ts` `loadSession`).
+fn only_the_last_row_streams(body: &Value) -> bool {
+    let rows = body["messages"].as_array().unwrap();
+    rows[..rows.len() - 1]
+        .iter()
+        .all(|row| row["status"] != "streaming")
+}
+
+/// Shapes that must each be at least this percent of the sessions at 1,000 sessions or more.
+const FLOOR_PERCENT: u32 = 3;
+const FLOORED: [&str; 10] = [
+    "stop",
+    "fail",
+    "crash",
+    "cli",
+    "checkpoints",
+    "read_file",
+    "tool cut mid-call",
+    "lost trailing events",
+    "attachments",
+    "children",
+];
+
 #[test]
 fn ten_thousand_generated_v5_sessions_upgrade_and_load_exactly() {
     use super::chats::counter_repairs;
     use super::convert::upgrade_inline_values;
     let store = v6_in_memory();
-    let (mut checkpointed, mut tooled, mut cut_short, mut errored, mut cli) = (0, 0, 0, 0, 0);
+    let mut seen = std::collections::BTreeMap::<&str, u32>::new();
     for seed in 0..sessions() {
-        let (body, markers) = simulate_v5(seed);
+        let (body, markers, tally) = simulate_tallied(seed);
         assert!(!markers.is_empty(), "seed {seed}");
+        assert!(only_the_last_row_streams(&body), "seed {seed}");
         if let Err(problem) = upgrade_and_check(&store, &body, &markers) {
             panic!("seed {seed}: {problem}");
         }
-        let rows = body["messages"].as_array().unwrap();
-        let has = |status: &str| rows.iter().any(|row| row["status"] == status);
-        checkpointed += (!body["contextState"]["checkpoints"]
-            .as_array()
-            .is_none_or(Vec::is_empty)) as u32;
-        tooled += rows.iter().any(|row| row.get("tools").is_some()) as u32;
-        cut_short += (has("stopped") || has("streaming")) as u32;
-        errored += has("error") as u32;
-        cli += body["id"].as_str().unwrap().starts_with("cli_") as u32;
+        for shape in shapes(&body, tally) {
+            *seen.entry(shape).or_default() += 1;
+        }
     }
-    println!(
-        "{} sessions: {checkpointed} with checkpoints, {tooled} with tools, {cut_short} cut short, \
-         {errored} with error rows, {cli} from the CLI",
-        sessions()
-    );
+    let total = sessions();
+    println!("{total} sessions:");
+    for (shape, count) in &seen {
+        println!(
+            "  {shape:<24} {count:>6}  {:>5.1}%",
+            f64::from(*count) * 100.0 / total as f64
+        );
+    }
     assert_eq!(upgrade_inline_values(), 0);
     assert_eq!(counter_repairs(), 0);
     // The generator must reach every shape, or the property proves nothing.
-    if sessions() >= 200 {
-        for (name, seen) in [
-            ("checkpoints", checkpointed),
-            ("tools", tooled),
-            ("stopped or streaming rows", cut_short),
-            ("error rows", errored),
-            ("cli sessions", cli),
+    if total >= 1000 {
+        for shape in FLOORED {
+            let count = u64::from(seen.get(shape).copied().unwrap_or(0));
+            assert!(
+                count * 100 >= total * u64::from(FLOOR_PERCENT),
+                "only {count} of {total} generated sessions had {shape}"
+            );
+        }
+        for shape in [
+            "empty final turn",
+            "several checkpoints",
+            "trailing streaming row",
         ] {
-            assert!(seen > 0, "no generated session had {name}");
+            assert!(seen.contains_key(shape), "no generated session had {shape}");
         }
     }
 }
@@ -629,8 +903,10 @@ fn the_simulator_matches_v5_restore() {
             .get("contextState")
             .map(|state| serde_json::from_value(state.clone()).unwrap());
         let source = run_source(&messages, rule).unwrap();
-        assert!(
+        // The one shape v5 cannot continue is the desktop's empty answer; every other chat can.
+        assert_eq!(
             ContextState::restore(&source, saved.as_ref()).is_ok(),
+            v5_can_continue(&body),
             "seed {seed}"
         );
     }

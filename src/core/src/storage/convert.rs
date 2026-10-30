@@ -658,9 +658,7 @@ fn plan(
             .collect();
         let content = &message["content"];
         let text = content.as_str().unwrap_or_default();
-        // Only a run that did not complete shows text that is in no model row (correction 2).
-        let may_tail = message["status"] != "complete";
-        let (tail, echo, unproven) = content_form(transcript, &mut turns, text, may_tail);
+        let (tail, echo, unproven) = content_form(transcript, &mut turns, text);
         if let Some(echo) = echo {
             propose_ref(
                 &mut proposals,
@@ -822,7 +820,6 @@ fn content_form(
     transcript: &[Value],
     turns: &mut Vec<usize>,
     content: &str,
-    may_tail: bool,
 ) -> (Option<String>, Option<usize>, bool) {
     let texts: Option<Vec<&str>> = turns
         .iter()
@@ -848,7 +845,7 @@ fn content_form(
         }
     }
     let covered = accumulate(texts.iter().copied());
-    if covered == content || (may_tail && content.starts_with(&covered)) {
+    if content.starts_with(&covered) {
         return (Some(content[covered.len()..].to_owned()), echo, false);
     }
     (None, echo, true)
@@ -1665,15 +1662,47 @@ mod tests {
     }
 
     #[test]
-    fn the_mismatch_fixture_stays_inline_and_says_why() {
+    fn content_that_extends_its_turns_keeps_the_extension_as_a_tail_whatever_the_status() {
+        // The fixture's complete row reads "Checking\n\nAll good, edited after the run": its turns
+        // are a prefix, so the rest is a tail (ruling: any status, still proven by resolution).
         let db = v6_in_memory();
-        let session = fixture("text_tool_mismatch");
+        // Turns long enough that a reference pays off.
+        let long = "All good, and here is a longer line so that a reference saves space";
+        let session: Value = serde_json::from_str(
+            &fixture("text_tool_mismatch")
+                .to_string()
+                .replace("All good", long),
+        )
+        .unwrap();
+        assert_eq!(session["messages"][1]["status"], "complete");
+        assert_eq!(
+            session["messages"][1]["content"],
+            format!("Checking\n\n{long}, edited after the run")
+        );
+        let outcomes = upgrade(&db, std::slice::from_ref(&session));
+        let report = kept(&outcomes["text_tool_mismatch"]);
+        assert_eq!(report.inline_bytes, 0);
+        assert!(report.inline_reasons.is_empty());
+        assert_eq!(
+            db.load_json_v6("text_tool_mismatch").unwrap().unwrap(),
+            session
+        );
+        let rows = event_bodies(&db, "text_tool_mismatch");
+        assert_eq!(rows[1].1["content"]["tail"], ", edited after the run");
+        assert!(rows[1].1["tools"][0].get("call").is_some());
+    }
+
+    #[test]
+    fn content_that_does_not_start_with_its_turns_stays_inline_and_says_why() {
+        let db = v6_in_memory();
+        let mut session = fixture("text_tool_mismatch");
+        session["messages"][1]["content"] = json!("Edited\n\nAll good, edited after the run");
         let outcomes = upgrade(&db, std::slice::from_ref(&session));
         let report = kept(&outcomes["text_tool_mismatch"]);
         assert_eq!(report.inline_reasons, BTreeMap::from([("content", 1)]));
         assert_eq!(
             report.inline_bytes,
-            json_len(&json!("Checking\n\nAll good, edited after the run"))
+            json_len(&json!("Edited\n\nAll good, edited after the run"))
         );
         assert_eq!(
             db.load_json_v6("text_tool_mismatch").unwrap().unwrap(),
@@ -1683,7 +1712,7 @@ mod tests {
         let rows = event_bodies(&db, "text_tool_mismatch");
         assert_eq!(
             rows[1].1["content"],
-            "Checking\n\nAll good, edited after the run"
+            "Edited\n\nAll good, edited after the run"
         );
         assert!(rows[1].1["tools"][0].get("call").is_some());
     }
