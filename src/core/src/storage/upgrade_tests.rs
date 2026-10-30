@@ -823,6 +823,45 @@ fn table_exists(database: &Path, name: &str) -> bool {
         .unwrap()
 }
 
+/// Rows in the tables beside the chats, so a crash test can see that they are untouched too.
+fn seed_other_tables(database: &Path) {
+    Connection::open(database)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO settings VALUES ('preferences','{\"theme\":\"dark\"}');
+             INSERT INTO memory(id,content,updated_at,fact_key) VALUES ('m','a fact',1,'m');
+             INSERT INTO memory_search(id,content) VALUES ('m','a fact');
+             INSERT INTO memory_proposals VALUES ('p','{\"proposal\":1}');
+             INSERT INTO paired_devices VALUES ('d','{\"device\":1}');",
+        )
+        .unwrap();
+}
+
+/// Every row of the non-chat tables a restore brings back, byte for byte.
+fn other_tables(database: &Path) -> Vec<(String, Vec<String>)> {
+    let connection = Connection::open(database).unwrap();
+    ["settings", "memory", "memory_proposals", "paired_devices"]
+        .iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            ((*table).to_owned(), rows)
+        })
+        .collect()
+}
+
 /// Every chat but the deliberately invalid one loads as it did in v5.
 fn assert_chats_intact(db: &LocalStore, sessions: &[Value]) {
     for session in sessions.iter().filter(|s| s["id"] != "bad_role") {
@@ -843,7 +882,9 @@ fn a_crash_after_backup_during_convert_or_before_commit_reopens_as_whole_v5_then
         let dir = Scratch::new("crash");
         let sessions = v5_sessions();
         build_v5(&dir, &sessions, 5);
+        seed_other_tables(&dir.database());
         let before = session_rows(&dir.database());
+        let before_other = other_tables(&dir.database());
         let sync = Scratch::new("crash-sync");
         fs::create_dir_all(&sync.0).unwrap();
 
@@ -874,18 +915,31 @@ fn a_crash_after_backup_during_convert_or_before_commit_reopens_as_whole_v5_then
         );
 
         if at == AbortAt::AfterCommit {
-            // Committed, then killed before the integrity check and the pruning.
+            // Committed, then killed before the integrity check and the pruning: its state file
+            // is still there.
             assert_eq!(version_of(&dir.database()), V6, "{name}");
+            assert!(
+                backup_files(&dir).contains(&"upgrade-state.json".to_owned()),
+                "{name}"
+            );
         } else {
             // Reading the file rolls its hot journal back: the whole v5 database, untouched.
             assert_eq!(version_of(&dir.database()), 5, "{name}");
             assert_eq!(session_rows(&dir.database()), before, "{name}");
+            assert_eq!(other_tables(&dir.database()), before_other, "{name}");
             assert!(!table_exists(&dir.database(), "chat_events"), "{name}");
         }
 
         let db = open6(&dir).unwrap();
         assert_chats_intact(&db, &sessions);
         drop(db);
+        // The next successful open finishes the cleanup: no state file is left, whatever the
+        // crash point (after a commit, the v6 open clears it).
+        assert!(
+            !backup_files(&dir).contains(&"upgrade-state.json".to_owned()),
+            "{name}: {:?}",
+            backup_files(&dir)
+        );
         assert_eq!(baks(&dir).len(), 1, "{name}: {:?}", backup_files(&dir));
         // Whatever the crash left in the backups folder is gone or still one backup's own.
         assert!(
@@ -950,6 +1004,18 @@ fn two_processes_opening_one_v5_database_one_migrates_and_the_other_waits() {
     fs::write(sync.0.join("go"), b"").unwrap();
     // One of them is now inside the upgrade, holding the write lock with its backup made.
     wait_for(&dir.0.join(backup::GATE_HELD), &mut children.0);
+    // Both reached the write lock: the winner holds it, so the other is asking for it now.
+    let start = Instant::now();
+    while locking_marks(&dir) < 2 {
+        for child in &mut children.0 {
+            assert!(child.try_wait().unwrap().is_none(), "a child exited early");
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "the second opener never reached the lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // The other cannot be done: it can only be waiting for the lock (or still on its way to it).
     for child in &mut children.0 {
         assert!(child.try_wait().unwrap().is_none());
@@ -968,11 +1034,19 @@ fn two_processes_opening_one_v5_database_one_migrates_and_the_other_waits() {
             log
         })
         .collect();
-    let migrations: usize = logs
-        .iter()
-        .map(|log| log.matches("chats upgraded to v6").count())
-        .sum();
-    assert_eq!(migrations, 1, "{logs:?}");
+    // One upgraded; the other waited for the lock and then found v6.
+    let upgraded = |log: &String| log.contains("chats upgraded to v6");
+    let waited = |log: &String| log.contains("found v6 after waiting");
+    assert_eq!(
+        logs.iter().filter(|log| upgraded(log)).count(),
+        1,
+        "{logs:?}"
+    );
+    assert_eq!(logs.iter().filter(|log| waited(log)).count(), 1, "{logs:?}");
+    assert!(
+        logs.iter().all(|log| upgraded(log) != waited(log)),
+        "{logs:?}"
+    );
     assert_eq!(baks(&dir).len(), 1);
     assert_eq!(version_of(&dir.database()), V6);
     assert_chats_intact(&open6(&dir).unwrap(), &sessions);
@@ -980,6 +1054,21 @@ fn two_processes_opening_one_v5_database_one_migrates_and_the_other_waits() {
         LocalStore::upgrade_status(&dir).unwrap(),
         UpgradeStatus::Current
     );
+}
+
+/// How many openers have marked that they are about to ask for the write lock.
+fn locking_marks(dir: &Scratch) -> usize {
+    fs::read_dir(&dir.0)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("locking-")
+        })
+        .count()
 }
 
 /// One of the two openers of the two-process test. The one that wins the lock parks at the gate.
@@ -1202,13 +1291,15 @@ fn production(file: &str) -> &str {
 
 /// The rule behind the POSIX lock fix: the database file is never opened outside SQLite, because
 /// on unix closing any descriptor of it drops every lock this process holds on it. Every std open
-/// in these two files is listed here, and none of them takes the database path.
+/// in these three files is listed here, and none of them takes the database path.
 #[test]
 fn the_database_file_is_never_opened_outside_sqlite() {
     let upgrade = production(include_str!("upgrade.rs"));
     let backup = production(include_str!("backup.rs"));
+    let storage = production(include_str!("../storage.rs"));
     let opens = [
         "File::open(",
+        "File::options(",
         "File::create(",
         "OpenOptions::new(",
         "fs::read(",
@@ -1230,6 +1321,17 @@ fn the_database_file_is_never_opened_outside_sqlite() {
         Vec::<String>::new(),
         "upgrade.rs opens a file"
     );
+    // `open_at` creates the database file exclusively: the open succeeds only for a brand-new
+    // file, which no connection can hold a lock on yet, and opens nothing when it exists. The
+    // other write is the no-lock marker, not the database.
+    assert_eq!(
+        calls(storage),
+        [
+            "match fs::OpenOptions::new()",
+            "let _ = fs::write(directory.join(NO_LOCK_MARKER), b\"\");",
+        ],
+        "a new std open in storage.rs: it must never be the database file"
+    );
     assert_eq!(
         calls(backup),
         [
@@ -1242,11 +1344,16 @@ fn the_database_file_is_never_opened_outside_sqlite() {
             "let mut file = create_private(&temp)?;",
             "create_private(partial)?;",
             "open_plain(partial, true)?.sync_all()?;",
-            // Test-only: the two-process gate's marker file.
+            // Test-only: the two-process test's marker files, in the data folder.
+            "let _ = fs::write(",
             "let _ = fs::write(data_directory.join(GATE_HELD), b\"\");",
         ],
         "a new std open in backup.rs: it must never be the database file"
     );
+    // The state file is written only inside the locked upgrade (`back_up`), and cleared only
+    // under the write lock (the post-commit cleanup and the v6 open finishing one a crash cut).
+    assert_eq!(upgrade.matches("backup::write_state(").count(), 1);
+    assert_eq!(upgrade.matches("backup::clear_state(").count(), 2);
     // The identity is read through SQLite on a connection it is given, and only stat-ed.
     let start = backup.find("pub(crate) fn source_id(").unwrap();
     let body = &backup[start..start + backup[start..].find("\n}\n").unwrap()];
@@ -1260,4 +1367,50 @@ fn the_database_file_is_never_opened_outside_sqlite() {
     ] {
         assert!(!body.contains(open), "source_id uses {open}");
     }
+}
+
+#[test]
+fn retry_resets_the_count_only_under_the_write_lock() {
+    let dir = Scratch::new("retrylock");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    set_fault(&dir, Some(Fault::ConvertError(0)));
+    for _ in 0..3 {
+        failed_backup(open6(&dir));
+    }
+    let state = dir.backups().join("upgrade-state.json");
+    let stopped = fs::read(&state).unwrap();
+    // Another window holds the write lock: Retry waits for it, gives up, and leaves the state
+    // file exactly as it was, still stopped.
+    set_test_busy_timeout(&dir, Some(Duration::from_millis(50)));
+    let writer = Connection::open(dir.database()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(matches!(
+        LocalStore::retry_upgrade(&dir),
+        Err(StorageError::UpgradeBusy)
+    ));
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(fs::read(&state).unwrap(), stopped);
+    assert!(matches!(
+        LocalStore::upgrade_status(&dir).unwrap(),
+        UpgradeStatus::Failed {
+            attempts: 3,
+            stopped: true,
+            ..
+        }
+    ));
+    assert!(matches!(open6(&dir), Err(StorageError::UpgradeStopped(_))));
+    // With the lock free, Retry counts this as attempt 1 of a new run: still failing, not stopped.
+    let (path, _) = failed_backup(LocalStore::retry_upgrade(&dir));
+    assert_eq!(
+        LocalStore::upgrade_status(&dir).unwrap(),
+        UpgradeStatus::Failed {
+            backup: path.display().to_string(),
+            attempts: 1,
+            stopped: false,
+        }
+    );
+    assert_eq!(baks(&dir).len(), 1, "Retry reuses the backup");
+    set_fault(&dir, None);
+    drop(LocalStore::retry_upgrade(&dir).unwrap());
+    assert_eq!(version_of(&dir.database()), V6);
 }

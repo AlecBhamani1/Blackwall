@@ -116,6 +116,10 @@ impl LocalStore {
     /// Opens the database at schema version `target`: 5, or 6, which upgrades an older database
     /// first (see `upgrade`). `open` stays at v5 until the switch-over.
     pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
+        Self::open_with(directory, target, false)
+    }
+    /// [`Self::open_at`]; `retry` is the Retry button, which lets a stopped v6 upgrade try again.
+    fn open_with(directory: &Path, target: i64, retry: bool) -> Result<Self, StorageError> {
         if target != SCHEMA_VERSION && target != upgrade::V6 {
             return Err(StorageError::Invalid(
                 "This version of Blackwall cannot open that storage format yet.",
@@ -168,7 +172,7 @@ impl LocalStore {
         }
         let connection = Connection::open(path)?;
         if target == upgrade::V6 {
-            return upgrade::open_v6(directory, connection);
+            return upgrade::open_v6(directory, connection, retry);
         }
         Self::initialize(connection)
     }

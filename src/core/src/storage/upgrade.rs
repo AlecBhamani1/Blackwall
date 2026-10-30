@@ -158,9 +158,11 @@ impl Summary {
 // ---- open ----
 
 /// Opens `connection` at v6, upgrading the database first when it is older.
+/// `retry` starts the attempt count again (the Retry button), under the write lock.
 pub(super) fn open_v6(
     directory: &Path,
     connection: Connection,
+    retry: bool,
 ) -> Result<LocalStore, StorageError> {
     let (busy, upgrade_busy) = busy_timeouts(directory);
     // `configure` already reads the schema, so it can be the step that finds the file busy.
@@ -176,10 +178,11 @@ pub(super) fn open_v6(
         return Err(StorageError::Invalid(NEWER_VERSION));
     }
     if version == V6 {
+        finish_interrupted_cleanup(directory, &connection);
         prune_expired_once(directory, &connection);
     } else {
         connection.busy_timeout(upgrade_busy)?;
-        let upgraded = upgrade(directory, &connection);
+        let upgraded = upgrade(directory, &connection, retry);
         connection.busy_timeout(BUSY_TIMEOUT)?;
         upgraded?;
     }
@@ -228,7 +231,9 @@ fn user_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
-fn upgrade(directory: &Path, connection: &Connection) -> Result<(), StorageError> {
+fn upgrade(directory: &Path, connection: &Connection, retry: bool) -> Result<(), StorageError> {
+    #[cfg(test)]
+    backup::fault(directory, backup::Fault::Locking)?;
     // Dropping `tx` on any early return rolls back.
     let tx = match write_tx(connection) {
         Err(error) if is_busy(&error) => return Err(StorageError::UpgradeBusy),
@@ -236,14 +241,15 @@ fn upgrade(directory: &Path, connection: &Connection) -> Result<(), StorageError
     };
     let version = user_version(&tx)?;
     if version == V6 {
-        return Ok(()); // another window upgraded it while this one waited
+        eprintln!("info: upgrade: found v6 after waiting; another window upgraded the chats");
+        return Ok(());
     }
     if version > V6 {
         return Err(StorageError::Invalid(NEWER_VERSION));
     }
     let now = SystemTime::now();
     let backup = if has_data(&tx, version)? {
-        Some(back_up(directory, &tx, version)?)
+        Some(back_up(directory, &tx, version, retry)?)
     } else {
         None
     };
@@ -290,14 +296,27 @@ fn has_data(tx: &Connection, version: i64) -> Result<bool, StorageError> {
 /// Makes (or reuses) the verified backup of the locked source and counts this attempt. The
 /// caller holds the write lock on `tx`, so the source cannot change while it is identified and
 /// copied, and the identity describes exactly what the backup holds.
-fn back_up(directory: &Path, tx: &Connection, version: i64) -> Result<Backup, StorageError> {
+///
+/// `upgrade-state.json` is only ever written here, under that lock. On `retry` the saved attempt
+/// count starts again at 0, so a stopped upgrade gets [`MAX_ATTEMPTS`] more tries.
+fn back_up(
+    directory: &Path,
+    tx: &Connection,
+    version: i64,
+    retry: bool,
+) -> Result<Backup, StorageError> {
     let dir = match backup::backups_dir(directory) {
         Err(StorageError::BackupFailed) => return Err(StorageError::Invalid(NOT_PRIVATE)),
         dir => dir?,
     };
     let database = directory.join(DATABASE_FILE);
     let source = backup::source_id(tx, &database)?;
-    let saved = backup::read_state(&dir).filter(|state| state.matches(&source, &dir));
+    let saved = backup::read_state(&dir)
+        .filter(|state| state.matches(&source, &dir))
+        .map(|state| UpgradeState {
+            attempts: if retry { 0 } else { state.attempts },
+            ..state
+        });
     let (made, attempts) = match saved {
         Some(state) if state.attempts >= MAX_ATTEMPTS => {
             return Err(StorageError::UpgradeStopped(dir.join(state.backup)));
@@ -471,6 +490,25 @@ fn clean_up(
     backup::clear_state(&dir)
 }
 
+/// A state file at v6 means an upgrade committed and then stopped (a crash) before its post-commit
+/// cleanup: finish it, under the write lock, keeping the backup the state names. Only a `stat`
+/// on the usual lock-free open; a failure is logged and the next open tries again.
+fn finish_interrupted_cleanup(directory: &Path, connection: &Connection) {
+    let dir = directory.join(BACKUPS_DIR);
+    if !backup::has_state(&dir) {
+        return;
+    }
+    let current = backup::read_state(&dir).map(|state| state.backup);
+    let finished = backup::backups_dir(directory).and_then(|dir| {
+        let _lock = write_tx(connection)?;
+        backup::prune(&dir, current.as_deref(), SystemTime::now(), None, None)?;
+        backup::clear_state(&dir)
+    });
+    if let Err(error) = finished {
+        eprintln!("warn: upgrade: could not finish an interrupted cleanup: {error:?}");
+    }
+}
+
 /// With [`DELETE_BACKUPS_AFTER`] set, a v6 open deletes expired backups, once per process.
 fn prune_expired_once(directory: &Path, connection: &Connection) {
     static PRUNED: OnceLock<()> = OnceLock::new();
@@ -608,9 +646,9 @@ impl LocalStore {
     /// rolls straight back.
     ///
     /// - A window holding the write lock may be upgrading right now: `Pending`, never `Failed`.
-    /// - A crashed upgrade leaves a hot `-journal` that a read-only connection cannot roll back,
-    ///   and page 1 is not restored yet, so the source cannot be matched: the state file is
-    ///   reported as it stands. The next open rolls the journal back.
+    /// - A crashed upgrade leaves a hot `-journal` that a read-only connection cannot roll back, so
+    ///   the source cannot be read and matched: the state file is reported as it stands. The next
+    ///   open rolls the journal back.
     pub fn upgrade_status(directory: &Path) -> Result<UpgradeStatus, StorageError> {
         let path = directory.join(DATABASE_FILE);
         if fs::symlink_metadata(&path).is_err() {
@@ -671,15 +709,12 @@ impl LocalStore {
         })
     }
 
-    /// The Retry button: the attempt count starts again at 0, then the database opens at v6.
+    /// The Retry button: the database opens at v6, and the upgrade that runs starts its attempt
+    /// count again at 0.
     pub fn retry_upgrade(directory: &Path) -> Result<Self, StorageError> {
-        if let Some(mut state) = backup::read_state(&directory.join(BACKUPS_DIR)) {
-            if state.attempts > 0 {
-                state.attempts = 0;
-                backup::write_state(&backup::backups_dir(directory)?, &state)?;
-            }
-        }
-        Self::open_at(directory, V6)
+        // The count is reset inside the upgrade, under the write lock (never here, where another
+        // window's upgrade could be writing the same state file).
+        Self::open_with(directory, V6, true)
     }
 }
 

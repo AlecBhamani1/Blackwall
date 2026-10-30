@@ -279,29 +279,6 @@ fn create_private_dir(dir: &Path) -> Result<(), StorageError> {
 
 // ---- the source ----
 
-/// What identifies a source database, read through SQLite on `connection`.
-///
-/// NEVER open the database file outside SQLite. On unix, closing ANY descriptor of a file drops
-/// every POSIX lock the process holds on it ("How To Corrupt An SQLite Database", 2.2), and the
-/// app keeps other connections to this file in the same process (v5 opens one per command; a
-/// run's writer can be active while Settings asks for the upgrade status). So nothing here opens
-/// the file: the size and mtime come from `stat`, which opens no descriptor, and the rest is SQL.
-///
-/// `source_hash` covers everything a restore would bring back, table by table, so a new table
-/// cannot fall through:
-/// - `user_version`, `page_count` and `freelist_count`;
-/// - `sessions`: each row's id, `updated_at` and body length, ordered by id. Every v5 chat write
-///   (save, delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
-///   milliseconds, so two saves in one millisecond can share one; the body length tells those
-///   apart for free, because `octet_length` reads it from the row header without loading the
-///   body;
-/// - every other ordinary table in `sqlite_master` (settings, memory, proposals, paired devices,
-///   FTS shadow tables): every row in full, in rowid order, or primary-key order for a WITHOUT
-///   ROWID table. Not the `sqlite_%` internals, not virtual tables (their rows live in their
-///   shadow tables, which are hashed), and not [`DERIVED_TABLES`].
-///
-/// The caller reads it inside one transaction so the parts agree; the upgrade, under its write
-/// lock, so it describes exactly what the backup copies.
 /// Tables rebuilt from `sessions`, skipped by [`source_id`]: v5's recall index
 /// (`session_messages`, which the deferred v5 backfill rewrites on any open, `indexed_sessions`,
 /// and the shadow tables of `message_search`, its external-content FTS). They hold nothing a
@@ -315,6 +292,25 @@ const DERIVED_TABLES: [&str; 6] = [
     "message_search_config",
 ];
 
+/// What identifies a source database, read through SQLite on `connection`.
+///
+/// NEVER open the database file outside SQLite. On unix, closing ANY descriptor of a file drops
+/// every POSIX lock the process holds on it ("How To Corrupt An SQLite Database", 2.2), and the
+/// app keeps other connections to this file in the same process (v5 opens one per command; a
+/// run's writer can be active while Settings asks for the upgrade status). So nothing here opens
+/// the file: the size and mtime come from `stat`, which opens no descriptor, and the rest is SQL.
+///
+/// `source_hash` covers everything a restore would bring back, table by table, so a new table
+/// cannot fall through:
+/// - `user_version`, `page_count` and `freelist_count`;
+/// - the content of every table, by [`hash_tables`].
+///
+/// [`DERIVED_TABLES`] are skipped at the content level only: a write to them still moves
+/// `page_count`, `freelist_count` and the size, so it can still change the identity. That errs
+/// the safe way (at worst one more verified backup).
+///
+/// The caller reads it inside one transaction so the parts agree; the upgrade, under its write
+/// lock, so it describes exactly what the backup copies.
 pub(crate) fn source_id(
     connection: &Connection,
     database: &Path,
@@ -328,10 +324,32 @@ pub(crate) fn source_id(
         let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
         hash.update(format!("{pragma}={value};"));
     }
+    hash_tables(connection, &mut hash)?;
+    Ok(SourceId {
+        size: meta.len(),
+        mtime_ms: meta.modified().map(millis).unwrap_or(0),
+        source_hash: hex(&hash.finalize()),
+    })
+}
+
+/// Adds the content of every table in `main` to `hash`:
+/// - `sessions`: each row's id, `updated_at` and body length, ordered by id. Every v5 chat write
+///   (save, delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
+///   milliseconds, so two saves in one millisecond can share one; the body length tells those
+///   apart for free, because `octet_length` reads it from the row header without loading the
+///   body.
+/// - every other ordinary or shadow table (settings, memory, proposals, paired devices, FTS
+///   shadow tables): every row in full, in rowid order, or primary-key order for a WITHOUT ROWID
+///   table. Not the `sqlite_%` internals, not virtual tables (`pragma_table_list` type
+///   `virtual`; their rows live in their shadow tables, which are hashed), and not
+///   [`DERIVED_TABLES`].
+fn hash_tables(connection: &Connection, hash: &mut Sha256) -> Result<(), StorageError> {
     let tables: Vec<String> = connection
         .prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
-             AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name",
+            "SELECT name FROM pragma_table_list
+             WHERE schema='main' AND type IN ('table','shadow')
+               AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+             ORDER BY name",
         )?
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
@@ -340,10 +358,10 @@ pub(crate) fn source_id(
             continue;
         }
         let query = if table == "sessions" {
-            "SELECT id, updated_at, octet_length(body) FROM sessions ORDER BY id".to_owned()
+            "SELECT id, updated_at, octet_length(body) FROM main.sessions ORDER BY id".to_owned()
         } else {
             format!(
-                "SELECT * FROM {} ORDER BY {}",
+                "SELECT * FROM main.{} ORDER BY {}",
                 quoted(&table),
                 row_order(connection, &table)?
             )
@@ -356,15 +374,11 @@ pub(crate) fn source_id(
         while let Some(row) = rows.next()? {
             hash.update(b"row");
             for column in 0..columns {
-                feed(&mut hash, row.get_ref(column)?);
+                feed(hash, row.get_ref(column)?);
             }
         }
     }
-    Ok(SourceId {
-        size: meta.len(),
-        mtime_ms: meta.modified().map(millis).unwrap_or(0),
-        source_hash: hex(&hash.finalize()),
-    })
+    Ok(())
 }
 
 /// `rowid`, or for a WITHOUT ROWID table its primary-key columns in key order.
@@ -378,7 +392,7 @@ fn row_order(connection: &Connection, table: &str) -> Result<String, StorageErro
         return Ok("rowid".into());
     }
     let keys: Vec<String> = connection
-        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+        .prepare("SELECT name FROM pragma_table_info(?1,'main') WHERE pk>0 ORDER BY pk")?
         .query_map([table], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     Ok(keys
@@ -399,8 +413,12 @@ fn feed(hash: &mut Sha256, value: ValueRef<'_>) {
         ValueRef::Null => hash.update(b"n"),
         ValueRef::Integer(n) => hash.update(format!("i{n};")),
         ValueRef::Real(x) => hash.update(format!("r{};", x.to_bits())),
-        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+        ValueRef::Text(bytes) => {
             hash.update(format!("t{}:", bytes.len()));
+            hash.update(bytes);
+        }
+        ValueRef::Blob(bytes) => {
+            hash.update(format!("b{}:", bytes.len()));
             hash.update(bytes);
         }
     }
@@ -450,6 +468,11 @@ pub(crate) fn write_state(dir: &Path, state: &UpgradeState) -> Result<(), Storag
     cleanup.keep();
     sync_dir(dir)?;
     Ok(())
+}
+
+/// Whether a state file (or anything else) sits where it belongs. A `stat`, which opens nothing.
+pub(crate) fn has_state(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(STATE_FILE)).is_ok()
 }
 
 /// Removes the state once the upgrade has committed. A link there is removed, not followed.
@@ -824,6 +847,9 @@ pub(crate) enum Fault {
     /// [`GATE_HELD`] in the data folder and waits until [`GATE_RELEASE`] exists there. Files, not
     /// sleeps, so a test that drives several processes can order them on any runner.
     Gate,
+    /// The point just before the upgrade asks for the write lock. Under [`Fault::Gate`] the
+    /// process marks it with a `locking-<pid>` file in the data folder.
+    Locking,
 }
 
 /// The file the gated process creates once it is holding the upgrade's write lock.
@@ -874,6 +900,13 @@ pub(crate) fn fault(data_directory: &Path, point: Fault) -> Result<(), StorageEr
     match (armed, point) {
         (Some(Fault::Slow(pause)), Fault::Slow(_)) => {
             std::thread::sleep(pause);
+            Ok(())
+        }
+        (Some(Fault::Gate), Fault::Locking) => {
+            let _ = fs::write(
+                data_directory.join(format!("locking-{}", std::process::id())),
+                b"",
+            );
             Ok(())
         }
         (Some(Fault::Gate), Fault::Slow(_)) => {
@@ -1256,8 +1289,15 @@ mod tests {
             "a new table",
             "CREATE TABLE later(x); INSERT INTO later VALUES (1)",
         );
-        // The recall index is rebuilt from `sessions`: its writes are not part of the identity.
-        let before = hash();
+        // The recall index is rebuilt from `sessions`: its content is not part of the identity.
+        // (Skipping it is content-level only: its writes still move page_count, freelist_count
+        // and the size, which can change the whole identity. That errs the safe way.)
+        let content = || {
+            let mut hash = Sha256::new();
+            hash_tables(&db, &mut hash).unwrap();
+            hex(&hash.finalize())
+        };
+        let before = content();
         db.execute_batch(
             "INSERT INTO sessions VALUES ('s','S',1,'{}');
              INSERT INTO indexed_sessions VALUES ('s',NULL,'chat');
@@ -1265,11 +1305,28 @@ mod tests {
                  VALUES ('s','m',0,'user','needle');",
         )
         .unwrap();
-        let with_chat = hash();
+        let with_chat = content();
         assert_ne!(with_chat, before, "the chat itself counts");
         db.execute_batch("DELETE FROM session_messages; DELETE FROM indexed_sessions;")
             .unwrap();
-        assert_eq!(hash(), with_chat, "the recall index does not");
+        assert_eq!(content(), with_chat, "the recall index does not");
+    }
+
+    #[test]
+    fn text_and_a_blob_of_the_same_bytes_hash_differently() {
+        let data = Data::new();
+        let db = data.source();
+        db.execute_batch("CREATE TABLE v(x); INSERT INTO v VALUES ('abc');")
+            .unwrap();
+        let text = source_id(&db, &data.db()).unwrap().source_hash;
+        db.execute_batch("UPDATE v SET x=CAST('abc' AS BLOB)")
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT typeof(x) FROM v", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "blob"
+        );
+        assert_ne!(source_id(&db, &data.db()).unwrap().source_hash, text);
     }
 
     fn touch(dir: &Path, name: &str) {
