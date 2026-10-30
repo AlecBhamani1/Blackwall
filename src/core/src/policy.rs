@@ -16,6 +16,8 @@ const MAX_AUDIT_BYTES: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How much of each owner command tool argument the audit keeps.
 const MAX_AUDIT_ARG: usize = 1000;
+/// How many bytes of owner command tool arguments one audit record keeps in all.
+const MAX_AUDIT_ARGS_BYTES: usize = 8 * 1024;
 /// Options whose next word is a credential.
 const SECRET_OPTIONS: [&str; 5] = ["-u", "--user", "--password", "--token", "--api-key"];
 
@@ -831,7 +833,6 @@ pub(crate) fn normalize(path: &str) -> Option<PathBuf> {
     Some(normal)
 }
 
-/// Redact credentials line by line, keeping line breaks.
 /// An owner command tool's call, for its audit record: the absolute program, the tool, where it
 /// runs, its arguments after the program, the pass-through names it gets, and the SHA-256 of
 /// its standard input. Never a variable's value; arguments are redacted as a subject is.
@@ -848,25 +849,35 @@ pub(crate) struct ProgramCall<'a> {
 }
 
 /// Each argument [`redact`]ed, and the one after a credential option or `Bearer` hidden whole.
-/// Each is cut at [`MAX_AUDIT_ARG`] characters, so a long prompt cannot crowd out the log.
+/// Each is cut at [`MAX_AUDIT_ARG`] characters, and once they reach [`MAX_AUDIT_ARGS_BYTES`] the
+/// rest are counted in a final `…(N more args)`, so calls the log records without a prompt, such
+/// as denied ones, cannot rotate older records away.
 fn redact_args(args: &[String]) -> Vec<String> {
     let mut hide_next = false;
-    args.iter()
-        .map(|arg| {
-            let lower = arg.to_ascii_lowercase();
-            let shown = match hide_next {
-                true => "[redacted]".to_owned(),
-                false => redact(arg),
-            };
-            hide_next = lower.ends_with("bearer") || SECRET_OPTIONS.contains(&lower.as_str());
-            match shown.chars().nth(MAX_AUDIT_ARG) {
-                Some(_) => shown.chars().take(MAX_AUDIT_ARG).chain(['…']).collect(),
-                None => shown,
-            }
-        })
-        .collect()
+    let mut total = 0;
+    let mut kept = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        let lower = arg.to_ascii_lowercase();
+        let shown = match hide_next {
+            true => "[redacted]".to_owned(),
+            false => redact(arg),
+        };
+        hide_next = lower.ends_with("bearer") || SECRET_OPTIONS.contains(&lower.as_str());
+        let shown: String = match shown.chars().nth(MAX_AUDIT_ARG) {
+            Some(_) => shown.chars().take(MAX_AUDIT_ARG).chain(['…']).collect(),
+            None => shown,
+        };
+        total += shown.len();
+        if total > MAX_AUDIT_ARGS_BYTES {
+            kept.push(format!("…({} more args)", args.len() - index));
+            break;
+        }
+        kept.push(shown);
+    }
+    kept
 }
 
+/// Redact credentials line by line, keeping line breaks.
 pub(crate) fn redact_text(text: &str) -> String {
     text.lines().map(redact).collect::<Vec<_>>().join("\n")
 }
@@ -968,6 +979,51 @@ mod tests {
         let long = redact_args(&["é".repeat(MAX_AUDIT_ARG + 5)]);
         assert_eq!(long[0].chars().count(), MAX_AUDIT_ARG + 1);
         assert!(long[0].ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn an_owner_tool_record_stays_small_with_the_most_and_longest_arguments() {
+        let mut policy = policy(r#"{"rules":[]}"#);
+        policy.audit = std::env::temp_dir().join(format!(
+            "blackwall-audit-cap-{}.jsonl",
+            rand::random::<u64>()
+        ));
+        // A tool's longest command line: 64 arguments of 8,000 bytes each.
+        let args: Vec<String> = (0..64)
+            .map(|i| format!("{i:02}{}", "x".repeat(7998)))
+            .collect();
+        let call = ProgramCall {
+            program: Path::new("/usr/bin/tool"),
+            tool: "review",
+            isolation: crate::command_tools::Isolation::Outside,
+            args: &args,
+            env: &[],
+            stdin_sha256: None,
+            overridden: false,
+        };
+        policy
+            .record_program(
+                ApprovalKind::Exec,
+                "tool {a}",
+                Some(&call),
+                Decision::Deny,
+                false,
+                None,
+                None,
+            )
+            .await;
+        let line = tokio::fs::read_to_string(&policy.audit).await.unwrap();
+        let _ = tokio::fs::remove_file(&policy.audit).await;
+        assert!(line.len() < 10 * 1024, "{} bytes", line.len());
+        let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(record["tool"], "review");
+        assert_eq!(record["isolation"], "outside");
+        assert_eq!(record["program"], "/usr/bin/tool");
+        let shown = record["args"].as_array().unwrap();
+        let kept = shown.len() - 1;
+        assert!((1..64).contains(&kept), "{kept}");
+        assert_eq!(shown[kept], format!("…({} more args)", 64 - kept));
+        assert!(shown[0].as_str().unwrap().starts_with("00x"));
     }
 
     fn policy(body: &str) -> Policy {

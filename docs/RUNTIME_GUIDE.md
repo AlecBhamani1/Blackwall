@@ -294,7 +294,8 @@ decided, as `{"source":"user"|"project","index":N,"mode":"strictest"|"ordered"}`
 from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default. A
 record for an owner command tool also has `program`, the absolute path of the program it ran;
 `tool`; `isolation` (`outside` or `sandboxed`); `args`, the arguments after the program, redacted
-like the rest and each cut at 1,000 characters; `env`, the names of the variables it was passed
+like the rest, each cut at 1,000 characters, and after 8 KiB in all the rest counted as
+`…(N more args)`; `env`, the names of the variables it was passed
 (never their values); and `stdinSha256` when it was sent standard input. When an allow rule
 matches a tool that always asks, `rule` names that rule and `"overridden": true` says it did not
 decide.
