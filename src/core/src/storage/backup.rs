@@ -279,6 +279,11 @@ fn create_private_dir(dir: &Path) -> Result<(), StorageError> {
 
 /// Size, mtime and the SHA-256 of page 1 of `database`. The page size comes from header bytes
 /// 16-17 (big endian; 1 means 65536).
+///
+/// Never call this while any connection in this process holds a lock on `database`. On unix,
+/// closing ANY descriptor of a file drops every POSIX lock the process holds on it ("How To
+/// Corrupt An SQLite Database", 2.2), so a write lock would silently pass to another process.
+/// The upgrade reads it before `BEGIN IMMEDIATE` and checks `data_version` after.
 pub(crate) fn source_id(database: &Path) -> Result<SourceId, StorageError> {
     // Followed like SQLite follows it: this describes the file SQLite will convert.
     let mut file = File::open(database)?;
@@ -723,6 +728,8 @@ pub(crate) enum Fault {
     /// [`GATE_HELD`] in the data folder and waits until [`GATE_RELEASE`] exists there. Files, not
     /// sleeps, so a test that drives several processes can order them on any runner.
     Gate,
+    /// Another connection commits between the upgrade's read of the source and its write lock.
+    RaceBeforeLock,
 }
 
 /// The file the gated process creates once it is holding the upgrade's write lock.

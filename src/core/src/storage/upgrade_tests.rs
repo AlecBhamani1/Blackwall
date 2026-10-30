@@ -918,16 +918,7 @@ fn crash_child() {
     std::process::exit(SURVIVED);
 }
 
-// BLOCKED on Unix by a production bug this test found: `backup::source_id` opens the database with
-// `File::open` while `upgrade` holds SQLite's write lock, and closing that descriptor drops every
-// POSIX lock the process holds on the file. A second process then takes the write lock and makes
-// its own backup mid-upgrade. Windows locks belong to the handle, so it runs there. Remove the
-// `ignore` when `source_id` stops releasing the lock (see task-A11-report.md).
 #[test]
-#[cfg_attr(
-    unix,
-    ignore = "fails until backup::source_id stops dropping the POSIX write lock (task-A11-report.md)"
-)]
 fn two_processes_opening_one_v5_database_one_migrates_and_the_other_waits() {
     let dir = Scratch::new("two");
     let sessions = v5_sessions();
@@ -1160,4 +1151,66 @@ fn a_v5_delete_on_v6_cascades_cleanly() {
     // Every other chat is whole.
     let rest: Vec<Value> = sessions.into_iter().filter(|s| s["id"] != id).collect();
     assert_chats_intact(&open6(&dir).unwrap(), &rest);
+}
+
+/// A regression test for the POSIX lock drop: once the upgrading process has its backup made (its
+/// source identified, the backup copied, the state written), the write lock is still its own, and
+/// another process cannot take it.
+#[test]
+fn another_process_cannot_take_the_write_lock_from_an_upgrade_in_progress() {
+    let dir = Scratch::new("heldlock");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    let sync = Scratch::new("heldlock-sync");
+    fs::create_dir_all(&sync.0).unwrap();
+    let mut children = Reaper(vec![spawn_child(
+        "storage::upgrade::tests::upgrade_child",
+        &sync.0.join("a.log"),
+        &[
+            (CHILD_DIR, dir.to_str().unwrap()),
+            (CHILD_SYNC, sync.to_str().unwrap()),
+            (CHILD_NAME, "a"),
+        ],
+    )]);
+    wait_for(&sync.0.join("a.ready"), &mut children.0);
+    fs::write(sync.0.join("go"), b"").unwrap();
+    wait_for(&dir.0.join(backup::GATE_HELD), &mut children.0);
+    let other = Connection::open(dir.database()).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    let taken = other.execute_batch("BEGIN IMMEDIATE");
+    let _ = other.execute_batch("ROLLBACK");
+    drop(other);
+    fs::write(dir.0.join(backup::GATE_RELEASE), b"").unwrap();
+    let child = children.0.pop().unwrap();
+    let status = wait_exit(child);
+    let log = fs::read_to_string(sync.0.join("a.log")).unwrap();
+    assert!(
+        matches!(&taken, Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy),
+        "another process took the upgrade's write lock: {taken:?}"
+    );
+    assert!(status.success(), "{status:?}\n{log}");
+    assert_eq!(version_of(&dir.database()), V6);
+}
+
+#[test]
+fn a_commit_between_reading_the_source_and_the_lock_is_noticed() {
+    let dir = Scratch::new("race");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    // Another connection commits after every read of the source: each try sees it and starts
+    // over, so the upgrade never runs on a stale source and gives up after its last try.
+    set_fault(&dir, Some(Fault::RaceBeforeLock));
+    assert!(matches!(open6(&dir), Err(StorageError::UpgradeBusy)));
+    assert_eq!(version_of(&dir.database()), 5);
+    let raced: i64 = Connection::open(dir.database())
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM settings WHERE key LIKE 'raced-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raced, SOURCE_READS as i64);
+    assert_eq!(baks(&dir), Vec::<String>::new());
+    set_fault(&dir, None);
+    drop(open6(&dir).unwrap());
+    assert_eq!(version_of(&dir.database()), V6);
 }
