@@ -250,7 +250,18 @@ pub(crate) fn resolve_assistant(rows: &Index<'_>, seq: i64) -> Result<Value, Vie
         .ok_or(ViewError::BadRef { seq })?;
     if let Some(full) = body.get("full") {
         only(&row.body, &["run", "full"], seq)?;
-        return Ok(full.clone());
+        return full
+            .is_object()
+            .then(|| full.clone())
+            .ok_or(ViewError::BadBody { seq });
+    }
+    // Content and status come only from the terminal; the start owns the rest.
+    let complete = body.contains_key("content") && body.contains_key("status");
+    let overrides = ["id", "role", "createdAt", "attachments"]
+        .iter()
+        .any(|key| body.contains_key(*key));
+    if !complete || overrides {
+        return Err(ViewError::BadBody { seq });
     }
     let mut message = progress(rows, run)?;
     for (key, value) in body.iter().filter(|(key, _)| *key != "run") {
@@ -315,8 +326,9 @@ fn list(value: &Value, seq: i64) -> Result<&Vec<Value>, ViewError> {
     value.as_array().ok_or(ViewError::BadBody { seq })
 }
 
-/// Resolves each tool residual in `tools` and upserts it into the message's tools by `id`: a
-/// known id is replaced in place, a new one goes last.
+/// Resolves each tool residual in `tools` and upserts it into the message's tools by `id`, as
+/// `RunFold` does: an instructions entry is removed and re-appended, so it moves to the end; any
+/// other known id is replaced in place, and a new one goes last (ruling A4-r1).
 fn upsert(
     rows: &Index<'_>,
     message: &mut Map<String, Value>,
@@ -330,12 +342,24 @@ fn upsert(
         let Value::Array(known) = message.entry("tools").or_insert_with(|| json!([])) else {
             return Err(ViewError::BadBody { seq });
         };
+        if is_instructions(&tool) {
+            known.retain(|known| known.get("id") != Some(&id));
+        }
         match known.iter_mut().find(|known| known.get("id") == Some(&id)) {
             Some(known) => *known = tool,
             None => known.push(tool),
         }
     }
     Ok(())
+}
+
+/// The synthetic tool `RunFold` makes for `InstructionsLoaded`: named `project_instructions`, with
+/// the id `instructions` or `instructions_<agent>`.
+fn is_instructions(tool: &Value) -> bool {
+    tool["name"] == "project_instructions"
+        && tool["id"]
+            .as_str()
+            .is_some_and(|id| id == "instructions" || id.starts_with("instructions_"))
 }
 
 /// A `content` field: a string, or `{turns, tail?}` rebuilt with the agent's accumulator.
@@ -937,6 +961,86 @@ mod tests {
     }
 
     #[test]
+    fn a_reloaded_instructions_entry_moves_to_the_end_as_fold_run_does() {
+        use crate::run_fold::{fold_run, RunEnd};
+        let fixture: Value =
+            serde_json::from_str(include_str!("../run_fold/assistant_runs.json")).unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "instructions_replaced")
+            .unwrap();
+        let events: Vec<crate::protocol::AgentEvent> =
+            serde_json::from_value(case["events"].clone()).unwrap();
+        let (id, created_at) = (
+            case["id"].as_str().unwrap(),
+            case["createdAt"].as_i64().unwrap(),
+        );
+        let fold = |events: &[crate::protocol::AgentEvent], end: Option<&RunEnd>| {
+            fold_run(id, created_at, AssistantShape::Desktop, events, end)
+        };
+        // The first batch ends after the tool result; the second after the last reload.
+        let first = fold(&events[..4], None);
+        let open = fold(&events, None);
+        assert_eq!(
+            first["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| &t["id"])
+                .collect::<Vec<_>>(),
+            ["instructions", "0_0_r"]
+        );
+        assert_eq!(
+            open["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| &t["id"])
+                .collect::<Vec<_>>(),
+            ["0_0_r", "instructions_child-1", "instructions"]
+        );
+        let mut rows = vec![
+            user(0, "u", "Read it"),
+            reference(1, 0),
+            start(2, id, created_at, 0),
+            model(
+                3,
+                json!({"role": "assistant", "content": "Reading 🦀", "tool_calls": [
+                    {"id": "0_0_r", "type": "function",
+                     "function": {"name": "read_file", "arguments": "{\"path\":\"sub/x.rs\"}"}},
+                ]}),
+            ),
+            model(
+                4,
+                json!({"role": "tool", "tool_call_id": "0_0_r", "content": "fn x() {}"}),
+            ),
+            progress(
+                5,
+                json!({"run": 2, "tools": [
+                    first["tools"][0],
+                    {"id": "0_0_r", "call": [3, 0], "result": 4, "contentOffset": 10, "status": "complete"},
+                ]}),
+            ),
+            said(6, "Done."),
+            progress(
+                7,
+                json!({"run": 2, "tools": [open["tools"][1], open["tools"][2]]}),
+            ),
+        ];
+        assert_eq!(view(&rows).messages[1], open);
+
+        let complete = fold(&events, Some(&RunEnd::Complete));
+        assert_eq!(complete, case["expected"]);
+        rows.push(assistant(
+            8,
+            json!({"run": 2, "content": {"turns": [3, 6]}, "status": "complete"}),
+        ));
+        assert_eq!(view(&rows).messages[1], complete);
+    }
+
+    #[test]
     fn the_transcript_is_the_first_model_len_rows_from_model_from() {
         let rows = [
             said(0, "old"),
@@ -1018,7 +1122,7 @@ mod tests {
         );
 
         let terminal = |seq: i64, residual: Value| {
-            let mut body = json!({"run": 2, "status": "complete"});
+            let mut body = json!({"run": 2, "content": "done", "status": "complete"});
             body.as_object_mut()
                 .unwrap()
                 .extend(residual.as_object().unwrap().clone());
@@ -1121,6 +1225,19 @@ mod tests {
             )],
             ViewError::BadBody { seq: 7 },
         );
+
+        // A terminal must carry content and status, and may not set what the start set.
+        for residual in [
+            json!({"run": 2, "status": "complete"}),
+            json!({"run": 2, "content": "done"}),
+            json!({"run": 2, "content": "done", "status": "complete", "id": "b"}),
+            json!({"run": 2, "content": "done", "status": "complete", "role": "user"}),
+            json!({"run": 2, "content": "done", "status": "complete", "createdAt": 1}),
+            json!({"run": 2, "content": "done", "status": "complete", "attachments": []}),
+            json!({"run": 2, "full": "not a message"}),
+        ] {
+            fails(vec![assistant(7, residual)], ViewError::BadBody { seq: 7 });
+        }
 
         // An assistant echo whose run terminal is broken is broken too.
         fails(
