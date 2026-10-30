@@ -560,11 +560,35 @@ System runtime reads include `/System`, `/usr`, `/bin`, `/sbin`, and `/opt/homeb
 external source trees, home-installed runtimes and shared temporary folders are not granted. Put
 build output and scratch files inside the project when using workspace-write.
 
+On Linux, Read-only runs each command under bubblewrap, which ships with the AppImage and the
+`.deb` (bubblewrap 0.13.1, LGPL, run as a separate program); a system `bwrap` is used only when it
+is version 0.12.0 or newer. A `bwrap` is trusted only when root owns it and the folders above it
+and nobody else can write to them; the one inside the running AppImage is the exception. The `.deb`
+also installs an AppArmor profile, where the system's AppArmor accepts it, that gives only the
+bundled `bwrap` user namespaces and mounts, and the programs it runs no capabilities. The command
+sees the system folders (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, Linuxbrew), a short list of
+`/etc` files (certificates, `resolv.conf`, `hosts`, `passwd` and the like) and a private `/tmp`,
+with no `/run` and no home folder. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
+`.blackwall`, `.ssh`, `.aws`, `.gnupg`, `.config`, `.codex`, `.claude` and `.agents` are hidden;
+inside `node_modules`, `target`, `.venv`, `venv`, `__pycache__`, `dist` and `build`, only their
+direct children are checked for those names. Commands cannot open Unix-domain or VSOCK sockets, so
+they cannot reach the desktop session or a container daemon. They also cannot create user
+namespaces or use `io_uring`. The network is off unless Command network is on. The project cannot
+be your home folder, a folder that contains it, or `/`; Blackwall's data folder cannot be inside
+the project; and a project with more than 500,000 files and folders is refused, with the message
+naming its largest folder. Workspace-write is not available on Linux yet: the selector turns it
+off and `bw` refuses it.
+
+If bubblewrap is missing, too old or not trusted, Read-only stays selectable with a note to install
+it, and commands fail closed without running. This is checked before the approval prompt. Blackwall
+runs a real sandboxed command when it starts; if that fails, the note says "Bubblewrap didn't start
+just now. Try again in a moment." and it tries again after 30 seconds.
+
 Approval still applies to commands, including exact command text and working folder. Approval or
 an allow rule never widens the profile. A denied action must be reported to the owner; change the
-profile explicitly before proposing it again. A missing/broken macOS backend fails closed with no
-unsandboxed retry. Linux and Windows currently fail closed for restricted profiles; full account
-execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
+profile explicitly before proposing it again. A missing/broken macOS or Linux backend fails
+closed with no unsandboxed retry. Windows currently fails closed for restricted profiles; full
+account execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
 Windows uses Windows PowerShell.
 
 Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
@@ -591,7 +615,7 @@ credentials from reaching a program that does not need them.
 - An unsandboxed shell command runs with your environment (`SSH_AUTH_SOCK`, `KUBECONFIG`,
   `AWS_PROFILE`, `DISPLAY` and so on), minus Blackwall's own keys, loader and code-injection
   variables, and the AppImage runtime's (`APPDIR`, `APPIMAGE`, `ARGV0`, `OWD` and similar). On
-  Linux every shell command currently runs unsandboxed, so this applies to all of them.
+  Linux this applies to shell commands run under Unsandboxed.
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
 - A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and

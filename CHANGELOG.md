@@ -9,6 +9,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- On Linux, Read-only commands now run in a sandbox: the project is read-only with `.git`, `.ssh`
+  and the other protected folders hidden, there is no home folder, only the system folders and a
+  short list of `/etc` files are visible, `/tmp` is private, Unix-domain sockets are blocked and
+  the network is off unless Command network is on. It uses the bundled bubblewrap, or a root-owned
+  system one of version 0.12.0 or newer. Without one, the note asks you to install bubblewrap and
+  commands fail closed. A project that is your home folder, contains it, or has more than 500,000
+  files is refused. Workspace-write is not available on Linux yet and is turned off there.
 - The Linux packages bundle bubblewrap 0.13.1 for sandboxed commands at `/usr/lib/blackwall/bwrap`
   (not setuid, built in CI from the release tarball whose SHA-256 is pinned; LGPL-2.0-or-later,
   license text under `/usr/share/doc/blackwall/bubblewrap/`, see `NOTICE`). Where the system's
