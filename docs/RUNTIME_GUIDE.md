@@ -331,6 +331,15 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 ]}
 ```
 
+**Environment.** A command tool starts with a short allow-listed environment, not Blackwall's own
+(see [Child environments](#child-environments)). To pass your own variables through, list their
+names: `"env":["GITHUB_TOKEN","HTTPS_PROXY"]`. Names only, never values; at most 32 distinct names,
+and the variable must be set where Blackwall runs. Only you can write this list, and HTTP tools
+take no `env`. A command tool run in a restricted (sandboxed) profile ignores `env` and gets only
+the sandbox set; the names apply when it runs unsandboxed. A name that loads code into a program
+(`LD_*`, `DYLD_*`, `PYTHONPATH`, `NODE_OPTIONS`, `BASH_ENV` and similar), `PATH`, or one of
+Blackwall's own secrets is refused, and the file is invalid.
+
 **Argument schemas.** Without `parameters`, each placeholder is a required text parameter. A tool
 with `"stdin":"json"` or `"body":"json"` and no `parameters` then takes exactly those names, each a
 string; anything else is refused, since the whole object reaches the program or service. With
@@ -404,11 +413,25 @@ names are invalid or already used are skipped with a warning. Every call needs E
 rules match the namespaced name, so `{"decision":"allow","kind":"exec","command":"files__read_text_file"}`
 allows that tool; server descriptions and hints never grant permission. Calls use the command time
 limit, and a server that times out is not used again in that run. Text results are returned to the
-model; other content is noted but omitted. Servers inherit your environment without the
-credentials Blackwall itself uses. A server that needs an access token lists its environment
-variable name under `secrets`; the value lives only in the platform credential store and is given to
-that server's process when it starts. If the file is invalid, a secret is missing, or a server does
-not start, the run continues without those tools and shows a warning.
+model; other content is noted but omitted. A server starts with an allow-listed environment (see
+[Child environments](#child-environments)), not a copy of yours. If it needs a variable such as a
+proxy setting or a token you already export, list its name under `env`:
+`"env":["GITHUB_TOKEN"]`. Names only, never values; at most 32 distinct names, and the variable must
+be set where Blackwall runs. Only you can set `env`: a server added by a project's
+`.blackwall/project.json` cannot use it, and a server with a `url` takes no `env` (use `headers`).
+A name that loads code into a program (`LD_*`, `DYLD_*`, `PYTHONPATH`, `NODE_OPTIONS` and similar),
+`PATH`, or one of Blackwall's own secrets is refused, and the file is invalid. A server that needs an
+access token can also list its environment variable name under `secrets`; the value lives only in
+the platform credential store and is given to that server's process when it starts. If the file is
+invalid, a secret is missing, or a server does not start, the run continues without those tools and
+shows a warning.
+
+When a server does not start, the tool card's details show the last lines of its error output and
+the variable names it was not given, so a missing `env` entry is easy to spot. The text has
+terminal escape sequences removed, is capped at 2 KiB, and has the server's secrets redacted. Only
+you see it: it is not sent to the model, saved in the conversation or traced. `bw` prints it under
+the warning as `  details: …` on standard error, also with `bw run --json`, whose JSON on
+standard output never includes it.
 
 A server offered as a web address uses MCP streamable HTTP (protocol 2025-06-18) instead of a
 command. Give it a `url`, and `headers` whose values each name a saved secret:
@@ -518,6 +541,34 @@ create a new process group/session to escape cleanup: direct `setpgid`/`setsid` 
 `posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
 `posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
 command tools; separately configured MCP servers retain their own account permissions and approvals.
+
+### Child environments
+
+Every program Blackwall starts gets a cleaned environment instead of Blackwall's own: an allow-list,
+except for unsandboxed shell commands (below). This
+covers shell commands, command tools, MCP servers, and the git, browser-opener and listening-port
+discovery (`lsof`, `netstat`) helpers, on every system. The Linux browser opener also gets the
+desktop-session variables it needs. It keeps the AppImage's runtime variables (`PYTHONHOME`,
+`LD_LIBRARY_PATH` and similar) from breaking Python and other runtimes, and keeps your unrelated
+credentials from reaching a program that does not need them.
+
+- MCP servers and command tools you run unsandboxed get
+  `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`,
+  plus the names you list under `env` in `mcp.json` or `tools.json`.
+- An unsandboxed shell command runs with your environment (`SSH_AUTH_SOCK`, `KUBECONFIG`,
+  `AWS_PROFILE`, `DISPLAY` and so on), minus Blackwall's own keys, loader and code-injection
+  variables, and the AppImage runtime's (`APPDIR`, `APPIMAGE`, `ARGV0`, `OWD` and similar). On
+  Linux every shell command currently runs unsandboxed, so this applies to all of them.
+- A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
+  and `PATH`, and ignores `env`.
+- A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and
+  never in a directory that resolves into the project. An absolute path is used as written.
+- `PATH` is your login shell's, with relative and empty entries, the project folder and the
+  AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
+- Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.
+
+To see what an MCP server or command tool gets, add a `tools.json` entry that runs `env` (and
+list the names you expect under `env`), or read the "not passed" names in a failed server's details.
 File tools remain workspace jailed, with reviewed edits; **Web access** controls the separate web
 tools and does not enable command network. Model connections remain available with command network off.
 

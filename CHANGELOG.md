@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- When an MCP server does not start, the tool card's details now show the last lines of its error
+  output and the environment variable names it was not given, and `bw` prints them under the
+  warning as `  details: …`. The text is cleaned of terminal escape sequences, capped at 2 KiB and
+  redacted of the server's secrets. Only you see it: it is not sent to the model, saved in the
+  conversation or traced.
 - A configurable command output cap (`maxOutputBytes`, 4 KiB to 1 MiB, default 64 KiB; Memory →
   Advanced, or `bw config set output-bytes`). Output over it keeps its first 40% and last 60%
   around a `[… N bytes omitted …]` line, cut on character boundaries after redaction, and the tool
@@ -134,6 +139,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Python and other runtimes now start from the Linux AppImage. Programs it launches no longer get
+  the AppImage's own `PYTHONHOME` and library paths. A Python MCP server that fails to start now
+  shows why in the tool card's details.
+
 - A run now reads `.blackwall/project.json` once, so its rules and its limits always come from the same version of the file, even if the file changes while the run starts.
 - A subagent that runs on a command tool (`runs_on`) now gets an `execute_tool` span in its trace, like any other tool call, with the same redaction rules. Its approval events are recorded on that span.
 - Usage no longer reads an oversized line in a local OTLP metrics file into memory. A line over
@@ -159,6 +168,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
 ### Changed
+
+- Start child programs from a cleaned environment instead of Blackwall's own, which changes
+  what they see. This covers shell commands, command tools, MCP servers, the git and browser-opener
+  helpers (the Linux opener also gets the desktop-session variables it needs), and listening-port
+  discovery (`lsof`, `netstat`), on every system. MCP servers, command tools and the other helpers
+  keep `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ`,
+  `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed commands get less. Unsandboxed shell commands
+  keep your whole environment (`SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE` and so on) minus
+  Blackwall's own keys, loader and code-injection variables, and the AppImage runtime's. An MCP server or unsandboxed command tool that relied on an inherited
+  variable (a token, a proxy setting, a custom config path) stops seeing it. To migrate, add its
+  name to the new `env` list in `mcp.json` or `tools.json`, such as `"env":["GITHUB_TOKEN"]`. `env`
+  is owner-only (not allowed in project servers), is refused on URL servers and HTTP tools, is
+  ignored for sandboxed commands, and cannot name `PATH`, loader-injection variables or
+  Blackwall's own secrets.
+  A bare program name in `mcp.json` or `tools.json` is now found only in that cleaned `PATH`, so a
+  project folder on your `PATH` (direnv, `node_modules/.bin`) cannot supply the program. `BROWSER`
+  is no longer passed to the browser opener and cannot be listed in `env`.
 
 - A first launch with no saved connection lists the servers found on this computer and connects
   only to the one chosen, instead of connecting to the first that answered.

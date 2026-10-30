@@ -6,7 +6,7 @@ use blackwall_core::{
     context::{ContextRun, ContextState},
     memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
-    protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+    protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest, ServerDiagnostic},
     skills::SkillStore,
     storage::LocalStore,
     storage::MemorySource,
@@ -743,7 +743,11 @@ fn render_event(
             *snapshot = Some(state);
             return;
         }
-        println!("{}", serde_json::to_string(&event).unwrap_or_default());
+        let (line, details) = json_line(&event);
+        for detail in details {
+            eprintln!("{detail}");
+        }
+        println!("{line}");
         match event {
             AgentEvent::AssistantDelta { delta, .. } => answer.push_str(&delta),
             AgentEvent::ApprovalRequest {
@@ -771,6 +775,7 @@ fn render_event(
         AgentEvent::InstructionsLoaded {
             sources,
             warnings,
+            diagnostics,
             agent_id,
             ..
         } => {
@@ -787,6 +792,10 @@ fn render_event(
             );
             for warning in warnings {
                 eprintln!("Instruction warning: {}", safe(&warning));
+            }
+            // For the owner at this terminal only; the model never sees them.
+            for line in detail_lines(&diagnostics) {
+                eprintln!("{line}");
             }
         }
         AgentEvent::ToolCall { name, .. } => eprintln!("\n[{}]", safe(&name)),
@@ -819,6 +828,47 @@ fn render_event(
         } => eprintln!("\n[{}]", thought_for(reasoning_ms.unwrap_or(0))),
         _ => {}
     }
+}
+
+/// The JSON line for stdout, which may reach a model or a log, and the owner's details for the
+/// terminal. Server details never go in the line.
+fn json_line(event: &AgentEvent) -> (String, Vec<String>) {
+    let mut event = event.clone();
+    let mut details = vec![];
+    if let AgentEvent::InstructionsLoaded { diagnostics, .. } = &mut event {
+        details = detail_lines(diagnostics);
+        diagnostics.clear();
+    }
+    (serde_json::to_string(&event).unwrap_or_default(), details)
+}
+
+/// The terminal lines for the owner, each prefixed and made safe to print.
+fn detail_lines(diagnostics: &[ServerDiagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .flat_map(diagnostic_lines)
+        .map(|line| format!("  details: {}", safe(&line)))
+        .collect()
+}
+
+/// What to print under a server's warning: the variables it was not given, then its last output.
+/// Every line starts with the server name, so output from several failed servers stays apart.
+fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
+    let mut lines = vec![];
+    if !diagnostic.not_passed.is_empty() {
+        lines.push(format!(
+            "{}: not passed: {}",
+            diagnostic.server,
+            diagnostic.not_passed.join(", ")
+        ));
+    }
+    lines.extend(
+        diagnostic
+            .stderr
+            .lines()
+            .map(|line| format!("{}: {line}", diagnostic.server)),
+    );
+    lines
 }
 
 /// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
@@ -860,6 +910,57 @@ mod tests {
             text.ends_with("Type yes to allow; anything else denies."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn server_details_list_unpassed_variables_then_stderr_lines() {
+        let diagnostic = ServerDiagnostic {
+            server: "docs".into(),
+            stderr: "Traceback\nno module named x".into(),
+            not_passed: vec!["TOKEN".into(), "HOME_KEY".into()],
+        };
+        assert_eq!(
+            diagnostic_lines(&diagnostic),
+            [
+                "docs: not passed: TOKEN, HOME_KEY",
+                "docs: Traceback",
+                "docs: no module named x"
+            ]
+        );
+        let quiet = ServerDiagnostic {
+            not_passed: vec![],
+            stderr: String::new(),
+            ..diagnostic
+        };
+        assert!(diagnostic_lines(&quiet).is_empty());
+    }
+
+    #[test]
+    fn json_events_carry_no_server_details_while_the_terminal_gets_them() {
+        let event = AgentEvent::InstructionsLoaded {
+            request_id: "r".into(),
+            agent_id: None,
+            sources: vec![],
+            warnings: vec!["MCP server docs did not start: stopped.".into()],
+            diagnostics: vec![ServerDiagnostic {
+                server: "docs".into(),
+                stderr: "no module \u{1b}[2Jx".into(),
+                not_passed: vec!["TOKEN".into()],
+            }],
+        };
+        let (line, details) = json_line(&event);
+        assert!(line.contains("did not start"), "{line}");
+        for secret in ["diagnostics", "no module", "TOKEN"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+        assert_eq!(
+            details,
+            [
+                "  details: docs: not passed: TOKEN",
+                "  details: docs: no module [2Jx"
+            ]
+        );
+        assert!(details.iter().all(|line| !line.contains('\u{1b}')));
     }
 
     #[test]

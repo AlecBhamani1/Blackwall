@@ -61,17 +61,12 @@ pub struct ReviewSnapshot {
     paths: BTreeSet<String>,
 }
 
-/// Dropping this future kills the Git child. Neither output pipe can grow unbounded.
-async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
-    let mut command = Command::new("git");
-    // Ignore inherited Git directory/index/config overrides. Keep PATH for the installed Git.
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
-            command.env_remove(key);
-        }
-    }
+/// Git starts from the owner allow-list, which carries no inherited `GIT_*` directory, index or
+/// config overrides, and then gets the fixed settings below. PATH stays so the installed Git runs.
+fn git_environment(command: &mut Command, path: &Path) {
+    let project = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    crate::child_env::from_process(crate::child_env::Scope::Owner, &project, &[]).apply(command);
     command
-        .current_dir(path)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         // Partial clones must fail on missing objects rather than launch a remote transport.
@@ -81,7 +76,15 @@ async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
         .env(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
+        );
+}
+
+/// Dropping this future kills the Git child. Neither output pipe can grow unbounded.
+async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
+    let mut command = Command::new("git");
+    git_environment(&mut command, path);
+    command
+        .current_dir(path)
         .args([
             "--no-pager",
             "-c",
@@ -377,6 +380,34 @@ pub struct Finding {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_gets_the_allow_list_plus_its_fixed_settings_only() {
+        let mut command = Command::new("/usr/bin/env");
+        git_environment(&mut command, &std::env::temp_dir());
+        let output = command.output().await.unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        // Cargo sets this for the test process, so an inherited environment would show it.
+        assert!(!text.contains("CARGO_MANIFEST_DIR"), "{text}");
+        assert!(text.contains("GIT_OPTIONAL_LOCKS=0"), "{text}");
+        let mut git_names: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .filter(|name| name.starts_with("GIT_"))
+            .collect();
+        git_names.sort_unstable();
+        assert_eq!(
+            git_names,
+            [
+                "GIT_ALLOW_PROTOCOL",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_NO_LAZY_FETCH",
+                "GIT_OPTIONAL_LOCKS",
+                "GIT_TERMINAL_PROMPT"
+            ]
+        );
+    }
     use crate::model::{ModelError, ModelTurn, ToolCall, ToolFunction};
     use futures_util::future::BoxFuture;
     use serde_json::Value;

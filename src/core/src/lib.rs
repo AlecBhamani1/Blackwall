@@ -21,6 +21,8 @@ pub use protocol::{
 
 pub mod agent;
 pub mod approvals;
+pub(crate) mod child_env;
+pub use child_env::apply_owner_env;
 pub mod command_tools;
 pub mod instructions;
 pub mod mcp;

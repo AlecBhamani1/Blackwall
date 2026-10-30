@@ -1294,6 +1294,10 @@ mod tests {
                 "secrets",
             ),
             (
+                json!({"mcp":{"servers":[{"name":"x","url":"https://a.example","env":["HOME"]}]}}),
+                "env",
+            ),
+            (
                 json!({"mcp":{"servers":[{"name":"x","url":"http://a.example"}]}}),
                 "https",
             ),
