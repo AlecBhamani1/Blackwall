@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 const LOCK_ACCOUNT: &str = "passphrase-v1";
-pub(crate) const KEYRING_NEEDED: &str = "Your app lock is stored in the system keyring, which isn't available. Start your keyring (GNOME Keyring or KWallet), then try again.";
+pub(crate) const KEYRING_NEEDED: &str = "Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.";
 #[derive(Default)]
 struct Inner {
     initialized: bool,
@@ -409,6 +409,15 @@ mod tests {
         // Cleanup completion does not itself unlock the app.
         assert!(state.ensure_unlocked().await.is_err());
         assert!(!state.0.lock().await.locking);
+    }
+    #[tokio::test]
+    async fn unlock_says_to_start_the_keyring_while_it_is_needed() {
+        let state = AuthState::default();
+        state.0.lock().await.keyring_needed = true;
+        assert_eq!(
+            state.unlock("unused".into()).await.err().as_deref(),
+            Some("Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.")
+        );
     }
     fn present(directory: &Path, name: &str) -> bool {
         directory.join(name).exists()

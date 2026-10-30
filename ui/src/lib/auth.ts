@@ -6,12 +6,12 @@ export interface AuthStatus {
   enabled: boolean;
   /** False when the app opened without a system keyring. */
   keyring: boolean;
-  /** A lock or saved data exists but its keyring is unavailable, so it cannot be opened yet. */
+  /** The data has a lock, or a lock state that can't be confirmed, and the keyring is unavailable. */
   keyringNeeded: boolean;
 }
 /** The message the backend returns when a keyring is needed to open the app. */
 export const KEYRING_NEEDED =
-  "Your app lock is stored in the system keyring, which isn't available. Start your keyring (GNOME Keyring or KWallet), then try again.";
+  'Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.';
 /** Shown on every setting that can only be saved in a keyring. */
 export const NO_KEYRING_NOTE =
   "No system keyring is available, so this can't be saved. Start GNOME Keyring or KWallet, then restart Blackwall.";

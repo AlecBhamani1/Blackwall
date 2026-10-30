@@ -51,6 +51,9 @@ describe('app lock', () => {
       props: { initialized: true, keyringNeeded: true, onUnlock: vi.fn(), onRetry: retry },
     });
     expect(screen.getByText(KEYRING_NEEDED)).toBeVisible();
+    expect(KEYRING_NEEDED).toBe(
+      'Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.',
+    );
     expect(screen.queryByText('Enter your passphrase to open your conversations.')).toBeNull();
     expect(screen.queryByText('Checking your app lock…')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
