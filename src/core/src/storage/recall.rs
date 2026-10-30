@@ -105,23 +105,54 @@ pub(super) fn index(db: &Connection, session: &Value) -> Result<(), StorageError
 }
 
 impl LocalStore {
+    pub(super) fn message_index_is_current(&self) -> Result<bool, StorageError> {
+        Ok(self.connection.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE id NOT IN (SELECT session_id FROM indexed_sessions)
+                LIMIT 1
+            )",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Each database open backfills at most five existing sessions, in one transaction.
     /// New saves are indexed synchronously; no background worker retains deleted text.
     pub(super) fn migrate_message_index(&self) -> Result<(), StorageError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let mut statement = transaction.prepare("SELECT body FROM sessions WHERE id NOT IN (SELECT session_id FROM indexed_sessions) ORDER BY updated_at DESC LIMIT ?1")?;
-        let rows = statement.query_map([MIGRATION_BATCH], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            let body = row?;
-            if body.len() > super::MAX_SESSION_BYTES {
-                return Err(StorageError::Invalid(
-                    "A saved conversation exceeds the migration limit.",
-                ));
+        let sessions = {
+            let mut statement = self.connection.prepare("SELECT id, body FROM sessions WHERE id NOT IN (SELECT session_id FROM indexed_sessions) ORDER BY updated_at DESC LIMIT ?1")?;
+            let rows = statement.query_map([MIGRATION_BATCH], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                let (id, body) = row?;
+                if body.len() > super::MAX_SESSION_BYTES {
+                    return Err(StorageError::Invalid(
+                        "A saved conversation exceeds the migration limit.",
+                    ));
+                }
+                let session: Value = serde_json::from_str(&body)?;
+                sessions.push((id, session));
             }
-            let session: Value = serde_json::from_str(&body)?;
-            index(&transaction, &session)?;
+            sessions
+        };
+
+        let transaction = self.connection.unchecked_transaction()?;
+        for (id, session) in sessions {
+            let should_index: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions
+                    WHERE id=?1 AND id NOT IN (SELECT session_id FROM indexed_sessions)
+                )",
+                [&id],
+                |row| row.get(0),
+            )?;
+            if should_index {
+                index(&transaction, &session)?;
+            }
         }
-        drop(statement);
         transaction.commit()?;
         Ok(())
     }
@@ -336,8 +367,11 @@ mod tests {
             .pragma_update(None, "user_version", 3)
             .unwrap();
         let db = LocalStore::initialize(db.connection).unwrap();
-        assert_eq!(search(&db, "needle").remaining_sessions, 7);
+        // The schema-migration open releases its writer lock without starting the backfill.
+        assert_eq!(search(&db, "needle").remaining_sessions, 12);
         db.delete_session("old_9").unwrap(); // Deletion before backfill must never resurrect text.
+        let db = LocalStore::initialize(db.connection).unwrap();
+        assert_eq!(search(&db, "needle").remaining_sessions, 6);
         let db = LocalStore::initialize(db.connection).unwrap();
         assert_eq!(search(&db, "needle").remaining_sessions, 1);
         let db = LocalStore::initialize(db.connection).unwrap();
