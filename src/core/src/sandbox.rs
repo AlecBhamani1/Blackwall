@@ -799,7 +799,7 @@ mod tests {
         use crate::sandbox::linux::{
             Availability, LINUX_BLOCKED, LINUX_RETRYING, LINUX_UNAVAILABLE,
         };
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         use std::time::Duration;
 
         /// `<tmp>/blackwall-linux-sandbox-<random>/{project,data}`, removed when dropped.
@@ -2058,7 +2058,7 @@ else:
             project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
             let out = project
                 .run(
-                    "mkdir .git && printf '[core]' > .git/config; mkdir -p a/.claude; \
+                    "mkdir .git && printf '[core]' > .git/config; mkdir -p a/.claude z/.claude; \
                      mv src .agents; printf x > AGENTS.md; printf x > .GIT",
                     &bw,
                 )
@@ -2066,7 +2066,12 @@ else:
                 .unwrap();
             let path = &project.workspace.path;
             // The real tree is as it was: `src` survives, and nothing refused got in.
-            assert_eq!(tree(path), ["a", "a/keep", "src", "src/lib.rs"], "{out}");
+            // (`z` is new and holds only a refused folder: it is applied, empty.)
+            assert_eq!(
+                tree(path),
+                ["a", "a/keep", "src", "src/lib.rs", "z"],
+                "{out}"
+            );
             assert_eq!(
                 std::fs::read_to_string(path.join("src/lib.rs")).unwrap(),
                 "code"
@@ -2075,6 +2080,7 @@ else:
             for refused in [
                 ".git (a protected name",
                 "a/.claude (a protected name",
+                "z/.claude (a protected name",
                 ".agents (a protected name",
                 ".GIT (a protected name",
                 "AGENTS.md (an agent instruction file)",
@@ -2082,7 +2088,7 @@ else:
                 assert!(out.contains(refused), "{refused} in {out}");
             }
             assert!(
-                out.contains("5 refused, 0 conflicted, 1 held back"),
+                out.contains("6 refused, 0 conflicted, 1 held back"),
                 "{out}"
             );
             // `mv src .agents` left a whiteout at `src`: its delete waits, so `src` isn't lost.
@@ -2145,6 +2151,7 @@ else:
                 std::fs::write(&real, "the owner's edit, longer than before").unwrap();
             });
             let out = out.unwrap();
+            // The 2 applied are `started` and `extra.txt`.
             assert!(
                 out.contains("2 applied, 0 deleted, 0 refused, 1 conflicted"),
                 "{out}"
@@ -2182,22 +2189,38 @@ else:
             project.file("old", "o");
             project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
             let mut run = Box::pin(project.run(
-                "touch started; printf partial > made.txt; rm old; sleep 30; printf late > late.txt",
+                "printf partial > made.txt; rm old; \
+                 while :; do printf x >> beat; sleep 0.1; done & \
+                 touch started; sleep 30; printf late > late.txt",
                 &bw,
             ));
+            // `started` comes after the writes and the delete this test looks at, and a
+            // heartbeat in the background shows whether anything of the sandbox survives.
             let upper = tokio::select! {
                 result = &mut run => panic!("ended before cancellation: {result:?}"),
-                upper = upper_once_staged(&project, "started") => upper,
+                upper = async {
+                    let upper = upper_once_staged(&project, "started").await;
+                    upper_once_staged(&project, "beat").await;
+                    upper
+                } => upper,
             };
             drop(run);
             let path = &project.workspace.path;
-            // Nothing was applied, and the delete wasn't either.
+            // Nothing was applied, and the delete wasn't either; but it was staged, as a whiteout.
             assert_eq!(tree(path), ["old"]);
-            // The staging is kept, and the command was stopped: it never got to its last write.
+            let whiteout = std::fs::symlink_metadata(upper.join("old")).unwrap();
+            assert!(whiteout.file_type().is_char_device() && whiteout.rdev() == 0);
+            // The staging is kept, and the sandbox was stopped by the drop: its heartbeat has
+            // stopped (it beat every 0.1 s before), and its last write never comes.
             let staged = project.staged_left();
             assert_eq!(staged.len(), 1);
             assert_eq!(upper, staged[0].join("upper"));
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let beat = || std::fs::metadata(upper.join("beat")).unwrap().len();
+            let size = beat();
+            assert!(size > 0);
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            assert_eq!(beat(), size, "the sandbox outlived the cancellation");
             assert!(upper.join("made.txt").exists());
             assert!(!upper.join("late.txt").exists());
             assert_eq!(tree(path), ["old"]);
