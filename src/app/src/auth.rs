@@ -1,15 +1,11 @@
 //! Native lock enforcement and passphrase verification data kept in the credential store.
+use blackwall_core::storage::{DATABASE_FILE, LOCK_MARKER, NO_LOCK_MARKER};
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 const LOCK_ACCOUNT: &str = "passphrase-v1";
-/// Empty, non-secret file in the data folder: an app lock exists, even when the keyring cannot say so.
-pub(crate) const LOCK_MARKER: &str = "app-lock-enabled";
-/// Empty, non-secret file in the data folder: this data has no app lock.
-pub(crate) const NO_LOCK_MARKER: &str = "app-lock-disabled";
-const DATABASE: &str = "blackwall.sqlite3";
 pub(crate) const KEYRING_NEEDED: &str = "Your app lock is stored in the system keyring, which isn't available. Start your keyring (GNOME Keyring or KWallet), then try again.";
 #[derive(Default)]
 struct Inner {
@@ -236,7 +232,7 @@ fn resolve(read: LockRead, directory: &Path) -> Startup {
                 Startup::KeyringNeeded
             } else if file_exists(directory, NO_LOCK_MARKER, false) {
                 Startup::Open { keyring: false }
-            } else if !file_exists(directory, DATABASE, true) {
+            } else if !file_exists(directory, DATABASE_FILE, true) {
                 let _ = write_marker(directory, NO_LOCK_MARKER);
                 Startup::Open { keyring: false }
             } else {
@@ -426,12 +422,22 @@ mod tests {
         );
         assert!(present(&directory, NO_LOCK_MARKER));
         // The first saved conversation creates the database.
-        std::fs::write(directory.join(DATABASE), b"").unwrap();
+        std::fs::write(directory.join(DATABASE_FILE), b"").unwrap();
         assert_eq!(
             resolve(LockRead::Unavailable, &directory),
             Startup::Open { keyring: false }
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn profile_created_by_the_cli_opens_without_a_keyring() {
+        let directory = data_folder("cli");
+        drop(blackwall_core::storage::LocalStore::open(&directory).unwrap());
+        assert_eq!(
+            resolve(LockRead::Unavailable, &directory),
+            Startup::Open { keyring: false }
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn both_markers_need_the_keyring() {
@@ -451,7 +457,7 @@ mod tests {
             resolve(LockRead::Failed("dismissed".into()), &directory),
             Startup::Retry(_)
         ));
-        std::fs::write(directory.join(DATABASE), b"").unwrap();
+        std::fs::write(directory.join(DATABASE_FILE), b"").unwrap();
         assert_eq!(
             resolve(LockRead::Unavailable, &directory),
             Startup::KeyringNeeded
