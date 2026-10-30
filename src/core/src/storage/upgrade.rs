@@ -13,16 +13,14 @@
 //!
 //! A database with no data yet takes the same steps without a backup. A v6 open only reads the
 //! version: it never takes the write lock.
-use super::backup::{
-    self, SourceId, UpgradeState, BACKUPS_DIR, DELETE_BACKUPS_AFTER, MAX_ATTEMPTS,
-};
+use super::backup::{self, UpgradeState, BACKUPS_DIR, DELETE_BACKUPS_AFTER, MAX_ATTEMPTS};
 use super::chats::{apply_v6_schema, write_tx};
 use super::convert::{convert_session_in_tx, migrate_v6, ConvertOutcome};
 use super::{
     configure, is_busy, LocalStore, StorageError, BUSY_TIMEOUT, DATABASE_FILE, NEWER_VERSION,
     UPGRADE_BUSY_TIMEOUT,
 };
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -230,55 +228,12 @@ fn user_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
-/// How many times the upgrade reads the source again when another process commits between that
-/// read and the write lock. Past it the database is too busy to upgrade now.
-const SOURCE_READS: usize = 5;
-
-/// Identifies the source, then takes the write lock, in that order (see `backup::source_id` for
-/// why the file may not be read under the lock). `PRAGMA data_version` read before the file and
-/// again under the lock proves no other process committed in between; if one did, it starts over.
-/// `None` is an empty file, which has nothing to back up.
-fn lock_with_source<'c>(
-    connection: &'c Connection,
-    database: &Path,
-) -> Result<(Transaction<'c>, Option<SourceId>), StorageError> {
-    #[cfg_attr(not(test), allow(clippy::unused_enumerate_index))]
-    for (_try, _) in (0..SOURCE_READS).enumerate() {
-        // This connection holds no lock here: `open_v6`'s reads are finished, and so is any
-        // earlier try's transaction.
-        let seen = data_version(connection)?;
-        let source = match fs::metadata(database) {
-            Ok(meta) if meta.len() > 0 => Some(backup::source_id(database)?),
-            _ => None,
-        };
-        #[cfg(test)]
-        if let Some(data) = database.parent() {
-            if backup::fault(data, backup::Fault::RaceBeforeLock).is_err() {
-                Connection::open(database)?.execute(
-                    "INSERT INTO settings(key,value) VALUES (?1,'1')",
-                    [format!("raced-{_try}")],
-                )?;
-            }
-        }
-        let tx = match write_tx(connection) {
-            Err(error) if is_busy(&error) => return Err(StorageError::UpgradeBusy),
-            tx => tx?,
-        };
-        if data_version(&tx)? == seen {
-            return Ok((tx, source));
-        }
-        // Dropping it rolls back and releases the lock before the file is read again.
-    }
-    Err(StorageError::UpgradeBusy)
-}
-
-fn data_version(connection: &Connection) -> Result<i64, StorageError> {
-    Ok(connection.pragma_query_value(None, "data_version", |row| row.get(0))?)
-}
-
 fn upgrade(directory: &Path, connection: &Connection) -> Result<(), StorageError> {
     // Dropping `tx` on any early return rolls back.
-    let (tx, source) = lock_with_source(connection, &directory.join(DATABASE_FILE))?;
+    let tx = match write_tx(connection) {
+        Err(error) if is_busy(&error) => return Err(StorageError::UpgradeBusy),
+        tx => tx?,
+    };
     let version = user_version(&tx)?;
     if version == V6 {
         return Ok(()); // another window upgraded it while this one waited
@@ -288,9 +243,7 @@ fn upgrade(directory: &Path, connection: &Connection) -> Result<(), StorageError
     }
     let now = SystemTime::now();
     let backup = if has_data(&tx, version)? {
-        // A database with data is never an empty file.
-        let source = source.ok_or(StorageError::BackupFailed)?;
-        Some(back_up(directory, version, source)?)
+        Some(back_up(directory, &tx, version)?)
     } else {
         None
     };
@@ -335,14 +288,15 @@ fn has_data(tx: &Connection, version: i64) -> Result<bool, StorageError> {
 }
 
 /// Makes (or reuses) the verified backup of the locked source and counts this attempt. The
-/// caller holds the write lock, so the source cannot change while it is copied, and `source` is
-/// the identity it read just before taking it.
-fn back_up(directory: &Path, version: i64, source: SourceId) -> Result<Backup, StorageError> {
+/// caller holds the write lock on `tx`, so the source cannot change while it is identified and
+/// copied, and the identity describes exactly what the backup holds.
+fn back_up(directory: &Path, tx: &Connection, version: i64) -> Result<Backup, StorageError> {
     let dir = match backup::backups_dir(directory) {
         Err(StorageError::BackupFailed) => return Err(StorageError::Invalid(NOT_PRIVATE)),
         dir => dir?,
     };
     let database = directory.join(DATABASE_FILE);
+    let source = backup::source_id(tx, &database)?;
     let saved = backup::read_state(&dir).filter(|state| state.matches(&source, &dir));
     let (made, attempts) = match saved {
         Some(state) if state.attempts >= MAX_ATTEMPTS => {
@@ -378,7 +332,7 @@ fn back_up(directory: &Path, version: i64, source: SourceId) -> Result<Backup, S
         backup: made.name.clone(),
         source_size: source.size,
         source_mtime_ms: source.mtime_ms,
-        header_hash: source.header_hash,
+        source_hash: source.source_hash,
         attempts: attempts + 1,
     };
     backup::write_state(&made.dir, &state).map_err(named)?;
@@ -675,7 +629,6 @@ impl LocalStore {
             Err(error) if needs_rollback(&error) => return Ok(unmatched_status(&dir)),
             Err(error) => return Err(error),
         }
-        drop(reader);
         // A writer that holds the lock without a journal yet (an upgrade before its first write)
         // is invisible to readers; only taking the lock shows it.
         let probe = Connection::open_with_flags(
@@ -699,10 +652,22 @@ impl LocalStore {
         let Some(state) = backup::read_state(&dir) else {
             return Ok(UpgradeStatus::Pending);
         };
-        // Both connections above are closed, so reading the file here drops no lock of ours.
-        Ok(match backup::source_id(&path) {
+        // The identity the upgrade compares, read the same way: through SQLite, in one read
+        // transaction, never by opening the file (see `backup::source_id`).
+        let identity = reader
+            .unchecked_transaction()
+            .map_err(StorageError::from)
+            .and_then(|read| {
+                let source = backup::source_id(&read, &path)?;
+                read.commit()?;
+                Ok(source)
+            });
+        Ok(match identity {
             Ok(source) if state.matches(&source, &dir) => failed_status(&dir, &state),
-            _ => UpgradeStatus::Pending,
+            Ok(_) => UpgradeStatus::Pending,
+            Err(error) if is_busy(&error) => UpgradeStatus::Pending,
+            Err(error) if needs_rollback(&error) => unmatched_status(&dir),
+            Err(error) => return Err(error),
         })
     }
 

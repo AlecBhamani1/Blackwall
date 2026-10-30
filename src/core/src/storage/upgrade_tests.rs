@@ -703,10 +703,13 @@ fn a_changed_source_after_a_stop_gets_a_new_backup_and_count() {
         failed_backup(open6(&dir));
     }
     assert!(matches!(open6(&dir), Err(StorageError::UpgradeStopped(_))));
-    // A v5 window still running writes: this is a different source now.
+    // A v5 window still running saves a chat: this is a different source now.
     Connection::open(dir.database())
         .unwrap()
-        .execute("INSERT INTO settings(key,value) VALUES ('v5','write')", [])
+        .execute(
+            "UPDATE sessions SET updated_at=updated_at+1 WHERE id=(SELECT min(id) FROM sessions)",
+            [],
+        )
         .unwrap();
     let (second, _) = failed_backup(open6(&dir));
     assert_ne!(second, first);
@@ -1191,26 +1194,73 @@ fn another_process_cannot_take_the_write_lock_from_an_upgrade_in_progress() {
     assert_eq!(version_of(&dir.database()), V6);
 }
 
-#[test]
-fn a_commit_between_reading_the_source_and_the_lock_is_noticed() {
-    let dir = Scratch::new("race");
-    build_v5(&dir, &v5_sessions()[..2], 5);
-    // Another connection commits after every read of the source: each try sees it and starts
-    // over, so the upgrade never runs on a stale source and gives up after its last try.
-    set_fault(&dir, Some(Fault::RaceBeforeLock));
-    assert!(matches!(open6(&dir), Err(StorageError::UpgradeBusy)));
-    assert_eq!(version_of(&dir.database()), 5);
-    let raced: i64 = Connection::open(dir.database())
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM settings WHERE key LIKE 'raced-%'",
-            [],
-            |row| row.get(0),
-        )
+/// The production code of `file`: everything before its test module.
+fn production(file: &str) -> &str {
+    let end = file
+        .find("#[cfg(test)]\n#[allow(clippy::unwrap_used)]")
+        .or_else(|| file.find("#[cfg(test)]\nmod tests"))
         .unwrap();
-    assert_eq!(raced, SOURCE_READS as i64);
-    assert_eq!(baks(&dir), Vec::<String>::new());
-    set_fault(&dir, None);
-    drop(open6(&dir).unwrap());
-    assert_eq!(version_of(&dir.database()), V6);
+    &file[..end]
+}
+
+/// The rule behind the POSIX lock fix: the database file is never opened outside SQLite, because
+/// on unix closing any descriptor of it drops every lock this process holds on it. Every std open
+/// in these two files is listed here, and none of them takes the database path.
+#[test]
+fn the_database_file_is_never_opened_outside_sqlite() {
+    let upgrade = production(include_str!("upgrade.rs"));
+    let backup = production(include_str!("backup.rs"));
+    let opens = [
+        "File::open(",
+        "File::create(",
+        "OpenOptions::new(",
+        "fs::read(",
+        "fs::read_to_string(",
+        "fs::copy(",
+        "fs::write(",
+        "open_plain(",
+        "create_private(",
+    ];
+    let calls = |code: &str| -> Vec<String> {
+        code.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && opens.iter().any(|open| line.contains(open)))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        calls(upgrade),
+        Vec::<String>::new(),
+        "upgrade.rs opens a file"
+    );
+    assert_eq!(
+        calls(backup),
+        [
+            "fn create_private(path: &Path) -> io::Result<File> {",
+            "let mut options = OpenOptions::new();",
+            "fn open_plain(path: &Path, write: bool) -> io::Result<File> {",
+            "let mut options = OpenOptions::new();",
+            "File::open(dir)?.sync_all()",
+            "let file = open_plain(&dir.join(STATE_FILE), false).ok()?;",
+            "let mut file = create_private(&temp)?;",
+            "create_private(partial)?;",
+            "open_plain(partial, true)?.sync_all()?;",
+            // Test-only: the two-process gate's marker file.
+            "let _ = fs::write(data_directory.join(GATE_HELD), b\"\");",
+        ],
+        "a new std open in backup.rs: it must never be the database file"
+    );
+    // The identity is read through SQLite on a connection it is given, and only stat-ed.
+    let start = backup.find("pub(crate) fn source_id(").unwrap();
+    let body = &backup[start..start + backup[start..].find("\n}\n").unwrap()];
+    assert!(body.contains("connection: &Connection"));
+    for open in [
+        "File",
+        "OpenOptions",
+        "open_plain",
+        "create_private",
+        "fs::read",
+    ] {
+        assert!(!body.contains(open), "source_id uses {open}");
+    }
 }

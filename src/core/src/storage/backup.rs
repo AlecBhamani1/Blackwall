@@ -7,6 +7,7 @@
 use super::StorageError;
 use rusqlite::{
     backup::{Backup, StepResult},
+    types::ValueRef,
     Connection, OpenFlags,
 };
 use serde::{Deserialize, Serialize};
@@ -50,16 +51,17 @@ pub(crate) struct UpgradeState {
     pub backup: String,
     pub source_size: u64,
     pub source_mtime_ms: i64,
-    pub header_hash: String,
+    pub source_hash: String,
     pub attempts: u32,
 }
 
-/// What identifies a source database: its size, mtime and a hash of its first page.
+/// What identifies a source database: its size, its mtime and a hash of its logical content
+/// (see [`source_id`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceId {
     pub size: u64,
     pub mtime_ms: i64,
-    pub header_hash: String,
+    pub source_hash: String,
 }
 
 // ---- links, modes and no-follow opens ----
@@ -277,37 +279,68 @@ fn create_private_dir(dir: &Path) -> Result<(), StorageError> {
 
 // ---- the source ----
 
-/// Size, mtime and the SHA-256 of page 1 of `database`. The page size comes from header bytes
-/// 16-17 (big endian; 1 means 65536).
+/// What identifies a source database, read through SQLite on `connection`.
 ///
-/// Never call this while any connection in this process holds a lock on `database`. On unix,
-/// closing ANY descriptor of a file drops every POSIX lock the process holds on it ("How To
-/// Corrupt An SQLite Database", 2.2), so a write lock would silently pass to another process.
-/// The upgrade reads it before `BEGIN IMMEDIATE` and checks `data_version` after.
-pub(crate) fn source_id(database: &Path) -> Result<SourceId, StorageError> {
-    // Followed like SQLite follows it: this describes the file SQLite will convert.
-    let mut file = File::open(database)?;
-    let meta = file.metadata()?;
+/// NEVER open the database file outside SQLite. On unix, closing ANY descriptor of a file drops
+/// every POSIX lock the process holds on it ("How To Corrupt An SQLite Database", 2.2), and the
+/// app keeps other connections to this file in the same process (v5 opens one per command; a
+/// run's writer can be active while Settings asks for the upgrade status). So nothing here opens
+/// the file: the size and mtime come from `stat`, which opens no descriptor, and the rest is SQL.
+///
+/// `source_hash` is the SHA-256 of `user_version`, `page_count`, `freelist_count`, and every
+/// `sessions` row's id, `updated_at` and body length, ordered by id. Every v5 chat write (save,
+/// delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
+/// milliseconds, so two saves in one millisecond can share one; the body length tells those apart
+/// for free, because `octet_length` reads it from the row header without loading the body.
+///
+/// The caller reads it inside one transaction so the parts agree; the upgrade, under its write
+/// lock, so it describes exactly what the backup copies.
+pub(crate) fn source_id(
+    connection: &Connection,
+    database: &Path,
+) -> Result<SourceId, StorageError> {
+    let meta = fs::metadata(database)?;
     if !meta.is_file() {
         return Err(StorageError::BackupFailed);
     }
-    let mut header = [0u8; 18];
-    file.read_exact(&mut header)
-        .map_err(|_| StorageError::BackupFailed)?;
-    let page_size = match u16::from_be_bytes([header[16], header[17]]) {
-        1 => 65_536,
-        n @ 512..=32_768 if n.is_power_of_two() => usize::from(n),
-        _ => return Err(StorageError::BackupFailed),
-    };
-    let mut page = vec![0u8; page_size];
-    page[..header.len()].copy_from_slice(&header);
-    file.read_exact(&mut page[header.len()..])
-        .map_err(|_| StorageError::BackupFailed)?;
+    let mut hash = Sha256::new();
+    for pragma in ["user_version", "page_count", "freelist_count"] {
+        let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
+        hash.update(format!("{pragma}={value};"));
+    }
+    let has_sessions: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_sessions {
+        let mut statement = connection
+            .prepare("SELECT id, updated_at, octet_length(body) FROM sessions ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            for column in 0..3 {
+                feed(&mut hash, row.get_ref(column)?);
+            }
+        }
+    }
     Ok(SourceId {
         size: meta.len(),
         mtime_ms: meta.modified().map(millis).unwrap_or(0),
-        header_hash: hex(&Sha256::digest(&page)),
+        source_hash: hex(&hash.finalize()),
     })
+}
+
+/// Adds one value to the hash, tagged by type and length-prefixed, so no two rows run together.
+fn feed(hash: &mut Sha256, value: ValueRef<'_>) {
+    match value {
+        ValueRef::Null => hash.update(b"n"),
+        ValueRef::Integer(n) => hash.update(format!("i{n};")),
+        ValueRef::Real(x) => hash.update(format!("r{};", x.to_bits())),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            hash.update(format!("t{}:", bytes.len()));
+            hash.update(bytes);
+        }
+    }
 }
 
 fn millis(time: SystemTime) -> i64 {
@@ -365,11 +398,11 @@ pub(crate) fn clear_state(dir: &Path) -> Result<(), StorageError> {
 }
 
 impl UpgradeState {
-    /// Whether this state describes `source` and its backup is still there. The size and header
+    /// Whether this state describes `source` and its backup is still there. The size and source
     /// hash decide; the mtime never does (it changes when nothing else has).
     pub(crate) fn matches(&self, source: &SourceId, dir: &Path) -> bool {
         self.source_size == source.size
-            && self.header_hash == source.header_hash
+            && self.source_hash == source.source_hash
             && parse_backup_name(&self.backup).is_some()
             && plain_file_at(&dir.join(&self.backup))
     }
@@ -728,8 +761,6 @@ pub(crate) enum Fault {
     /// [`GATE_HELD`] in the data folder and waits until [`GATE_RELEASE`] exists there. Files, not
     /// sleeps, so a test that drives several processes can order them on any runner.
     Gate,
-    /// Another connection commits between the upgrade's read of the source and its write lock.
-    RaceBeforeLock,
 }
 
 /// The file the gated process creates once it is holding the upgrade's write lock.
@@ -979,7 +1010,7 @@ mod tests {
             backup: backup.into(),
             source_size: 4096,
             source_mtime_ms: 1_000,
-            header_hash: "ab".repeat(32),
+            source_hash: "ab".repeat(32),
             attempts: 1,
         }
     }
@@ -1041,18 +1072,18 @@ mod tests {
     }
 
     #[test]
-    fn state_matches_on_size_and_header_not_mtime() {
+    fn state_matches_on_size_and_source_hash_not_mtime() {
         let data = Data::new();
         let dir = backups_dir(&data.0).unwrap();
         let backup = create_backup(&data.source(), &dir, 5).unwrap();
-        let id = source_id(&data.db()).unwrap();
+        let id = source_id(&data.source(), &data.db()).unwrap();
         assert_eq!(id.size, fs::metadata(data.db()).unwrap().len());
-        assert_eq!(id.header_hash.len(), 64);
+        assert_eq!(id.source_hash.len(), 64);
         let saved = UpgradeState {
             backup: backup.clone(),
             source_size: id.size,
             source_mtime_ms: id.mtime_ms,
-            header_hash: id.header_hash.clone(),
+            source_hash: id.source_hash.clone(),
             attempts: 1,
         };
         assert!(saved.matches(&id, &dir));
@@ -1067,22 +1098,22 @@ mod tests {
         };
         assert!(!saved.matches(&bigger, &dir));
         let other = SourceId {
-            header_hash: "00".repeat(32),
+            source_hash: "00".repeat(32),
             ..id.clone()
         };
         assert!(!saved.matches(&other, &dir));
-        // The real file: a new mtime still matches, a changed page 1 does not.
+        // The real file: a new mtime still matches, a changed version does not.
         let file = fs::OpenOptions::new().write(true).open(data.db()).unwrap();
         file.set_modified(at(1_000_000)).unwrap();
         drop(file);
-        let moved = source_id(&data.db()).unwrap();
+        let moved = source_id(&data.source(), &data.db()).unwrap();
         assert_ne!(moved.mtime_ms, id.mtime_ms);
         assert!(saved.matches(&moved, &dir));
         data.source()
             .execute_batch("PRAGMA user_version=6;")
             .unwrap();
-        let changed = source_id(&data.db()).unwrap();
-        assert!(!saved.matches(&changed, &dir), "page 1 changed");
+        let changed = source_id(&data.source(), &data.db()).unwrap();
+        assert!(!saved.matches(&changed, &dir), "the version changed");
         // The backup it names must still be a real file there.
         fs::remove_file(dir.join(&backup)).unwrap();
         assert!(!saved.matches(&id, &dir));
@@ -1091,6 +1122,34 @@ mod tests {
             ..saved
         };
         assert!(!escape.matches(&id, &dir));
+    }
+
+    #[test]
+    fn the_source_hash_follows_every_v5_chat_write_and_nothing_else() {
+        let data = Data::new();
+        let db = data.source();
+        db.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL, body TEXT NOT NULL);
+             INSERT INTO sessions VALUES ('a','A',1,'{\"x\":1}'), ('b','B',2,'{}');",
+        )
+        .unwrap();
+        let hash = || source_id(&db, &data.db()).unwrap().source_hash;
+        let start = hash();
+        assert_eq!(hash(), start, "reading twice gives the same identity");
+        let mut seen = vec![start.clone()];
+        let mut changes = |sql: &str| {
+            db.execute_batch(sql).unwrap();
+            let now = hash();
+            assert!(!seen.contains(&now), "{sql} kept an earlier identity");
+            seen.push(now);
+        };
+        // A save that bumps the date, one in the same millisecond, an import and a delete.
+        changes("UPDATE sessions SET updated_at=3, body='{\"x\":2}' WHERE id='a'");
+        changes("UPDATE sessions SET body='{\"x\":22}' WHERE id='a'");
+        changes("INSERT INTO sessions VALUES ('c','C',3,'{}')");
+        changes("DELETE FROM sessions WHERE id='b'");
+        changes("PRAGMA user_version=4");
     }
 
     fn touch(dir: &Path, name: &str) {
