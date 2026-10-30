@@ -83,6 +83,7 @@ pub struct LocalStore {
     connection: Connection,
 }
 mod chats;
+mod convert;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod memory;
@@ -90,6 +91,8 @@ mod recall;
 mod search;
 mod view;
 pub use chats::{Cap, MetadataPatch, NewSession, StoredChat, StoredContext};
+/// Moved to `convert`; re-exported here for the v5 save path until B6.
+pub(crate) use convert::validate_session;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 pub use recall::{RecallHit, RecallQuery, RecallResults};
 
@@ -436,57 +439,6 @@ pub(crate) fn validate_id(id: &str) -> Result<(), StorageError> {
     }
     Ok(())
 }
-fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), StorageError> {
-    let id = session
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or(StorageError::Invalid("Missing conversation identifier."))?;
-    validate_id(id)?;
-    let title = session
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty() && s.len() <= 1000)
-        .ok_or(StorageError::Invalid("Invalid conversation title."))?;
-    let updated = session
-        .get("updatedAt")
-        .and_then(Value::as_u64)
-        .filter(|n| *n <= i64::MAX as u64)
-        .ok_or(StorageError::Invalid("Invalid conversation date."))?;
-    let messages = session
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|m| m.len() <= 2000)
-        .ok_or(StorageError::Invalid(
-            "This conversation contains too many messages.",
-        ))?;
-    for message in messages {
-        if !matches!(
-            message.get("role").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) || message.get("content").and_then(Value::as_str).is_none()
-            || message
-                .get("attachments")
-                .and_then(Value::as_array)
-                .is_none()
-        {
-            return Err(StorageError::Invalid(
-                "This conversation contains an invalid message.",
-            ));
-        }
-    }
-    if let Some(context) = session.get("contextState").filter(|v| !v.is_null()) {
-        let state: crate::context::ContextState = serde_json::from_value(context.clone())?;
-        state
-            .validate()
-            .map_err(|_| StorageError::Invalid("Invalid saved model context."))?;
-    }
-    let body = serde_json::to_string(session)?;
-    if body.len() as u64 > MAX_SESSION_BYTES {
-        return Err(StorageError::Invalid(Cap::SessionTotal.message()));
-    }
-    Ok((id, title, updated as i64, body))
-}
-
 /// What `configure` reports when `foreign_keys` would not turn on.
 pub(crate) const FOREIGN_KEYS_OFF: &str = "Blackwall could not turn on its database safety checks. Your existing data has been left in place.";
 
