@@ -56,7 +56,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
 
 Type a message to ask the agent. Type // to start a message with a literal /.
 File tools stay in the project; edits, shell commands, and web requests need approval.
-At an approval, type yes to allow once; other input denies. Ctrl+C stops a turn.";
+At an approval, type y or yes to allow once; other input denies. Ctrl+C stops a turn.";
 
 const HELP: &str = "bw — Blackwall project assistant
 
@@ -396,20 +396,60 @@ fn configure(
     settings: &mut Settings,
     arguments: &[String],
 ) -> Result<(), String> {
-    match arguments {
-        [] => {}
-        [show] if show == "show" => {}
+    let changed = match arguments {
+        [] => None,
+        [show] if show == "show" => None,
         [set, key, values @ ..] if set == "set" && !values.is_empty() => {
             set_setting(store, directory, settings, key, &values.join(" "))?;
+            Some(key.as_str())
         }
         _ => {
             return Err(
                 "Use bw config show or bw config set <model|endpoint|profile|command-network|command-tools-isolation|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
             )
         }
+    };
+    if let Some(key) = changed {
+        let label = setting_label(key)?;
+        let description = settings.describe();
+        let line = description
+            .lines()
+            .find(|line| line.starts_with(label))
+            .ok_or("The changed setting could not be displayed.")?;
+        println!("{line}");
+    } else {
+        println!("{}", settings.describe());
     }
-    println!("{}", settings.describe());
     Ok(())
+}
+
+fn setting_label(key: &str) -> Result<&'static str, String> {
+    Ok(match key {
+        "web" => "web:",
+        "memory" => "memory:",
+        "recall" => "agent recall:",
+        "traces" => "traces:",
+        "trace-content" => "trace content:",
+        "text-tool-calls" => "text tool calls:",
+        "context" => "context:",
+        "output" => "output:",
+        "compact" => "automatic compaction:",
+        "iterations" => "iterations:",
+        "timeout" => "command time limit:",
+        "output-bytes" => "command output cap:",
+        "subagent-steps" | "subagent-tools" | "subagent-runs-on" => "subagents:",
+        "instruction-file-kib" | "instruction-total-kib" | "instruction-files" => "instructions:",
+        "profile" => "execution profile:",
+        "command-network" => "command network:",
+        "command-tools-isolation" => "command tools:",
+        "otlp-endpoint" | "otlp-protocol" | "otlp-signals" | "otlp-include-project" => {
+            "otlp export:"
+        }
+        "usage-retention-days" => "usage history:",
+        "model" => "model:",
+        "endpoint" => "endpoint:",
+        _ => return Err(format!("Unknown setting: {key}.")),
+    })
 }
 
 /// Change one saved setting. Turning recording on or off is marked for the Usage page's gaps.

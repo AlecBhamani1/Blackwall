@@ -1142,7 +1142,7 @@ fn validate_for(
             }
             Some(url) => {
                 if !http::valid_url(url) {
-                    return Err("An MCP server URL must use https, or http on 127.0.0.1, ::1, or localhost, and must not include a user name or password.");
+                    return Err("An MCP server URL must use https, or http on 127.0.0.1 or ::1, and must not include a user name or password.");
                 }
                 if server.headers.len() > 16
                     || !server
