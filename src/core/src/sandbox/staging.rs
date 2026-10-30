@@ -340,6 +340,19 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         std::fs::canonicalize(path).unwrap()
     }
+    /// [`sweep`] once a lease that was just let go is really free. A child that another test is
+    /// starting holds a copy of every open file until it execs, so a dropped lease can stay locked
+    /// for a moment.
+    fn sweep_once_free(data: &Path, now: SystemTime) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let removed = sweep(data, now);
+            if removed > 0 || std::time::Instant::now() >= deadline {
+                return removed;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn age(path: &Path, by: Duration) {
         std::fs::File::open(path)
             .unwrap()
@@ -401,7 +414,7 @@ mod tests {
         assert!(outside.exists());
         assert!(staging.root.exists());
         drop(staging);
-        assert_eq!(sweep(&data, SystemTime::now() + 2 * KEEP_FOR), 1);
+        assert_eq!(sweep_once_free(&data, SystemTime::now() + 2 * KEEP_FOR), 1);
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -423,7 +436,7 @@ mod tests {
         fs::flock(&held, FlockOperation::NonBlockingLockExclusive).unwrap();
         assert_eq!(sweep(&data, SystemTime::now()), 0);
         drop(held);
-        assert_eq!(sweep(&data, SystemTime::now()), 1);
+        assert_eq!(sweep_once_free(&data, SystemTime::now()), 1);
         assert!(!root.exists());
         // A lease that is a symlink can't be checked, so the folder stays.
         let odd = data.join("staging/odd");
