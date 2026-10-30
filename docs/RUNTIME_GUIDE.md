@@ -512,9 +512,8 @@ your login shell's `PATH`, so tools installed with Homebrew or npm work when Bla
 the Dock. It asks the shell once at startup and keeps the system default if that takes more than
 five seconds.
 
-Shell commands use an owner-selected execution profile, and so do owner-defined command tools
-when you choose that. In desktop Agent mode, choose
-**Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
+Shell commands and sandboxed command tools use an owner-selected execution profile. In desktop
+Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
 CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
 `bw config set command-network on|off`; `/settings` offers the same controls. The default is
 read-only with command network disabled. Desktop selections reset when switching conversations;
