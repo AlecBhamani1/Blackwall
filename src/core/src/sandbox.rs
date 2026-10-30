@@ -76,7 +76,7 @@ fn wrap_with_backend(
     unsandboxed: crate::child_env::Scope,
     pass_through: &[String],
 ) -> Result<tokio::process::Command, ToolError> {
-    use crate::child_env::{from_process, Scope};
+    use crate::child_env::from_process;
     if workspace.execution.profile == ExecutionProfile::Unsandboxed {
         from_process(unsandboxed, &workspace.path, pass_through).apply(&mut process);
         return Ok(process);
@@ -102,7 +102,7 @@ fn wrap_with_backend(
         // Do not hand application credentials, shell startup hooks, or loader injection variables
         // to project programs. The OS policy also blocks credential stores and unrelated IPC.
         // Owner pass-through names are not honoured inside the sandbox.
-        from_process(Scope::Sandboxed, &workspace.path, &[]).apply(&mut sandbox);
+        from_process(crate::child_env::Scope::Sandboxed, &workspace.path, &[]).apply(&mut sandbox);
         Ok(sandbox)
     }
 }
@@ -222,9 +222,22 @@ mod tests {
     #[test]
     fn unsupported_platform_fails_closed_but_explicit_opt_out_is_available() {
         let mut workspace = Workspace::open(&std::env::temp_dir()).unwrap();
-        assert!(wrap(&workspace, tokio::process::Command::new("unused"), &[]).is_err());
+        let owner = crate::child_env::Scope::Owner;
+        assert!(wrap(
+            &workspace,
+            tokio::process::Command::new("unused"),
+            owner,
+            &[]
+        )
+        .is_err());
         workspace.execution.profile = ExecutionProfile::Unsandboxed;
-        assert!(wrap(&workspace, tokio::process::Command::new("unused"), &[]).is_ok());
+        assert!(wrap(
+            &workspace,
+            tokio::process::Command::new("unused"),
+            owner,
+            &[]
+        )
+        .is_ok());
     }
 
     #[cfg(target_os = "macos")]
