@@ -35,7 +35,7 @@ impl Availability {
         }
     }
 }
-pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
+pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.";
 pub const LINUX_RETRYING: &str = "Bubblewrap didn't start just now. Try again in a moment.";
 pub const LINUX_BLOCKED: &str = "Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.";
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
@@ -587,7 +587,10 @@ mod tests {
             Some("Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.")
         );
         assert_eq!(Availability::Retrying.note(), Some(LINUX_RETRYING));
-        assert_eq!(Availability::Unavailable.note(), Some(LINUX_UNAVAILABLE));
+        assert_eq!(
+            Availability::Unavailable.note(),
+            Some("Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.")
+        );
         let available = Availability::Available {
             bwrap: "/usr/lib/blackwall/bwrap".into(),
             version: (0, 13, 1),

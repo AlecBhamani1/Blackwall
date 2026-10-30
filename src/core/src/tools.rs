@@ -657,7 +657,7 @@ pub(crate) async fn program_with_timeout(
 /// profile's display name.
 pub(crate) const SANDBOXED_TOOL_HINT: &str = "This may have been blocked by the {profile} sandbox. Command tools that need their own files or network can run outside it: Memory → Advanced · Subagents → Command tools, or `bw config set command-tools-isolation outside`.";
 /// What a sandbox denial prints, in lower case. A program that merely failed prints none.
-const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
+const SANDBOX_DENIAL_MARKERS: [&str; 10] = [
     "operation not permitted",
     "permission denied",
     "read-only file system",
@@ -667,6 +667,8 @@ const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
     "could not resolve host",
     "connection refused",
     "not allowed",
+    // bubblewrap's own errors, such as a program that isn't in the sandbox.
+    "bwrap: ",
 ];
 /// `text` with the sandbox hint added when a sandboxed profile is in force and the failure looks
 /// like a denial. Never on the time limit, and never for a program that just exited non-zero.
@@ -1004,6 +1006,12 @@ mod tests {
             ExecutionProfile::WorkspaceWrite
         )
         .contains("the Workspace-write sandbox."));
+        // bubblewrap's own failure, such as a program missing from the sandbox.
+        assert!(hinted(
+            "Exit: 1\nbwrap: execvp /x: No such file or directory\n",
+            ExecutionProfile::ReadOnly
+        )
+        .contains("the Read-only sandbox."));
         // A plain failure, the time limit, and an unsandboxed profile get no hint.
         for text in [
             "Exit: 3\n",

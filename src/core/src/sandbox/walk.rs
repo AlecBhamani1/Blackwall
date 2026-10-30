@@ -167,7 +167,8 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
     Ok(Walk { masks })
 }
 
-const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
+const CONTAINS_HOME: &str =
+    "This project folder is your home folder or contains it. Choose a smaller project folder.";
 const DATA_INSIDE_PROJECT: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
 const NO_HOME: &str = "Blackwall couldn't find your home folder, so it won't sandbox this command.";
 const UNRESOLVED: &str =
@@ -199,8 +200,8 @@ fn canonical_allowing_missing(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
-/// A project must sit strictly inside the home folder, and the app's data folder must not sit
-/// inside the project. Paths are resolved first (`..`, relative paths and symlinks), and anything
+/// A project must not be the home folder or one of its ancestors, and the app's data folder must
+/// not sit inside the project. Paths are resolved first (`..`, relative paths and symlinks), and anything
 /// that cannot be resolved, including a missing home folder, is refused.
 pub(crate) fn check_location(
     project: &Path,
@@ -218,7 +219,7 @@ pub(crate) fn check_location(
         return refuse(UNRESOLVED);
     };
     if home.starts_with(&project) {
-        return refuse(OUTSIDE_HOME);
+        return refuse(CONTAINS_HOME);
     }
     if let Some(data) = data {
         let Ok(data) = canonical_allowing_missing(data) else {
@@ -487,15 +488,16 @@ mod tests {
             check_location(project, Some(&self.home), data).map_err(|e| e.to_string())
         }
     }
-    const OUTSIDE: &str = "Choose a project folder inside your home folder";
+    const CONTAINS_HOME: &str =
+        "This project folder is your home folder or contains it. Choose a smaller project folder.";
     const DATA_INSIDE: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
 
     #[test]
     fn location_refuses_home_its_ancestors_and_data_inside_project() {
         let h = Home::new();
-        assert_eq!(h.check(&h.home, None), Err(OUTSIDE.into()));
-        assert_eq!(h.check(&h.root.0, None), Err(OUTSIDE.into()));
-        assert_eq!(h.check(Path::new("/"), None), Err(OUTSIDE.into()));
+        assert_eq!(h.check(&h.home, None), Err(CONTAINS_HOME.into()));
+        assert_eq!(h.check(&h.root.0, None), Err(CONTAINS_HOME.into()));
+        assert_eq!(h.check(Path::new("/"), None), Err(CONTAINS_HOME.into()));
         // The data folder does not exist yet.
         assert_eq!(
             h.check(&h.project, Some(&h.project.join(".data/deeper"))),
@@ -521,7 +523,7 @@ mod tests {
         let h = Home::new();
         assert_eq!(
             h.check(&h.project.join(".."), None),
-            Err(OUTSIDE.into()),
+            Err(CONTAINS_HOME.into()),
             "p/.. is the home folder"
         );
         // data written with .. that lands inside the project
@@ -538,7 +540,7 @@ mod tests {
             h.home.strip_prefix("/").unwrap().display()
         ));
         assert!(relative.is_relative());
-        assert_eq!(h.check(&relative, None), Err(OUTSIDE.into()));
+        assert_eq!(h.check(&relative, None), Err(CONTAINS_HOME.into()));
     }
 
     #[test]
@@ -549,10 +551,10 @@ mod tests {
         let project_link = h.root.0.join("project-link");
         symlink(&h.project, &project_link).unwrap();
         // The home folder through a link is still the home folder.
-        assert_eq!(h.check(&home_link, None), Err(OUTSIDE.into()));
+        assert_eq!(h.check(&home_link, None), Err(CONTAINS_HOME.into()));
         assert_eq!(
             check_location(&h.home, Some(&home_link), None).map_err(|e| e.to_string()),
-            Err(OUTSIDE.into())
+            Err(CONTAINS_HOME.into())
         );
         // A project reached through a link, and its data reached through another.
         assert_eq!(

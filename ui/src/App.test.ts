@@ -151,7 +151,7 @@ it('sends the selected command boundary and resets full access on a new session'
 it('keeps Read-only, disables Workspace-write and shows the bubblewrap note when unavailable', async () => {
   const user = userEvent.setup();
   const note =
-    "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
+    "Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.";
   const fallback = native.invoke.getMockImplementation();
   native.invoke.mockImplementation(async (command, args) =>
     command === 'sandbox_status'

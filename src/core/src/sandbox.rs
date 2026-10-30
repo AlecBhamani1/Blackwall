@@ -205,13 +205,30 @@ pub(crate) async fn ready(workspace: &Workspace) -> Result<(), ToolError> {
         if workspace.execution.profile == ExecutionProfile::Unsandboxed {
             return Ok(());
         }
-        ready_with(workspace, find_availability(workspace).await?)
+        ready_for(workspace, find_availability(workspace).await?).await
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = workspace;
         Ok(())
     }
+}
+/// [`ready_with`], then the project's location (not its contents, so it is quick): a project that
+/// is the home folder, or holds Blackwall's data, fails before the prompt rather than after it.
+#[cfg(target_os = "linux")]
+async fn ready_for(
+    workspace: &Workspace,
+    availability: &linux::Availability,
+) -> Result<(), ToolError> {
+    ready_with(workspace, availability)?;
+    let project = workspace.path.clone();
+    let data = workspace.execution.data_directory.clone();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    tokio::task::spawn_blocking(move || {
+        walk::check_location(&project, home.as_deref(), data.as_deref())
+    })
+    .await
+    .map_err(|_| ToolError::Execution(PREPARE_FAILED.into()))?
 }
 /// Bubblewrap is there and the profile is one Linux can sandbox.
 #[cfg(target_os = "linux")]
@@ -826,6 +843,36 @@ mod tests {
                 .expect("the command tool asked for approval");
                 assert!(tool_result.is_err());
             }
+            // A project that is the home folder fails before the prompt too, even where
+            // bubblewrap works. The check doesn't walk the project, so it is cheap.
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            project.workspace.execution.profile = ExecutionProfile::ReadOnly;
+            let mut at_home = Workspace::open(&home).unwrap();
+            at_home.execution = project.workspace.execution.clone();
+            let works = Availability::Available {
+                bwrap: "/no/such/bwrap".into(),
+                version: (0, 13, 1),
+            };
+            assert_eq!(
+                ready_for(&at_home, &works).await.unwrap_err().to_string(),
+                "This project folder is your home folder or contains it. Choose a smaller project folder."
+            );
+            assert!(ready_for(&project.workspace, &works).await.is_ok());
+            let shell_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::tools::execute(
+                    &at_home,
+                    &shell,
+                    "run",
+                    &approvals,
+                    &emit,
+                    Duration::from_secs(5),
+                    &Default::default(),
+                ),
+            )
+            .await
+            .expect("the shell asked for approval");
+            assert!(shell_result.is_err());
             assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert!(!project.workspace.path.join("ran").exists());
         }
