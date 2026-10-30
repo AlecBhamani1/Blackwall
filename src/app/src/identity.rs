@@ -1,6 +1,10 @@
 //! Alternate bundle identifiers isolate acceptance builds from the production app.
 //! The production identifier retains its established data paths and credential-store names.
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 use tauri::{AppHandle, Manager};
 const PRODUCTION_ID: &str = "com.blackwall.app";
 static IDENTIFIER: OnceLock<String> = OnceLock::new();
@@ -58,15 +62,26 @@ fn service_for(identifier: &str, legacy_service: &str) -> String {
     }
 }
 pub fn data_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    if app.config().identifier == PRODUCTION_ID {
-        app.path()
-            .home_dir()
-            .map(|home| home.join(".blackwall"))
-            .map_err(|_| "Your home folder could not be found.".into())
+    let override_path = std::env::var_os("BLACKWALL_DATA_DIR");
+    data_directory_for(
+        &app.config().identifier,
+        override_path.as_deref(),
+        app.path().home_dir().ok().as_deref(),
+        app.path().app_data_dir().ok().as_deref(),
+    )
+}
+fn data_directory_for(
+    identifier: &str,
+    override_path: Option<&OsStr>,
+    home: Option<&Path>,
+    app_data: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if identifier == PRODUCTION_ID {
+        blackwall_core::data_directory::resolve(override_path, home).map_err(str::to_owned)
     } else {
-        app.path()
-            .app_data_dir()
-            .map_err(|_| "The application's data folder could not be found.".into())
+        app_data
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "The application's data folder could not be found.".into())
     }
 }
 #[cfg(test)]
@@ -88,5 +103,50 @@ mod tests {
             assert_ne!(client, service);
             assert_ne!(host, client);
         }
+    }
+
+    #[test]
+    fn production_data_uses_the_shared_override_and_default_rules() {
+        let home = Path::new("/Users/owner");
+        let app_data = Path::new("/acceptance/data");
+        assert_eq!(
+            data_directory_for(
+                PRODUCTION_ID,
+                Some(OsStr::new("/var/blackwall-owner")),
+                Some(home),
+                Some(app_data),
+            )
+            .unwrap(),
+            Path::new("/var/blackwall-owner")
+        );
+        assert_eq!(
+            data_directory_for(PRODUCTION_ID, None, Some(home), Some(app_data)).unwrap(),
+            home.join(".blackwall")
+        );
+        assert_eq!(
+            data_directory_for(
+                PRODUCTION_ID,
+                Some(OsStr::new("relative")),
+                Some(home),
+                Some(app_data),
+            ),
+            blackwall_core::data_directory::resolve(Some(OsStr::new("relative")), Some(home))
+                .map_err(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn acceptance_identity_keeps_its_isolated_data_directory() {
+        let app_data = Path::new("/acceptance/data");
+        assert_eq!(
+            data_directory_for(
+                "com.blackwall.acceptance.host",
+                Some(OsStr::new("/var/production-data")),
+                None,
+                Some(app_data),
+            )
+            .unwrap(),
+            app_data
+        );
     }
 }
