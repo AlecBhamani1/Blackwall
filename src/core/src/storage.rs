@@ -31,6 +31,8 @@ pub enum StorageError {
 pub struct LocalStore {
     connection: Connection,
 }
+#[cfg(test)]
+mod fixtures;
 mod memory;
 mod recall;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
