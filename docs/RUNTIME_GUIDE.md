@@ -567,7 +567,8 @@ credentials from reaching a program that does not need them.
   AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
 - Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.
 
-To see what a program gets, run `env` as an unsandboxed command.
+To see what an MCP server or command tool gets, add a `tools.json` entry that runs `env` (and
+list the names you expect under `env`), or read the "not passed" names in a failed server's details.
 File tools remain workspace jailed, with reviewed edits; **Web access** controls the separate web
 tools and does not enable command network. Model connections remain available with command network off.
 

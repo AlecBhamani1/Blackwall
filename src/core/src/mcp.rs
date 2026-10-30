@@ -1012,13 +1012,7 @@ fn start_process(
 ) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
-        let program = crate::command_tools::resolve_program(&config.command[0], project)
-            .ok_or_else(|| {
-                ToolError::Execution(format!(
-                    "{} was not found on this computer.",
-                    config.command[0]
-                ))
-            })?;
+        let program = crate::command_tools::resolve_program(&config.command[0], project)?;
         let (process, stdin, stdout, stderr) =
             crate::tools::spawn_server(directory, &program, &config.command[1..], env, secrets)?;
         // Draining the logs keeps a chatty server from blocking. Their end is kept for the owner

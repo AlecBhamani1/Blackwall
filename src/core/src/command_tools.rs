@@ -540,12 +540,7 @@ impl CommandTool {
                 Some(input)
             }
         };
-        let program = resolve_program(&self.command[0], project).ok_or_else(|| {
-            ToolError::Execution(format!(
-                "{} was not found on this computer.",
-                self.command[0]
-            ))
-        })?;
+        let program = resolve_program(&self.command[0], project)?;
         Ok((program, args, input))
     }
 }
@@ -578,23 +573,39 @@ fn is_option(value: &str) -> bool {
 /// symlinks) into `project`. A repository can therefore never plant the program that an owner
 /// command tool or MCP server starts. On Windows the `.exe` is resolved here, so the approved path
 /// is exactly the one that runs.
-pub(crate) fn resolve_program(program: &str, project: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_program(program: &str, project: &Path) -> Result<PathBuf, ToolError> {
     let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
     let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
     resolve_in(
         program,
-        &crate::tools::search_path()?,
+        crate::tools::search_path().as_deref(),
         crate::child_env::valid_appdir(appdir.as_deref()),
         &project,
     )
+    .map_err(|why| {
+        ToolError::Execution(match why {
+            NotResolved::Missing => format!("{program} was not found on this computer."),
+            NotResolved::OnlyInProject => format!(
+                "{program} was only found inside the project folder, which Blackwall never runs programs from. Use an absolute path in the config."
+            ),
+        })
+    })
+}
+
+/// Why a program name did not resolve.
+#[derive(Debug, PartialEq, Eq)]
+enum NotResolved {
+    Missing,
+    /// Every match was in a `PATH` directory inside the project.
+    OnlyInProject,
 }
 
 fn resolve_in(
     program: &str,
-    search_path: &std::ffi::OsStr,
+    search_path: Option<&std::ffi::OsStr>,
     appdir: Option<&Path>,
     project: &Path,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, NotResolved> {
     let name = if cfg!(windows) && Path::new(program).extension().is_none() {
         format!("{program}.exe")
     } else {
@@ -602,17 +613,31 @@ fn resolve_in(
     };
     let path = Path::new(&name);
     if path.is_absolute() {
-        return executable(path).then(|| path.to_path_buf());
+        return if executable(path) {
+            Ok(path.to_path_buf())
+        } else {
+            Err(NotResolved::Missing)
+        };
     }
-    let outside_project = |directory: &Path| {
-        project.as_os_str().is_empty()
-            || std::fs::canonicalize(directory).is_ok_and(|real| !real.starts_with(project))
-    };
-    let directories = crate::child_env::validated_path(search_path, appdir, project)?;
-    std::env::split_paths(&directories)
-        .filter(|directory| directory.is_absolute() && outside_project(directory))
+    let search_path = search_path.ok_or(NotResolved::Missing)?;
+    // `validated_path` already drops directories that are, or resolve into, the project.
+    let found = crate::child_env::validated_path(search_path, appdir, project)
+        .into_iter()
+        .flat_map(|directories| std::env::split_paths(&directories).collect::<Vec<_>>())
         .map(|directory| directory.join(&name))
-        .find(|candidate| executable(candidate))
+        .find(|candidate| executable(candidate));
+    found.ok_or_else(|| {
+        let planted = std::env::split_paths(search_path).any(|directory| {
+            directory.is_absolute()
+                && executable(&directory.join(&name))
+                && crate::child_env::inside_project(&directory, project)
+        });
+        if planted {
+            NotResolved::OnlyInProject
+        } else {
+            NotResolved::Missing
+        }
+    })
 }
 
 fn executable(path: &Path) -> bool {
@@ -769,40 +794,42 @@ mod tests {
         let system = plant(&root, "system/bin");
         std::os::unix::fs::symlink(&planted, root.join("alias")).unwrap();
         let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        let find =
+            |program: &str, dirs: &[&Path]| resolve_in(program, Some(&join(dirs)), None, &project);
         // The project directory is on PATH first, but the system one is chosen.
-        assert_eq!(
-            resolve_in("tool", &join(&[&planted, &system]), None, &project),
-            Some(system.join("tool"))
-        );
+        assert_eq!(find("tool", &[&planted, &system]), Ok(system.join("tool")));
         // A symlink that leads back into the project does not count either.
         assert_eq!(
-            resolve_in(
-                "tool",
-                &join(&[&root.join("alias"), &system]),
-                None,
-                &project
-            ),
-            Some(system.join("tool"))
+            find("tool", &[&root.join("alias"), &system]),
+            Ok(system.join("tool"))
         );
-        // With only project entries, nothing is found.
+        // With only project entries, nothing is found, and the error says why.
         assert_eq!(
-            resolve_in(
-                "tool",
-                &join(&[&planted, &root.join("alias")]),
-                None,
-                &project
-            ),
-            None
+            find("tool", &[&planted, &root.join("alias")]),
+            Err(NotResolved::OnlyInProject)
         );
+        assert_eq!(find("absent", &[&system]), Err(NotResolved::Missing));
         // An absolute path in the configuration is the owner's explicit choice.
+        let absolute = planted.join("tool");
+        assert_eq!(find(absolute.to_str().unwrap(), &[&system]), Ok(absolute));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_programs_resolve_without_any_search_path() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("blackwall-resolve-{}", rand::random::<u64>()));
+        let system = plant(&root, "system/bin");
+        let tool = system.join("tool");
         assert_eq!(
-            resolve_in(
-                planted.join("tool").to_str().unwrap(),
-                &join(&[&system]),
-                None,
-                &project
-            ),
-            Some(planted.join("tool"))
+            resolve_in(tool.to_str().unwrap(), None, None, Path::new("/p")),
+            Ok(tool)
+        );
+        assert_eq!(
+            resolve_in("tool", None, None, Path::new("/p")),
+            Err(NotResolved::Missing)
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

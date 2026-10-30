@@ -94,9 +94,10 @@ pub(crate) const WINDOWS_ALLOW: [&str; 24] = [
     "PROCESSOR_ARCHITECTURE",
     "OS",
 ];
-/// Variables the AppImage runtime sets for itself (`GIO_MODULE_DIR` and the Python, GTK and Qt ones
-/// are in [`INJECTION`]); a shell command must not inherit them.
-pub(crate) const APPIMAGE_ENV: [&str; 7] = [
+/// Variables the AppImage runtime sets for itself, which a shell command must not inherit. Others
+/// are in [`INJECTION`] (`GIO_MODULE_DIR`, `GTK_PATH`, `QT_PLUGIN_PATH`, the Python ones), and in a
+/// shell any variable whose value holds the AppImage mount is refused too.
+pub(crate) const APPIMAGE_ENV: [&str; 17] = [
     "APPDIR",
     "APPIMAGE",
     "ARGV0",
@@ -104,6 +105,16 @@ pub(crate) const APPIMAGE_ENV: [&str; 7] = [
     "GDK_PIXBUF_MODULE_FILE",
     "GST_PLUGIN_SYSTEM_PATH",
     "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GSETTINGS_SCHEMA_DIR",
+    "GI_TYPELIB_PATH",
+    "GDK_BACKEND",
+    "GTK_THEME",
+    "GST_PLUGIN_PATH_1_0",
+    "GST_PLUGIN_SCANNER_1_0",
+    "GST_PTP_HELPER_1_0",
 ];
 /// Blackwall's model and relay secrets, which child programs never inherit.
 pub(crate) const SECRET_ENV: [&str; 4] = [
@@ -151,7 +162,13 @@ pub(crate) fn build(
         let on_windows = cfg!(windows) && listed(&WINDOWS_ALLOW);
         let allowed = on_windows
             || match scope {
-                Scope::Shell => !same_name(name, "PATH") && !shell_refuses(name),
+                Scope::Shell => {
+                    !same_name(name, "PATH")
+                        && !shell_refuses(name)
+                        // Whatever the AppRun hooks exported that points into the mount.
+                        && (name == "XDG_DATA_DIRS"
+                            || !holds_appdir(value, appdir))
+                }
                 Scope::Sandboxed => listed(&SANDBOX_ALLOW),
                 Scope::Owner => {
                     listed(&OWNER_ALLOW)
@@ -212,9 +229,10 @@ pub(crate) fn from_process(scope: Scope, project: &Path, pass_through: &[String]
 }
 
 /// Keeps only the `PATH` entries a child may search: absolute ones outside the AppImage mount and
-/// the project (pass the project's canonical absolute path, which is what symlink-free `PATH`
-/// entries are compared with). Empty and relative entries would resolve to the current directory, and a project
-/// entry would let a repository plant programs that the owner's tools then run.
+/// the project (pass the project's canonical absolute path). An entry that is, or resolves through
+/// symlinks into, the project is dropped too. Empty and relative entries would resolve to the
+/// current directory, and a project entry would let a repository plant programs that the owner's
+/// tools then run.
 pub(crate) fn validated_path(
     path: &OsStr,
     appdir: Option<&Path>,
@@ -230,6 +248,18 @@ pub(crate) fn validated_data_dirs(dirs: &OsStr, appdir: Option<&Path>) -> Option
     keep_entries(dirs, appdir, None)
 }
 
+/// Whether `entry` is, or resolves through symlinks into, `project`. An empty `project` holds
+/// nothing.
+pub(crate) fn inside_project(entry: &Path, project: &Path) -> bool {
+    if project.as_os_str().is_empty() {
+        return false;
+    }
+    let root = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    entry.starts_with(project)
+        || entry.starts_with(&root)
+        || std::fs::canonicalize(entry).is_ok_and(|real| real.starts_with(&root))
+}
+
 fn keep_entries(list: &OsStr, appdir: Option<&Path>, project: Option<&Path>) -> Option<OsString> {
     let inside = |entry: &Path, root: Option<&Path>| {
         root.is_some_and(|root| !root.as_os_str().is_empty() && entry.starts_with(root))
@@ -241,13 +271,20 @@ fn keep_entries(list: &OsStr, appdir: Option<&Path>, project: Option<&Path>) -> 
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
                 && !inside(entry, appdir)
-                && !inside(entry, project)
+                && !project.is_some_and(|project| inside_project(entry, project))
         })
         .collect();
     if kept.is_empty() {
         return None;
     }
     std::env::join_paths(kept).ok()
+}
+
+/// Whether `value` contains the AppImage mount path.
+fn holds_appdir(value: &OsStr, appdir: Option<&Path>) -> bool {
+    appdir
+        .and_then(Path::to_str)
+        .is_some_and(|dir| value.to_str().is_some_and(|value| value.contains(dir)))
 }
 
 /// Whether a shell command must not inherit `name`: Blackwall's secrets, variables that load
@@ -464,6 +501,63 @@ mod tests {
             .dropped()
             .contains(&"BLACKWALL_MODEL_API_KEY".to_owned()));
         assert!(!env.dropped().contains(&"SSH_AUTH_SOCK".to_owned()));
+    }
+
+    #[test]
+    fn shell_scope_drops_every_variable_that_points_into_the_appimage() {
+        let env = build(
+            vars(&[
+                ("APPDIR", "/tmp/.mount_x"),
+                ("FOO_MODULE_DIR", "/tmp/.mount_x/lib"),
+                ("GTK_DATA_PREFIX", "/tmp/.mount_x"),
+                ("SOME_LIST", "/opt/a:/tmp/.mount_x/usr/share"),
+                ("GTK_THEME", "Adwaita"),
+                ("GDK_BACKEND", "x11"),
+                ("GI_TYPELIB_PATH", "/usr/lib/girepository-1.0"),
+                ("GST_PLUGIN_SCANNER_1_0", "/s"),
+                ("GSETTINGS_SCHEMA_DIR", "/g"),
+                ("EDITOR", "vim"),
+                ("XDG_DATA_DIRS", "/tmp/.mount_x/usr/share:/usr/share"),
+            ]),
+            Scope::Shell,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert_eq!(names(&env), ["EDITOR", "XDG_DATA_DIRS"]);
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some("/usr/share"));
+        // Without an AppImage, such a value is just a value.
+        let env = build(
+            vars(&[("FOO_MODULE_DIR", "/tmp/.mount_x/lib")]),
+            Scope::Shell,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert_eq!(names(&env), ["FOO_MODULE_DIR"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_entries_that_alias_the_project_are_dropped() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("blackwall-alias-{}", rand::random::<u64>()));
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&project, root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(project.join("bin"), root.join("binalias")).unwrap();
+        let path = format!(
+            "{}:{}:{}:/usr/bin",
+            root.join("alias").display(),
+            root.join("binalias").display(),
+            project.join("bin").display()
+        );
+        for scope in [Scope::Owner, Scope::Shell, Scope::Sandboxed] {
+            let env = build(vars(&[("PATH", &path)]), scope, None, &project, &[]);
+            assert_eq!(get(&env, "PATH"), Some("/usr/bin"), "{scope:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
