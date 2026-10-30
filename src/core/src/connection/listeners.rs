@@ -108,6 +108,13 @@ async fn output(program: &str, arguments: &[&str], limit: Duration) -> Option<St
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // The listing tools start from the allow-list, not this process's whole environment.
+    crate::child_env::from_process(
+        crate::child_env::Scope::Owner,
+        std::path::Path::new(""),
+        &[],
+    )
+    .apply(&mut command);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash from the app.
     let result = tokio::time::timeout(limit, command.output())

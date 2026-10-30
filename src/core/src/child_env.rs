@@ -226,6 +226,13 @@ pub(crate) fn valid_pass_through(name: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Gives a program the desktop app starts for the owner (a browser opener, say) the owner
+/// allow-list environment plus the `pass_through` names, for code outside this crate.
+pub fn apply_owner_env(command: &mut tokio::process::Command, pass_through: &[&str]) {
+    let names: Vec<String> = pass_through.iter().map(|name| (*name).to_owned()).collect();
+    from_process(Scope::Owner, Path::new(""), &names).apply(command);
+}
+
 /// Checks the `env` list of an MCP server or command tool: at most 32 distinct valid names.
 pub(crate) fn valid_pass_through_list(names: &[String]) -> Result<(), &'static str> {
     const TOO_MANY: &str = "List at most 32 distinct env names.";

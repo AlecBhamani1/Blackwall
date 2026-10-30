@@ -106,6 +106,21 @@ pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut opener = tokio::process::Command::new("xdg-open");
+    // The opener starts from the allow-list, so the AppImage runtime's library and Python
+    // variables never reach it. On Linux it still needs the desktop session to find a browser.
+    blackwall_core::apply_owner_env(
+        &mut opener,
+        &[
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "DESKTOP_SESSION",
+            "BROWSER",
+        ],
+    );
     let status = tokio::time::timeout(
         Duration::from_secs(10),
         opener.arg(&target).kill_on_drop(true).status(),

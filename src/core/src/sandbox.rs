@@ -218,9 +218,9 @@ mod tests {
     #[test]
     fn unsupported_platform_fails_closed_but_explicit_opt_out_is_available() {
         let mut workspace = Workspace::open(&std::env::temp_dir()).unwrap();
-        assert!(wrap(&workspace, tokio::process::Command::new("unused")).is_err());
+        assert!(wrap(&workspace, tokio::process::Command::new("unused"), &[]).is_err());
         workspace.execution.profile = ExecutionProfile::Unsandboxed;
-        assert!(wrap(&workspace, tokio::process::Command::new("unused")).is_ok());
+        assert!(wrap(&workspace, tokio::process::Command::new("unused"), &[]).is_ok());
     }
 
     #[cfg(target_os = "macos")]
