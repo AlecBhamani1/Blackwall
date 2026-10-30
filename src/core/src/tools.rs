@@ -660,7 +660,7 @@ pub(crate) async fn program_with_timeout(
 }
 /// Added to a command tool failure that looks like a sandbox denial; `{profile}` is the
 /// profile's display name.
-pub(crate) const SANDBOXED_TOOL_HINT: &str = "This may have been blocked by the {profile} sandbox. Command tools that need their own files or network can run outside it: Settings → Command tools.";
+pub(crate) const SANDBOXED_TOOL_HINT: &str = "This may have been blocked by the {profile} sandbox. Command tools that need their own files or network can run outside it: Memory → Advanced · Subagents → Command tools, or `bw config set command-tools-isolation outside`.";
 /// What a sandbox denial prints, in lower case. A program that merely failed prints none.
 const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
     "operation not permitted",
@@ -999,7 +999,7 @@ mod tests {
         let read_only = hinted(denied, ExecutionProfile::ReadOnly);
         assert!(read_only.starts_with(denied));
         assert!(read_only.contains("This may have been blocked by the Read-only sandbox."));
-        assert!(read_only.contains("Settings → Command tools"));
+        assert!(read_only.contains("Memory → Advanced · Subagents → Command tools"));
         assert!(hinted(
             "curl: (6) Could not resolve host: x",
             ExecutionProfile::WorkspaceWrite

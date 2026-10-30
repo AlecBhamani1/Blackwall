@@ -1154,7 +1154,10 @@ mod tests {
             error.contains("This may have been blocked by the Read-only sandbox."),
             "{error}"
         );
-        assert!(error.contains("Settings → Command tools"), "{error}");
+        assert!(
+            error.contains("Memory → Advanced · Subagents → Command tools"),
+            "{error}"
+        );
         assert!(!path.join("tool-write").exists());
         tokio::fs::remove_dir_all(&path).await.unwrap();
     }
