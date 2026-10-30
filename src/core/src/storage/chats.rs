@@ -548,6 +548,13 @@ pub(crate) fn append_ui_assistant(
     Ok(seq)
 }
 
+/// The next checkpoint ordinal, which is also the count (ordinals are contiguous from 0): one
+/// primary-key seek that reads no body.
+const NEXT_ORDINAL_SQL: &str =
+    "SELECT COALESCE(MAX(ordinal)+1,0) FROM chat_checkpoints WHERE session_id=?1";
+const CHECKPOINT_BYTES_SQL: &str =
+    "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM chat_checkpoints WHERE session_id=?1";
+
 /// Upserts the `chat_context` row, and adds `new_checkpoints` after the stored ones, or with
 /// `replace_checkpoints` instead of them. Every check runs before the first write.
 pub(crate) fn write_context(
@@ -562,17 +569,16 @@ pub(crate) fn write_context(
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
-    let (stored, stored_bytes): (i64, i64) = stmt(
-        tx,
-        "SELECT count(*),COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM chat_checkpoints WHERE session_id=?1",
-    )?
-    .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let (kept, kept_bytes) = if replace_checkpoints {
-        (0, 0)
+    // Appending reads one key (the next ordinal, which is also how many are kept) and no body.
+    // Only a replace sums the old bodies, to give their bytes back.
+    let (kept, mut total) = if replace_checkpoints {
+        let stored_bytes: i64 =
+            stmt(tx, CHECKPOINT_BYTES_SQL)?.query_row([id], |row| row.get(0))?;
+        (0, c.total_bytes.saturating_sub(unsigned(stored_bytes)?))
     } else {
-        (unsigned(stored)?, unsigned(stored_bytes)?)
+        let next: i64 = stmt(tx, NEXT_ORDINAL_SQL)?.query_row([id], |row| row.get(0))?;
+        (unsigned(next)?, c.total_bytes)
     };
-    let mut total = c.total_bytes - unsigned(stored_bytes)? + kept_bytes;
     for (number, text) in texts.iter().enumerate() {
         if text.len() > MAX_CHECKPOINT_BYTES {
             return Err(StorageError::Limit(Cap::Checkpoint));
@@ -860,12 +866,23 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
 /// Today's session JSON for a chat: the typed columns, each `metadata` key at the top level, the
 /// messages, and a `contextState` only when the stored context is valid. That value is
 /// `build_view`'s own, not a re-serialized `ContextState`.
+/// Top-level session JSON keys that metadata may not carry.
+const RESERVED_KEYS: [&str; 7] = [
+    "id",
+    "title",
+    "updatedAt",
+    "mode",
+    "workspace",
+    "messages",
+    "contextState",
+];
+
 fn chat_json(loaded: &Loaded) -> Value {
     let chat = &loaded.chat;
     let mut json = Map::new();
     for (key, value) in &chat.metadata {
-        // A literal `contextState:null` is the only form of it metadata may carry.
-        if key != "contextState" || value.is_null() {
+        // A reserved key is owned by a column, the log or the context, so metadata never shows it.
+        if !RESERVED_KEYS.contains(&key.as_str()) {
             json.insert(key.clone(), value.clone());
         }
     }
@@ -938,6 +955,15 @@ impl LocalStore {
         validate_id(id)?;
         if let Some(title) = &patch.title {
             check_title(title)?;
+        }
+        if patch
+            .metadata
+            .as_ref()
+            .is_some_and(|map| map.keys().any(|key| RESERVED_KEYS.contains(&key.as_str())))
+        {
+            return Err(StorageError::Invalid(
+                "These conversation details use a name that is reserved, so they were not saved.",
+            ));
         }
         let metadata = patch
             .metadata
@@ -2029,16 +2055,14 @@ mod tests {
         ));
         assert_eq!(rows(&db, "s"), events);
         assert_eq!(counters(&db, "s"), counted);
-        // A literal contextState:null lives in metadata and only survives while there is no valid context.
+        // Metadata keys show at the top level, but never a contextState: only a valid context gives one.
         let patch = MetadataPatch {
             title: None,
-            metadata: Some(
-                serde_json::from_value(json!({"contextState": null, "pinned": 1})).unwrap(),
-            ),
+            metadata: Some(serde_json::from_value(json!({"pinned": 1})).unwrap()),
         };
         db.update_session_metadata("s", &patch, 1).unwrap();
         let json = db.load_json_v6("s").unwrap().unwrap();
-        assert_eq!(json["contextState"], Value::Null);
+        assert!(json.get("contextState").is_none());
         assert_eq!(json["pinned"], 1);
         set(good.clone());
         let json = db.load_json_v6("s").unwrap().unwrap();
@@ -2060,10 +2084,7 @@ mod tests {
         run(&db, "s", 0);
         let patch = MetadataPatch {
             title: None,
-            metadata: Some(
-                serde_json::from_value(json!({"messages": "spoof", "id": "spoof", "extra": [1]}))
-                    .unwrap(),
-            ),
+            metadata: Some(serde_json::from_value(json!({"extra": [1]})).unwrap()),
         };
         db.update_session_metadata("s", &patch, 1).unwrap();
         let json = db.load_json_v6("s").unwrap().unwrap();
@@ -2089,6 +2110,113 @@ mod tests {
         make(&db, "bare");
         let bare = db.load_json_v6("bare").unwrap().unwrap();
         assert!(bare.get("mode").is_none() && bare.get("workspace").is_none());
+    }
+
+    #[test]
+    fn metadata_cannot_carry_a_reserved_key() {
+        let db = v6_in_memory();
+        make(&db, "bare"); // mode and workspace are NULL
+        for key in RESERVED_KEYS {
+            let patch = MetadataPatch {
+                title: None,
+                metadata: Some(serde_json::from_value(json!({ key: "x", "ok": 1 })).unwrap()),
+            };
+            match db.update_session_metadata("bare", &patch, 1) {
+                Err(StorageError::Invalid(text)) => assert!(text.contains("reserved"), "{text}"),
+                other => panic!("{key}: expected Invalid, got {other:?}"),
+            }
+        }
+        let chat = db.load_chat("bare").unwrap().unwrap();
+        assert_eq!(chat.revision, 1, "a refused patch changes nothing");
+        assert!(chat.metadata.is_empty());
+        // If a reserved key is in the column anyway, the session JSON still ignores it, so it
+        // cannot fill a NULL mode or workspace behind set-once and the path check.
+        db.connection()
+            .execute(
+                r#"UPDATE sessions SET metadata='{"mode":"agent","workspace":"/evil","id":"x","title":"x","updatedAt":9,"messages":[1],"contextState":null,"ok":1}' WHERE id='bare'"#,
+                [],
+            )
+            .unwrap();
+        let json = db.load_json_v6("bare").unwrap().unwrap();
+        assert!(json.get("mode").is_none() && json.get("workspace").is_none());
+        assert!(json.get("contextState").is_none());
+        assert_eq!(json["id"], "bare");
+        assert_eq!(json["title"], "Chat bare");
+        assert_eq!(json["updatedAt"], 1000);
+        assert_eq!(json["messages"], json!([]));
+        assert_eq!(json["ok"], 1);
+    }
+
+    #[test]
+    fn appending_a_checkpoint_reads_no_checkpoint_body() {
+        let db = v6_in_memory();
+        make(&db, "s");
+        let row = ContextRow {
+            model_from: 0,
+            model_len: 0,
+            covered_messages: 0,
+            source_hash: "h".into(),
+            server_usage: None,
+        };
+        let big = json!({"summary": "x".repeat(200_000)});
+        write(&db, "s", |tx, c| {
+            write_context(tx, "s", c, &row, &[big.clone(), big.clone()], false)
+        })
+        .unwrap();
+        // The query behind the non-replace path is one primary-key seek, never a scan of bodies.
+        let plan: Vec<String> = {
+            let mut statement = db
+                .connection()
+                .prepare(&format!("EXPLAIN QUERY PLAN {NEXT_ORDINAL_SQL}"))
+                .unwrap();
+            let rows = statement
+                .query_map(["s"], |r| r.get::<_, String>(3))
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        let plan = plan.join(" | ");
+        assert!(plan.contains("PRIMARY KEY"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+        // One statement to find the ordinal, one insert, one context upsert: no sum, no delete.
+        let before = statements();
+        write(&db, "s", |tx, c| {
+            write_context(tx, "s", c, &row, std::slice::from_ref(&big), false)
+        })
+        .unwrap();
+        let appended = statements() - before;
+        let before = statements();
+        write(&db, "s", |tx, c| {
+            write_context(tx, "s", c, &row, std::slice::from_ref(&big), true)
+        })
+        .unwrap();
+        let replaced = statements() - before;
+        // write(): read_counters + write_counters = 2 around the call.
+        assert_eq!(appended, 2 + 3);
+        assert_eq!(replaced, 2 + 4, "only a replace sums and deletes");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*)*100+max(ordinal) FROM chat_checkpoints WHERE session_id='s'"
+            ),
+            100,
+            "one checkpoint, at ordinal 0"
+        );
+        // A corrupt (too small) total cannot underflow a replace.
+        write(&db, "s", |tx, c| {
+            write_context(tx, "s", c, &row, std::slice::from_ref(&big), false)
+        })
+        .unwrap();
+        db.connection()
+            .execute("UPDATE sessions SET total_bytes=1 WHERE id='s'", [])
+            .unwrap();
+        write(&db, "s", |tx, c| {
+            write_context(tx, "s", c, &row, std::slice::from_ref(&big), true)
+        })
+        .unwrap();
+        let repaired = db.load_chat("s").unwrap().unwrap();
+        assert_eq!(repaired.id, "s");
+        let tx = write_tx(db.connection()).unwrap();
+        assert_eq!(recount(&tx, "s").unwrap(), read_counters(&tx, "s").unwrap());
     }
 
     #[test]
