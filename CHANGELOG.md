@@ -169,13 +169,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Open Blackwall on Linux without a system keyring (#52). A new data folder opens, and an access
   key works for the session only, marked "Not saved: no system keyring". Saving a lock, telemetry
-  header, MCP secret or HTTP tool secret says to start GNOME Keyring or KWallet instead; `bw` shows
-  the same note.
+  header, MCP secret or HTTP tool secret says to start GNOME Keyring or KWallet and restart
+  Blackwall instead; `bw` shows the same note for telemetry headers, MCP secrets and tool secrets.
 
 - Keep an app lock enforced when the Linux keyring is unavailable. Turning the lock on leaves an
   `app-lock-enabled` marker in the data folder; with that marker or saved conversations and no
-  keyring, the app stays locked and asks you to start the keyring and try again. A dismissed or
-  locked keyring prompt is an error with "Try again", not "no keyring".
+  keyring, the app stays locked and asks you to start the keyring and try again. The desktop app
+  cannot set a lock without a keyring. A dismissed or locked keyring prompt is an error with "Try
+  again", not "no keyring".
 
 ### Changed
 

@@ -7,9 +7,12 @@ Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved acce
 credentials, and the app-lock verifier use the platform credential store: Keychain on macOS,
 Credential Manager on Windows, and the Secret Service (GNOME Keyring, KWallet, or a compatible
 provider) on Linux. On Linux, start and unlock a keyring before saving keys. Without one, a new data
-folder still opens, an access key works for that session only (shown as "Not saved: no system
-keyring"), and saving a lock, telemetry header or tool secret is refused. Blackwall never falls back
-to plain-text storage. Local data lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows).
+folder still opens and a model access key works for that session only (shown as "Not saved: no
+system keyring"). Saving a lock, telemetry header, MCP secret, tool secret or pairing key is refused
+until you start GNOME Keyring or KWallet and restart Blackwall, and `bw` shows the same note when
+saving a telemetry header, MCP secret or tool secret. Blackwall never falls back to plain-text
+storage. Local data
+lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows).
 
 ## Connect a model
 
@@ -1038,11 +1041,12 @@ Enable **App lock** in **Settings → General → Security** with a passphrase o
 Blackwall stores a salted Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
 sharing after flushing pending conversation saves. Failed attempts incur a short delay, increasing
 after repeated failures. Changing or removing the lock requires the current passphrase. Turning the
-lock on also writes an `app-lock-enabled` marker file (no secret) in the data folder. On Linux, if
-the keyring is not available and that marker or any saved conversation exists, the app stays locked
-and says the lock is stored in the system keyring: start GNOME Keyring or KWallet, then try again.
-A keyring prompt you dismiss counts as an error, not as no keyring. Without a keyring you cannot
-set a lock, and `bw` shows the same note.
+lock on also writes an `app-lock-enabled` marker file (no secret) in the data folder, and the app
+writes it whenever the keyring holds a lock, including locks made before this marker existed. On
+Linux, if the keyring is not available and that marker or any saved conversation exists, the app
+stays locked and says the lock is stored in the system keyring: start GNOME Keyring or KWallet, then
+try again. A keyring prompt you dismiss counts as an error, not as no keyring. Without a keyring you
+cannot set a lock in the desktop app.
 
 This is an access control for the desktop app, meant for someone at your unlocked screen. It does not encrypt the database, attachments, skills,
 or exports, and does not stop the same user account from reading them or using the CLI. Disk

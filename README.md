@@ -26,8 +26,9 @@ computer:
 
 Linux builds target Ubuntu 22.04 or newer (and equivalent distributions) with WebKitGTK 4.1. They
 store access keys through the Secret Service, so a keyring such as GNOME Keyring or KWallet must
-be running and unlocked; without one, a new data folder still opens but keys are kept for the
-session only, and an existing lock keeps the app locked. Windows stores access keys in Credential Manager; macOS uses Keychain.
+be running and unlocked. Without one, a new data folder still opens and a model access key is kept
+for the session only, and an existing lock keeps the app locked. Windows stores access keys in
+Credential Manager; macOS uses Keychain.
 Windows and macOS builds are not yet code-signed by a platform publisher, so the first launch shows
 a SmartScreen or Gatekeeper warning.
 
