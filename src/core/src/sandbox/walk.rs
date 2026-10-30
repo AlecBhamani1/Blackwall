@@ -10,13 +10,18 @@
 //!   recorded, so swapping the whole folder is caught. Inside it, the walk goes by path: a process
 //!   outside the sandbox that renames folders within the project while the walk runs (moving a
 //!   protected name into a folder already walked, say) can still leave that name unmasked.
+//! - The walk stops after [`TIME_LIMIT`] and never enters another mounted file system, but a read
+//!   that hangs (an unresponsive network or FUSE mount as the project itself) still blocks the
+//!   blocking-pool thread until it returns.
 //! - Names compare as raw bytes with ASCII case folding. A case-folding filesystem that also folds
 //!   non-ASCII (or non-UTF-8) names can reach a protected name this does not recognise.
 
 use crate::tools::ToolError;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub(crate) const PROTECTED: [&str; 11] = [
     ".git",
@@ -41,6 +46,8 @@ pub(crate) const SKIP_BELOW_ROOT: [&str; 7] = [
     "build",
 ];
 pub(crate) const MAX_ENTRIES: usize = 500_000;
+/// How long the walk may take before the command is refused.
+pub(crate) const TIME_LIMIT: Duration = Duration::from_secs(10);
 /// ASCII case-insensitive on the raw bytes, the way the copy-back refuses names. A name with a
 /// non-UTF-8 byte is just a different name: `.G\xffIT` is not `.git` and is not protected.
 pub(crate) fn is_protected(name: &OsStr) -> bool {
@@ -60,6 +67,7 @@ pub(crate) struct Mask {
     pub kind: MaskKind,
 }
 
+#[derive(Debug)]
 pub(crate) struct Walk {
     /// Sorted by path.
     pub masks: Vec<Mask>,
@@ -80,6 +88,12 @@ pub(crate) enum WalkError {
     Unreadable {
         path: PathBuf,
     },
+    /// It took longer than its time limit.
+    TimedOut,
+    /// A folder on another file system than the project's (a mount point), which isn't entered.
+    OtherFileSystem {
+        path: PathBuf,
+    },
 }
 
 impl From<WalkError> for ToolError {
@@ -95,6 +109,11 @@ impl From<WalkError> for ToolError {
                 "Blackwall couldn't read {} in this project, so it can't check it before sandboxing. Fix its permissions or move it out of the project. The command was not run.",
                 path.display()
             ),
+            WalkError::TimedOut => "Blackwall took too long to check this project folder, so the command was not run.".to_string(),
+            WalkError::OtherFileSystem { path } => format!(
+                "This project contains another mounted file system at {}, which Blackwall can't check safely. The command was not run.",
+                path.display()
+            ),
         })
     }
 }
@@ -103,9 +122,15 @@ impl From<WalkError> for ToolError {
 /// A masked directory is not entered. A directory in `SKIP_BELOW_ROOT` is not entered either, but
 /// its direct children are still checked for protected names and are not counted. Past the limit
 /// the error names the top-level entry that has the most entries counted so far (ties go to the
-/// lower name), or the root itself when its direct entries alone are over the limit.
+/// lower name), or the root itself when its direct entries alone are over the limit. It gives up
+/// after [`TIME_LIMIT`], and refuses a folder on another file system rather than enter it.
 pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
-    use std::os::unix::fs::MetadataExt;
+    walk_within(root, limit, TIME_LIMIT)
+}
+/// [`walk`] with its own time limit.
+pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<Walk, WalkError> {
+    let deadline = Instant::now() + time;
+    let late = || Instant::now() >= deadline;
     let unreadable_root = || WalkError::Unreadable {
         path: PathBuf::new(),
     };
@@ -123,8 +148,14 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
         let unreadable = || WalkError::Unreadable {
             path: relative.clone(),
         };
+        if late() {
+            return Err(WalkError::TimedOut);
+        }
         let entries = std::fs::read_dir(root.join(&relative)).map_err(|_| unreadable())?;
         for entry in entries {
+            if late() {
+                return Err(WalkError::TimedOut);
+            }
             let entry = entry.map_err(|_| unreadable())?;
             let name = entry.file_name();
             let path = relative.join(&name);
@@ -171,6 +202,10 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
                 };
                 masks.push(Mask { path, kind });
             } else if file_type.is_dir() && !shallow {
+                // A mount (a disk, a network share, /proc) may be huge, change underneath or hang.
+                if meta.dev() != top.dev() {
+                    return Err(WalkError::OtherFileSystem { path });
+                }
                 let skipped = SKIP_BELOW_ROOT.iter().any(|s| name == OsStr::new(s));
                 pending.push((path, skipped));
             }
@@ -370,10 +405,58 @@ mod tests {
 
     #[test]
     fn walk_records_the_identity_of_the_folder_it_walked() {
-        use std::os::unix::fs::MetadataExt;
         let root = Root::new();
         let meta = std::fs::metadata(&root.0).unwrap();
         assert_eq!(walk(&root.0, 10).unwrap().root, (meta.dev(), meta.ino()));
+    }
+
+    #[test]
+    fn walk_gives_up_at_its_time_limit() {
+        let root = Root::new();
+        root.file("a/b");
+        assert_eq!(
+            walk_within(&root.0, MAX_ENTRIES, Duration::ZERO).err(),
+            Some(WalkError::TimedOut)
+        );
+        assert!(walk_within(&root.0, MAX_ENTRIES, TIME_LIMIT).is_ok());
+        assert_eq!(
+            ToolError::from(WalkError::TimedOut).to_string(),
+            "Blackwall took too long to check this project folder, so the command was not run."
+        );
+    }
+
+    #[test]
+    fn walk_never_enters_another_file_system() {
+        assert_eq!(
+            ToolError::from(WalkError::OtherFileSystem {
+                path: "mnt/disk".into()
+            })
+            .to_string(),
+            "This project contains another mounted file system at mnt/disk, which Blackwall can't check safely. The command was not run."
+        );
+        // /dev nearly always has others mounted directly inside it (/dev/pts, /dev/shm). Every
+        // entry is checked as its folder is listed, so the walk stops at the first of them.
+        let dev = Path::new("/dev");
+        let device = |path: &Path| std::fs::symlink_metadata(path).unwrap().dev();
+        let mounted: Vec<PathBuf> = std::fs::read_dir(dev)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|meta| meta.is_dir() && meta.dev() != device(dev))
+            })
+            .map(|entry| PathBuf::from(entry.file_name()))
+            .collect();
+        if mounted.is_empty() {
+            eprintln!("skipped: nothing is mounted directly inside /dev here");
+            return;
+        }
+        match walk(dev, MAX_ENTRIES) {
+            Err(WalkError::OtherFileSystem { path }) => {
+                assert!(mounted.contains(&path), "{path:?}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
