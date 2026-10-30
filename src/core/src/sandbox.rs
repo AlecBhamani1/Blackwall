@@ -1315,6 +1315,10 @@ mod tests {
                 workspace_write: true,
             }
         }
+        /// How long a test waits for the project lock. A child that another test is starting holds a
+        /// copy of every open file until it execs, so the last guard's lock can outlive it briefly.
+        const LOCK_WAIT: Duration = Duration::from_secs(5);
+
         async fn prepare_staged(
             project: &Project,
             timeout: Duration,
@@ -1417,7 +1421,7 @@ mod tests {
             assert!(!root.exists());
             assert!(project.staged_left().is_empty());
             assert!(project.runs_left().is_empty());
-            let (_, again) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let (_, again) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
             // A failed command's changes are applied too: it ran to its end.
             let staging = &again.staged.as_ref().unwrap().staging;
             std::fs::write(staging.upper.join("after-failure.txt"), "x").unwrap();
@@ -1480,7 +1484,7 @@ mod tests {
                 "Exit: signal\n",
                 "The command could not start.",
             ] {
-                let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+                let (_, guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
                 let staging = &guard.staged.as_ref().unwrap().staging;
                 std::fs::write(staging.upper.join("unfinished.txt"), "x").unwrap();
                 let root = staging.root.clone();
@@ -1504,7 +1508,7 @@ mod tests {
             }
             // Another kind of error keeps its message and gets the note too, and nothing is
             // applied either.
-            let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let (_, guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
             let root = guard.staged.as_ref().unwrap().staging.root.clone();
             std::fs::write(root.join("upper/other.txt"), "x").unwrap();
             let error = guard
@@ -1521,11 +1525,11 @@ mod tests {
             );
             assert!(root.exists() && !project.workspace.path.join("other.txt").exists());
             // Cancelled (the guard dropped without finishing): kept, and the lock is let go.
-            let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let (_, guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
             let root = guard.staged.as_ref().unwrap().staging.root.clone();
             drop(guard);
             assert!(root.exists());
-            let (mut launcher, mut guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let (mut launcher, mut guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
             // The project swapped for another folder before bubblewrap starts: it doesn't start.
             let path = project.workspace.path.clone();
             std::fs::rename(&path, project.root.join("moved")).unwrap();
@@ -1542,7 +1546,7 @@ mod tests {
             drop(guard);
             assert!(project.runs_left().is_empty());
             // Through the command runner, the owner is told why, not just that it didn't start.
-            let (launcher, mut guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let (launcher, mut guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
             std::fs::rename(&path, project.root.join("moved")).unwrap();
             std::fs::create_dir(&path).unwrap();
             let outcome = crate::tools::run_with_input(
@@ -1739,7 +1743,7 @@ mod tests {
                 ("Exit: 1\n", false),
                 ("Exit: 1\nx: Operation not permitted\n", true),
             ] {
-                let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+                let (_, guard) = prepare_staged(&project, LOCK_WAIT).await.unwrap();
                 // Blackwall's own repository has src/core/src/sandbox.rs.
                 let upper = &guard.staged.as_ref().unwrap().staging.upper;
                 std::fs::create_dir(upper.join("src")).unwrap();
