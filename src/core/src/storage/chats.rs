@@ -202,6 +202,9 @@ pub struct StoredChat {
     pub open_run: bool,
 }
 
+/// A chat's UI messages, and the index of the one a still-open run has folded.
+pub(crate) type SearchSource = (Vec<Value>, Option<u64>);
+
 /// A session's running totals, kept on its `sessions` row and moved with every write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Counters {
@@ -683,6 +686,8 @@ struct Loaded {
     counted: Counters,
     /// Whether the stored counters could be read at all (negative ones cannot).
     stored_ok: bool,
+    /// The UI index of the message a run still open has folded, which is not indexed yet.
+    open_message: Option<u64>,
 }
 
 impl Loaded {
@@ -842,10 +847,8 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
     };
 
     // A run still open is not indexed until its terminal, so its folded message counts for nothing.
-    let search_bytes = search::derived_bytes(
-        &view.messages,
-        view.open_run.as_ref().map(|open| open.message_index),
-    );
+    let open_message = view.open_run.as_ref().map(|open| open.message_index);
+    let search_bytes = search::derived_bytes(&view.messages, open_message);
     let counted = tally.finish(&metadata_text, checkpoint_bytes, search_bytes);
     let stored_ok = stored.iter().all(|value| *value >= 0);
     let stored = Counters {
@@ -872,6 +875,7 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
         stored,
         counted,
         stored_ok,
+        open_message,
     }))
 }
 
@@ -1050,6 +1054,14 @@ impl LocalStore {
             }
         }
         Ok(Some(loaded))
+    }
+
+    /// A chat's UI messages and the index of the one a still-open run has folded, for search to
+    /// rebuild the text it indexed. It repairs counters as [`Self::load_chat`] does.
+    pub(crate) fn load_for_search(&self, id: &str) -> Result<Option<SearchSource>, StorageError> {
+        Ok(self
+            .load_checked(id)?
+            .map(|loaded| (loaded.chat.messages, loaded.open_message)))
     }
 
     /// The session list as today's JSON, from typed columns only; no `chat_events` row is read.

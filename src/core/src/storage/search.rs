@@ -150,7 +150,7 @@ pub(crate) fn search_v6(
             store.connection(),
             "SELECT k.id, s.id, k.message_id, k.message_index, s.title,
                 CASE WHEN s.mode='agent' THEN 'agent'
-                     WHEN s.mode IS NULL AND s.id LIKE 'cli\\_%' ESCAPE '\\' THEN 'agent'
+                     WHEN s.mode IS NULL AND substr(s.id,1,4)='cli_' THEN 'agent'
                      ELSE 'chat' END,
                 s.workspace, s.updated_at, k.role
              FROM chat_search
@@ -189,12 +189,17 @@ pub(crate) fn search_v6(
     let mut texts = vec![];
     for row in &rows {
         if !chats.contains_key(&row.session_id) {
-            let indexed = match store.load_chat(&row.session_id)? {
-                Some(chat) => indexed_texts(&chat.messages, None)
+            // A chat that cannot be rebuilt loses its own hits, not everyone's.
+            let indexed = match store.load_for_search(&row.session_id) {
+                Ok(Some((messages, open))) => indexed_texts(&messages, open)
                     .into_iter()
                     .map(|(position, text)| (position, text.to_owned()))
                     .collect(),
-                None => vec![],
+                Ok(None) => vec![],
+                Err(error) => {
+                    eprintln!("warn: recall skipped chat {}: {error}", row.session_id);
+                    vec![]
+                }
             };
             chats.insert(row.session_id.clone(), indexed);
         }
@@ -205,6 +210,12 @@ pub(crate) fn search_v6(
         if let Some(text) = text {
             texts.push((row.key, text));
         }
+    }
+    if texts.is_empty() {
+        return Ok(RecallResults {
+            results: vec![],
+            remaining_sessions: 0,
+        });
     }
     let mut excerpts = snippets(store.connection(), &texts, &expression)?;
     let hits = rows.into_iter().filter_map(|row| {
@@ -867,5 +878,268 @@ mod tests {
         db.load_chat("s").unwrap().unwrap();
         assert_eq!(crate::storage::chats::counter_repairs(), before);
         assert_eq!(find(&db, "final").results[0].message_id, "a");
+    }
+
+    // ---- v5 on the same data ----
+
+    type Chat<'a> = (&'a str, Option<&'a str>, i64, Vec<Value>);
+
+    /// The same chats saved by the real v5 `save_session`, to compare recall with.
+    fn v5_store(chats: &[Chat]) -> LocalStore {
+        let v5 = LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap();
+        for (id, mode, updated_at, messages) in chats {
+            let mut session = json!({"id": id, "title": "T", "updatedAt": updated_at,
+                "workspace": "/p", "messages": messages});
+            if let Some(mode) = mode {
+                session["mode"] = json!(mode);
+            }
+            v5.save_session(&session).unwrap();
+        }
+        v5
+    }
+    fn v6_store(chats: &[Chat]) -> LocalStore {
+        let v6 = v6_in_memory();
+        for (id, mode, updated_at, messages) in chats {
+            store(&v6, id, "T", *mode, Some("/p"), *updated_at, messages);
+        }
+        v6
+    }
+    /// Both stores must answer every query with the same JSON, hit for hit.
+    fn assert_same_as_v5(chats: &[Chat], queries: &[&str]) -> Vec<Value> {
+        let (v5, v6) = (v5_store(chats), v6_store(chats));
+        let mut all = vec![];
+        for query in queries {
+            let query = RecallQuery {
+                query: (*query).into(),
+                limit: Some(10),
+                ..Default::default()
+            };
+            let old = v5.search_messages(MemoryClient::Cli, &query).unwrap();
+            let new = search_v6(&v6, MemoryClient::Cli, &query).unwrap();
+            let (old, new) = (
+                serde_json::to_value(old).unwrap(),
+                serde_json::to_value(new).unwrap(),
+            );
+            assert_eq!(new, old, "query {:?}", query.query);
+            all.push(new);
+        }
+        all
+    }
+    fn user(id: &str, text: &str) -> Value {
+        json!({"id": id, "role": "user", "content": text, "attachments": []})
+    }
+    fn reply(id: &str, text: &str) -> Value {
+        json!({"id": id, "role": "assistant", "content": text, "attachments": []})
+    }
+
+    #[test]
+    fn the_64_kib_clip_decides_the_excerpt_as_in_v5() {
+        // Both words sit inside the 64 KiB cut but far apart, and again side by side beyond it.
+        // snippet() prefers a window holding both words, so over the whole text it would show
+        // the pair near the end; over what v5 stored it shows the early, single word.
+        let text = format!(
+            "zqxjone head {}zqxjtwo mid {}zqxjone zqxjtwo tail",
+            "pad ".repeat(100),
+            "pad ".repeat(20_000)
+        );
+        assert!(text.len() > MESSAGE_TEXT_BYTES + 1000);
+        let chats = [("s", Some("chat"), 1, vec![user("u", &text)])];
+        let found = assert_same_as_v5(&chats, &["zqxjone zqxjtwo", "tail", "pad"]);
+        let hit = &found[0]["results"][0];
+        assert!(hit["excerpt"].as_str().unwrap().contains("head"));
+        assert!(!hit["excerpt"].as_str().unwrap().contains("tail"));
+        // A word only past the cut is not found at all.
+        assert!(found[1]["results"].as_array().unwrap().is_empty());
+        // And the excerpt is what snippet() gives on the clipped text, made by hand.
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE VIRTUAL TABLE r USING fts5(content)")
+            .unwrap();
+        let end = indexed_len(&text, 0);
+        assert_eq!(end, MESSAGE_TEXT_BYTES);
+        connection
+            .execute("INSERT INTO r(content) VALUES (?1)", [&text[..end]])
+            .unwrap();
+        let by_hand: String = connection
+            .query_row(
+                "SELECT snippet(r,0,'','',' … ',32) FROM r WHERE r MATCH '\"zqxjone\" AND \"zqxjtwo\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit["excerpt"], by_hand.as_str());
+        // The whole text would have given another one.
+        connection
+            .execute("UPDATE r SET content=?1", [&text])
+            .unwrap();
+        let whole: String = connection
+            .query_row(
+                "SELECT snippet(r,0,'','',' … ',32) FROM r WHERE r MATCH '\"zqxjone\" AND \"zqxjtwo\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(whole, by_hand);
+    }
+
+    #[test]
+    fn the_512_kib_session_allowance_decides_the_excerpt_as_in_v5() {
+        // Eight messages of 60,000 bytes use 480,000 of the 524,288. The ninth has 44,288 left, so
+        // the words side by side at about 50,000 are cut off; the tenth has nothing left.
+        let filler = |n: usize| "word ".repeat(n / 5);
+        let mut messages = vec![];
+        for i in 0..8 {
+            let text = filler(60_000);
+            messages.push(if i % 2 == 0 {
+                user(&format!("m{i}"), &text)
+            } else {
+                reply(&format!("m{i}"), &text)
+            });
+        }
+        let ninth = format!(
+            "zqxjone head {}zqxjtwo mid {}zqxjone zqxjtwo tail {}",
+            filler(500),
+            filler(50_000),
+            filler(10_000)
+        );
+        assert!(ninth.len() > 60_000);
+        messages.push(user("m8", &ninth));
+        messages.push(reply("m9", "zqxjlate zqxjone zqxjtwo"));
+        let chats = [("s", Some("chat"), 1, messages)];
+        let found = assert_same_as_v5(&chats, &["zqxjone zqxjtwo", "zqxjlate", "tail"]);
+        let hits = found[0]["results"].as_array().unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the ninth message has room for its terms"
+        );
+        assert_eq!(hits[0]["messageId"], "m8");
+        assert!(hits[0]["excerpt"].as_str().unwrap().contains("head"));
+        assert!(!hits[0]["excerpt"].as_str().unwrap().contains("tail"));
+        assert!(found[1]["results"].as_array().unwrap().is_empty());
+        assert!(found[2]["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mode_prefix_is_case_sensitive_as_in_v5() {
+        let chats = [
+            ("cli_lower", None, 3, vec![user("a", "caseword one")]),
+            ("CLI_upper", None, 2, vec![user("b", "caseword two")]),
+            ("Cli_mixed", None, 1, vec![user("c", "caseword three")]),
+        ];
+        let found = assert_same_as_v5(&chats, &["caseword"]);
+        let modes: Vec<_> = found[0]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["sessionId"].as_str().unwrap(),
+                    h["mode"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                ("cli_lower", "agent"),
+                ("CLI_upper", "chat"),
+                ("Cli_mixed", "chat")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chat_that_cannot_be_rebuilt_loses_only_its_own_hits() {
+        let db = v6_in_memory();
+        put(&db, "bad", "sharedterm bad", "/p", 2, Some("chat"));
+        put(&db, "good", "sharedterm good", "/p", 1, Some("chat"));
+        assert_eq!(find(&db, "sharedterm").results.len(), 2);
+        db.connection()
+            .execute(
+                "UPDATE chat_events SET body='not json' WHERE session_id='bad' AND seq=0",
+                [],
+            )
+            .unwrap();
+        let hits = find(&db, "sharedterm").results;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "good");
+        assert_eq!(hits[0].excerpt, "sharedterm good");
+    }
+
+    #[test]
+    fn search_skips_the_open_run_wherever_it_sits() {
+        // A run left open on the first user message folds right after it, so it is not the last
+        // message. Eight users of 64 KiB would fill the session if the folded message counted.
+        let db = v6_in_memory();
+        db.create_session(&NewSession {
+            id: "s".into(),
+            title: "T".into(),
+            mode: None,
+            workspace: None,
+            updated_at: 1,
+        })
+        .unwrap();
+        let tx = write_tx(db.connection()).unwrap();
+        let mut c = read_counters(&tx, "s").unwrap();
+        let mut first = 0;
+        for i in 0..8usize {
+            let text = if i == 7 {
+                format!("zqxjlast {}", "a ".repeat(32_000))
+            } else {
+                "a ".repeat(32_768)
+            };
+            let message = user(&format!("u{i}"), &text);
+            let seq = append_ui_user(&tx, "s", &mut c, &message).unwrap();
+            if i == 0 {
+                first = seq;
+            }
+            // The open run's message sits at index 1, so user i is at i + 1 from the second on.
+            let at = if i == 0 { 0 } else { i as u64 + 1 };
+            index_message(&tx, "s", &mut c, seq, at, &message).unwrap();
+        }
+        append_run_start(&tx, "s", &mut c, "open", 2, first).unwrap();
+        append_model(
+            &tx,
+            "s",
+            &mut c,
+            &json!({"role":"assistant","content":"b ".repeat(32_768)}),
+        )
+        .unwrap();
+        write_counters(&tx, "s", &c, 1).unwrap();
+        tx.commit().unwrap();
+        let (messages, open) = db.load_for_search("s").unwrap().unwrap();
+        assert_eq!((messages.len(), open), (9, Some(1)));
+        assert_eq!(messages[1]["content"].as_str().unwrap().len(), 65_536);
+        let before = crate::storage::chats::counter_repairs();
+        let hits = find(&db, "zqxjlast").results;
+        assert_eq!(crate::storage::chats::counter_repairs(), before);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            (hits[0].message_index, hits[0].message_id.as_str()),
+            (8, "u7")
+        );
+        assert!(hits[0].excerpt.starts_with("zqxjlast"));
+    }
+
+    #[test]
+    fn no_hits_make_no_temporary_table() {
+        let db = v6_in_memory();
+        put(&db, "s", "something", "/p", 1, Some("chat"));
+        let before: i64 = db
+            .connection()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert!(find(&db, "absentword").results.is_empty());
+        let after: i64 = db
+            .connection()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        let temp: i64 = db
+            .connection()
+            .query_row("SELECT count(*) FROM sqlite_temp_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp, 0, "a search with no hits never created one");
     }
 }
