@@ -35,6 +35,8 @@ const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SCHEMA_VERSION: i64 = 5;
+/// The schema version `open` upgrades to. It stays at v5 until the v6 event log goes live.
+const OPEN_TARGET: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -86,7 +88,7 @@ pub(crate) mod fixtures;
 mod memory;
 mod recall;
 mod view;
-pub use chats::Cap;
+pub use chats::{Cap, MetadataPatch, NewSession, StoredChat, StoredContext};
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 pub use recall::{RecallHit, RecallQuery, RecallResults};
 
@@ -95,6 +97,15 @@ impl LocalStore {
         &self.connection
     }
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
+        Self::open_at(directory, OPEN_TARGET)
+    }
+    /// Opens the database at schema version `target`. Only v5 can be opened until the upgrade lands.
+    pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
+        if target != SCHEMA_VERSION {
+            return Err(StorageError::Invalid(
+                "This version of Blackwall cannot open that storage format yet.",
+            ));
+        }
         if fs::symlink_metadata(directory).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(StorageError::Invalid(
                 "The local data folder must not be a symbolic link.",
