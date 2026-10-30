@@ -375,14 +375,14 @@ pub(crate) fn open_directory(directory: &Path) -> std::io::Result<OwnedFd> {
     Ok(rustix::io::fcntl_dupfd_cloexec(&opened, FIRST_HANDED_FD)?)
 }
 
-/// The project for `--ro-bind-fd`, or `None` unless it is the very folder the walk checked
-/// (`identity`, its device and inode) and `project` is still its canonical path.
-pub(crate) fn open_project(project: &Path, identity: (u64, u64)) -> Option<OwnedFd> {
+/// The project for `--ro-bind-fd` and its device and inode, or `None` unless `project` is still its
+/// canonical path. Opened before the walk, it pins the folder: the walk must start at the same
+/// device and inode, and while the descriptor is open the inode can't be freed and reused.
+pub(crate) fn pin_project(project: &Path) -> Option<(OwnedFd, (u64, u64))> {
     let file = std::fs::File::from(open_directory(project).ok()?);
     let meta = file.metadata().ok()?;
-    ((meta.dev(), meta.ino()) == identity
-        && std::fs::canonicalize(project).ok().as_deref() == Some(project))
-    .then(|| file.into())
+    (std::fs::canonicalize(project).ok().as_deref() == Some(project))
+        .then(|| (file.into(), (meta.dev(), meta.ino())))
 }
 
 /// Run `spawn` with `fd` open in the new process at the same number, then close it here. The
@@ -1032,13 +1032,13 @@ mod tests {
         assert_eq!(appimage_dir(image(), Some(OsString::from("/")), &exe), None);
     }
     #[test]
-    fn the_project_opens_only_as_the_folder_that_was_checked() {
+    fn the_project_is_pinned_at_its_canonical_path_before_the_walk() {
         let root = Root::new();
         let project = root.path.join("p");
         std::fs::create_dir(&project).unwrap();
         let meta = std::fs::metadata(&project).unwrap();
-        let checked = (meta.dev(), meta.ino());
-        let fd = open_project(&project, checked).unwrap();
+        let (fd, pinned) = pin_project(&project).unwrap();
+        assert_eq!(pinned, (meta.dev(), meta.ino()));
         assert!(fd.as_raw_fd() >= FIRST_HANDED_FD);
         let flags = rustix::io::fcntl_getfd(&fd).unwrap();
         assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
@@ -1046,19 +1046,20 @@ mod tests {
             std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap(),
             project
         );
-        assert!(open_project(&project, (checked.0, checked.1 + 1)).is_none());
         // A link to it, or a name for it that isn't canonical, is not the project's path.
         let link = root.path.join("link");
         std::os::unix::fs::symlink(&project, &link).unwrap();
-        assert!(open_project(&link, checked).is_none());
-        assert!(open_project(&project.join("../p"), checked).is_none());
-        // Another folder put in its place.
+        assert!(pin_project(&link).is_none());
+        assert!(pin_project(&project.join("../p")).is_none());
+        // Another folder put in its place after pinning: the walk then starts somewhere else,
+        // and the pinned folder can't be freed and its inode reused while the fd is open.
         std::fs::rename(&project, root.path.join("moved")).unwrap();
         std::fs::create_dir(&project).unwrap();
-        assert!(open_project(&project, checked).is_none());
+        let walked = super::super::walk::walk(&project, 100).unwrap();
+        assert_ne!(walked.root, pinned);
         std::fs::remove_dir(&project).unwrap();
         std::os::unix::fs::symlink(root.path.join("moved"), &project).unwrap();
-        assert!(open_project(&project, checked).is_none());
+        assert!(pin_project(&project).is_none());
     }
     #[test]
     fn only_spawn_with_hands_the_descriptor_on() {

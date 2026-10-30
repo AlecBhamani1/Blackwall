@@ -9,7 +9,8 @@
 //!
 //! What the sandbox sees: the system roots read-only (merged-/usr links recreated as symlinks), a
 //! short list of `/etc` entries, a private `/dev`, `/proc` and `/tmp`, empty parent folders down
-//! to the project, and the project itself read-only with every protected name masked. Locally
+//! to the project, and the project itself read-only with its protected names masked (below a
+//! skipped folder such as `node_modules`, only its direct children are checked). Locally
 //! managed configuration under the system roots (`/usr/local/etc`, Linuxbrew's `etc`) is hidden
 //! behind an empty read-only tmpfs. The project
 //! is mounted from a descriptor (`--ro-bind-fd`) for the folder that was checked, not by its path,
@@ -63,7 +64,7 @@ pub(crate) struct MountPlan<'a> {
     /// Where the project appears inside the sandbox: its own (canonical) path.
     pub project: &'a Path,
     /// What is mounted there: a descriptor for the checked folder, open in bubblewrap at this
-    /// number (see `linux::open_project` and `linux::spawn_with`).
+    /// number (see `linux::pin_project` and `linux::spawn_with`).
     pub project_fd: RawFd,
     pub network: bool,
     pub roots: Vec<Root>,
@@ -101,18 +102,22 @@ pub(crate) fn host_system_masks(roots: &[Root]) -> Vec<PathBuf> {
 }
 
 /// Each of [`SYSTEM_MASKS`] that is a real directory under `base`, inside one of the bound
-/// `roots`. A symlink in its place is left alone, as is anything under a root that is a symlink
-/// (and so not mounted).
+/// `roots`, reached through real directories only. A symlink in its place or above it, up to the
+/// bound root (`/usr/local -> ../var/usrlocal` on ostree systems), is left alone, as is anything
+/// under a root that is a symlink (and so not mounted).
 pub(crate) fn system_masks_at(base: &Path, roots: &[Root]) -> Vec<PathBuf> {
+    let real_dir = |path: &Path| {
+        std::fs::symlink_metadata(base.join(relative(&path.to_string_lossy())))
+            .is_ok_and(|meta| meta.is_dir())
+    };
     SYSTEM_MASKS
         .iter()
         .map(PathBuf::from)
         .filter(|mask| {
-            roots
-                .iter()
-                .any(|root| matches!(root, Root::Bind(bound) if mask.starts_with(bound)))
-                && std::fs::symlink_metadata(base.join(relative(&mask.to_string_lossy())))
-                    .is_ok_and(|meta| meta.is_dir())
+            roots.iter().any(|root| {
+                matches!(root, Root::Bind(bound) if mask.starts_with(bound)
+                    && mask.ancestors().take_while(|dir| dir.starts_with(bound)).all(real_dir))
+            })
         })
         .collect()
 }
@@ -502,6 +507,17 @@ mod tests {
             system_masks_at(b, &roots_at(b)),
             ["/usr/local/etc", "/home/linuxbrew/.linuxbrew/etc"].map(PathBuf::from)
         );
+        // A parent that is a link (/usr/local -> ../var/usrlocal on ostree systems such as
+        // Silverblue) is left alone too: the mask would land outside what is mounted.
+        std::fs::create_dir_all(b.join("var/usrlocal/etc")).unwrap();
+        std::fs::rename(b.join("usr/local"), b.join("usr/local-real")).unwrap();
+        symlink("../var/usrlocal", b.join("usr/local")).unwrap();
+        assert_eq!(
+            system_masks_at(b, &roots_at(b)),
+            [PathBuf::from("/home/linuxbrew/.linuxbrew/etc")]
+        );
+        std::fs::remove_file(b.join("usr/local")).unwrap();
+        std::fs::rename(b.join("usr/local-real"), b.join("usr/local")).unwrap();
         // A missing folder, or a link in its place, is left alone.
         std::fs::remove_dir(b.join("usr/local/etc")).unwrap();
         symlink("../share", b.join("usr/local/etc")).unwrap();

@@ -6,10 +6,11 @@
 //!   found, because scanning huge dependency and build trees before every command is too slow.
 //!   Only a skipped directory's direct children are checked. Network is off by default, so the
 //!   exposure is read-only.
-//! - The project itself is mounted from a descriptor for the folder whose identity the walk
-//!   recorded, so swapping the whole folder is caught. Inside it, the walk goes by path: a process
-//!   outside the sandbox that renames folders within the project while the walk runs (moving a
-//!   protected name into a folder already walked, say) can still leave that name unmasked.
+//! - The project is pinned by a descriptor before the walk, the walk must start at that folder,
+//!   and that descriptor is what gets mounted, so swapping the whole folder (before, during or
+//!   after the walk) is caught. Inside it, the walk goes by path: a process outside the sandbox
+//!   that renames folders within the project while the walk runs (moving a protected name into a
+//!   folder already walked, say) can still leave that name unmasked.
 //! - The walk stops after [`TIME_LIMIT`] and never enters another mounted file system, but a read
 //!   that hangs (an unresponsive network or FUSE mount as the project itself) still blocks the
 //!   blocking-pool thread until it returns.
@@ -71,8 +72,8 @@ pub(crate) struct Mask {
 pub(crate) struct Walk {
     /// Sorted by path.
     pub masks: Vec<Mask>,
-    /// The walked folder's device and inode, so the folder that gets mounted can be checked
-    /// against it.
+    /// The walked folder's device and inode (from the `lstat` it started with), to check against
+    /// the pinned project.
     pub root: (u64, u64),
 }
 
@@ -161,14 +162,14 @@ pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<W
             let path = relative.join(&name);
             if !shallow {
                 count += 1;
-                let top = relative
+                let top_level = relative
                     .components()
                     .next()
                     .map_or(name.as_os_str(), |first| first.as_os_str());
-                match per_top.get_mut(top) {
+                match per_top.get_mut(top_level) {
                     Some(seen) => *seen += 1,
                     None => {
-                        per_top.insert(top.to_os_string(), 1);
+                        per_top.insert(top_level.to_os_string(), 1);
                     }
                 }
                 if at_root && count > limit {

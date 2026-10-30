@@ -301,10 +301,14 @@ pub(crate) async fn prepare_with(
     // thread that starts it, and a blocking-pool thread can exit while the command still runs.
     let (guard, run) = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
         walk::check_location(&project, home.as_deref(), Some(&data))?;
+        // Pin the folder first, then walk it: the walk must start at the pinned folder, which is
+        // what gets mounted (by descriptor), so the path can't be swapped during or after it.
+        let changed = || ToolError::Execution(PROJECT_CHANGED.into());
+        let (project_fd, pinned) = linux::pin_project(&project).ok_or_else(changed)?;
         let found = walk::walk(&project, walk::MAX_ENTRIES)?;
-        // Mount the folder that was walked, by descriptor, so the path can't be swapped after.
-        let project_fd = linux::open_project(&project, found.root)
-            .ok_or_else(|| ToolError::Execution(PROJECT_CHANGED.into()))?;
+        if found.root != pinned {
+            return Err(changed());
+        }
         let roots = bwrap::host_roots();
         let plan = bwrap::MountPlan {
             project: &project,

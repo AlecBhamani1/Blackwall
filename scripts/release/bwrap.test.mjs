@@ -52,6 +52,16 @@ test('each release builds bubblewrap without a token, then publishes its verifie
   assert.match(read('NOTICE'), /source tarball \(bubblewrap-0\.13\.1\.tar\.xz, SHA-256 checked\) is published with each Blackwall release/);
 });
 
+test('the release build job checks out without leaving its token on disk', () => {
+  for (const workflow of ['release-beta.yml', 'release-main.yml']) {
+    const text = read(`.github/workflows/${workflow}`);
+    const job = text.slice(text.indexOf('\n  build-desktop:'), text.indexOf('\n  publish:'));
+    const checkout = steps(job).find(step => /- uses: actions\/checkout@/.test(step));
+    assert.ok(checkout, workflow);
+    assert.match(checkout, /^\s*persist-credentials: false$/m, workflow);
+  }
+});
+
 test('CI runs the real-bubblewrap tests on x86-64 and arm64, and the quality gate needs both', () => {
   const ci = read('.github/workflows/ci.yml');
   const job = ci.slice(ci.indexOf('\n  linux-sandbox:'), ci.indexOf('\n  relay-linux:'));
