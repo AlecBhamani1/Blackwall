@@ -9,7 +9,9 @@
 //!
 //! What the sandbox sees: the system roots read-only (merged-/usr links recreated as symlinks), a
 //! short list of `/etc` entries, a private `/dev`, `/proc` and `/tmp`, empty parent folders down
-//! to the project, and the project itself read-only with every protected name masked. The project
+//! to the project, and the project itself read-only with every protected name masked. Locally
+//! managed configuration under the system roots (`/usr/local/etc`, Linuxbrew's `etc`) is hidden
+//! behind an empty read-only tmpfs. The project
 //! is mounted from a descriptor (`--ro-bind-fd`) for the folder that was checked, not by its path,
 //! so swapping the folder at that path after the check changes nothing. No folder
 //! under `/run` or `/var/run` is ever mounted, because host pathname sockets live there (the user
@@ -49,6 +51,9 @@ pub(crate) const ETC_FILES: [&str; 12] = [
     "localtime",
     "alternatives",
 ];
+/// Locally managed configuration under the system roots, rather than the distribution's own files.
+/// Each one that exists is hidden behind an empty read-only tmpfs.
+pub(crate) const SYSTEM_MASKS: [&str; 2] = ["/usr/local/etc", "/home/linuxbrew/.linuxbrew/etc"];
 /// Where host pathname sockets live. Nothing that resolves under these is ever mounted, with
 /// one exception: a single regular file (see [`etc_at`]).
 const SOCKET_DIRS: [&str; 2] = ["run", "var/run"];
@@ -64,6 +69,8 @@ pub(crate) struct MountPlan<'a> {
     pub roots: Vec<Root>,
     /// Absolute `/etc/<name>` paths that exist on the host.
     pub etc: Vec<PathBuf>,
+    /// Absolute paths from [`SYSTEM_MASKS`] to hide.
+    pub system_masks: Vec<PathBuf>,
     /// Relative to `project`.
     pub masks: &'a [Mask],
 }
@@ -86,6 +93,28 @@ pub(crate) fn host_roots() -> Vec<Root> {
 /// The `/etc` entries on this host.
 pub(crate) fn host_etc() -> Vec<PathBuf> {
     etc_at(Path::new("/"))
+}
+
+/// The [`SYSTEM_MASKS`] on this host, for `roots`.
+pub(crate) fn host_system_masks(roots: &[Root]) -> Vec<PathBuf> {
+    system_masks_at(Path::new("/"), roots)
+}
+
+/// Each of [`SYSTEM_MASKS`] that is a real directory under `base`, inside one of the bound
+/// `roots`. A symlink in its place is left alone, as is anything under a root that is a symlink
+/// (and so not mounted).
+pub(crate) fn system_masks_at(base: &Path, roots: &[Root]) -> Vec<PathBuf> {
+    SYSTEM_MASKS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|mask| {
+            roots
+                .iter()
+                .any(|root| matches!(root, Root::Bind(bound) if mask.starts_with(bound)))
+                && std::fs::symlink_metadata(base.join(relative(&mask.to_string_lossy())))
+                    .is_ok_and(|meta| meta.is_dir())
+        })
+        .collect()
 }
 
 /// Each of [`SYSTEM_ROOTS`] under `base`, as the sandbox should see it at the same absolute path:
@@ -189,6 +218,10 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
                 push(&[s("--symlink"), target.as_os_str(), link.as_os_str()]);
             }
         }
+    }
+    for mask in &plan.system_masks {
+        let mask = mask.as_os_str();
+        push(&[s("--tmpfs"), mask, s("--remount-ro"), mask]);
     }
     push(&[s("--dir"), s("/etc")]);
     for etc in &plan.etc {
@@ -333,6 +366,7 @@ mod tests {
                 Root::Bind("/home/linuxbrew/.linuxbrew".into()),
             ],
             etc: vec!["/etc/hosts".into(), "/etc/ssl".into()],
+            system_masks: Vec::new(),
             masks,
         }
     }
@@ -422,6 +456,57 @@ mod tests {
         assert!(!a
             .windows(2)
             .any(|w| w[0] == "--ro-bind" && w[1] == "/home/u/p"));
+    }
+
+    #[test]
+    fn local_configuration_is_masked_after_the_roots_and_before_the_root_remount() {
+        let mut masked = plan(Path::new("/home/u/p"), false, &[]);
+        masked.system_masks = vec![
+            "/usr/local/etc".into(),
+            "/home/linuxbrew/.linuxbrew/etc".into(),
+        ];
+        let a = strs(&args(&masked));
+        let usr = pos(&a, "--tmpfs /usr/local/etc --remount-ro /usr/local/etc");
+        let brew = pos(
+            &a,
+            "--tmpfs /home/linuxbrew/.linuxbrew/etc --remount-ro /home/linuxbrew/.linuxbrew/etc",
+        );
+        assert!(pos(&a, "--ro-bind /usr /usr") < usr);
+        assert!(
+            pos(
+                &a,
+                "--ro-bind /home/linuxbrew/.linuxbrew /home/linuxbrew/.linuxbrew"
+            ) < usr
+        );
+        assert!(usr < brew);
+        assert!(brew < pos(&a, "--dir /etc"));
+        assert!(brew < pos(&a, "--remount-ro / --chdir"));
+    }
+
+    #[test]
+    fn only_real_configuration_folders_under_bound_roots_are_masked() {
+        let base = Temp::new();
+        let b = &base.0;
+        std::fs::create_dir_all(b.join("usr/local/etc")).unwrap();
+        std::fs::create_dir_all(b.join("brew/etc")).unwrap();
+        std::fs::create_dir_all(b.join("home/linuxbrew")).unwrap();
+        // Linuxbrew through a link isn't bound, so there is nothing of it to mask.
+        symlink("../../brew", b.join("home/linuxbrew/.linuxbrew")).unwrap();
+        assert_eq!(
+            system_masks_at(b, &roots_at(b)),
+            [PathBuf::from("/usr/local/etc")]
+        );
+        std::fs::remove_file(b.join("home/linuxbrew/.linuxbrew")).unwrap();
+        std::fs::create_dir_all(b.join("home/linuxbrew/.linuxbrew/etc")).unwrap();
+        assert_eq!(
+            system_masks_at(b, &roots_at(b)),
+            ["/usr/local/etc", "/home/linuxbrew/.linuxbrew/etc"].map(PathBuf::from)
+        );
+        // A missing folder, or a link in its place, is left alone.
+        std::fs::remove_dir(b.join("usr/local/etc")).unwrap();
+        symlink("../share", b.join("usr/local/etc")).unwrap();
+        std::fs::remove_dir(b.join("home/linuxbrew/.linuxbrew/etc")).unwrap();
+        assert!(system_masks_at(b, &roots_at(b)).is_empty());
     }
 
     #[test]
@@ -518,6 +603,7 @@ mod tests {
         let host = MountPlan {
             roots: host_roots(),
             etc: host_etc(),
+            system_masks: host_system_masks(&host_roots()),
             ..plan(project, true, &masks)
         };
         let a = args(&host);
@@ -649,6 +735,7 @@ mod tests {
                 network,
                 roots: host_roots(),
                 etc: host_etc(),
+                system_masks: host_system_masks(&host_roots()),
                 masks: &self.masks,
             };
             let seccomp = run.join("seccomp.bpf");
@@ -790,6 +877,17 @@ mod tests {
             "{}",
             tmp.stderr
         );
+
+        // Local configuration under /usr is hidden.
+        if Path::new("/usr/local/etc").is_dir() {
+            let local = sb.run(false, "ls -A /usr/local/etc").await;
+            assert_eq!(
+                (local.code, local.stdout.as_str()),
+                (Some(0), ""),
+                "{}",
+                local.stderr
+            );
+        }
 
         // Nothing from /run, the host home or the run folder is visible, and bubblewrap (pid 1)
         // carries only the environment the launcher was given, not the test's.

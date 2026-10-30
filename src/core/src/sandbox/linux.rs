@@ -329,11 +329,13 @@ pub(crate) fn probe(bwrap: &Path, scratch: &Path, timeout: Duration) -> Result<(
 }
 fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), ProbeError> {
     let project_fd = open_directory(project).map_err(ProbeError::Files)?;
+    let roots = super::bwrap::host_roots();
     let plan = super::bwrap::MountPlan {
         project,
         project_fd: project_fd.as_raw_fd(),
         network: false,
-        roots: super::bwrap::host_roots(),
+        system_masks: super::bwrap::host_system_masks(&roots),
+        roots,
         etc: super::bwrap::host_etc(),
         masks: &[],
     };

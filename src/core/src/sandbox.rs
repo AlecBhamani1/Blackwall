@@ -331,11 +331,13 @@ pub(crate) async fn prepare_with(
         // Mount the folder that was walked, by descriptor, so the path can't be swapped after.
         let project_fd = linux::open_project(&project, found.root)
             .ok_or_else(|| ToolError::Execution(PROJECT_CHANGED.into()))?;
+        let roots = bwrap::host_roots();
         let plan = bwrap::MountPlan {
             project: &project,
             project_fd: std::os::fd::AsRawFd::as_raw_fd(&project_fd),
             network,
-            roots: bwrap::host_roots(),
+            system_masks: bwrap::host_system_masks(&roots),
+            roots,
             etc: bwrap::host_etc(),
             masks: &found.masks,
         };
