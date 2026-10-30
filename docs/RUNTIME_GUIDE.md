@@ -810,6 +810,7 @@ limits and extra files in **Memory → Advanced · Instructions** or with `bw co
 | Per-file limit, 1–64 KiB | `instruction-file-kib <n>` | 8 |
 | Total for a turn, 8–256 KiB | `instruction-total-kib <n>` | 32 |
 | Up to 8 extra files read after `AGENTS.md` | `instruction-files <a,b,…\|none>` | none |
+| Maximum skill size, 32–256 KiB | `max-skill-kib <auto\|n>` | Auto: 10% of configured context, clamped to 32–256 KiB |
 
 A file over the per-file limit is cut at the limit, on a character boundary, and the run's warnings
 name it; the model sees a note after the file's guidance, not inside it. A file that would pass the
@@ -1018,7 +1019,12 @@ and report concrete findings with file paths.
 ```
 
 Names use lowercase letters, numbers, and hyphens, up to 64 characters. A file must be valid UTF-8
-Markdown with YAML frontmatter and fit within 32 KiB. Malformed skills are reported and skipped.
+Markdown with YAML frontmatter and fit within the configured maximum skill size. Auto uses 10% of
+the configured context window at four bytes per token, clamped to 32–256 KiB; it never changes with
+server model load state. Set it in **Memory → Advanced · Instructions** or with
+`bw config set max-skill-kib <auto|32-256>`. Malformed skills are reported and skipped. Installed
+skills over a newly lowered limit remain listed and removable, but are skipped with a warning when
+chat context is built.
 Agent runs list each enabled skill's name and description, within an 8,000-byte budget, and the
 model loads a skill's instructions with `read_skill` when it is relevant, so larger libraries stay
 usable.
@@ -1041,6 +1047,8 @@ skill, `bw skills approve <id>` saves one and keeps the proposal in `skills/.pro
 a record of its source, and `bw skills reject <id>` discards it, even one that can no longer be
 read. If the skill changed after the proposal was made, approval is refused so the owner's edit is
 kept; reject it and review a fresh proposal. At most 20 proposals can be pending.
+`bw skills list` lists every saved skill, including one over the current size limit, and
+`bw skills remove <name>` removes it without loading its contents.
 
 In the desktop app, **Skills** lists pending proposals under **Pending review**. Each one shows its
 source session and message, the saved skill it would replace, and the proposed description and

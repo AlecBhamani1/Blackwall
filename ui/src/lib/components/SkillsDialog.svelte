@@ -294,6 +294,7 @@
           <div class="body">
             <button
               class="skill"
+              disabled={!!skill.warning}
               onclick={() => {
                 creating = false;
                 editing = { ...skill };
@@ -303,15 +304,21 @@
                 >{/if}
               <p>{skill.description}</p></button
             >
+            {#if skill.warning}<p class="warning">{skill.warning}</p>{/if}
             {#if scans[skill.name]}<ScanBadge findings={scans[skill.name]} name={skill.name} />{/if}
           </div>
-          <button
+          {#if skill.warning}<button
+            class="delete"
+            disabled={busy}
+            aria-label={`Delete ${skill.name}`}
+            onclick={() => remove(skill)}>Delete</button
+          >{:else}<button
             class:enabled={skill.enabled}
             class="toggle"
             disabled={busy}
             aria-label={`${skill.enabled ? 'Disable' : 'Enable'} ${skill.name}`}
             onclick={() => toggle(skill)}>{skill.enabled ? 'Enabled' : 'Disabled'}</button
-          >
+          >{/if}
         </article>{/each}
       <p class="hint">
         Agent runs list enabled skills by name and description and load one when it is relevant.

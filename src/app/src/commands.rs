@@ -546,6 +546,7 @@ pub(crate) async fn stream_chat(
     agent: State<'_, crate::agent_commands::AgentState>,
     options: Option<AgentOptions>,
 ) -> Result<StreamStarted, CommandError> {
+    let configured_context_window = request.context_budget.context_window;
     require_unlocked(&app).await?;
     let request_id = request.request_id.clone();
     let setup_result = request
@@ -634,8 +635,9 @@ pub(crate) async fn stream_chat(
             }),
             _ => None,
         };
-        let skill_context = crate::data::with_skills(&app, |store| {
-            Ok(blackwall_core::skills::prompt(&store.list()?.0))
+        let skill_context = crate::data::with_skills(&app, move |store| {
+            let (skills, _) = store.load()?;
+            Ok(blackwall_core::skills::prompt(&skills))
         })
         .await
         .map_err(|message| CommandError {
@@ -693,14 +695,19 @@ pub(crate) async fn stream_chat(
                 detail: None,
                 retryable: false,
             })?;
-        let instruction_settings = crate::data::instruction_settings(instruction_directory.clone())
-            .await
-            .map_err(|message| CommandError {
-                code: "settings_error",
-                message,
-                detail: None,
-                retryable: false,
-            })?;
+        let mut instruction_settings =
+            crate::data::instruction_settings(instruction_directory.clone())
+                .await
+                .map_err(|message| CommandError {
+                    code: "settings_error",
+                    message,
+                    detail: None,
+                    retryable: false,
+                })?;
+        if instruction_settings.max_skill_kib.is_none() {
+            instruction_settings.max_skill_kib =
+                Some(instruction_settings.effective_skill_kib(configured_context_window));
+        }
         let runner = blackwall_core::agent::Agent {
             backend: &backend,
             workspace,

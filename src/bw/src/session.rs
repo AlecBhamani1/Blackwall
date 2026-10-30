@@ -26,6 +26,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+fn effective_instructions(
+    settings: &Settings,
+) -> blackwall_core::instructions::InstructionSettings {
+    let mut instructions = settings.instructions.clone();
+    if instructions.max_skill_kib.is_none() {
+        instructions.max_skill_kib =
+            Some(instructions.effective_skill_kib(settings.budget.context_window));
+    }
+    instructions
+}
+
 /// A failed run and why it ended. Plain string errors are `RunReason::Error`.
 #[derive(Debug)]
 pub struct Failure {
@@ -235,9 +246,14 @@ impl Conversation {
         {
             definitions.push(blackwall_core::memory::recall_definition());
         }
-        let skills = SkillStore::open(&directory.join("skills"))
-            .and_then(|skills| skills.list())
-            .map_err(|error| error.to_string())?;
+        let skills = SkillStore::open_with_limit(
+            &directory.join("skills"),
+            settings
+                .instructions
+                .effective_skill_kib(settings.budget.context_window),
+        )
+        .and_then(|skills| skills.load())
+        .map_err(|error| error.to_string())?;
         if skills.0.iter().any(|skill| skill.enabled) {
             definitions.push(blackwall_core::skills::definition());
         }
@@ -286,7 +302,7 @@ impl Conversation {
                 compact: true,
                 trace: None,
                 subagents: settings.subagents.clone(),
-                instruction_settings: settings.instructions.clone(),
+                instruction_settings: effective_instructions(settings),
             },
             settings.trace,
             Some(input),
@@ -388,7 +404,7 @@ impl Conversation {
                 compact: false,
                 trace: None,
                 subagents: settings.subagents.clone(),
-                instruction_settings: settings.instructions.clone(),
+                instruction_settings: effective_instructions(settings),
             },
             settings.trace,
             input,
@@ -458,12 +474,15 @@ fn context(
     if !memory.is_empty() {
         messages.insert(0, json!({"role":"system","content":memory}));
     }
-    let skills = SkillStore::open(&directory.join("skills")).map_err(|error| error.to_string())?;
+    let skills = SkillStore::open_with_limit(
+        &directory.join("skills"),
+        settings
+            .instructions
+            .effective_skill_kib(settings.budget.context_window),
+    )
+    .map_err(|error| error.to_string())?;
     skills.seed().map_err(|error| error.to_string())?;
-    let (enabled, warnings) = skills.list().map_err(|error| error.to_string())?;
-    for warning in warnings {
-        eprintln!("Skill: {warning}");
-    }
+    let (enabled, _) = skills.load().map_err(|error| error.to_string())?;
     let workflows = blackwall_core::skills::prompt(&enabled);
     if !workflows.is_empty() {
         messages.insert(0, json!({"role":"system","content":workflows}));

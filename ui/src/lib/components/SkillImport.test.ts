@@ -42,7 +42,7 @@ const found = (): SkillImportCandidate[] => [
   {
     ...candidate('big'),
     skill: null,
-    error: 'A skill folder can hold at most 200 files and 5 MB.',
+    error: 'Too many files: 201 (limit 200)',
   },
 ];
 const suggested: SuggestedSkill[] = [
@@ -89,7 +89,7 @@ describe('skill import', () => {
       screen.getByText('License: Apache-2.0 · 2 bundled files: LICENSE.txt, scripts/fill.py'),
     ).toBeInTheDocument();
     expect(screen.getAllByText('Scanned: no issues found')).toHaveLength(2);
-    expect(screen.getByText(/at most 200 files and 5 MB/)).toBeInTheDocument();
+    expect(screen.getByText(/Too many files: 201 \(limit 200\)/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Import 1 skill' }));
     expect(save).toHaveBeenCalledExactlyOnceWith(found()[0].source, false, false);
     expect(done).toHaveBeenCalledWith(1);

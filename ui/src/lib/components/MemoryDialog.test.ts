@@ -219,7 +219,19 @@ describe('memory management', () => {
       instructionMaxFileKib: 4,
       instructionMaxTotalKib: 64,
       instructionExtraFiles: ['CLAUDE.md', '.github/copilot-instructions.md'],
+      maxSkillSizeKib: null,
     });
+    await user.click(screen.getByLabelText('Manual'));
+    const skill = screen.getByLabelText('Max skill size (KiB)');
+    for (const value of ['31', '257']) {
+      await user.clear(skill);
+      await user.type(skill, value);
+      expect(button).toBeDisabled();
+    }
+    await user.clear(skill);
+    await user.type(skill, '96');
+    await user.click(button);
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ maxSkillSizeKib: 96 }));
   });
   it('loads saved instruction settings', async () => {
     const user = userEvent.setup();

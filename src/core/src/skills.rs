@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 use thiserror::Error;
-const MAX_SKILL: usize = 32 * 1024;
+const DEFAULT_MAX_SKILL_KIB: u16 = 32;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
@@ -18,6 +18,14 @@ pub struct Skill {
     /// Saved as `disable-model-invocation: true`, the key other harnesses use.
     #[serde(default)]
     pub user_only: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEntry {
+    #[serde(flatten)]
+    pub skill: Skill,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,8 +48,10 @@ pub enum SkillError {
     Name,
     #[error("A skill needs valid YAML frontmatter with name and description, followed by its instructions.")]
     Format,
-    #[error("Skills must be UTF-8 text and no larger than 32 KiB.")]
-    Limit,
+    #[error("Too large: {actual_kib} KiB (limit {limit_kib} KiB)")]
+    TooLarge { actual_kib: u64, limit_kib: u16 },
+    #[error("Not UTF-8 text")]
+    Utf8,
     #[error(
         "The skill folder or file could not be accessed. Existing files have been left in place."
     )]
@@ -56,10 +66,16 @@ pub enum SkillError {
     Pending,
     #[error("This proposal could not be read. Reject it by its ID.")]
     Invalid,
+    #[error("This skill proposal is too large ({actual_kib} KiB, limit {limit_kib} KiB).")]
+    ProposalTooLarge { actual_kib: u64, limit_kib: u64 },
     #[error("A skill with this name already exists. Choose to replace it, or rename one of them.")]
     Exists,
-    #[error("A skill folder can hold at most 200 files and 5 MB.")]
-    Folder,
+    #[error("Too many files: {actual} (limit {limit})")]
+    FolderFiles { actual: usize, limit: usize },
+    #[error("Too many files: more than {visited} (limit {limit})")]
+    FolderScanLimit { visited: usize, limit: usize },
+    #[error("Folder too large: {actual_kib} KiB (limit {limit_kib} KiB)")]
+    FolderSize { actual_kib: u64, limit_kib: u64 },
     #[error("The safety scan found something in this skill. Review the findings, then allow or block it.")]
     Flagged,
     #[error("This name is a built-in command, so typing it could not run the skill. Give the skill another name.")]
@@ -101,9 +117,11 @@ pub struct SkillProposal {
 impl SkillProposal {
     /// The safety scan over the skill file this proposal would save.
     pub fn scan(&self) -> Vec<crate::skill_scan::Finding> {
-        validate(&self.skill)
-            .map(|document| crate::skill_scan::scan_text(SKILL_FILE, &document))
-            .unwrap_or_default()
+        let document = format!(
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            self.skill.name, self.skill.description, self.skill.body
+        );
+        crate::skill_scan::scan_text(SKILL_FILE, &document)
     }
     /// A unified diff from the current skill, or from nothing for a new skill.
     pub fn diff(&self) -> String {
@@ -146,7 +164,7 @@ struct Writing {
 }
 const MAX_PROPOSALS: usize = 20;
 /// A proposal holds up to two skills; JSON escaping can grow each body several times.
-const MAX_PROPOSAL: usize = 256 * 1024;
+const PROPOSAL_HEADROOM: usize = 8;
 fn valid_proposal_id(id: &str) -> Result<(), SkillError> {
     match id.strip_prefix("skill_") {
         Some(hex) if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(()),
@@ -165,9 +183,13 @@ fn validate_name(name: &str) -> Result<(), SkillError> {
         Ok(())
     }
 }
-pub fn parse(text: &str) -> Result<Skill, SkillError> {
-    if text.len() > MAX_SKILL {
-        return Err(SkillError::Limit);
+#[cfg(test)]
+fn parse(text: &str) -> Result<Skill, SkillError> {
+    parse_with_limit(text, DEFAULT_MAX_SKILL_KIB)
+}
+pub fn parse_with_limit(text: &str, max_kib: u16) -> Result<Skill, SkillError> {
+    if text.len() > usize::from(max_kib) * 1024 {
+        return Err(too_large(text.len() as u64, max_kib));
     }
     let normalized = text.replace("\r\n", "\n");
     let rest = normalized.strip_prefix("---\n").ok_or(SkillError::Format)?;
@@ -189,8 +211,18 @@ pub fn parse(text: &str) -> Result<Skill, SkillError> {
         user_only: frontmatter.user_only,
     })
 }
+fn too_large(bytes: u64, limit_kib: u16) -> SkillError {
+    SkillError::TooLarge {
+        actual_kib: bytes.div_ceil(1024),
+        limit_kib,
+    }
+}
 /// The saved file for a skill, after the same checks as reading one back.
-pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
+#[cfg(test)]
+fn validate(skill: &Skill) -> Result<String, SkillError> {
+    validate_with_limit(skill, DEFAULT_MAX_SKILL_KIB)
+}
+pub(crate) fn validate_with_limit(skill: &Skill, max_kib: u16) -> Result<String, SkillError> {
     validate_name(&skill.name)?;
     if COMMANDS.contains(&skill.name.as_str()) {
         return Err(SkillError::Reserved);
@@ -207,7 +239,7 @@ pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
         },
         skill.body
     );
-    parse(&document)?;
+    parse_with_limit(&document, max_kib)?;
     Ok(document)
 }
 /// A skill is `<name>.md`, or a folder `<name>/SKILL.md` with bundled files such as scripts and
@@ -215,6 +247,7 @@ pub(crate) fn validate(skill: &Skill) -> Result<String, SkillError> {
 pub struct SkillStore {
     directory: Dir,
     path: std::path::PathBuf,
+    max_skill_kib: u16,
 }
 const SKILL_FILE: &str = "SKILL.md";
 /// Bundled files a folder skill may hold, together.
@@ -223,7 +256,10 @@ pub const MAX_FOLDER_BYTES: u64 = 5 * 1024 * 1024;
 /// One bundled file the agent can read through `read_skill`.
 const MAX_BUNDLED_READ: u64 = 64 * 1024;
 impl SkillStore {
-    pub fn open(path: &Path) -> Result<Self, SkillError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, SkillError> {
+        Self::open_with_limit(path, DEFAULT_MAX_SKILL_KIB)
+    }
+    pub fn open_with_limit(path: &Path, max_skill_kib: u16) -> Result<Self, SkillError> {
         if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(SkillError::File);
         }
@@ -242,9 +278,19 @@ impl SkillStore {
             directory: Dir::open_ambient_dir(path, cap_std::ambient_authority())
                 .map_err(|_| SkillError::File)?,
             path: path.to_owned(),
+            max_skill_kib,
         };
         store.sweep();
         Ok(store)
+    }
+    pub fn max_skill_kib(&self) -> u16 {
+        self.max_skill_kib
+    }
+    fn max_proposal_bytes(&self) -> usize {
+        usize::from(self.max_skill_kib) * 1024 * PROPOSAL_HEADROOM
+    }
+    fn max_stored_proposal_bytes() -> usize {
+        256 * 1024 * PROPOSAL_HEADROOM
     }
     /// Remove staged or replaced folders an interrupted import left behind. Recent ones may belong
     /// to an import still running in another process, so only those over an hour old go.
@@ -388,11 +434,15 @@ impl SkillStore {
             .read_to_end(&mut bytes)
             .map_err(|_| SkillError::File)?;
         if bytes.len() as u64 > MAX_BUNDLED_READ {
-            return Err(SkillError::Limit);
+            return Err(too_large(
+                bytes.len() as u64,
+                (MAX_BUNDLED_READ / 1024) as u16,
+            ));
         }
-        String::from_utf8(bytes).map_err(|_| SkillError::Limit)
+        String::from_utf8(bytes).map_err(|_| SkillError::Utf8)
     }
-    pub fn list(&self) -> Result<(Vec<Skill>, Vec<String>), SkillError> {
+    /// Skills eligible to enter model context. Oversized installed skills become visible warnings.
+    pub fn load(&self) -> Result<(Vec<Skill>, Vec<String>), SkillError> {
         let mut skills = vec![];
         let mut warnings = vec![];
         for entry in self
@@ -428,26 +478,99 @@ impl SkillStore {
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         Ok((skills, warnings))
     }
+    /// Every installed skill for owner management, including oversized skills that may be removed.
+    pub fn list(&self) -> Result<(Vec<SkillEntry>, Vec<String>), SkillError> {
+        let mut entries = vec![];
+        let mut warnings = vec![];
+        for (name, filename) in self.installed()? {
+            match self.read(&name) {
+                Ok(skill) => entries.push(SkillEntry {
+                    skill,
+                    warning: None,
+                }),
+                Err(SkillError::TooLarge {
+                    actual_kib,
+                    limit_kib,
+                }) => {
+                    let warning = format!(
+                        "Too large for the current limit ({actual_kib} KiB, limit {limit_kib} KiB)"
+                    );
+                    entries.push(SkillEntry {
+                        skill: Skill {
+                            name,
+                            description: String::new(),
+                            body: String::new(),
+                            enabled: false,
+                            user_only: false,
+                        },
+                        warning: Some(warning),
+                    });
+                }
+                Err(error) => warnings.push(format!("{filename}: {error}")),
+            }
+        }
+        entries.sort_by(|a, b| a.skill.name.cmp(&b.skill.name));
+        Ok((entries, warnings))
+    }
+    fn installed(&self) -> Result<Vec<(String, String)>, SkillError> {
+        let mut installed = vec![];
+        for entry in self
+            .directory
+            .entries()
+            .map_err(|_| SkillError::File)?
+            .take(200)
+        {
+            let entry = entry.map_err(|_| SkillError::File)?;
+            let kind = entry.file_type().map_err(|_| SkillError::File)?;
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            let name = if kind.is_file() {
+                match filename.strip_suffix(".md") {
+                    Some(name) => name.to_owned(),
+                    None => continue,
+                }
+            } else if kind.is_dir()
+                && !filename.starts_with('.')
+                && self
+                    .directory
+                    .try_exists(format!("{filename}/{SKILL_FILE}"))
+                    .unwrap_or(false)
+            {
+                filename.clone()
+            } else {
+                continue;
+            };
+            installed.push((name, filename));
+        }
+        Ok(installed)
+    }
     pub fn read(&self, name: &str) -> Result<Skill, SkillError> {
+        self.read_with_limit(name, self.max_skill_kib)
+    }
+    fn read_with_limit(&self, name: &str, max_skill_kib: u16) -> Result<Skill, SkillError> {
         validate_name(name)?;
         let filename = self.file_of(name).ok_or(SkillError::File)?;
-        if !self
+        let metadata = self
             .directory
             .symlink_metadata(&filename)
-            .map_err(|_| SkillError::File)?
-            .is_file()
-        {
+            .map_err(|_| SkillError::File)?;
+        if !metadata.is_file() {
             return Err(SkillError::File);
+        }
+        if metadata.len() > u64::from(max_skill_kib) * 1024 {
+            return Err(too_large(metadata.len(), max_skill_kib));
         }
         let mut bytes = vec![];
         self.directory
             .open(filename)
             .map_err(|_| SkillError::File)?
-            .take(MAX_SKILL as u64 + 1)
+            .take(u64::from(max_skill_kib) * 1024 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| SkillError::File)?;
-        let text = String::from_utf8(bytes).map_err(|_| SkillError::Limit)?;
-        let skill = parse(&text)?;
+        if bytes.len() > usize::from(max_skill_kib) * 1024 {
+            return Err(too_large(bytes.len() as u64, max_skill_kib));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| SkillError::Utf8)?;
+        let skill = parse_with_limit(&text, max_skill_kib)?;
         if skill.name != name {
             return Err(SkillError::Format);
         }
@@ -466,7 +589,7 @@ impl SkillStore {
     /// at the same moment.
     pub fn create(&self, skill: &Skill) -> Result<(), SkillError> {
         let _writing = self.writing()?;
-        let document = validate(skill)?;
+        let document = validate_with_limit(skill, self.max_skill_kib)?;
         if self.contains(&skill.name) {
             return Err(SkillError::Exists);
         }
@@ -515,7 +638,7 @@ impl SkillStore {
     }
     /// `save` for a caller that already holds `writing`.
     fn save_held(&self, skill: &Skill) -> Result<(), SkillError> {
-        let document = validate(skill)?;
+        let document = validate_with_limit(skill, self.max_skill_kib)?;
         // A folder skill keeps its bundled files; only its SKILL.md changes.
         if self.folder(&skill.name).is_some() {
             let folder = self
@@ -588,10 +711,10 @@ impl SkillStore {
         directory
             .open(&filename)
             .map_err(|_| SkillError::Missing)?
-            .take(MAX_PROPOSAL as u64 + 1)
+            .take(Self::max_stored_proposal_bytes() as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| SkillError::File)?;
-        let proposal: SkillProposal = (bytes.len() <= MAX_PROPOSAL)
+        let proposal: SkillProposal = (bytes.len() <= Self::max_stored_proposal_bytes())
             .then(|| serde_json::from_slice(&bytes).ok())
             .flatten()
             .ok_or(SkillError::Invalid)?;
@@ -615,12 +738,15 @@ impl SkillStore {
         source: crate::storage::MemorySource,
     ) -> Result<SkillProposal, SkillError> {
         validate_name(&skill.name)?;
-        parse(&format!(
-            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
-            skill.name,
-            serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
-            skill.body
-        ))?;
+        parse_with_limit(
+            &format!(
+                "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+                skill.name,
+                serde_json::to_string(&skill.description).map_err(|_| SkillError::Format)?,
+                skill.body
+            ),
+            self.max_skill_kib,
+        )?;
         crate::storage::validate_id(&source.session_id)
             .and_then(|()| crate::storage::validate_id(&source.message_id))
             .map_err(|_| SkillError::Invalid)?;
@@ -639,8 +765,11 @@ impl SkillStore {
             source,
         };
         let body = serde_json::to_vec(&proposal).map_err(|_| SkillError::Format)?;
-        if body.len() > MAX_PROPOSAL {
-            return Err(SkillError::Limit);
+        if body.len() > self.max_proposal_bytes() {
+            return Err(SkillError::ProposalTooLarge {
+                actual_kib: (body.len() as u64).div_ceil(1024),
+                limit_kib: (self.max_proposal_bytes() as u64) / 1024,
+            });
         }
         let directory = self.proposal_directory()?;
         let temporary = format!(".skill-{:016x}", rand::random::<u64>());
@@ -737,7 +866,7 @@ impl SkillStore {
     /// is moved aside first and put back if the new one cannot be saved.
     pub fn replace_with_file(&self, skill: &Skill) -> Result<(), SkillError> {
         let _writing = self.writing()?;
-        let document = validate(skill)?;
+        let document = validate_with_limit(skill, self.max_skill_kib)?;
         let temporary = self.write_temporary(&document)?;
         let old = if self.folder(&skill.name).is_some() {
             Some(skill.name.clone())
@@ -784,7 +913,7 @@ impl SkillStore {
     /// a replaced one is moved aside first and removed once the new one is in place.
     pub fn install(&self, staged: &str, skill: &Skill, replace: bool) -> Result<(), SkillError> {
         let _writing = self.writing()?;
-        let document = validate(skill)?;
+        let document = validate_with_limit(skill, self.max_skill_kib)?;
         let result = (|| {
             // Scoped so the handle is closed before the rename: Windows cannot rename an open folder.
             {
@@ -980,6 +1109,7 @@ pub async fn propose_call(
     directory: std::path::PathBuf,
     source: crate::storage::MemorySource,
     arguments: &str,
+    max_skill_kib: u16,
 ) -> Result<String, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -997,11 +1127,12 @@ pub async fn propose_call(
         enabled: true,
         user_only: false,
     };
-    let proposal =
-        tokio::task::spawn_blocking(move || SkillStore::open(&directory)?.propose(skill, source))
-            .await
-            .map_err(|_| "Skills could not be accessed.".to_owned())?
-            .map_err(|error| error.to_string())?;
+    let proposal = tokio::task::spawn_blocking(move || {
+        SkillStore::open_with_limit(&directory, max_skill_kib)?.propose(skill, source)
+    })
+    .await
+    .map_err(|_| "Skills could not be accessed.".to_owned())?
+    .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({"pendingProposalId":proposal.id,"status":"pending_review","message":"No workflow changed. The owner must review this with bw skills pending or in the desktop Skills dialog."}).to_string())
 }
 /// The instructions of one enabled skill, delimited like other untrusted context.
@@ -1021,6 +1152,18 @@ fn document(skill: &Skill) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_proposal_error_is_explicit() {
+        assert_eq!(
+            SkillError::ProposalTooLarge {
+                actual_kib: 300,
+                limit_kib: 256
+            }
+            .to_string(),
+            "This skill proposal is too large (300 KiB, limit 256 KiB)."
+        );
+    }
     #[test]
     fn read_call_lists_and_reads_bundled_files_of_enabled_skills() {
         let path = std::env::temp_dir().join(format!("blackwall-skills-{}", rand::random::<u64>()));
@@ -1115,6 +1258,37 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, [format!(".import-{now}-c"), ".import-legacy".into()]);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn shrinking_limit_keeps_skill_manageable_but_skips_context_load() {
+        let path = std::env::temp_dir().join(format!("blackwall-skills-{}", rand::random::<u64>()));
+        let large = Skill {
+            name: "large-skill".into(),
+            description: "A large installed skill.".into(),
+            body: "x".repeat(40 * 1024),
+            enabled: true,
+            user_only: false,
+        };
+        SkillStore::open_with_limit(&path, 64)
+            .unwrap()
+            .save(&large)
+            .unwrap();
+        let store = SkillStore::open_with_limit(&path, 32).unwrap();
+        let (listed, warnings) = store.list().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].skill.name, "large-skill");
+        assert!(listed[0].warning.as_deref().is_some_and(
+            |warning| warning == "Too large for the current limit (41 KiB, limit 32 KiB)"
+        ));
+        let (loaded, warnings) = store.load().unwrap();
+        assert!(loaded.is_empty());
+        assert!(warnings[0].contains("Too large: 41 KiB (limit 32 KiB)"));
+        store.remove("large-skill").unwrap();
+        // Close the store first; Windows cannot delete a folder with an open file in it.
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]

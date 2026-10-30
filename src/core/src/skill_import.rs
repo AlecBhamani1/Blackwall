@@ -12,8 +12,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Larger files cannot fit in a skill once converted, so they are not read in full.
-const MAX_SOURCE: u64 = 64 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_SCANNED: usize = 10_000;
 const MAX_DESCRIPTION: usize = 500;
@@ -105,9 +103,14 @@ fn loose(frontmatter: &str) -> Result<serde_yaml_ng::Mapping, SkillError> {
 
 /// Convert a `SKILL.md` or Blackwall skill document. `folder` names the skill when its
 /// frontmatter does not. The frontmatter's `license` value, if any, is returned for display.
-pub fn convert(
+#[cfg(test)]
+fn convert(text: &str, folder: &str) -> Result<(Skill, Vec<String>, Option<String>), SkillError> {
+    convert_with_limit(text, folder, 32)
+}
+pub fn convert_with_limit(
     text: &str,
     folder: &str,
+    max_skill_kib: u16,
 ) -> Result<(Skill, Vec<String>, Option<String>), SkillError> {
     let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let rest = text.strip_prefix("---\n").ok_or(SkillError::Format)?;
@@ -182,7 +185,7 @@ pub fn convert(
             skill.name
         ));
     }
-    crate::skills::validate(&skill)?;
+    crate::skills::validate_with_limit(&skill, max_skill_kib)?;
     let license = text_of("license").map(|value| value.chars().take(80).collect());
     Ok((skill, notes, license))
 }
@@ -224,6 +227,12 @@ fn read_bytes(path: &Path, limit: u64) -> Result<(Vec<u8>, bool), SkillError> {
     if !metadata.is_file() {
         return Err(SkillError::File);
     }
+    if metadata.len() > limit {
+        return Err(SkillError::TooLarge {
+            actual_kib: metadata.len().div_ceil(1024),
+            limit_kib: (limit / 1024) as u16,
+        });
+    }
     #[cfg(unix)]
     let executable = {
         use std::os::unix::fs::PermissionsExt;
@@ -236,13 +245,17 @@ fn read_bytes(path: &Path, limit: u64) -> Result<(Vec<u8>, bool), SkillError> {
         .read_to_end(&mut bytes)
         .map_err(|_| SkillError::File)?;
     if bytes.len() as u64 > limit {
-        return Err(SkillError::Limit);
+        return Err(SkillError::TooLarge {
+            actual_kib: bytes.len().div_ceil(1024) as u64,
+            limit_kib: (limit / 1024) as u16,
+        });
     }
     Ok((bytes, executable))
 }
 
-fn read(path: &Path) -> Result<String, SkillError> {
-    String::from_utf8(read_bytes(path, MAX_SOURCE)?.0).map_err(|_| SkillError::Limit)
+fn read(path: &Path, max_skill_kib: u16) -> Result<String, SkillError> {
+    String::from_utf8(read_bytes(path, u64::from(max_skill_kib) * 1024)?.0)
+        .map_err(|_| SkillError::Utf8)
 }
 
 /// A file copied with a folder skill.
@@ -276,9 +289,17 @@ fn bundle(folder: &Path, notes: &mut Vec<String>) -> Result<Vec<Bundled>, SkillE
     let mut found = vec![];
     let mut skipped = vec![];
     let mut bytes = 0u64;
+    let mut visited = 0usize;
     let mut stack = vec![(folder.to_path_buf(), String::new(), 0usize)];
     while let Some((directory, prefix, depth)) = stack.pop() {
         for (name, path) in entries(&directory) {
+            visited += 1;
+            if visited > MAX_SCANNED {
+                return Err(SkillError::FolderScanLimit {
+                    visited: MAX_SCANNED,
+                    limit: MAX_FOLDER_FILES,
+                });
+            }
             if prefix.is_empty() && is_skill_file(&name) {
                 continue;
             }
@@ -296,11 +317,20 @@ fn bundle(folder: &Path, notes: &mut Vec<String>) -> Result<Vec<Bundled>, SkillE
             } else if metadata.is_file() {
                 bytes += metadata.len();
                 found.push(Bundled { relative, path });
-                if found.len() > MAX_FOLDER_FILES || bytes > MAX_FOLDER_BYTES {
-                    return Err(SkillError::Folder);
-                }
             }
         }
+    }
+    if found.len() > MAX_FOLDER_FILES {
+        return Err(SkillError::FolderFiles {
+            actual: found.len(),
+            limit: MAX_FOLDER_FILES,
+        });
+    }
+    if bytes > MAX_FOLDER_BYTES {
+        return Err(SkillError::FolderSize {
+            actual_kib: bytes.div_ceil(1024),
+            limit_kib: MAX_FOLDER_BYTES / 1024,
+        });
     }
     found.sort_by(|a, b| a.relative.cmp(&b.relative));
     if !skipped.is_empty() {
@@ -348,7 +378,7 @@ struct Prepared {
 
 /// Convert one Markdown file. A `SKILL.md` is named after its folder and brings the files
 /// beside it; any other `.md` file is named after itself. Every text file is scanned.
-fn prepare(path: &Path) -> Result<Prepared, SkillError> {
+fn prepare(path: &Path, max_skill_kib: u16) -> Result<Prepared, SkillError> {
     let Source {
         file_name,
         text,
@@ -356,7 +386,7 @@ fn prepare(path: &Path) -> Result<Prepared, SkillError> {
         mut notes,
         mut license,
         files,
-    } = source(path)?;
+    } = source(path, max_skill_kib)?;
     let mut findings = scan_text(&file_name, &text);
     let mut unread = vec![];
     for file in &files {
@@ -408,24 +438,24 @@ struct Source {
     files: Vec<Bundled>,
 }
 
-fn source(path: &Path) -> Result<Source, SkillError> {
+fn source(path: &Path, max_skill_kib: u16) -> Result<Source, SkillError> {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let text = read(path)?;
+    let text = read(path, max_skill_kib)?;
     let (skill, notes, license, files) = if is_skill_file(&file_name) {
         let parent = path.parent().unwrap_or(Path::new(""));
         let folder = parent
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (skill, mut notes, license) = convert(&text, &folder)?;
+        let (skill, mut notes, license) = convert_with_limit(&text, &folder, max_skill_kib)?;
         let files = bundle(parent, &mut notes)?;
         (skill, notes, license, files)
     } else {
         let stem = file_name.strip_suffix(".md").unwrap_or(&file_name);
-        let (skill, notes, license) = convert(&text, stem)?;
+        let (skill, notes, license) = convert_with_limit(&text, stem, max_skill_kib)?;
         (skill, notes, license, vec![])
     };
     Ok(Source {
@@ -438,7 +468,7 @@ fn source(path: &Path) -> Result<Source, SkillError> {
     })
 }
 
-fn candidate(origin: &str, path: &Path) -> ImportCandidate {
+fn candidate(origin: &str, path: &Path, max_skill_kib: u16) -> ImportCandidate {
     // The source is imported later by its path, so it must survive a round trip as text.
     let mut found = ImportCandidate {
         origin: origin.into(),
@@ -451,7 +481,7 @@ fn candidate(origin: &str, path: &Path) -> ImportCandidate {
         license: None,
         findings: vec![],
     };
-    match path.to_str().map(|_| prepare(path)) {
+    match path.to_str().map(|_| prepare(path, max_skill_kib)) {
         Some(Ok(prepared)) => {
             found.skill = Some(prepared.skill);
             found.notes = prepared.notes;
@@ -474,13 +504,13 @@ fn candidate(origin: &str, path: &Path) -> ImportCandidate {
 
 /// Find skills at `path`: a `SKILL.md` or Markdown file, a skill folder, or a folder of skill
 /// folders and Markdown skills one level down. Nothing is saved.
-pub fn scan(origin: &str, path: &Path) -> Vec<ImportCandidate> {
+pub fn scan_with_limit(origin: &str, path: &Path, max_skill_kib: u16) -> Vec<ImportCandidate> {
     if path.is_file() {
-        return vec![candidate(origin, path)];
+        return vec![candidate(origin, path, max_skill_kib)];
     }
     let here = entries(path);
     if let Some((_, skill)) = here.iter().find(|(name, _)| is_skill_file(name)) {
-        return vec![candidate(origin, skill)];
+        return vec![candidate(origin, skill, max_skill_kib)];
     }
     here.into_iter()
         .take(MAX_ENTRIES)
@@ -489,9 +519,10 @@ pub fn scan(origin: &str, path: &Path) -> Vec<ImportCandidate> {
                 entries(&child)
                     .into_iter()
                     .find(|(name, _)| is_skill_file(name))
-                    .map(|(_, skill)| candidate(origin, &skill))
+                    .map(|(_, skill)| candidate(origin, &skill, max_skill_kib))
             } else {
-                name.ends_with(".md").then(|| candidate(origin, &child))
+                name.ends_with(".md")
+                    .then(|| candidate(origin, &child, max_skill_kib))
             }
         })
         .collect()
@@ -534,7 +565,7 @@ pub fn import(
         skill,
         files,
         ..
-    } = self::source(source)?;
+    } = self::source(source, store.max_skill_kib())?;
     let mut findings = scan_text(&file_name, &text);
     if files.is_empty() {
         if !allow_findings && !findings.is_empty() {
@@ -558,13 +589,19 @@ pub fn import(
         let (bytes, runnable) =
             read_bytes(&file.path, MAX_FOLDER_BYTES - total.min(MAX_FOLDER_BYTES)).map_err(
                 |error| match error {
-                    SkillError::Limit => SkillError::Folder,
+                    SkillError::TooLarge { actual_kib, .. } => SkillError::FolderSize {
+                        actual_kib: total.div_ceil(1024) + actual_kib,
+                        limit_kib: MAX_FOLDER_BYTES / 1024,
+                    },
                     other => other,
                 },
             )?;
         total += bytes.len() as u64;
         if total > MAX_FOLDER_BYTES {
-            return Err(SkillError::Folder);
+            return Err(SkillError::FolderSize {
+                actual_kib: total.div_ceil(1024),
+                limit_kib: MAX_FOLDER_BYTES / 1024,
+            });
         }
         if crate::skill_scan::is_text(&file.relative) {
             if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -609,6 +646,10 @@ pub fn import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan(origin: &str, path: &Path) -> Vec<ImportCandidate> {
+        scan_with_limit(origin, path, 32)
+    }
 
     struct Folder(PathBuf);
     impl Folder {
@@ -697,7 +738,27 @@ mod tests {
             assert!(convert(text, "").is_err(), "{text}");
         }
         let big = format!("---\ndescription: d\n---\n{}", "x".repeat(40 * 1024));
-        assert!(matches!(convert(&big, "big"), Err(SkillError::Limit)));
+        assert!(matches!(
+            convert(&big, "big"),
+            Err(SkillError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn import_errors_name_size_and_utf8_rules() {
+        let data = Folder::new();
+        let large = data.0.join("large.md");
+        std::fs::write(&large, vec![b'a'; 49 * 1024]).unwrap();
+        let candidate = scan_with_limit("Chosen", &large, 32).pop().unwrap();
+        assert_eq!(
+            candidate.error.as_deref(),
+            Some("Too large: 49 KiB (limit 32 KiB)")
+        );
+
+        let invalid = data.0.join("invalid.md");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        let candidate = scan_with_limit("Chosen", &invalid, 32).pop().unwrap();
+        assert_eq!(candidate.error.as_deref(), Some("Not UTF-8 text"));
     }
 
     #[test]
@@ -862,14 +923,27 @@ mod tests {
             "huge/SKILL.md",
             "---\nname: huge\ndescription: d\n---\nBody",
         );
-        for index in 0..=crate::skills::MAX_FOLDER_FILES {
+        for index in 0..250 {
             source.write(&format!("huge/data/{index:03}.txt"), "x");
         }
         let found = scan("x", &source.0.join("huge"));
         assert!(found[0]
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("200 files")));
+            .is_some_and(|e| e == "Too many files: 250 (limit 200)"));
+
+        source.write(
+            "enormous/SKILL.md",
+            "---\nname: enormous\ndescription: d\n---\nBody",
+        );
+        for index in 0..MAX_SCANNED {
+            source.write(&format!("enormous/data/{index:05}.txt"), "");
+        }
+        let found = scan("x", &source.0.join("enormous"));
+        assert!(found[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error == "Too many files: more than 10000 (limit 200)"));
         #[cfg(unix)]
         {
             source.write(
