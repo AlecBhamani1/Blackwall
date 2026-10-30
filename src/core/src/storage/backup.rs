@@ -5,14 +5,17 @@
 //! folder and files are private (0700 and 0600). Windows has no mode bits or `O_NOFOLLOW`, so
 //! there a symlink or reparse point is refused by checking `symlink_metadata` first.
 use super::StorageError;
-use rusqlite::{backup::Backup, Connection, OpenFlags};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    Connection, OpenFlags,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// The folder in the data folder that holds the backups and the upgrade state.
@@ -32,6 +35,13 @@ const BACKUP_SUFFIX: &str = ".bak";
 const PARTIAL_SUFFIX: &str = ".partial";
 /// SQLite's journal and WAL sidecars for the partial file.
 const SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
+/// How long a backup keeps retrying a source that stays busy or locked before it fails.
+#[cfg(not(test))]
+const BACKUP_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const BACKUP_DEADLINE: Duration = Duration::from_millis(200);
+/// The pause between retries of a busy or locked step.
+const BACKUP_RETRY_PAUSE: Duration = Duration::from_millis(10);
 
 /// Which backup an unfinished upgrade made, for which source, and how many tries it has had.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -510,14 +520,13 @@ fn copy_and_verify(
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut copy = Connection::open_with_flags(partial, flags)?;
     super::configure(&copy, super::BUSY_TIMEOUT)?;
-    // All pages in one step; `run_to_completion` insists on a positive count.
     let backup = Backup::new(source, &mut copy)?;
     #[cfg(test)]
     {
         inject(dir, Fault::BackupCopy)?;
         inject(dir, Fault::BackupPanic)?;
     }
-    backup.run_to_completion(i32::MAX, Duration::ZERO, None)?;
+    copy_all_pages(&backup)?;
     drop(backup);
     // The copy inherits the source's journal mode; make the file self-contained.
     let mode: String =
@@ -542,6 +551,21 @@ fn copy_and_verify(
     open_plain(partial, true)?.sync_all()?;
     publish(dir, partial, finished)?;
     Ok(())
+}
+
+/// Copies every page, retrying a busy or locked step until [`BACKUP_DEADLINE`]. A source that
+/// is still busy then (another writer, or a source connection inside a write transaction, which
+/// SQLite reports as busy for as long as it lasts) fails the backup instead of spinning.
+fn copy_all_pages(backup: &Backup<'_, '_>) -> Result<(), StorageError> {
+    let deadline = Instant::now() + BACKUP_DEADLINE;
+    loop {
+        match backup.step(-1)? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => {}
+            _ if Instant::now() >= deadline => return Err(StorageError::BackupFailed),
+            _ => std::thread::sleep(BACKUP_RETRY_PAUSE),
+        }
+    }
 }
 
 /// Moves the finished partial to its final name without ever replacing a file. A hard link fails
@@ -898,6 +922,22 @@ mod tests {
                 "clean after {point:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_source_that_stays_busy_fails_the_backup_instead_of_spinning() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        // SQLite reports a source connection inside a write transaction as busy throughout.
+        let source = data.source();
+        source.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        let error = create_backup(&source, &dir, 5).unwrap_err();
+        assert!(matches!(error, StorageError::BackupFailed), "{error:?}");
+        assert!(started.elapsed() >= BACKUP_DEADLINE);
+        assert!(names(&dir).is_empty(), "left {:?}", names(&dir));
+        source.execute_batch("ROLLBACK").unwrap();
+        assert!(create_backup(&source, &dir, 5).is_ok());
     }
 
     fn state(backup: &str) -> UpgradeState {

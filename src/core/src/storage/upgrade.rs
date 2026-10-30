@@ -55,8 +55,9 @@ pub enum StorageNotice {
     SetAside { chats: u32 },
     /// Messages that were given generated ids because theirs were missing or repeated.
     RenamedIds { messages: u32, chats: u32 },
-    /// The check after the upgrade found damage; `backup` is the pre-upgrade copy to restore.
-    IntegrityFailed { backup: String },
+    /// The check after the upgrade found damage. `backup` is the pre-upgrade copy to restore,
+    /// or `None` for a database that had no data to back up.
+    IntegrityFailed { backup: Option<String> },
     /// How much the upgrade deduplicated, and what it left inline and why (P2-6).
     #[serde(rename_all = "camelCase")]
     UpgradeStorageReport {
@@ -161,14 +162,14 @@ pub(super) fn open_v6(
     directory: &Path,
     connection: Connection,
 ) -> Result<LocalStore, StorageError> {
-    configure(&connection, BUSY_TIMEOUT)?;
-    let version = match user_version(&connection) {
-        Err(error) if is_busy(&error) => {
-            connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
-            let version = user_version(&connection);
-            connection.busy_timeout(BUSY_TIMEOUT)?;
-            version?
-        }
+    let (busy, upgrade_busy) = busy_timeouts(directory);
+    // `configure` already reads the schema, so it can be the step that finds the file busy.
+    let read = |wait| configure(&connection, wait).and_then(|()| user_version(&connection));
+    let version = match read(busy) {
+        Err(error) if is_busy(&error) => match read(upgrade_busy) {
+            Err(error) if is_busy(&error) => return Err(StorageError::UpgradeBusy),
+            version => version?,
+        },
         version => version?,
     };
     if version > V6 {
@@ -177,12 +178,50 @@ pub(super) fn open_v6(
     if version == V6 {
         prune_expired_once(directory, &connection);
     } else {
-        connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
+        connection.busy_timeout(upgrade_busy)?;
         let upgraded = upgrade(directory, &connection);
         connection.busy_timeout(BUSY_TIMEOUT)?;
         upgraded?;
     }
+    connection.busy_timeout(BUSY_TIMEOUT)?;
     Ok(LocalStore { connection })
+}
+
+/// The open's normal and upgrade lock waits: [`BUSY_TIMEOUT`] and [`UPGRADE_BUSY_TIMEOUT`],
+/// unless a test set a short wait for this data folder.
+fn busy_timeouts(directory: &Path) -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(wait) = test_busy_timeout(directory) {
+        return (wait, wait);
+    }
+    #[cfg(not(test))]
+    let _ = directory;
+    (BUSY_TIMEOUT, UPGRADE_BUSY_TIMEOUT)
+}
+
+#[cfg(test)]
+static TEST_BUSY_TIMEOUTS: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes opens of `directory` wait at most `wait` for a lock (both waits), or restores the real
+/// waits with `None`. Test-only and per data folder, like the faults.
+#[cfg(test)]
+pub(crate) fn set_test_busy_timeout(directory: &Path, wait: Option<Duration>) {
+    let mut set = TEST_BUSY_TIMEOUTS.lock().unwrap_or_else(|e| e.into_inner());
+    set.retain(|(path, _)| path != directory);
+    if let Some(wait) = wait {
+        set.push((directory.to_owned(), wait));
+    }
+}
+
+#[cfg(test)]
+fn test_busy_timeout(directory: &Path) -> Option<Duration> {
+    TEST_BUSY_TIMEOUTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(path, _)| path == directory)
+        .map(|(_, wait)| *wait)
 }
 
 fn user_version(connection: &Connection) -> Result<i64, StorageError> {
@@ -253,7 +292,7 @@ fn back_up(directory: &Path, version: i64) -> Result<Backup, StorageError> {
     let database = directory.join(DATABASE_FILE);
     let source = backup::source_id(&database)?;
     let saved = backup::read_state(&dir).filter(|state| state.matches(&source, &dir));
-    let (made, attempts, created) = match saved {
+    let (made, attempts) = match saved {
         Some(state) if state.attempts >= MAX_ATTEMPTS => {
             return Err(StorageError::UpgradeStopped(dir.join(state.backup)));
         }
@@ -263,7 +302,6 @@ fn back_up(directory: &Path, version: i64) -> Result<Backup, StorageError> {
                 name: state.backup,
             },
             state.attempts,
-            false,
         ),
         None => {
             // SQLite's backup refuses (SQLITE_BUSY) a source connection that is inside a write
@@ -272,10 +310,10 @@ fn back_up(directory: &Path, version: i64) -> Result<Backup, StorageError> {
                 &database,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            reader.busy_timeout(BUSY_TIMEOUT)?;
+            configure(&reader, BUSY_TIMEOUT)?;
             let name = backup::create_backup(&reader, &dir, version)?;
             drop(reader);
-            (Backup { dir, name }, 0, true)
+            (Backup { dir, name }, 0)
         }
     };
     // From here the backup exists, so every error names it.
@@ -283,9 +321,7 @@ fn back_up(directory: &Path, version: i64) -> Result<Backup, StorageError> {
         backup: Some(made.path()),
         source: Box::new(source),
     };
-    if created {
-        backup::prune(&made.dir, Some(&made.name), SystemTime::now(), None, None).map_err(named)?;
-    }
+    // Older backups are pruned only after the commit: a failed attempt never deletes one.
     let state = UpgradeState {
         backup: made.name.clone(),
         source_size: source.size,
@@ -376,17 +412,15 @@ fn after_commit(
 ) {
     if !integrity_ok(directory, connection) {
         eprintln!("warn: upgrade: the integrity check after the upgrade found a problem");
-        if let Some(backup) = backup {
-            let notice = StorageNotice::IntegrityFailed {
-                backup: backup.path().display().to_string(),
-            };
-            let recorded = write_tx(connection).and_then(|tx| {
-                record_notices(&tx, &[notice])?;
-                Ok(tx.commit()?)
-            });
-            if let Err(error) = recorded {
-                eprintln!("warn: upgrade: could not record the integrity notice: {error:?}");
-            }
+        let notice = StorageNotice::IntegrityFailed {
+            backup: backup.map(|backup| backup.path().display().to_string()),
+        };
+        let recorded = write_tx(connection).and_then(|tx| {
+            record_notices(&tx, &[notice])?;
+            Ok(tx.commit()?)
+        });
+        if let Err(error) = recorded {
+            eprintln!("warn: upgrade: could not record the integrity notice: {error:?}");
         }
     }
     if let Err(error) = clean_up(directory, connection, backup, now) {
@@ -444,6 +478,9 @@ fn prune_expired_once(directory: &Path, connection: &Connection) {
     });
 }
 
+// TODO(#51 age-prune): before `DELETE_BACKUPS_AFTER` is turned on, (1) take the write lock
+// around this prune as the post-commit prune does, and (2) key the once-per-process guard by data
+// folder: the single `OnceLock` in `prune_expired_once` skips every folder after the first.
 fn prune_expired(
     directory: &Path,
     connection: &Connection,
@@ -521,46 +558,97 @@ pub(super) fn migrate(store: &mut LocalStore, sessions: &[Value]) -> Result<(), 
     Ok(())
 }
 
+/// A read-only connection met a hot journal it may not roll back.
+fn needs_rollback(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Database(rusqlite::Error::SqliteFailure(error, _))
+            if error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+    )
+}
+
+/// The state file as it stands, when the source cannot be compared with it.
+fn unmatched_status(dir: &Path) -> UpgradeStatus {
+    backup::read_state(dir).map_or(UpgradeStatus::Pending, |state| failed_status(dir, &state))
+}
+
+fn failed_status(dir: &Path, state: &UpgradeState) -> UpgradeStatus {
+    if state.attempts == 0 {
+        return UpgradeStatus::Pending;
+    }
+    UpgradeStatus::Failed {
+        backup: dir.join(&state.backup).display().to_string(),
+        attempts: state.attempts,
+        stopped: state.attempts >= MAX_ATTEMPTS,
+    }
+}
+
 impl LocalStore {
     /// The notices not yet shown, removed as they are read: each one is shown once.
     pub fn take_storage_notices(&self) -> Result<Vec<StorageNotice>, StorageError> {
+        // Most opens have none: only then is the write lock worth taking.
+        if read_notices(&self.connection)?.is_empty() {
+            return Ok(vec![]);
+        }
         let tx = write_tx(&self.connection)?;
         let notices = read_notices(&tx)?;
-        if !notices.is_empty() {
-            tx.execute("DELETE FROM settings WHERE key=?1", [NOTICES_KEY])?;
-            tx.commit()?;
-        }
+        tx.execute("DELETE FROM settings WHERE key=?1", [NOTICES_KEY])?;
+        tx.commit()?;
         Ok(notices)
     }
 
     /// Where the upgrade of the database in `directory` stands. It reads the version and
-    /// `upgrade-state.json` and changes nothing; it never upgrades.
+    /// `upgrade-state.json`; it never upgrades. Its only write lock is a zero-wait probe that it
+    /// rolls straight back.
+    ///
+    /// - A window holding the write lock may be upgrading right now: `Pending`, never `Failed`.
+    /// - A crashed upgrade leaves a hot `-journal` that a read-only connection cannot roll back,
+    ///   and page 1 is not restored yet, so the source cannot be matched: the state file is
+    ///   reported as it stands. The next open rolls the journal back.
     pub fn upgrade_status(directory: &Path) -> Result<UpgradeStatus, StorageError> {
         let path = directory.join(DATABASE_FILE);
         if fs::symlink_metadata(&path).is_err() {
             return Ok(UpgradeStatus::Pending);
         }
-        let connection = Connection::open_with_flags(
+        let dir = directory.join(BACKUPS_DIR);
+        let reader = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        if user_version(&connection)? >= V6 {
-            return Ok(UpgradeStatus::Current);
+        // `configure` reads the schema, so it shares the version read's outcomes.
+        match configure(&reader, Duration::ZERO).and_then(|()| user_version(&reader)) {
+            Ok(version) if version >= V6 => return Ok(UpgradeStatus::Current),
+            Ok(_) => {}
+            Err(error) if is_busy(&error) => return Ok(UpgradeStatus::Pending),
+            Err(error) if needs_rollback(&error) => return Ok(unmatched_status(&dir)),
+            Err(error) => return Err(error),
         }
-        drop(connection);
-        let dir = directory.join(BACKUPS_DIR);
+        drop(reader);
+        // A writer that holds the lock without a journal yet (an upgrade before its first write)
+        // is invisible to readers; only taking the lock shows it.
+        let probe = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        configure(&probe, Duration::ZERO)?;
+        match probe
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+            .map_err(StorageError::from)
+        {
+            Err(error) if is_busy(&error) => return Ok(UpgradeStatus::Pending),
+            result => result?,
+        }
+        drop(probe);
+        let mut journal = path.as_os_str().to_owned();
+        journal.push("-journal");
+        if fs::symlink_metadata(PathBuf::from(journal)).is_ok() {
+            return Ok(unmatched_status(&dir));
+        }
         let Some(state) = backup::read_state(&dir) else {
             return Ok(UpgradeStatus::Pending);
         };
         Ok(match backup::source_id(&path) {
-            Ok(source) if state.attempts > 0 && state.matches(&source, &dir) => {
-                UpgradeStatus::Failed {
-                    backup: dir.join(&state.backup).display().to_string(),
-                    attempts: state.attempts,
-                    stopped: state.attempts >= MAX_ATTEMPTS,
-                }
-            }
+            Ok(source) if state.matches(&source, &dir) => failed_status(&dir, &state),
             _ => UpgradeStatus::Pending,
         })
     }

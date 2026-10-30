@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::MemoryClient;
-use crate::storage::backup::{set_fault, Fault, BACKUPS_DIR};
+use crate::storage::backup::{backup_name, backups_dir, set_fault, Fault, BACKUPS_DIR};
 use crate::storage::fixtures::{
     build_v5, golden, master, platform_neutral, v5_sessions, RECALL_QUERIES,
 };
@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use std::{
     fs,
     path::PathBuf,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// The ids fixture's renames: rows 0 and 5 had no id, and row 3 repeated row 2's `a`.
@@ -44,6 +44,7 @@ impl std::ops::Deref for Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         set_fault(&self.0, None);
+        set_test_busy_timeout(&self.0, None);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -485,9 +486,236 @@ fn a_post_commit_integrity_failure_is_a_notice_not_an_error() {
     let notices = db.take_storage_notices().unwrap();
     assert!(
         notices.contains(&StorageNotice::IntegrityFailed {
-            backup: path.display().to_string()
+            backup: Some(path.display().to_string())
         }),
         "{notices:?}"
     );
     assert!(path.is_file(), "the backup to restore from stays");
+}
+
+/// Copies a file, or a folder of files, from one data folder to another.
+fn copy_into(from: &Path, to: &Path, name: &str) {
+    let (from, to) = (from.join(name), to.join(name));
+    if from.is_dir() {
+        fs::create_dir(&to).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&to, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for entry in fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    } else {
+        fs::copy(from, to).unwrap();
+    }
+}
+
+#[test]
+fn a_crashed_upgrade_reports_its_state_until_an_open_recovers_it() {
+    let dir = Scratch::new("crashed");
+    let sessions = v5_sessions();
+    build_v5(&dir, &sessions, 5);
+    set_fault(&dir, Some(Fault::ConvertError(0)));
+    failed_backup(open6(&dir));
+    set_fault(&dir, None);
+    // A writer caught mid-transaction, copied as a crash leaves it: the database, its hot
+    // journal, and the upgrade's backups folder.
+    let crashed = Scratch::new("crashed-copy");
+    fs::create_dir(&crashed.0).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&crashed.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let writer = Connection::open(dir.database()).unwrap();
+    writer
+        .execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE sessions SET body=body||' ';")
+        .unwrap();
+    for name in [
+        DATABASE_FILE,
+        &format!("{DATABASE_FILE}-journal"),
+        BACKUPS_DIR,
+    ] {
+        copy_into(&dir, &crashed, name);
+    }
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    let backup = crashed.backups().join(&baks(&crashed)[0]);
+    assert_eq!(
+        LocalStore::upgrade_status(&crashed).unwrap(),
+        UpgradeStatus::Failed {
+            backup: backup.display().to_string(),
+            attempts: 1,
+            stopped: false,
+        }
+    );
+    // The open rolls the journal back, matches the source and reuses its backup.
+    let db = open6(&crashed).unwrap();
+    for session in sessions.iter().filter(|s| s["id"] != "bad_role") {
+        let id = session["id"].as_str().unwrap();
+        assert_eq!(
+            db.load_json_v6(id).unwrap().unwrap(),
+            expected(session),
+            "{id}"
+        );
+    }
+    assert_eq!(baks(&crashed).len(), 1);
+    assert_eq!(
+        LocalStore::upgrade_status(&crashed).unwrap(),
+        UpgradeStatus::Current
+    );
+}
+
+#[test]
+fn status_is_pending_not_failed_while_another_window_holds_the_lock() {
+    let dir = Scratch::new("inprogress");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    set_fault(&dir, Some(Fault::ConvertError(0)));
+    let (path, _) = failed_backup(open6(&dir));
+    let writer = Connection::open(dir.database()).unwrap();
+    // An upgrade before its first write holds only the lock; one committing holds it exclusively.
+    for begin in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+        writer.execute_batch(begin).unwrap();
+        assert_eq!(
+            LocalStore::upgrade_status(&dir).unwrap(),
+            UpgradeStatus::Pending,
+            "{begin}"
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+    assert_eq!(
+        LocalStore::upgrade_status(&dir).unwrap(),
+        UpgradeStatus::Failed {
+            backup: path.display().to_string(),
+            attempts: 1,
+            stopped: false,
+        }
+    );
+}
+
+#[test]
+fn a_held_lock_returns_upgrade_busy_and_changes_nothing() {
+    let dir = Scratch::new("busy");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    let bytes = fs::read(dir.database()).unwrap();
+    set_test_busy_timeout(&dir, Some(Duration::from_millis(50)));
+    let writer = Connection::open(dir.database()).unwrap();
+    // IMMEDIATE: the version reads, the lock does not come. EXCLUSIVE: not even the read does.
+    for begin in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+        writer.execute_batch(begin).unwrap();
+        assert!(
+            matches!(open6(&dir), Err(StorageError::UpgradeBusy)),
+            "{begin}"
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+    assert_eq!(fs::read(dir.database()).unwrap(), bytes);
+    assert_eq!(backup_files(&dir), Vec::<String>::new());
+    drop(writer);
+    drop(open6(&dir).unwrap());
+    assert_eq!(version_of(&dir.database()), V6);
+}
+
+#[test]
+fn an_integrity_failure_on_a_fresh_database_is_still_noticed() {
+    let dir = Scratch::new("fresh-integrity");
+    set_fault(&dir, Some(Fault::IntegrityCheck));
+    let db = open6(&dir).unwrap();
+    assert_eq!(version_of(&dir.database()), V6);
+    assert_eq!(
+        db.take_storage_notices().unwrap(),
+        [StorageNotice::IntegrityFailed { backup: None }]
+    );
+    assert_eq!(
+        serde_json::to_value(StorageNotice::IntegrityFailed { backup: None }).unwrap(),
+        json!({"kind": "integrityFailed", "backup": null})
+    );
+}
+
+#[test]
+fn a_failed_attempt_never_deletes_older_backups() {
+    let dir = Scratch::new("keepold");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    let backups = backups_dir(&dir).unwrap();
+    let old: Vec<String> = (1..=3u32)
+        .map(|day| {
+            backup_name(
+                UNIX_EPOCH + Duration::from_secs(u64::from(day) * 86_400),
+                day,
+            )
+        })
+        .collect();
+    for name in &old {
+        fs::write(backups.join(name), b"an older backup").unwrap();
+    }
+    set_fault(&dir, Some(Fault::ConvertError(0)));
+    let (path, _) = failed_backup(open6(&dir));
+    let current = path.file_name().unwrap().to_str().unwrap().to_owned();
+    let mut all = old.clone();
+    all.push(current.clone());
+    assert_eq!(baks(&dir), all, "a failed attempt pruned a backup");
+    // Only the committed upgrade prunes: the 3 newest stay, its own among them.
+    set_fault(&dir, None);
+    drop(open6(&dir).unwrap());
+    assert_eq!(baks(&dir), [old[1].clone(), old[2].clone(), current]);
+}
+
+#[test]
+fn a_foreign_key_violation_rolls_back_to_whole_v5() {
+    let dir = Scratch::new("foreignkey");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    // Written with foreign keys off, as an old or damaged file could hold it.
+    Connection::open(dir.database())
+        .unwrap()
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE extra(session TEXT REFERENCES sessions(id));
+             INSERT INTO extra VALUES ('no_such_chat');",
+        )
+        .unwrap();
+    let bytes = fs::read(dir.database()).unwrap();
+    match open6(&dir) {
+        Err(StorageError::UpgradeFailed {
+            backup: Some(path),
+            source,
+        }) => {
+            assert!(path.is_file());
+            assert!(
+                matches!(*source, StorageError::Invalid(text) if text == FOREIGN_KEYS_BROKEN),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected UpgradeFailed, got {:?}", other.err()),
+    }
+    assert_eq!(fs::read(dir.database()).unwrap(), bytes);
+}
+
+#[test]
+fn a_changed_source_after_a_stop_gets_a_new_backup_and_count() {
+    let dir = Scratch::new("changed");
+    build_v5(&dir, &v5_sessions()[..2], 5);
+    set_fault(&dir, Some(Fault::ConvertError(0)));
+    let (first, _) = failed_backup(open6(&dir));
+    for _ in 0..2 {
+        failed_backup(open6(&dir));
+    }
+    assert!(matches!(open6(&dir), Err(StorageError::UpgradeStopped(_))));
+    // A v5 window still running writes: this is a different source now.
+    Connection::open(dir.database())
+        .unwrap()
+        .execute("INSERT INTO settings(key,value) VALUES ('v5','write')", [])
+        .unwrap();
+    let (second, _) = failed_backup(open6(&dir));
+    assert_ne!(second, first);
+    assert_eq!(
+        LocalStore::upgrade_status(&dir).unwrap(),
+        UpgradeStatus::Failed {
+            backup: second.display().to_string(),
+            attempts: 1,
+            stopped: false,
+        }
+    );
+    assert_eq!(baks(&dir).len(), 2);
 }
