@@ -335,9 +335,10 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 (see [Child environments](#child-environments)). To pass your own variables through, list their
 names: `"env":["GITHUB_TOKEN","HTTPS_PROXY"]`. Names only, never values; at most 32 distinct names,
 and the variable must be set where Blackwall runs. Only you can write this list, and HTTP tools
-take no `env`. A name that loads code into a program (`LD_*`, `DYLD_*`, `PYTHONPATH`,
-`NODE_OPTIONS`, `BASH_ENV` and similar), `PATH`, or one of Blackwall's own secrets is refused, and
-the file is invalid.
+take no `env`. A command tool run in a restricted (sandboxed) profile ignores `env` and gets only
+the sandbox set; the names apply when it runs unsandboxed. A name that loads code into a program
+(`LD_*`, `DYLD_*`, `PYTHONPATH`, `NODE_OPTIONS`, `BASH_ENV` and similar), `PATH`, or one of
+Blackwall's own secrets is refused, and the file is invalid.
 
 **Argument schemas.** Without `parameters`, each placeholder is a required text parameter. A tool
 with `"stdin":"json"` or `"body":"json"` and no `parameters` then takes exactly those names, each a
@@ -429,7 +430,8 @@ When a server does not start, the tool card's details show the last lines of its
 the variable names it was not given, so a missing `env` entry is easy to spot. The text has
 terminal escape sequences removed, is capped at 2 KiB, and has the server's secrets redacted. Only
 you see it: it is not sent to the model, saved in the conversation or traced. `bw` prints it under
-the warning as `  details: …`, to the terminal only; `bw run --json` keeps it out of the JSON.
+the warning as `  details: …` on standard error, also with `bw run --json`, whose JSON on
+standard output never includes it.
 
 A server offered as a web address uses MCP streamable HTTP (protocol 2025-06-18) instead of a
 command. Give it a `url`, and `headers` whose values each name a saved secret:
@@ -543,15 +545,17 @@ command tools; separately configured MCP servers retain their own account permis
 ### Child environments
 
 Every program Blackwall starts gets an allow-listed environment instead of Blackwall's own. This
-covers shell commands, command tools, MCP servers, and the git, browser-opener and folder-listing
-helpers, on every system. It keeps the AppImage's runtime variables (`PYTHONHOME`,
+covers shell commands, command tools, MCP servers, and the git, browser-opener and listening-port
+discovery (`lsof`, `netstat`) helpers, on every system. The Linux browser opener also gets the
+desktop-session variables it needs. It keeps the AppImage's runtime variables (`PYTHONHOME`,
 `LD_LIBRARY_PATH` and similar) from breaking Python and other runtimes, and keeps your unrelated
 credentials from reaching a program that does not need them.
 
-- Programs you run for yourself (unsandboxed shell commands, command tools, MCP servers) get `HOME`,
-  `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`, plus the
-  names you list under `env` in `mcp.json` or `tools.json`.
-- Sandboxed shell commands get only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR` and `PATH`.
+- Programs you run for yourself (unsandboxed shell commands and command tools, MCP servers) get
+  `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`,
+  plus the names you list under `env` in `mcp.json` or `tools.json`.
+- A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
+  and `PATH`, and ignores `env`.
 - `PATH` is your login shell's, with relative and empty entries, the project folder and the
   AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
 - Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.

@@ -169,15 +169,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Breaking:** Child programs now start from an allow-listed environment instead of Blackwall's
-  own. This covers shell commands, command tools, MCP servers, and the git, browser-opener and
-  folder-listing helpers, on every system. They keep `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`,
-  `USER`, `LOGNAME`, `SHELL`, `TZ`, `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed commands get
-  less. An MCP server or command tool that relied on an inherited variable (a token, a proxy
-  setting, a custom config path) stops seeing it. To migrate, add its name to the new `env` list
-  in `mcp.json` or `tools.json`, such as `"env":["GITHUB_TOKEN"]`. `env` is owner-only (not allowed
-  in project servers), is refused on URL servers and HTTP tools, and cannot name `PATH`,
-  loader-injection variables or Blackwall's own secrets.
+- Start child programs from an allow-listed environment instead of Blackwall's own, which changes
+  what they see. This covers shell commands, command tools, MCP servers, the git and browser-opener
+  helpers (the Linux opener also gets the desktop-session variables it needs), and listening-port
+  discovery (`lsof`, `netstat`), on every system. They keep `HOME`, `LANG`, `LC_*`, `TERM`,
+  `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ`, `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed
+  commands get less. An MCP server or unsandboxed command tool that relied on an inherited
+  variable (a token, a proxy setting, a custom config path) stops seeing it. To migrate, add its
+  name to the new `env` list in `mcp.json` or `tools.json`, such as `"env":["GITHUB_TOKEN"]`. `env`
+  is owner-only (not allowed in project servers), is refused on URL servers and HTTP tools, is
+  ignored for sandboxed commands, and cannot name `PATH`, loader-injection variables or
+  Blackwall's own secrets.
 
 - A first launch with no saved connection lists the servers found on this computer and connects
   only to the one chosen, instead of connecting to the first that answered.
