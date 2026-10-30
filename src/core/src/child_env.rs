@@ -435,6 +435,8 @@ mod tests {
         }
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn appimage_entries_are_stripped_from_path_and_not_passed() {
         let env = build(
@@ -455,6 +457,8 @@ mod tests {
         assert_eq!(get(&env, "XDG_DATA_DIRS"), None);
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn shell_scope_keeps_the_owner_environment_minus_secrets_loader_and_appimage_variables() {
         let env = build(
@@ -503,6 +507,8 @@ mod tests {
         assert!(!env.dropped().contains(&"SSH_AUTH_SOCK".to_owned()));
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn shell_scope_drops_every_variable_that_points_into_the_appimage() {
         let env = build(
@@ -638,6 +644,8 @@ mod tests {
         }
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn validated_path_drops_empty_relative_appdir_and_project_entries() {
         assert_eq!(
@@ -654,6 +662,8 @@ mod tests {
         );
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn data_dirs_lose_appimage_relative_and_empty_entries() {
         assert_eq!(
@@ -676,6 +686,8 @@ mod tests {
         );
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn passed_through_xdg_data_dirs_is_cleaned_and_dropped_when_nothing_is_left() {
         let host = |dirs: &str| vars(&[("APPDIR", "/tmp/.mount_x"), ("XDG_DATA_DIRS", dirs)]);
@@ -701,6 +713,8 @@ mod tests {
         assert_eq!(get(&env, "XDG_DATA_DIRS"), None);
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn validated_path_drops_entries_that_climb_out_of_a_blocked_directory() {
         assert_eq!(
@@ -709,6 +723,18 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn validated_path_on_windows_keeps_drive_paths_and_drops_relative_and_project_entries() {
+        let path = OsStr::new(r"C:\Windows\System32;;bin;C:\proj\bin;D:\tools");
+        assert_eq!(
+            validated_path(path, None, Path::new(r"C:\proj")),
+            Some(OsString::from(r"C:\Windows\System32;D:\tools"))
+        );
+    }
+
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn search_path_replaces_the_source_path_and_is_validated() {
         let env = build(
@@ -734,6 +760,8 @@ mod tests {
         assert_eq!(env.dropped(), ["GITHUB_TOKEN"]);
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn invalid_pass_through_is_not_added_and_valid_names_are_accepted() {
         let env = build(
@@ -788,6 +816,8 @@ mod tests {
         assert_eq!(set, [(OsStr::new("HOME"), Some(OsStr::new("/h")))]);
     }
 
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn sandboxed_scope_matches_todays_macos_set() {
         let env = build(
