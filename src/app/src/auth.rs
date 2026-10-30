@@ -185,12 +185,18 @@ fn change_lock(
     hash: Option<&str>,
     store: impl FnOnce(Option<&str>) -> Result<(), String>,
 ) -> Result<(), String> {
+    let had_marker = directory.join(LOCK_MARKER).exists();
     match hash {
         Some(_) => write_marker(directory),
         None => remove_marker(directory),
     }
     .map_err(|_| "The app lock marker could not be updated in your data folder.".to_string())?;
-    store(hash)
+    let stored = store(hash);
+    if stored.is_err() && hash.is_some() && !had_marker {
+        // A lock that was never saved must not leave a marker that locks the next launch.
+        let _ = remove_marker(directory);
+    }
+    stored
 }
 fn has_sessions(directory: &Path) -> bool {
     // If the data cannot be inspected, assume conversations exist and stay locked.
@@ -293,6 +299,9 @@ pub async fn set_passphrase(
     let mut inner = state.0.lock().await;
     if !inner.unlocked {
         return Err("Unlock Blackwall first.".into());
+    }
+    if !inner.keyring {
+        return Err(crate::secrets::SecretError::Unavailable.explain(""));
     }
     if inner.hash.is_some() {
         check(&mut inner, current).await?;
@@ -417,6 +426,21 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+    #[test]
+    fn failed_lock_save_leaves_no_new_marker_but_keeps_an_existing_one() {
+        let directory = data_folder("failed-save");
+        let marker = directory.join(LOCK_MARKER);
+        let failing = |_: Option<&str>| Err("no keyring".to_string());
+        assert!(change_lock(&directory, Some("hash"), failing).is_err());
+        assert!(
+            !marker.exists(),
+            "a lock that was never saved must not leave a marker"
+        );
+        write_marker(&directory).unwrap();
+        assert!(change_lock(&directory, Some("hash"), failing).is_err());
+        assert!(marker.exists(), "an existing lock keeps its marker");
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn marker_tracks_lock_and_failed_removal_keeps_lock() {
