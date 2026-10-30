@@ -163,12 +163,11 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
         | "project" => {}
         _ => return Err("Unknown command. Run bw --help.".into()),
     }
-    let directory = match env::var_os("BLACKWALL_DATA_DIR") {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => env::home_dir()
-            .ok_or("Your home folder could not be found.")?
-            .join(".blackwall"),
-    };
+    let override_path = env::var_os("BLACKWALL_DATA_DIR");
+    let home = env::home_dir();
+    let directory =
+        blackwall_core::data_directory::resolve(override_path.as_deref(), home.as_deref())
+            .map_err(str::to_owned)?;
     if command == "memory" {
         return memory::run(&directory, &arguments);
     }
