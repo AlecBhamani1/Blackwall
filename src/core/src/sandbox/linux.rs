@@ -62,6 +62,9 @@ pub const LINUX_NO_OVERLAY: &str = "Workspace-write isn't available on this comp
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
 /// After a Retrying or Blocked answer, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// How long the overlay probe may take. It mounts an overlay and starts a sandbox on top of the
+/// Read-only probe's work, and a busy machine can take well over the 2 seconds that one gets.
+const OVERLAY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// The lowest number a descriptor handed to bubblewrap gets: clear of the standard streams and of
 /// the seccomp (3) and argument (4) files that the launcher opens.
 const FIRST_HANDED_FD: RawFd = 10;
@@ -282,12 +285,17 @@ fn run_command(
 /// failed in a way that may pass (it could not be started or waited for, timed out, or its files
 /// could not be written). `scratch` is an existing private directory. Blocking: async callers use
 /// `spawn_blocking`.
-pub(crate) fn resolve(
+///
+/// The second half of the answer is true when the answer is `Available` but the overlay probe
+/// failed in a way that may pass (it timed out, could not be started or waited for, or its files
+/// could not be written): `workspace_write` is false for now, and should be asked again later.
+pub(crate) fn resolve_with_retry(
     candidates: &[PathBuf],
     scratch: &Path,
     timeout: Duration,
+    overlay_timeout: Duration,
     appimage: Option<&Path>,
-) -> Availability {
+) -> (Availability, bool) {
     let (mut blocked, mut transient) = (false, false);
     let mut seen = HashSet::new();
     for candidate in candidates {
@@ -313,12 +321,22 @@ pub(crate) fn resolve(
         match probe(&bwrap, scratch, timeout) {
             Ok(()) => {
                 // Read-only works. Whatever the overlay does, it stays available.
-                let workspace_write = probe_overlay(&bwrap, scratch, timeout).is_ok();
-                return Availability::Available {
-                    bwrap,
-                    version,
-                    workspace_write,
-                };
+                let overlay = probe_overlay(&bwrap, scratch, overlay_timeout);
+                let overlay_may_pass = matches!(
+                    overlay,
+                    Err(ProbeError::Spawn(_)
+                        | ProbeError::Wait(_)
+                        | ProbeError::TimedOut
+                        | ProbeError::Files(_))
+                );
+                return (
+                    Availability::Available {
+                        bwrap,
+                        version,
+                        workspace_write: overlay.is_ok(),
+                    },
+                    overlay_may_pass,
+                );
             }
             // It ran and refused: policy (AppArmor, disabled user namespaces) most likely.
             Err(ProbeError::Failed(_) | ProbeError::UnexpectedOutput) => blocked = true,
@@ -330,13 +348,25 @@ pub(crate) fn resolve(
             ) => transient = true,
         }
     }
-    if transient {
+    let failed = if transient {
         Availability::Retrying
     } else if blocked {
         Availability::Blocked
     } else {
         Availability::Unavailable
-    }
+    };
+    (failed, false)
+}
+
+/// [`resolve_with_retry`] without the retry flag, the overlay probe getting the same `timeout`.
+#[cfg(test)]
+pub(crate) fn resolve(
+    candidates: &[PathBuf],
+    scratch: &Path,
+    timeout: Duration,
+    appimage: Option<&Path>,
+) -> Availability {
+    resolve_with_retry(candidates, scratch, timeout, timeout, appimage).0
 }
 
 /// Start a sandbox exactly as a Read-only command gets one (the same mounts, user namespace,
@@ -675,11 +705,13 @@ static BLOCKED: Availability = Availability::Blocked;
 
 /// What [`availability`] has found so far.
 struct Memory {
-    /// A working bubblewrap, kept for the life of the process.
+    /// A working bubblewrap whose Workspace-write answer is settled, kept for the life of the
+    /// process.
     found: OnceLock<Availability>,
     /// No trusted, new-enough bubblewrap: kept for the life of the process too.
     never: AtomicBool,
-    /// The last Retrying or Blocked answer and when to ask again. Held while looking, so
+    /// The last Retrying or Blocked answer, or an Available one whose overlay probe failed in a
+    /// way that may pass, and when to ask again. Held while looking, so
     /// concurrent first callers wait for one answer instead of probing twice.
     retry: Mutex<Option<(Instant, &'static Availability)>>,
     retry_after: Duration,
@@ -695,8 +727,14 @@ impl Memory {
     }
     /// The remembered answer, or what `look` finds now. `look` gives `None` when it could not
     /// even get ready to look (no probe folder yet): that is `Retrying` but not remembered, so a
-    /// first launch, before the data folder exists, is not stuck with it for 30 seconds.
-    fn answer(&'static self, look: impl FnOnce() -> Option<Availability>) -> &'static Availability {
+    /// first launch, before the data folder exists, is not stuck with it for 30 seconds. Its
+    /// second value is true for an `Available` answer whose Workspace-write half may still pass
+    /// (see [`resolve_with_retry`]): Read-only callers get it at once, but it is asked again after
+    /// the retry time instead of being kept.
+    fn answer(
+        &'static self,
+        look: impl FnOnce() -> Option<(Availability, bool)>,
+    ) -> &'static Availability {
         if let Some(found) = self.found.get() {
             return found;
         }
@@ -718,11 +756,19 @@ impl Memory {
                 return answer;
             }
         }
-        let Some(looked) = look() else {
+        let Some((looked, overlay_may_pass)) = look() else {
             return &RETRYING;
         };
         let answer = match looked {
-            found @ Availability::Available { .. } => return self.found.get_or_init(|| found),
+            found @ Availability::Available { .. } if !overlay_may_pass => {
+                return self.found.get_or_init(|| found);
+            }
+            // Read-only works; Workspace-write is off for now. Reuse the last copy when it is
+            // the same, so asking again every retry time doesn't keep adding one.
+            found @ Availability::Available { .. } => match *retry {
+                Some((_, last)) if *last == found => last,
+                _ => Box::leak(Box::new(found)),
+            },
             Availability::Unavailable => {
                 self.never.store(true, Ordering::Release);
                 return &UNAVAILABLE;
@@ -740,7 +786,9 @@ static MEMORY: Memory = Memory::new(RETRY_AFTER);
 /// none are both remembered for the life of the process (the first data directory wins). Any other
 /// failure of a trusted candidate (it would not run, or a new-enough one would not start a
 /// sandbox) is not: the answer is `Blocked` or `Retrying`, and it is asked again after about 30
-/// seconds. A probe folder that can't be made is
+/// seconds. So is Workspace-write when only its overlay probe failed in a way that may pass (a
+/// timeout, say): Read-only stays `Available`, with `workspace_write` false until that is asked
+/// again. A probe folder that can't be made is
 /// `Retrying` and asked again on the next call. A processor the seccomp filter doesn't support is
 /// never available. Blocking: async callers use `spawn_blocking`.
 pub fn availability(data_directory: &Path) -> &'static Availability {
@@ -755,10 +803,11 @@ pub fn availability(data_directory: &Path) -> &'static Availability {
             std::env::var_os("APPDIR"),
             &exe,
         );
-        let found = resolve(
+        let found = resolve_with_retry(
             &candidates(&exe),
             &scratch,
             Duration::from_secs(2),
+            OVERLAY_PROBE_TIMEOUT,
             appimage.as_deref(),
         );
         let _ = super::staging::remove_dir(&scratch);
@@ -1278,30 +1327,31 @@ mod tests {
     fn availability_remembers_answers_but_not_a_failure_to_prepare() {
         let fresh =
             |retry_after| -> &'static Memory { Box::leak(Box::new(Memory::new(retry_after))) };
-        let never = || -> Option<Availability> { panic!("asked again") };
+        let never = || -> Option<(Availability, bool)> { panic!("asked again") };
+        let settled = |found: Availability| Some((found, false));
         // No probe folder (the data folder doesn't exist yet on a first launch): Retrying, but
         // the next call looks again at once.
         let memory = fresh(RETRY_AFTER);
         assert_eq!(memory.answer(|| None), &Availability::Retrying);
         assert_eq!(
-            memory.answer(|| Some(Availability::Blocked)),
+            memory.answer(|| settled(Availability::Blocked)),
             &Availability::Blocked
         );
         // Blocked and Retrying are repeated until the retry time, then asked again.
         assert_eq!(memory.answer(never), &Availability::Blocked);
         let memory = fresh(RETRY_AFTER);
         assert_eq!(
-            memory.answer(|| Some(Availability::Retrying)),
+            memory.answer(|| settled(Availability::Retrying)),
             &Availability::Retrying
         );
         assert_eq!(memory.answer(never), &Availability::Retrying);
         let memory = fresh(Duration::ZERO);
         assert_eq!(
-            memory.answer(|| Some(Availability::Blocked)),
+            memory.answer(|| settled(Availability::Blocked)),
             &Availability::Blocked
         );
         assert_eq!(
-            memory.answer(|| Some(Availability::Unavailable)),
+            memory.answer(|| settled(Availability::Unavailable)),
             &Availability::Unavailable
         );
         // Unavailable and Available are final.
@@ -1312,8 +1362,84 @@ mod tests {
             version: (0, 13, 1),
             workspace_write: true,
         };
-        assert_eq!(memory.answer(|| Some(found.clone())), &found);
+        assert_eq!(memory.answer(|| settled(found.clone())), &found);
         assert_eq!(memory.answer(never), &found);
+    }
+    #[test]
+    fn a_slow_overlay_probe_is_asked_again_while_read_only_stays_available() {
+        let root = Root::new();
+        let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
+        let overlay = "tr '\\0' '\\n' <&4 | grep -qx -- --overlay";
+        let fake = root.fake(&format!(
+            "{new}if {overlay}; then exec sleep 30; fi; printf ok;; esac"
+        ));
+        let look = |asked: &std::cell::Cell<u32>| {
+            asked.set(asked.get() + 1);
+            Some(resolve_with_retry(
+                std::slice::from_ref(&fake),
+                &root.scratch,
+                secs(2),
+                Duration::from_millis(500),
+                Some(&root.path),
+            ))
+        };
+        let read_only = Availability::Available {
+            bwrap: fake.clone(),
+            version: (0, 13, 1),
+            workspace_write: false,
+        };
+        let asked = std::cell::Cell::new(0);
+        // Inside the retry time the answer is Available, never Retrying, and nobody probes again.
+        let memory: &'static Memory = Box::leak(Box::new(Memory::new(RETRY_AFTER)));
+        assert_eq!(memory.answer(|| look(&asked)), &read_only);
+        assert_eq!(memory.answer(|| look(&asked)), &read_only);
+        assert_eq!(asked.get(), 1);
+        // After it, the overlay is probed again, and a slow one is not kept either.
+        let asked = std::cell::Cell::new(0);
+        let memory: &'static Memory = Box::leak(Box::new(Memory::new(Duration::ZERO)));
+        let first = memory.answer(|| look(&asked));
+        let second = memory.answer(|| look(&asked));
+        assert_eq!((first, second), (&read_only, &read_only));
+        assert_eq!(asked.get(), 2);
+        assert!(memory.found.get().is_none());
+        // The same answer is reused, not leaked again.
+        assert!(std::ptr::eq(first, second));
+    }
+    #[test]
+    fn a_definitive_overlay_failure_is_kept_for_the_life_of_the_process() {
+        let root = Root::new();
+        let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
+        let overlay = "tr '\\0' '\\n' <&4 | grep -qx -- --overlay";
+        for body in [
+            format!("{new}if {overlay}; then exit 1; fi; printf ok;; esac"),
+            format!("{new}printf ok;; esac"),
+        ] {
+            let fake = root.fake(&body);
+            let memory: &'static Memory = Box::leak(Box::new(Memory::new(Duration::ZERO)));
+            let asked = std::cell::Cell::new(0);
+            let found = memory.answer(|| {
+                asked.set(asked.get() + 1);
+                Some(resolve_with_retry(
+                    std::slice::from_ref(&fake),
+                    &root.scratch,
+                    secs(2),
+                    Duration::from_millis(500),
+                    Some(&root.path),
+                ))
+            });
+            assert_eq!(
+                found,
+                &Availability::Available {
+                    bwrap: fake.clone(),
+                    version: (0, 13, 1),
+                    workspace_write: false,
+                },
+                "{body}"
+            );
+            assert_eq!(memory.answer(|| panic!("asked again")), found);
+            assert_eq!(asked.get(), 1);
+            assert!(memory.found.get().is_some());
+        }
     }
     #[test]
     fn trusted_file_requires_a_plain_unwritable_file_in_unwritable_directories() {
@@ -1506,7 +1632,7 @@ mod tests {
             bwrap,
             version,
             workspace_write,
-        } = resolve(&found, &root.scratch, secs(5), None)
+        } = resolve_with_retry(&found, &root.scratch, secs(5), OVERLAY_PROBE_TIMEOUT, None).0
         else {
             panic!("no usable bwrap among {found:?}");
         };
@@ -1514,7 +1640,7 @@ mod tests {
         probe(&bwrap, &root.scratch, secs(5)).unwrap();
         // The overlay works under this bubblewrap and kernel, so Workspace-write is offered.
         assert!(workspace_write, "the overlay probe failed with {bwrap:?}");
-        probe_overlay(&bwrap, &root.scratch, secs(5)).unwrap();
+        probe_overlay(&bwrap, &root.scratch, OVERLAY_PROBE_TIMEOUT).unwrap();
         assert_eq!(std::fs::read_dir(&root.scratch).unwrap().count(), 0);
     }
 
@@ -1528,7 +1654,7 @@ mod tests {
         );
         let dir = root.scratch.join("overlay");
         std::fs::create_dir(&dir).unwrap();
-        probe_overlay_in(&bwrap, &dir, secs(5)).unwrap();
+        probe_overlay_in(&bwrap, &dir, OVERLAY_PROBE_TIMEOUT).unwrap();
         use std::os::unix::fs::FileTypeExt;
         let upper = dir.join("upper");
         assert_eq!(std::fs::read(upper.join("new")).unwrap(), b"new");
