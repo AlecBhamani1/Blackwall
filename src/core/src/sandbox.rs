@@ -455,6 +455,11 @@ async fn find_availability(
         .map_err(|_| ToolError::Execution(PREPARE_FAILED.into()))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// The home folder [`prepare_with`] uses on this thread instead of `$HOME`, in a test.
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 #[cfg(target_os = "linux")]
 const PREPARE_FAILED: &str =
     "Blackwall couldn't prepare the sandbox for this command. The command was not run.";
@@ -511,6 +516,8 @@ pub(crate) async fn prepare_with(
     let staged = execution.profile == ExecutionProfile::WorkspaceWrite;
     let instruction_files = workspace.instruction_files.clone();
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(test)]
+    let home = TEST_HOME.with(|test| test.borrow().clone()).or(home);
     let checked_bwrap = bwrap.clone();
     // Everything that reads or writes files runs off the async workers. The command itself is
     // spawned later by the caller, from the runtime: bubblewrap's --die-with-parent follows the
@@ -528,7 +535,7 @@ pub(crate) async fn prepare_with(
                 return Err(changed());
             }
             let fd = std::os::fd::AsRawFd::as_raw_fd(&project_fd);
-            let args = mount_args(&project, fd, None, network, &found.masks)?;
+            let args = mount_args(&project, fd, None, network, &found.masks, home.as_deref())?;
             let run = linux::run_directory(&data).map_err(failed)?;
             // From here on, dropping the guard removes the folder, even on an early return.
             let guard = RunGuard {
@@ -558,7 +565,14 @@ pub(crate) async fn prepare_with(
             upper: &staging.upper,
             work: &staging.work,
         };
-        let args = mount_args(&project, -1, Some(overlay), network, &found.masks)?;
+        let args = mount_args(
+            &project,
+            -1,
+            Some(overlay),
+            network,
+            &found.masks,
+            home.as_deref(),
+        )?;
         let run = linux::run_directory(&data).map_err(failed)?;
         let guard = RunGuard {
             run: Some(run.clone()),
@@ -611,6 +625,7 @@ fn mount_args(
     overlay: Option<bwrap::Overlay>,
     network: bool,
     masks: &[walk::Mask],
+    home: Option<&Path>,
 ) -> Result<Vec<u8>, ToolError> {
     let roots = bwrap::host_roots();
     let plan = bwrap::MountPlan {
@@ -624,6 +639,7 @@ fn mount_args(
         overlay,
         network,
         system_masks: bwrap::host_system_masks(&roots),
+        toolchains: home.map(bwrap::toolchains_at).unwrap_or_default(),
         roots,
         etc: bwrap::host_etc(),
         masks,
@@ -1860,16 +1876,77 @@ mod tests {
                 .run(r#"ls -A "$HOME" 2>/dev/null; true"#, &bw)
                 .await
                 .unwrap();
-            // Only the way down to the project, when the project is inside the home folder.
-            let expected = project
-                .workspace
-                .path
-                .strip_prefix(&home)
-                .ok()
-                .and_then(|rest| rest.components().next())
-                .map(|first| format!("{}\n", first.as_os_str().to_string_lossy()))
-                .unwrap_or_default();
-            assert_eq!(listing, format!("Exit: 0\n{expected}"));
+            // Only the way down to the project, when the project is inside the home folder, and
+            // to the toolchain folders there are.
+            let toolchains = super::bwrap::toolchains_at(&home).binds;
+            let mut expected: Vec<String> = toolchains
+                .iter()
+                .chain([&project.workspace.path])
+                .filter_map(|path| path.strip_prefix(&home).ok()?.components().next())
+                .map(|first| first.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            expected.sort();
+            expected.dedup();
+            let mut found: Vec<String> = listing
+                .strip_prefix("Exit: 0\n")
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            found.sort();
+            assert_eq!(found, expected);
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_reads_home_toolchains_but_not_the_rest_of_home() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            let home = project.root.join("home");
+            for (path, text) in [
+                (".rustup/marker", "RUSTUP-MARKER"),
+                (".cargo/credentials.toml", "TOKEN-CONTENT"),
+                (".ssh/id", "KEY-CONTENT"),
+            ] {
+                std::fs::create_dir_all(home.join(path).parent().unwrap()).unwrap();
+                std::fs::write(home.join(path), text).unwrap();
+            }
+            TEST_HOME.with(|test| *test.borrow_mut() = Some(home.clone()));
+            let h = home.display();
+            for profile in [ExecutionProfile::ReadOnly, ExecutionProfile::WorkspaceWrite] {
+                project.workspace.execution.profile = profile;
+                let read = project.run(&format!("cat {h}/.rustup/marker"), &bw).await;
+                assert!(
+                    read.as_ref().unwrap().starts_with("Exit: 0\nRUSTUP-MARKER"),
+                    "{read:?}"
+                );
+                // Read-only, in either profile.
+                let write = format!("printf x > {h}/.rustup/marker || echo REFUSED");
+                let out = project.run(&write, &bw).await.unwrap();
+                assert!(out.contains("REFUSED"), "{out}");
+                assert_eq!(
+                    std::fs::read_to_string(home.join(".rustup/marker")).unwrap(),
+                    "RUSTUP-MARKER"
+                );
+                // The rest of home is still not there, and the credentials can't be read.
+                let listing = project.run(&format!("ls -A {h}"), &bw).await.unwrap();
+                assert!(
+                    listing.starts_with("Exit: 0\n.cargo\n.rustup\n"),
+                    "{listing}"
+                );
+                let ssh = project.run(&format!("cat {h}/.ssh/id"), &bw).await;
+                assert!(ssh.is_err() && !format!("{ssh:?}").contains("KEY-CONTENT"));
+                let token = project
+                    .run(&format!("cat {h}/.cargo/credentials.toml"), &bw)
+                    .await;
+                let token = format!("{token:?}");
+                // A /dev/null bind is mounted nodev, so it can't be opened at all (as with every
+                // file mask), rather than reading as empty.
+                assert!(!token.contains("TOKEN-CONTENT"), "{token}");
+                assert!(token.contains("Permission denied"), "{token}");
+            }
+            assert!(project.staged_left().is_empty());
+            TEST_HOME.with(|test| *test.borrow_mut() = None);
         }
 
         #[tokio::test]

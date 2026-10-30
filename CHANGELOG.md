@@ -11,8 +11,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - On Linux, Read-only commands now run in a sandbox: the project is read-only with `.git`, `.ssh`
   and the other protected folders hidden (below `node_modules`, `target` and the other skipped
-  folders, only their direct children), there is no home folder, only the system folders (without
-  `/usr/local/etc` or Linuxbrew's `etc`) and a short list of `/etc` files are visible, `/tmp` is
+  folders, only their direct children), of the home folder only `~/.cargo`, `~/.rustup`,
+  `~/.nvm`, `~/.pyenv`, `~/.local/bin` and `~/.local/share/uv` are visible, read-only and with
+  Cargo's credentials hidden, only the system folders (without `/usr/local/etc` or Linuxbrew's
+  `etc`) and a short list of `/etc` files are visible, `/tmp` is
   private, Unix-domain sockets are blocked and the network is off unless Command network is on.
   In Read-only the project is mounted from the folder that was checked, by descriptor. It uses
   the bundled bubblewrap, or a root-owned system one of version 0.12.0 or newer. Without one, the

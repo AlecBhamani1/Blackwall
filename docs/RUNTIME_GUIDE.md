@@ -591,7 +591,12 @@ capabilities. The AppImage has no profile, so on Ubuntu 24.04 and later AppArmor
 use the `.deb` there. The command sees the system folders (`/usr`, `/bin`, `/sbin`, `/lib`,
 `/lib64`, Linuxbrew) with `/usr/local/etc` and Linuxbrew's `etc` hidden, a short list of `/etc`
 files (certificates, `resolv.conf`, `hosts`, `passwd` and the like) and a private `/tmp`, with no
-`/run` and no home folder. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
+`/run`. Of your home folder it sees only the toolchain folders `~/.cargo`, `~/.rustup`, `~/.nvm`,
+`~/.pyenv`, `~/.local/bin` and `~/.local/share/uv`, read-only, each where it is a real folder (not
+a link, and not reached through one), so tools installed there run. `~/.cargo/credentials` and
+`~/.cargo/credentials.toml` are hidden inside them; if either is anything but a plain file,
+`~/.cargo` is left out. Nothing else in your home folder is there, and no command can write to any
+of it. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
 `.blackwall`, `.ssh`, `.aws`, `.gnupg`, `.config`, `.codex`, `.claude` and `.agents` are hidden.
 The exception is `node_modules`, `target`, `.venv`, `venv`, `__pycache__`, `dist` and `build`:
 only their direct children are checked for those names, so a protected name deeper inside them
