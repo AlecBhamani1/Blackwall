@@ -38,7 +38,16 @@ pub struct SavedKey {
     pub saved: bool,
 }
 
+type GetSecret = fn(&str, &str) -> Result<Option<String>, blackwall_core::secrets::SecretError>;
+
 pub async fn model_key(
+    state: &crate::commands::AppState,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
+    model_key_with(crate::secrets::get, state, endpoint).await
+}
+async fn model_key_with(
+    get: GetSecret,
     state: &crate::commands::AppState,
     endpoint: &str,
 ) -> Result<Option<String>, String> {
@@ -53,7 +62,11 @@ pub async fn model_key(
     if let Some(key) = session_key(&state.session_keys, endpoint)? {
         return Ok(Some(key));
     }
-    read_key("com.blackwall.model", endpoint).await
+    saved_model_key(get, endpoint).await
+}
+/// With no keyring there is no saved key; a store that fails (locked, prompt dismissed) is an error.
+async fn saved_model_key(get: GetSecret, endpoint: &str) -> Result<Option<String>, String> {
+    read_secret_with(get, true, "com.blackwall.model", account(endpoint)?).await
 }
 pub async fn relay_key(endpoint: &str) -> Result<Option<String>, String> {
     read_key("com.blackwall.relay", endpoint).await
@@ -62,15 +75,24 @@ async fn read_key(service: &'static str, endpoint: &str) -> Result<Option<String
     read_secret(service, account(endpoint)?).await
 }
 async fn read_secret(service: &'static str, origin: String) -> Result<Option<String>, String> {
+    read_secret_with(crate::secrets::get, false, service, origin).await
+}
+async fn read_secret_with(
+    get: GetSecret,
+    none_without_keyring: bool,
+    service: &'static str,
+    origin: String,
+) -> Result<Option<String>, String> {
     let service = crate::identity::keychain_service(service);
-    crate::keychain::read(move || {
-        crate::secrets::get(&service, &origin).map_err(|error| {
+    crate::keychain::read(move || match get(&service, &origin) {
+        Err(blackwall_core::secrets::SecretError::Unavailable) if none_without_keyring => Ok(None),
+        result => result.map_err(|error| {
             error.explain(format!(
                 "Blackwall could not read the access key from {}. {}, then try again.",
                 crate::secrets::STORE,
                 crate::secrets::RECOVER
             ))
-        })
+        }),
     })
     .await
 }
@@ -241,6 +263,11 @@ pub async fn has_saved_credential(
     if matches!(&kind, CredentialKind::Model) && paired_account(&endpoint).is_ok() {
         return Ok(read_pair_key("client", &endpoint).await?.is_some());
     }
+    if matches!(&kind, CredentialKind::Model) {
+        return Ok(saved_model_key(crate::secrets::get, &endpoint)
+            .await?
+            .is_some());
+    }
     Ok(read_key(kind.service(), &endpoint).await?.is_some())
 }
 #[tauri::command]
@@ -352,6 +379,42 @@ mod tests {
         .await
         .unwrap();
         assert!(state.session_keys.lock().unwrap().is_empty());
+    }
+    fn get_unavailable(
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Unavailable)
+    }
+    fn get_failed(
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Failed)
+    }
+    #[tokio::test]
+    async fn keyring_unavailable_reads_as_no_saved_model_key_but_a_failing_store_is_an_error() {
+        let state = crate::commands::AppState::new().unwrap();
+        let endpoint = "https://model.example/v1";
+        assert_eq!(
+            model_key_with(get_unavailable, &state, endpoint).await,
+            Ok(None)
+        );
+        assert_eq!(saved_model_key(get_unavailable, endpoint).await, Ok(None));
+        assert!(model_key_with(get_failed, &state, endpoint).await.is_err());
+        // A session key still wins over the store.
+        state
+            .session_keys
+            .lock()
+            .unwrap()
+            .insert("https://model.example".into(), "sk-session".into());
+        assert!(
+            model_key_with(get_failed, &state, endpoint)
+                .await
+                .unwrap()
+                .as_deref()
+                == Some("sk-session")
+        );
     }
     #[test]
     fn keyring_only_saves_fail_with_the_shared_note() {
