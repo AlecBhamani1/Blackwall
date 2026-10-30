@@ -155,7 +155,10 @@ describe('saved access keys', () => {
       target: { value: 'session-key' },
     });
     await fireEvent.click(screen.getByRole('button', { name: 'Verify and save key' }));
-    expect(await screen.findByRole('status')).toHaveTextContent('Not saved: no system keyring');
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('Not saved: no system keyring');
+    expect(status).toHaveClass('muted');
+    expect(status).not.toHaveClass('feedback');
     expect(screen.queryByText(/verified and saved/)).not.toBeInTheDocument();
     expect(screen.getByText('No saved key')).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Remove key…' })).not.toBeInTheDocument();

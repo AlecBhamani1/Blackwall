@@ -32,7 +32,7 @@
     <LogoMark size={44} />
     <h1 id="lock-title">{initialized ? 'Welcome back' : 'Opening Blackwall'}</h1>
     {#if keyringNeeded}
-      <p>{KEYRING_NEEDED}</p>
+      <p role="alert">{KEYRING_NEEDED}</p>
       <button disabled={loading} onclick={onRetry}>Try again</button>
     {:else if initialized}
       <p>Enter your passphrase to open your conversations.</p>
