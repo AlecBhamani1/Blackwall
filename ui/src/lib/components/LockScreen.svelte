@@ -1,11 +1,13 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { KEYRING_NEEDED } from '../auth';
   import LogoMark from './LogoMark.svelte';
   export let loading = false;
   export let error = '';
   export let onUnlock: (passphrase: string) => Promise<void>;
   export let onRetry: () => Promise<void>;
   export let initialized = false;
+  export let keyringNeeded = false;
   let passphrase = '';
   let input: HTMLInputElement | undefined;
   async function focusPassphrase(node: HTMLInputElement) {
@@ -29,12 +31,11 @@
   <section aria-labelledby="lock-title">
     <LogoMark size={44} />
     <h1 id="lock-title">{initialized ? 'Welcome back' : 'Opening Blackwall'}</h1>
-    <p>
-      {initialized
-        ? 'Enter your passphrase to open your conversations.'
-        : 'Checking your app lock…'}
-    </p>
-    {#if initialized}
+    {#if keyringNeeded}
+      <p>{KEYRING_NEEDED}</p>
+      <button disabled={loading} onclick={onRetry}>Try again</button>
+    {:else if initialized}
+      <p>Enter your passphrase to open your conversations.</p>
       <form onsubmit={unlock}>
         <label for="unlock-passphrase">Passphrase</label>
         <input
@@ -51,10 +52,13 @@
           >{loading ? 'Unlocking…' : 'Unlock Blackwall'}</button
         >
       </form>
+      {#if error}<p class="error" role="alert">{error}</p>{/if}
     {:else if error}
+      <p class="error" role="alert">{error}</p>
       <button disabled={loading} onclick={onRetry}>Try again</button>
+    {:else}
+      <p>Checking your app lock…</p>
     {/if}
-    {#if error}<p class="error" role="alert">{error}</p>{/if}
   </section>
 </main>
 

@@ -25,7 +25,7 @@ beforeEach(() => {
   native.invoke.mockReset().mockImplementation(async (command, args) => {
     switch (command) {
       case 'auth_status':
-        return { locked: false, enabled: false };
+        return { locked: false, enabled: false, keyring: true, keyringNeeded: false };
       case 'load_preferences':
         return {};
       case 'list_sessions':

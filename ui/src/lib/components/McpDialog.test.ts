@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { authStatus, NO_KEYRING_NOTE } from '../auth';
 import { persistence } from '../persistence';
 import McpDialog from './McpDialog.svelte';
 
@@ -255,5 +256,19 @@ describe('MCP server management', () => {
     expect((screen.getByLabelText('Command') as HTMLInputElement).value).toContain(
       'server-filesystem',
     );
+  });
+  it('disables saving a secret without a keyring', async () => {
+    const user = userEvent.setup();
+    authStatus.update((status) => ({ ...status, keyring: false }));
+    try {
+      render(McpDialog, { props: { onClose: vi.fn() } });
+      await user.click(await screen.findByText('jira'));
+      expect(screen.getByLabelText('Environment variable')).toBeDisabled();
+      expect(screen.getByLabelText('Value')).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Save secret' })).toBeDisabled();
+      expect(screen.getByText(NO_KEYRING_NOTE)).toBeVisible();
+    } finally {
+      authStatus.update((status) => ({ ...status, keyring: true }));
+    }
   });
 });

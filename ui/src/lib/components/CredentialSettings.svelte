@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
+  import { KEY_NOT_SAVED } from '../auth';
   import { credentialClient, type CredentialKind } from '../credentials';
   import { platform } from '../platform';
 
@@ -62,15 +63,18 @@
     error = '';
     feedback = '';
     try {
+      let kept = true;
       if (remove) await client.remove(kind, endpoint);
-      else await client.saveModel(endpoint, key.trim());
+      else kept = (await client.saveModel(endpoint, key.trim())).saved;
       if (operation !== version) return;
-      saved = !remove;
+      if (kept) saved = !remove;
       key = '';
       confirming = false;
       feedback = remove
         ? `Saved key removed from ${platform.store}.`
-        : `Access key verified and saved in ${platform.store}.`;
+        : kept
+          ? `Access key verified and saved in ${platform.store}.`
+          : KEY_NOT_SAVED;
     } catch (cause) {
       if (operation === version) error = message(cause);
     } finally {

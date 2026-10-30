@@ -177,6 +177,7 @@
     loading={authBusy}
     error={lockError}
     initialized={authInitialized}
+    keyringNeeded={$authStatus.keyringNeeded}
     onUnlock={unlock}
     onRetry={initializeApp}
   />

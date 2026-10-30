@@ -417,7 +417,7 @@ describe('SettingsDialog', () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});
     const status = vi.spyOn(credentialClient, 'status').mockResolvedValue(true);
-    const save = vi.spyOn(credentialClient, 'saveModel').mockResolvedValue(undefined);
+    const save = vi.spyOn(credentialClient, 'saveModel').mockResolvedValue({ saved: true });
     const onConfigureEndpoint = vi.fn();
     render(SettingsDialog, {
       props: {
