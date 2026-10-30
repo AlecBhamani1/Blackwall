@@ -122,7 +122,7 @@ impl Approvals {
         detail: String,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
-        self.decide(request_id, kind, subject, None, None, detail, emit)
+        self.decide(request_id, kind, subject, None, None, None, detail, emit)
             .await
     }
     /// An owner HTTP command tool's request, asked with kind Network; `host` is the subject. See
@@ -141,22 +141,46 @@ impl Approvals {
             ApprovalKind::Network,
             host,
             None,
+            None,
             Some((tool, credentialed)),
             detail,
             emit,
         )
         .await
     }
-    /// A subagent handing its prompt to an owner command tool. It always asks, even when an
-    /// allow rule matches `subject` (the tool's command), and the answer is never remembered.
-    /// A deny rule still denies without asking: tightening always wins.
-    pub async fn request_delegate(
+    /// An owner command tool about to make `call`, which names the resolved absolute program;
+    /// `subject` is the tool's configured command, which rules match. The audit records both.
+    ///
+    /// With `outside` (it runs outside the sandbox) or `off_device` (a subagent hands it its
+    /// prompt), it always asks: an allow rule never skips the prompt, and the answer is never
+    /// remembered, not even for an identical call. A deny rule still denies without asking:
+    /// tightening always wins. Otherwise it asks as any command does, so allow rules and
+    /// "allow identical action this run" apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_owner_tool(
         &self,
         request_id: &str,
         subject: &str,
+        call: &crate::policy::ProgramCall<'_>,
         detail: String,
+        off_device: bool,
+        outside: bool,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
+        if !outside && !off_device {
+            return self
+                .decide(
+                    request_id,
+                    ApprovalKind::Exec,
+                    subject,
+                    Some(call),
+                    None,
+                    None,
+                    detail,
+                    emit,
+                )
+                .await;
+        }
         let policy = self
             .0
             .lock()
@@ -170,9 +194,10 @@ impl Approvals {
         if let (Some(policy), Some(verdict)) = (&policy, &verdict) {
             if verdict.decision == Decision::Deny {
                 policy
-                    .record(
+                    .record_program(
                         ApprovalKind::Exec,
                         subject,
+                        Some(call),
                         Decision::Deny,
                         false,
                         None,
@@ -182,6 +207,19 @@ impl Approvals {
                 return Ok(false);
             }
         }
+        // A broken policy file drops its deny rules, so the owner is told. The outside note
+        // stays first, where clients look for it.
+        let detail = match policy.as_ref().and_then(|policy| policy.error.as_ref()) {
+            Some(error) => match detail.strip_prefix(crate::command_tools::OUTSIDE_NOTE) {
+                Some(rest) => format!(
+                    "{}\n\n{error}\n\n{}",
+                    crate::command_tools::OUTSIDE_NOTE,
+                    rest.trim_start()
+                ),
+                None => format!("{error}\n\n{detail}"),
+            },
+            None => detail,
+        };
         let allowed = self
             .ask(
                 request_id,
@@ -190,15 +228,22 @@ impl Approvals {
                 detail,
                 emit,
                 false,
-                true,
+                off_device,
+                outside,
             )
             .await?
             != ApprovalDecision::Deny;
         if let (Some(policy), Some(verdict)) = (&policy, verdict) {
+            // A matching allow rule did not skip the prompt; the audit says so.
+            let call = crate::policy::ProgramCall {
+                overridden: verdict.decision == Decision::Allow,
+                ..call.clone()
+            };
             policy
-                .record(
+                .record_program(
                     ApprovalKind::Exec,
                     subject,
+                    Some(&call),
                     Decision::Ask,
                     allowed,
                     None,
@@ -221,6 +266,7 @@ impl Approvals {
             request_id,
             ApprovalKind::Exec,
             &subject,
+            None,
             Some(tool),
             None,
             detail,
@@ -234,6 +280,7 @@ impl Approvals {
         request_id: &str,
         kind: ApprovalKind,
         subject: &str,
+        call: Option<&crate::policy::ProgramCall<'_>>,
         tool: Option<ApprovalTool>,
         http_tool: Option<(&str, bool)>,
         detail: String,
@@ -252,7 +299,7 @@ impl Approvals {
             }
             // Without the owner's data folder there is nowhere to save a rule.
             let answer = self
-                .ask(request_id, kind, None, detail, emit, true, false)
+                .ask(request_id, kind, None, detail, emit, true, false, false)
                 .await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
@@ -275,7 +322,16 @@ impl Approvals {
                     None => detail,
                 };
                 let answer = self
-                    .ask(request_id, kind, tool.clone(), detail, emit, true, false)
+                    .ask(
+                        request_id,
+                        kind,
+                        tool.clone(),
+                        detail,
+                        emit,
+                        true,
+                        false,
+                        false,
+                    )
                     .await?;
                 if let Some(tool) = tool.filter(|_| answer != ApprovalDecision::Deny) {
                     match self.save_tool_rule(request_id, &policy, tool, answer).await {
@@ -292,9 +348,10 @@ impl Approvals {
             }
         };
         policy
-            .record(
+            .record_program(
                 kind,
                 subject,
+                call,
                 decision,
                 allowed,
                 saved.as_ref(),
@@ -368,7 +425,7 @@ impl Approvals {
             clipped(arguments, MAX_SHOWN_ARGUMENTS)
         );
         let allowed = self
-            .ask(request_id, kind, None, detail, emit, false, false)
+            .ask(request_id, kind, None, detail, emit, false, false, false)
             .await?
             != ApprovalDecision::Deny;
         if allowed && covers_request && kind == ApprovalKind::Network {
@@ -395,7 +452,8 @@ impl Approvals {
                 .is_ok_and(|mut state| state.text_web_calls.remove(request_id))
     }
     /// `remember` lets "allow identical action this run" skip later identical prompts.
-    /// `off_device` marks a prompt whose data may leave this device.
+    /// `off_device` marks a prompt whose data may leave this device, and `outside_sandbox` one
+    /// for a program that runs outside the sandbox.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -406,6 +464,7 @@ impl Approvals {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
         remember: bool,
         off_device: bool,
+        outside_sandbox: bool,
     ) -> Result<ApprovalDecision, String> {
         let (sender, receiver) = oneshot::channel();
         let id = format!("approval_{:016x}", UnwrapErr(SysRng).next_u64());
@@ -446,6 +505,7 @@ impl Approvals {
             tool,
             remember,
             off_device,
+            outside_sandbox,
         });
         let decision = tokio::time::timeout(Duration::from_secs(10 * 60), receiver)
             .await

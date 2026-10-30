@@ -291,7 +291,14 @@ contains it. Rules load when a run starts. If the file is invalid, every action 
 shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
 common credential forms redacted; the log rotates at 1 MiB. Each record's `rule` names the rule that
 decided, as `{"source":"user"|"project","index":N,"mode":"strictest"|"ordered"}` (`index` counts
-from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default.
+from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default. A
+record for an owner command tool also has `program`, the absolute path of the program it ran;
+`tool`; `isolation` (`outside` or `sandboxed`); `args`, the arguments after the program, redacted
+like the rest, each cut at 1,000 characters, and after 8 KiB in all the rest counted as
+`…(N more args)`; `env`, the names of the variables it was passed
+(never their values); and `stdinSha256` when it was sent standard input. When an allow rule
+matches a tool that always asks, `rule` names that rule and `"overridden": true` says it did not
+decide.
 
 To let Agent mode call other programs, such as another coding assistant's command line, list them
 in `tools.json` in the same data folder:
@@ -303,12 +310,17 @@ in `tools.json` in the same data folder:
 ```
 
 Each tool runs its program directly, without a shell, in the project folder. The program must be a
-name found in an absolute `PATH` directory or an absolute path. Batch files (`.bat`, `.cmd`) are
+name found in an absolute `PATH` directory or an absolute path, outside the project: an absolute
+path that is, or resolves through a symlink into, the project is refused. If the program changes
+between the prompt and the run (another file put in its place, the file rewritten, or the name now
+found elsewhere), the call is refused and the program does not run. Batch files (`.bat`, `.cmd`) are
 refused, and on Windows the program must be an `.exe`. An argument written as a whole `{name}` becomes a text parameter the model
 fills in; values that start with `-` (or `/` on Windows) are rejected so the model cannot add
 options. Every call needs Exec approval and is matched by rules
-against the configured command, so `{"decision":"allow","kind":"exec","command":"claude -p"}` allows
-it without a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
+against the configured command. By default a command tool runs outside the sandbox and always asks,
+so `{"decision":"allow","kind":"exec","command":"claude -p"}` does not skip the prompt (a deny rule
+still denies). With `bw config set command-tools-isolation sandboxed`, that rule allows it without
+a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
 owner tools are offered and the run shows a warning.
 
 There is no `bw` or desktop editor for `tools.json`; edit the file, and changes apply from the next
@@ -339,8 +351,10 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 (see [Child environments](#child-environments)). To pass your own variables through, list their
 names: `"env":["GITHUB_TOKEN","HTTPS_PROXY"]`. Names only, never values; at most 32 distinct names,
 and the variable must be set where Blackwall runs. Only you can write this list, and HTTP tools
-take no `env`. A command tool run in a restricted (sandboxed) profile ignores `env` and gets only
-the sandbox set; the names apply when it runs unsandboxed. A name that loads code into a program
+take no `env`. A command tool run sandboxed ignores `env` and gets only the sandbox set; the names
+apply when it runs outside the sandbox, which is the default. Then its prompt names the listed
+variables that are set, after the program, never their values: "Gets these variables from your
+environment: GITHUB_TOKEN, HTTPS_PROXY". A name that loads code into a program
 (`LD_*`, `DYLD_*`, `PYTHONPATH`, `NODE_OPTIONS`, `BASH_ENV` and similar), `PATH`, or one of
 Blackwall's own secrets is refused, and the file is invalid.
 
@@ -509,12 +523,26 @@ your login shell's `PATH`, so tools installed with Homebrew or npm work when Bla
 the Dock. It asks the shell once at startup and keeps the system default if that takes more than
 five seconds.
 
-Shell commands and owner-defined command tools use an owner-selected execution profile. In desktop
+Shell commands and sandboxed command tools use an owner-selected execution profile. In desktop
 Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** and **Command network**.
 CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
 `bw config set command-network on|off`; `/settings` offers the same controls. The default is
 read-only with command network disabled. Desktop selections reset when switching conversations;
 CLI selections persist. Old saved settings acquire the safe defaults.
+
+Command tools are the exception to the profile by default, because a program such as `claude -p`
+needs its own files and network. **Command tools** (Memory → Advanced · Subagents, or
+`bw config set command-tools-isolation outside|sandboxed`) is `outside` unless you change it, on
+every system including Windows. Only you can set it; a project file cannot. An `outside` tool runs
+in the project folder, without the sandbox, with your account permissions and the cleaned
+environment plus the names it lists under `env` (see [Child environments](#child-environments)).
+It **always asks**: an allow rule or "allow identical action this run" never skips the prompt, and
+a deny rule still denies. The prompt says "Runs outside the sandbox with your account
+permissions. It can run code from this project and use your files and network." and shows the
+resolved absolute program, which the audit log records as `program`.
+Because it always asks, `bw run --json` cannot run one, even with an allow rule. With `sandboxed`,
+command tools run under the profile as shell commands do; a failure that looks like a sandbox
+denial then adds a note that the tool may have been blocked by the profile and can run outside it.
 
 On macOS, Seatbelt applies before the shell/program starts and is inherited by descendants:
 
@@ -544,7 +572,8 @@ and timeouts terminate the process group or Windows Job Object. Restricted macOS
 create a new process group/session to escape cleanup: direct `setpgid`/`setsid` calls and
 `posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
 `posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
-command tools; separately configured MCP servers retain their own account permissions and approvals.
+command tools when they are `sandboxed`; separately configured MCP servers retain their own account
+permissions and approvals.
 
 ### Child environments
 
@@ -556,7 +585,7 @@ desktop-session variables it needs. It keeps the AppImage's runtime variables (`
 `LD_LIBRARY_PATH` and similar) from breaking Python and other runtimes, and keeps your unrelated
 credentials from reaching a program that does not need them.
 
-- MCP servers and command tools you run unsandboxed get
+- MCP servers and command tools you run unsandboxed or outside the sandbox get
   `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`,
   plus the names you list under `env` in `mcp.json` or `tools.json`.
 - An unsandboxed shell command runs with your environment (`SSH_AUTH_SOCK`, `KUBECONFIG`,
@@ -566,7 +595,8 @@ credentials from reaching a program that does not need them.
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
 - A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and
-  never in a directory that resolves into the project. An absolute path is used as written.
+  never in a directory that resolves into the project. An absolute path is used as written, unless
+  it is, or resolves through a symlink into, the project, which is refused.
 - `PATH` is your login shell's, with relative and empty entries, the project folder and the
   AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
 - Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.
@@ -613,9 +643,10 @@ the `Exit: 0` line) is the child's answer. The tool must:
 - declare a string `prompt` in `parameters`, need no other argument, and use no `{placeholders}`.
 
 `bw config set subagent-runs-on` and the desktop check this when you choose the tool, and every
-run checks again. Each delegation **always asks**: an allow rule never skips the prompt (a deny
-rule still denies), "allow identical action this run" is not offered, and the prompt shows the
-whole text being sent, marked **Sends data off this device**. The model is not offered that tool
+run checks again. Each delegation **always asks**, whether the tool runs outside the sandbox or
+sandboxed: an allow rule never skips the prompt (a deny rule still denies), "allow identical action
+this run" is not offered, and the prompt shows the whole text being sent, marked **Sends data off
+this device**. The model is not offered that tool
 directly, so it can reach it only this way. The delegation is traced as
 `invoke_agent subagent` with `blackwall.mode` `subagent`.
 
@@ -643,9 +674,11 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 | Codex | `\| exec codex exec --sandbox read-only -` (`-` reads the prompt from stdin) |
 | GitHub Copilot CLI | `\| xargs -0 copilot -p` with no `--allow-tool` or `--allow-all-tools`, so it cannot use tools that need permission (Copilot takes the prompt as an argument; check `copilot --help` for your version) |
 
-Then `bw config set subagent-runs-on review`. The tool runs under your execution profile, and the
-delegate CLI needs network to reach its service, so turn on command network or pick a profile that
-allows it.
+Then `bw config set subagent-runs-on review`. The tool follows the **Command tools** setting
+(see [Work in a project](#work-in-a-project)): by default it runs outside the sandbox with network
+and its own files. If you set `sandboxed`, it runs under your execution profile, and the delegate
+CLI needs network to reach its service, so turn on command network or pick a profile that allows
+it.
 
 A trusted project can lower the step limit and narrow the tools (see
 [Project settings](#project-settings)) but can never set where children run.
@@ -1111,7 +1144,8 @@ them; each also has a `tool_result` with `"denied": true`) and `usage` (`input` 
 server reported for every model call in the run, including calls before a failure, timeout or
 interrupt). A `model_usage` event carries each call's tokens as it returns. Standard input is not
 read: actions that owner rules allow run, and anything that would show an approval prompt is
-denied. Add `--timeout SECS` or `--timeout=SECS` (10–86400) to stop the whole run after that many
+denied, including every command tool that runs outside the sandbox, the default, even with an allow
+rule. Add `--timeout SECS` or `--timeout=SECS` (10–86400) to stop the whole run after that many
 seconds. Flags come before the prompt, each at most once; an unknown `--option` is a usage error,
 and `--` ends the flags so a prompt can start with `--`.
 

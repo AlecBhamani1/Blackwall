@@ -707,8 +707,8 @@ mod settings_tests {
         /// An executable script that echoes its standard input and then ` ANSWER`.
         #[cfg_attr(not(unix), allow(dead_code))]
         fn script(&self) -> String {
-            // Inside the project, which the default sandbox lets programs read.
-            let path = self.project().join("review.sh");
+            // Beside the project: Blackwall never runs a program from inside it.
+            let path = self.0.join("review.sh");
             std::fs::write(&path, "#!/bin/sh\ncat\nprintf ' ANSWER'\n").unwrap();
             #[cfg(unix)]
             {
@@ -1185,14 +1185,14 @@ mod settings_tests {
         }
         let prompts = prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts
-            .iter()
-            .all(
-                |(kind, detail, remember, off_device)| *kind == ApprovalKind::Exec
+        assert!(prompts.iter().all(
+            |(kind, detail, remember, off_device)| *kind == ApprovalKind::Exec
                     && !remember
                     && *off_device
                     && detail.contains("off this device")
-            ));
+                    // Runs-on tools follow the command tools setting, outside by default.
+                    && detail.starts_with(crate::command_tools::OUTSIDE_NOTE)
+        ));
         // A denial stops it, and a deny rule stops it without asking.
         let (emit, _) = answer(&approvals, ApprovalDecision::Deny);
         let error = child(

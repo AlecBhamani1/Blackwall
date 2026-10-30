@@ -2,6 +2,7 @@ use crate::{input::Input, project::safe, settings::Settings};
 use blackwall_core::{
     agent::{Agent, RunReason},
     approvals::Approvals,
+    command_tools::OUTSIDE_NOTE,
     connection::{normalize_endpoint, same_origin, served_budget},
     context::{ContextRun, ContextState},
     memory::{MemoryClient, MemoryTools},
@@ -808,9 +809,10 @@ fn render_event(
             request_id,
             approval_id,
             detail,
+            outside_sandbox,
             ..
         } => {
-            eprintln!("{}", approval_prompt(&detail));
+            eprintln!("{}", approval_prompt(&detail, outside_sandbox));
             *pending = Some(ResolveApprovalRequest {
                 request_id,
                 approval_id,
@@ -872,10 +874,22 @@ fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
 }
 
 /// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
-fn approval_prompt(detail: &str) -> String {
+/// A program that runs outside the sandbox is named so above the detail, which then does not
+/// repeat it.
+fn approval_prompt(detail: &str, outside_sandbox: bool) -> String {
+    let detail = match outside_sandbox {
+        true => format!(
+            "{OUTSIDE_NOTE}\n\n{}",
+            detail
+                .strip_prefix(OUTSIDE_NOTE)
+                .unwrap_or(detail)
+                .trim_start()
+        ),
+        false => detail.to_owned(),
+    };
     format!(
         "\n{}\n\nAllow this action once? Type yes to allow; anything else denies.",
-        safe(detail)
+        safe(&detail)
     )
 }
 
@@ -889,6 +903,7 @@ fn execution_workspace(
         profile: settings.execution_profile,
         network: settings.command_network,
         data_directory: Some(directory.into()),
+        command_tools: settings.command_tools_isolation,
     };
     Ok(workspace)
 }
@@ -898,9 +913,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outside_sandbox_prompts_say_so_above_the_detail() {
+        let detail = format!(
+            "{OUTSIDE_NOTE}\n\nProject: /p\nTool: review\nProgram: /usr/bin/claude\nGets these variables from your environment: GITHUB_TOKEN"
+        );
+        let text = approval_prompt(&detail, true);
+        assert!(
+            text.starts_with(&format!("\n{OUTSIDE_NOTE}\n\nProject: /p")),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nProgram: /usr/bin/claude\nGets these variables from your environment: GITHUB_TOKEN\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches(OUTSIDE_NOTE).count(), 1, "{text}");
+        // The whole note is printed once, then the detail without it.
+        assert!(
+            text.starts_with("\nRuns outside the sandbox with your account permissions. It can run code from this project and use your files and network.\n\nProject: /p\n"),
+            "{text}"
+        );
+        // Only the event's mark adds it; text in the detail alone is printed as it is.
+        let plain = approval_prompt("Program: /usr/bin/claude", false);
+        assert!(!plain.contains(OUTSIDE_NOTE), "{plain}");
+    }
+
+    #[test]
     fn approval_prompts_cannot_carry_terminal_escapes() {
-        let text =
-            approval_prompt("Delegate: \u{1b}[2J\u{1b}]8;;https://x.test\u{7}fix\u{202E}gnp.exe\r");
+        let text = approval_prompt(
+            "Delegate: \u{1b}[2J\u{1b}]8;;https://x.test\u{7}fix\u{202E}gnp.exe\r",
+            false,
+        );
         assert!(
             !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\r'),
             "{text}"

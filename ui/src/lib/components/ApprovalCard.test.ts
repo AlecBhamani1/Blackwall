@@ -39,12 +39,44 @@ describe('action approval', () => {
       screen.queryByRole('button', { name: 'Allow identical action this run' }),
     ).not.toBeInTheDocument();
   });
+  it('labels outside-sandbox prompts and offers no remember option', () => {
+    render(ApprovalCard, {
+      props: {
+        approval: {
+          ...approval,
+          kind: 'exec',
+          detail:
+            'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.\n\nTool: review\nProgram: /usr/local/bin/claude\nGets these variables from your environment: GITHUB_TOKEN',
+          tool: { server: 'docs', tool: 'docs__search' },
+          remember: false,
+          outsideSandbox: true,
+        },
+        onResolve: vi.fn(),
+      },
+    });
+    expect(
+      screen.getByText(
+        'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.',
+      ),
+    ).toBeVisible();
+    // The note is shown once, as the label, not again at the top of the details.
+    expect(screen.getAllByText(/Runs outside the sandbox/)).toHaveLength(1);
+    expect(screen.getByRole('region', { name: 'Proposed action details' }).textContent).toMatch(
+      /^Tool: review\nProgram: \/usr\/local\/bin\/claude\nGets these variables from your environment: GITHUB_TOKEN$/,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Allow identical action this run' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
+  });
   it('still offers a run-wide allow for ordinary prompts', () => {
     render(ApprovalCard, { props: { approval, onResolve: vi.fn() } });
     expect(
       screen.getByRole('button', { name: 'Allow identical action this run' }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Sends data off this device/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Runs outside the sandbox/)).not.toBeInTheDocument();
   });
   it('shows the exact proposed action and sends only one decision while pending', async () => {
     const user = userEvent.setup();

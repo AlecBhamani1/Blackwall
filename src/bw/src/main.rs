@@ -45,6 +45,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings iterations <n>  Limit model/tool iterations per Agent run
   /settings profile <read-only|workspace-write|unsandboxed>  Set command access (default read-only)
   /settings command-network on|off  Command network access (default off; unsandboxed always on)
+  /settings command-tools-isolation outside|sandboxed  Where command tools run (default outside)
   /settings timeout <n>     Limit each shell command in seconds
   /settings text-tool-calls on|off  Read tool calls the model writes as text (default off; always asks)
   /settings otlp-endpoint <url|off>  Export traces and metrics over OTLP/HTTP (default off)
@@ -68,6 +69,7 @@ USAGE:
   bw config [show]           Show effective settings
   bw config set <name> <value>
                              Includes text-tool-calls <on|off> (default off);
+                             command-tools-isolation <outside|sandboxed> (default outside);
                              otlp-endpoint <url|off> (default off), otlp-protocol <json|protobuf>
                              (default protobuf), otlp-signals <traces,metrics> (default both),
                              otlp-include-project <on|off> (default off), and
@@ -402,7 +404,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|command-tools-isolation|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
             )
         }
     }
@@ -550,7 +552,8 @@ async fn chat(
         blackwall_core::sandbox::ExecutionPolicy {
             profile: settings.execution_profile,
             network: settings.command_network,
-            data_directory: None
+            data_directory: None,
+            command_tools: settings.command_tools_isolation,
         }
         .description()
     );

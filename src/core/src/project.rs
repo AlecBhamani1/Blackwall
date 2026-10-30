@@ -1335,6 +1335,16 @@ mod tests {
     }
 
     #[test]
+    fn project_settings_cannot_choose_command_tool_isolation() {
+        for body in [
+            br#"{"commandToolsIsolation":"outside"}"#.as_slice(),
+            br#"{"limits":{"commandToolsIsolation":"outside"}}"#,
+        ] {
+            assert!(parse(body).is_err());
+        }
+    }
+
+    #[test]
     fn project_cannot_set_runs_on() {
         let folders = Folders::new();
         for body in [

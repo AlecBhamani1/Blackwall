@@ -142,7 +142,7 @@ describe('native chat failure boundary', () => {
     expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
   });
 
-  it('keeps the off-device mark on prompts and the trimmed mark on tool results', async () => {
+  it('keeps the off-device and outside-sandbox marks on prompts and the trimmed mark on tool results', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);
     const onEvent = vi.fn();
@@ -150,8 +150,16 @@ describe('native chat failure boundary', () => {
     const result = { type: 'tool_result', requestId: 'sub', toolCallId: 't', output: 'o' };
     native.invoke.mockImplementation(async () => {
       const listener = native.listen.mock.calls[0][1];
-      listener({ payload: { ...prompt, approvalId: 'a1', remember: false, offDevice: true } });
-      listener({ payload: { ...prompt, approvalId: 'a2', offDevice: 'yes' } });
+      listener({
+        payload: {
+          ...prompt,
+          approvalId: 'a1',
+          remember: false,
+          offDevice: true,
+          outsideSandbox: true,
+        },
+      });
+      listener({ payload: { ...prompt, approvalId: 'a2', offDevice: 'yes', outsideSandbox: 1 } });
       listener({ payload: { ...result, success: true, truncated: true } });
       listener({ payload: { ...result, success: true } });
       listener({ payload: { type: 'turn_complete', requestId: 'sub' } });
@@ -167,6 +175,7 @@ describe('native chat failure boundary', () => {
       approvalId: 'a1',
       remember: false,
       offDevice: true,
+      outsideSandbox: true,
     });
     expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
     expect(onEvent).toHaveBeenCalledWith({ ...result, success: true, truncated: true });

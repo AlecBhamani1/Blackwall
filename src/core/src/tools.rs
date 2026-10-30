@@ -4,6 +4,7 @@ use crate::{
     child_env::Scope,
     model::ToolCall,
     protocol::{AgentEvent, ApprovalKind},
+    sandbox::ExecutionProfile,
 };
 use cap_std::fs::{Dir, OpenOptions};
 use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
@@ -604,7 +605,8 @@ async fn shell_with_timeout(
 }
 /// Run a resolved program with separate arguments, never parsed by a shell. `input`, when
 /// given, is written to its standard input, which is otherwise empty. `pass_through` names the
-/// owner's variables the program also receives, unless the profile is sandboxed.
+/// owner's variables the program also receives, unless it runs sandboxed. It runs outside the
+/// sandbox unless the owner chose `Isolation::Sandboxed`.
 pub(crate) async fn program_with_timeout(
     workspace: &Workspace,
     program: &Path,
@@ -633,15 +635,57 @@ pub(crate) async fn program_with_timeout(
     {
         let mut process = tokio::process::Command::new(program);
         process.args(args);
-        run_with_input(
+        if workspace.execution.command_tools == crate::command_tools::Isolation::Outside {
+            // The owner chose to run command tools as themselves, whatever the shell profile.
+            crate::child_env::from_process(Scope::Owner, &workspace.path, pass_through)
+                .apply(&mut process);
+            return run_with_input(&workspace.path, process, input, timeout, output).await;
+        }
+        let result = run_with_input(
             &workspace.path,
             crate::sandbox::wrap(workspace, process, Scope::Owner, pass_through)?,
             input,
             timeout,
             output,
         )
-        .await
+        .await;
+        match result {
+            Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
+                text,
+                workspace.execution.profile,
+            ))),
+            result => result,
+        }
     }
+}
+/// Added to a command tool failure that looks like a sandbox denial; `{profile}` is the
+/// profile's display name.
+pub(crate) const SANDBOXED_TOOL_HINT: &str = "This may have been blocked by the {profile} sandbox. Command tools that need their own files or network can run outside it: Memory → Advanced · Subagents → Command tools, or `bw config set command-tools-isolation outside`.";
+/// What a sandbox denial prints, in lower case. A program that merely failed prints none.
+const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
+    "operation not permitted",
+    "permission denied",
+    "read-only file system",
+    "sandbox",
+    "deny",
+    "network is unreachable",
+    "could not resolve host",
+    "connection refused",
+    "not allowed",
+];
+/// `text` with the sandbox hint added when a sandboxed profile is in force and the failure looks
+/// like a denial. Never on the time limit, and never for a program that just exited non-zero.
+fn with_sandbox_hint(text: String, profile: ExecutionProfile) -> String {
+    let name = match profile {
+        ExecutionProfile::ReadOnly => "Read-only",
+        ExecutionProfile::WorkspaceWrite => "Workspace-write",
+        ExecutionProfile::Unsandboxed => return text,
+    };
+    let lower = text.to_lowercase();
+    if text == TIME_LIMIT_MESSAGE || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return text;
+    }
+    format!("{text}\n{}", SANDBOXED_TOOL_HINT.replace("{profile}", name))
 }
 static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
 /// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
@@ -947,6 +991,29 @@ mod tests {
             marker.parse::<usize>().unwrap(),
             input.len() - head.len() - tail.len()
         );
+    }
+    #[test]
+    fn sandbox_hint_only_follows_a_failure_that_looks_like_a_denial() {
+        let hinted = |text: &str, profile| with_sandbox_hint(text.to_owned(), profile);
+        let denied = "Exit: 1\ntouch: x: Operation not permitted\n";
+        let read_only = hinted(denied, ExecutionProfile::ReadOnly);
+        assert!(read_only.starts_with(denied));
+        assert!(read_only.contains("This may have been blocked by the Read-only sandbox."));
+        assert!(read_only.contains("Memory → Advanced · Subagents → Command tools"));
+        assert!(hinted(
+            "curl: (6) Could not resolve host: x",
+            ExecutionProfile::WorkspaceWrite
+        )
+        .contains("the Workspace-write sandbox."));
+        // A plain failure, the time limit, and an unsandboxed profile get no hint.
+        for text in [
+            "Exit: 3\n",
+            "Exit: 1\nFAILED tests::a\n",
+            TIME_LIMIT_MESSAGE,
+        ] {
+            assert_eq!(hinted(text, ExecutionProfile::ReadOnly), text);
+        }
+        assert_eq!(hinted(denied, ExecutionProfile::Unsandboxed), denied);
     }
     #[cfg(unix)]
     async fn run_env_probe(

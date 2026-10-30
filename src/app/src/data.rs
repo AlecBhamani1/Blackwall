@@ -138,6 +138,19 @@ pub(crate) async fn subagent_settings(
     .map_err(|_| "Settings could not be read.".to_owned())?
 }
 
+/// The owner's saved choice of where command tools run. It is read here, never taken from the
+/// request or a project file.
+pub(crate) async fn command_tools_isolation(
+    directory: std::path::PathBuf,
+) -> Result<blackwall_core::command_tools::Isolation, String> {
+    tokio::task::spawn_blocking(move || {
+        blackwall_core::command_tools::isolation_from_preferences(&saved_preferences(&directory)?)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "Settings could not be read.".to_owned())?
+}
+
 /// The owner's saved instruction caps and extra files for an Agent run, checked again here.
 pub(crate) async fn instruction_settings(
     directory: std::path::PathBuf,
@@ -469,6 +482,7 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "subagentMaxSteps"
                 | "subagentTools"
                 | "subagentRunsOn"
+                | "commandToolsIsolation"
                 | "instructionMaxFileKib"
                 | "instructionMaxTotalKib"
                 | "instructionExtraFiles"
@@ -527,6 +541,7 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
     }) {
         return Err("Choose a command output cap between 4,096 and 1,048,576 bytes.".into());
     }
+    blackwall_core::command_tools::isolation_from_preferences(object)?;
     // Caps in range; extra files relative, without .. or .git, at most 8.
     blackwall_core::instructions::InstructionSettings::from_preferences(object)?;
     // A delegate must exist and take its prompt on standard input before it is chosen.
@@ -1142,6 +1157,11 @@ mod telemetry_settings_tests {
         assert_eq!(
             instruction_settings(directory.clone()).await.unwrap(),
             blackwall_core::instructions::InstructionSettings::default()
+        );
+        // Saved before the command tools setting existed: they run outside, asking every time.
+        assert_eq!(
+            command_tools_isolation(directory.clone()).await.unwrap(),
+            blackwall_core::command_tools::Isolation::Outside
         );
         assert_eq!(settings.export, ExportConfig::default());
         assert_eq!(settings.retention, Retention::Days(400));

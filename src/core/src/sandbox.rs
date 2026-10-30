@@ -37,6 +37,8 @@ pub struct ExecutionPolicy {
     pub network: bool,
     /// The actual data directory, including installations using a custom data location.
     pub data_directory: Option<PathBuf>,
+    /// Where owner command tools run. Only the owner's saved setting sets it.
+    pub command_tools: crate::command_tools::Isolation,
 }
 impl ExecutionPolicy {
     pub fn description(&self) -> String {
@@ -263,6 +265,7 @@ mod tests {
                     profile,
                     network: false,
                     data_directory: Some(root.join("data")),
+                    ..Default::default()
                 };
                 Self {
                     root: std::fs::canonicalize(root).unwrap(),
@@ -430,10 +433,12 @@ mod tests {
         async fn native_approval_does_not_expand_shell_or_command_tool_access() {
             use crate::{
                 approvals::Approvals,
+                command_tools::Isolation,
                 model::{ToolCall, ToolFunction},
                 protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
             };
             let mut project = Project::new(ExecutionProfile::ReadOnly);
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
             let approvals = Approvals::default();
             let decisions = approvals.clone();
             let allow = move |event| {
@@ -503,12 +508,124 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn native_default_command_tools_leave_the_shell_sandbox_in_place() {
+            use crate::{
+                approvals::Approvals,
+                model::{ToolCall, ToolFunction},
+                protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+            };
+            // `command_tools` stays at its default, which runs command tools outside.
+            let project = Project::new(ExecutionProfile::ReadOnly);
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let allow = move |event| {
+                if let AgentEvent::ApprovalRequest {
+                    request_id,
+                    approval_id,
+                    ..
+                } = event
+                {
+                    decisions
+                        .resolve(ResolveApprovalRequest {
+                            request_id,
+                            approval_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .unwrap();
+                }
+            };
+            let call = ToolCall {
+                id: "shell".into(),
+                function: ToolFunction {
+                    name: "shell".into(),
+                    arguments: r#"{"command":"printf blocked > approved-write"}"#.into(),
+                },
+            };
+            assert!(crate::tools::execute(
+                &project.workspace,
+                &call,
+                "run",
+                &approvals,
+                &allow,
+                Duration::from_secs(5),
+                &Default::default()
+            )
+            .await
+            .is_err());
+            assert!(!project.workspace.path.join("approved-write").exists());
+        }
+
+        #[tokio::test]
+        async fn native_sandboxed_tool_failures_that_are_not_denials_get_no_hint() {
+            use crate::{
+                approvals::Approvals,
+                command_tools::Isolation,
+                protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+            };
+            let mut project = Project::new(ExecutionProfile::ReadOnly);
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let allow = move |event| {
+                if let AgentEvent::ApprovalRequest {
+                    request_id,
+                    approval_id,
+                    ..
+                } = event
+                {
+                    decisions
+                        .resolve(ResolveApprovalRequest {
+                            request_id,
+                            approval_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .unwrap();
+                }
+            };
+            let run = |command: serde_json::Value, timeout| {
+                let tool: crate::command_tools::CommandTool = serde_json::from_value(
+                    serde_json::json!({"name":"probe", "description":"Native fixture", "command":command}),
+                )
+                .unwrap();
+                let (workspace, approvals, allow) = (&project.workspace, &approvals, &allow);
+                async move {
+                    tool.run(
+                        workspace,
+                        "{}",
+                        "run",
+                        approvals,
+                        allow,
+                        timeout,
+                        &Default::default(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                }
+            };
+            let exited = run(
+                serde_json::json!(["/bin/sh", "-c", "exit 3"]),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(exited, "Exit: 3\n");
+            let timed_out = run(
+                serde_json::json!(["/bin/sleep", "5"]),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(timed_out, crate::tools::TIME_LIMIT_MESSAGE);
+        }
+
+        #[tokio::test]
         async fn native_stdin_json_reaches_a_sandboxed_command_tool() {
             use crate::{
                 approvals::Approvals,
+                command_tools::Isolation,
                 protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
             };
-            let project = Project::new(ExecutionProfile::WorkspaceWrite);
+            let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
             let approvals = Approvals::default();
             let decisions = approvals.clone();
             let allow = move |event| {

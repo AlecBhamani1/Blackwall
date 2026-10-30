@@ -228,6 +228,22 @@ pub(crate) fn from_process(scope: Scope, project: &Path, pass_through: &[String]
     )
 }
 
+/// The `pass_through` names an owner child started now receives, in the owner's order: those
+/// [`valid_pass_through`] accepts that are set in this process's environment. Names, never values.
+pub(crate) fn passed_through(pass_through: &[String]) -> Vec<String> {
+    let set: Vec<OsString> = std::env::vars_os().map(|(key, _)| key).collect();
+    pass_through
+        .iter()
+        .filter(|wanted| {
+            valid_pass_through(wanted).is_ok()
+                && set
+                    .iter()
+                    .any(|key| key.to_str().is_some_and(|key| same_name(wanted, key)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Keeps only the `PATH` entries a child may search: absolute ones outside the AppImage mount and
 /// the project (pass the project's canonical absolute path). An entry that is, or resolves through
 /// symlinks into, the project is dropped too. Empty and relative entries would resolve to the

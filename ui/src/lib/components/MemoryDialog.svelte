@@ -5,6 +5,7 @@
     instructionFileValid,
     MAX_INSTRUCTION_FILES,
     SUBAGENT_TOOLS,
+    type CommandToolsIsolation,
     type SubagentTool,
     type MemoryEntry,
     type MemoryProposal,
@@ -46,6 +47,7 @@
   let subagentTools: SubagentTool[] = ['read_file', 'list_files'];
   let subagentRunsOn: 'local' | 'tool' = 'local';
   let subagentTool = '';
+  let commandToolsIsolation: CommandToolsIsolation = 'outside';
   const toolLabels: Record<SubagentTool, string> = {
     read_file: 'Read files',
     list_files: 'List folders',
@@ -74,6 +76,7 @@
         subagentMaxSteps: Number(subagentMaxSteps),
         subagentTools,
         subagentRunsOn: subagentRunsOn === 'local' ? 'local' : { tool: subagentTool },
+        commandToolsIsolation,
       });
     } catch (cause) {
       error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
@@ -260,6 +263,7 @@
         const runsOn = savedPreferences.subagentRunsOn ?? 'local';
         subagentRunsOn = runsOn === 'local' ? 'local' : 'tool';
         subagentTool = runsOn === 'local' ? '' : runsOn.tool;
+        commandToolsIsolation = savedPreferences.commandToolsIsolation ?? 'outside';
         instructionMaxFileKib = savedPreferences.instructionMaxFileKib ?? 8;
         instructionMaxTotalKib = savedPreferences.instructionMaxTotalKib ?? 32;
         instructionFiles = (savedPreferences.instructionExtraFiles ?? []).join('\n');
@@ -559,6 +563,20 @@
             standard input, and you are asked every time. The tool needs "stdin": "json" and a
             "prompt" parameter in tools.json.
           </p>
+        {/if}
+        <fieldset disabled={busy || !loaded}>
+          <legend>Command tools</legend>
+          <label
+            ><input type="radio" bind:group={commandToolsIsolation} value="outside" /> Outside the sandbox
+            (asks every time)</label
+          >
+          <label
+            ><input type="radio" bind:group={commandToolsIsolation} value="sandboxed" /> Inside the Commands
+            profile</label
+          >
+        </fieldset>
+        {#if commandToolsIsolation === 'outside'}
+          <p class="hint">Command tools run with your account permissions and always ask first.</p>
         {/if}
         <p class="hint">Projects can lower these limits but never choose where subagents run.</p>
         <button

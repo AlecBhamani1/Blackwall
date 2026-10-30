@@ -44,6 +44,56 @@ const BUILT_IN: [&str; 13] = [
     "skill_propose",
 ];
 
+/// What an approval for an owner command tool that runs outside the sandbox says first.
+pub const OUTSIDE_NOTE: &str =
+    "Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.";
+
+/// Where the owner's command tools run: outside the sandbox, always asking (the default), or
+/// inside the Commands profile. Only the owner chooses; a project file cannot.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    #[default]
+    Outside,
+    Sandboxed,
+}
+
+impl Isolation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Outside => "outside",
+            Self::Sandboxed => "sandboxed",
+        }
+    }
+}
+
+impl std::str::FromStr for Isolation {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "outside" => Ok(Self::Outside),
+            "sandboxed" => Ok(Self::Sandboxed),
+            _ => Err("Choose outside or sandboxed."),
+        }
+    }
+}
+
+/// The desktop's saved `commandToolsIsolation`; a missing one is the default.
+pub fn isolation_from_preferences(
+    preferences: &Map<String, Value>,
+) -> Result<Isolation, &'static str> {
+    preferences
+        .get("commandToolsIsolation")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or("Choose outside or sandboxed.")
+                .and_then(str::parse)
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 /// What a tool does when called: run a program (the default) or send an HTTP request.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -356,8 +406,9 @@ impl CommandTool {
         Ok(text)
     }
 
-    /// Command rules match the configured command template, so `claude -p` can allow every
-    /// prompt. HTTP tools ask with kind Network, and rules match the request's host.
+    /// Command rules match the configured command template, so, for a sandboxed tool,
+    /// `claude -p` can allow every prompt. A tool outside the sandbox always asks; only deny
+    /// rules apply. HTTP tools ask with kind Network, and rules match the request's host.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -413,25 +464,33 @@ impl CommandTool {
                 .await
                 .map(|text| output.trim_text(text));
         }
-        let (program, args, input) = self.prepared(&values, &workspace.path)?;
+        let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
+        let outside = workspace.execution.command_tools == Isolation::Outside;
+        let env = self.passed_env(outside);
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
-            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
+            "{}Project: {}\nTool: {}\nProgram: {}\n{}Arguments: {}",
+            outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
+            passed_line(&env),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
         );
         if let Some(input) = &input {
             detail.push_str(&format!("\nStandard input: JSON, {}", shown_bytes(input)));
         }
-        detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        if !outside {
+            detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        }
         if !approvals
-            .request(
+            .request_owner_tool(
                 request_id,
-                ApprovalKind::Exec,
                 &self.command.join(" "),
+                &self.call(workspace, &program, &args, &env, input.as_deref()),
                 detail,
+                false,
+                outside,
                 emit,
             )
             .await
@@ -439,6 +498,7 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
+        self.unchanged(&program, &identity, &workspace.path)?;
         crate::tools::program_with_timeout(
             workspace, &program, &args, &self.env, input, timeout, output,
         )
@@ -491,30 +551,95 @@ impl CommandTool {
         if let Some(schema) = &self.parameters {
             validate_arguments(schema, &values)?;
         }
-        let (program, args, input) = self.prepared(&values, &workspace.path)?;
-        let detail = format!(
-            "A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}\n\n{}",
+        let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
+        let outside = workspace.execution.command_tools == Isolation::Outside;
+        let env = self.passed_env(outside);
+        let mut detail = format!(
+            "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\n{}Arguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
+            outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
+            passed_line(&env),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
             prompt.len(),
-            workspace.execution.description(),
         );
+        if !outside {
+            detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        }
         if !approvals
-            .request_delegate(request_id, &self.command.join(" "), detail, emit)
+            .request_owner_tool(
+                request_id,
+                &self.command.join(" "),
+                &self.call(workspace, &program, &args, &env, input.as_deref()),
+                detail,
+                true,
+                outside,
+                emit,
+            )
             .await
             .map_err(ToolError::Execution)?
         {
             return Err(ToolError::Denied);
         }
+        self.unchanged(&program, &identity, &workspace.path)?;
         crate::tools::program_with_timeout(
             workspace, &program, &args, &self.env, input, timeout, output,
         )
         .await
     }
 
-    /// The resolved program, its arguments, and its standard input for checked `values`.
+    /// What the audit records of a call to this tool.
+    fn call<'a>(
+        &'a self,
+        workspace: &crate::tools::Workspace,
+        program: &'a Path,
+        args: &'a [String],
+        env: &'a [String],
+        input: Option<&[u8]>,
+    ) -> crate::policy::ProgramCall<'a> {
+        crate::policy::ProgramCall {
+            program,
+            tool: &self.name,
+            isolation: workspace.execution.command_tools,
+            args,
+            env,
+            stdin_sha256: input.map(sha256_hex),
+            overridden: false,
+        }
+    }
+
+    /// The `env` names the program gets: those set in Blackwall's environment, when it runs
+    /// outside the sandbox. A sandboxed program gets none.
+    fn passed_env(&self, outside: bool) -> Vec<String> {
+        match outside {
+            true => crate::child_env::passed_through(&self.env),
+            false => Vec::new(),
+        }
+    }
+
+    /// Refuses to run when `program` is no longer the file the prompt named: the configured
+    /// name now resolves elsewhere, or the file was replaced or rewritten while the owner was
+    /// asked. Checked just before the program starts, after any wait for an answer.
+    fn unchanged(
+        &self,
+        program: &Path,
+        identity: &ProgramIdentity,
+        project: &Path,
+    ) -> Result<(), ToolError> {
+        let same = resolve_program(&self.command[0], project).is_ok_and(|again| again == program)
+            && ProgramIdentity::of(program).as_ref() == Some(identity);
+        match same {
+            true => Ok(()),
+            false => Err(ToolError::Execution(format!(
+                "{} changed after you approved it. The command was not run.",
+                program.display()
+            ))),
+        }
+    }
+
+    /// The resolved program, its identity, its arguments, and its standard input for checked
+    /// `values`.
     fn prepared(&self, values: &Value, project: &Path) -> Result<Prepared, ToolError> {
         let args = self.command[1..]
             .iter()
@@ -541,12 +666,67 @@ impl CommandTool {
             }
         };
         let program = resolve_program(&self.command[0], project)?;
-        Ok((program, args, input))
+        let identity = ProgramIdentity::of(&program).ok_or_else(|| {
+            ToolError::Execution(not_resolved_message(&self.command[0], NotResolved::Missing))
+        })?;
+        Ok((program, identity, args, input))
     }
 }
 
-/// A command tool's resolved program, its arguments, and its standard input.
-type Prepared = (PathBuf, Vec<String>, Option<Vec<u8>>);
+/// What an owner tool's approval detail starts with: [`OUTSIDE_NOTE`] when it runs outside the
+/// sandbox, where the sandbox description would be false.
+fn outside_prefix(outside: bool) -> String {
+    match outside {
+        true => format!("{OUTSIDE_NOTE}\n\n"),
+        false => String::new(),
+    }
+}
+
+/// The approval line naming the variables a program gets from the owner's environment, never
+/// their values; empty when it gets none.
+fn passed_line(names: &[String]) -> String {
+    match names.is_empty() {
+        true => String::new(),
+        false => format!(
+            "Gets these variables from your environment: {}\n",
+            names.join(", ")
+        ),
+    }
+}
+
+/// A command tool's resolved program, its identity, its arguments, and its standard input.
+type Prepared = (PathBuf, ProgramIdentity, Vec<String>, Option<Vec<u8>>);
+
+/// The file a resolved program names when its prompt is built: where it really is (through
+/// symlinks), and its size and modification time, plus its device, inode and change time on Unix.
+/// A file renamed over it, a retargeted link, or a rewrite in place changes it.
+#[derive(Debug, PartialEq, Eq)]
+struct ProgramIdentity {
+    canonical: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl ProgramIdentity {
+    fn of(program: &Path) -> Option<Self> {
+        let canonical = std::fs::canonicalize(program).ok()?;
+        let meta = std::fs::metadata(&canonical).ok()?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        Some(Self {
+            canonical,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode,
+        })
+    }
+}
 
 /// Size, digest, and the start of a payload for an approval prompt. The digest keeps a
 /// remembered approval exact when the shown text is clipped.
@@ -556,11 +736,18 @@ fn shown_bytes(bytes: &[u8]) -> String {
     if shown.len() < text.len() {
         shown.push('…');
     }
-    let digest: String = Sha256::digest(bytes)
+    format!(
+        "{} bytes, sha256 {}\n{shown}",
+        bytes.len(),
+        sha256_hex(bytes)
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{} bytes, sha256 {digest}\n{shown}", bytes.len())
+        .collect()
 }
 
 /// A value that could be read as an option the owner did not configure.
@@ -568,11 +755,12 @@ fn is_option(value: &str) -> bool {
     value.starts_with('-') || (cfg!(windows) && value.starts_with('/'))
 }
 
-/// An absolute program, or a bare name found in the child's validated `PATH`: absolute entries
-/// outside the AppImage mount and `project`, whose directory also does not resolve (through
-/// symlinks) into `project`. A repository can therefore never plant the program that an owner
-/// command tool or MCP server starts. On Windows the `.exe` is resolved here, so the approved path
-/// is exactly the one that runs.
+/// An absolute program outside `project`, or a bare name found in the child's validated `PATH`:
+/// absolute entries outside the AppImage mount and `project`, whose directory also does not
+/// resolve (through symlinks) into `project`. An absolute program that is, or resolves through
+/// symlinks into, `project` is refused. A repository can therefore never plant the program that
+/// an owner command tool or MCP server starts. On Windows the `.exe` is resolved here, so the
+/// approved path is exactly the one that runs.
 pub(crate) fn resolve_program(program: &str, project: &Path) -> Result<PathBuf, ToolError> {
     let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
     let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
@@ -582,14 +770,19 @@ pub(crate) fn resolve_program(program: &str, project: &Path) -> Result<PathBuf, 
         crate::child_env::valid_appdir(appdir.as_deref()),
         &project,
     )
-    .map_err(|why| {
-        ToolError::Execution(match why {
-            NotResolved::Missing => format!("{program} was not found on this computer."),
-            NotResolved::OnlyInProject => format!(
-                "{program} was only found inside the project folder, which Blackwall never runs programs from. Use an absolute path in the config."
-            ),
-        })
-    })
+    .map_err(|why| ToolError::Execution(not_resolved_message(program, why)))
+}
+
+fn not_resolved_message(program: &str, why: NotResolved) -> String {
+    match why {
+        NotResolved::Missing => format!("{program} was not found on this computer."),
+        NotResolved::OnlyInProject => format!(
+            "{program} was only found inside the project folder, which Blackwall never runs programs from. Install it outside the project."
+        ),
+        NotResolved::InsideProject => format!(
+            "{program} is inside the project folder, which Blackwall never runs programs from."
+        ),
+    }
 }
 
 /// Why a program name did not resolve.
@@ -598,6 +791,8 @@ enum NotResolved {
     Missing,
     /// Every match was in a `PATH` directory inside the project.
     OnlyInProject,
+    /// An absolute program that is, or resolves through symlinks into, the project.
+    InsideProject,
 }
 
 fn resolve_in(
@@ -613,10 +808,12 @@ fn resolve_in(
     };
     let path = Path::new(&name);
     if path.is_absolute() {
-        return if executable(path) {
-            Ok(path.to_path_buf())
-        } else {
+        return if !executable(path) {
             Err(NotResolved::Missing)
+        } else if crate::child_env::inside_project(path, project) {
+            Err(NotResolved::InsideProject)
+        } else {
+            Ok(path.to_path_buf())
         };
     }
     let search_path = search_path.ok_or(NotResolved::Missing)?;
@@ -771,6 +968,28 @@ fn validate_schema(schema: &Schema) -> Result<(), &'static str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn isolation_defaults_outside_and_parses_strictly() {
+        assert_eq!(Isolation::default(), Isolation::Outside);
+        assert_eq!("sandboxed".parse::<Isolation>(), Ok(Isolation::Sandboxed));
+        assert_eq!("outside".parse::<Isolation>(), Ok(Isolation::Outside));
+        assert!("inside".parse::<Isolation>().is_err());
+        assert_eq!(Isolation::Sandboxed.name(), "sandboxed");
+        assert_eq!(
+            isolation_from_preferences(&json!({}).as_object().unwrap().clone()),
+            Ok(Isolation::Outside)
+        );
+        let saved = json!({"commandToolsIsolation":"sandboxed"});
+        assert_eq!(
+            isolation_from_preferences(saved.as_object().unwrap()),
+            Ok(Isolation::Sandboxed)
+        );
+        for bad in [json!("inside"), json!(true), json!(null)] {
+            let saved = json!({ "commandToolsIsolation": bad });
+            assert!(isolation_from_preferences(saved.as_object().unwrap()).is_err());
+        }
+    }
+
     /// A fixture directory under the temp folder with a `bin` that holds an executable `tool`.
     #[cfg(unix)]
     fn plant(root: &Path, dir: &str) -> PathBuf {
@@ -809,9 +1028,49 @@ mod tests {
             Err(NotResolved::OnlyInProject)
         );
         assert_eq!(find("absent", &[&system]), Err(NotResolved::Missing));
-        // An absolute path in the configuration is the owner's explicit choice.
-        let absolute = planted.join("tool");
-        assert_eq!(find(absolute.to_str().unwrap(), &[&system]), Ok(absolute));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_programs_inside_the_project_are_refused_even_through_symlinks() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("blackwall-resolve-{}", rand::random::<u64>()));
+        let project = root.join("project");
+        let planted = plant(&project, "node_modules/.bin");
+        let system = plant(&root, "system/bin");
+        // A folder outside the project that links into it, and a file link to a planted program.
+        std::os::unix::fs::symlink(&planted, root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(planted.join("tool"), system.join("linked")).unwrap();
+        let find = |program: &Path| resolve_in(program.to_str().unwrap(), None, None, &project);
+        assert_eq!(find(&planted.join("tool")), Err(NotResolved::InsideProject));
+        assert_eq!(
+            find(&root.join("alias").join("tool")),
+            Err(NotResolved::InsideProject)
+        );
+        assert_eq!(
+            find(&system.join("linked")),
+            Err(NotResolved::InsideProject)
+        );
+        assert_eq!(find(&system.join("tool")), Ok(system.join("tool")));
+        let program = planted.join("tool");
+        let error = resolve_program(program.to_str().unwrap(), &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "is inside the project folder, which Blackwall never runs programs from."
+            ),
+            "{error}"
+        );
+        // A bare name found only in the project points the owner outside it, never into it.
+        let error = format!(
+            "{}",
+            ToolError::Execution(not_resolved_message("tool", NotResolved::OnlyInProject))
+        );
+        assert!(!error.contains("absolute path"), "{error}");
+        assert!(error.contains("Install it outside the project"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -976,6 +1235,94 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
+    /// A tool config whose program creates `tool-write` in the project folder.
+    #[cfg(unix)]
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#;
+    // PowerShell, not cmd.exe, which rejects the verbatim `\\?\` working directory.
+    #[cfg(windows)]
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["powershell","-NoProfile","-NonInteractive","-Command","Set-Content -Path tool-write -Value x"]}]}"#;
+
+    /// Run a tool that creates `tool-write` in the project, approving its prompt.
+    #[cfg(any(unix, windows))]
+    async fn touch_probe(
+        isolation: Isolation,
+        profile: crate::sandbox::ExecutionProfile,
+    ) -> (Result<String, ToolError>, PathBuf) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) = load(TOUCH_TOOL).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = profile;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let allow = move |event| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let result = tools
+            .get("touch_probe")
+            .unwrap()
+            .run(
+                &workspace,
+                r#"{}"#,
+                "run",
+                &approvals,
+                &allow,
+                // PowerShell can take far longer than 5 seconds to cold-start on a CI runner.
+                Duration::from_secs(if cfg!(windows) { 60 } else { 5 }),
+                &Default::default(),
+            )
+            .await;
+        (result, workspace.path.clone())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn outside_tool_runs_even_when_shell_profile_is_read_only() {
+        let (result, path) = touch_probe(
+            Isolation::Outside,
+            crate::sandbox::ExecutionProfile::ReadOnly,
+        )
+        .await;
+        result.unwrap();
+        assert!(path.join("tool-write").exists());
+        tokio::fs::remove_dir_all(&path).await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandboxed_tool_failure_names_the_setting() {
+        let (result, path) = touch_probe(
+            Isolation::Sandboxed,
+            crate::sandbox::ExecutionProfile::ReadOnly,
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Operation not permitted"), "{error}");
+        assert!(
+            error.contains("This may have been blocked by the Read-only sandbox."),
+            "{error}"
+        );
+        assert!(
+            error.contains("Memory → Advanced · Subagents → Command tools"),
+            "{error}"
+        );
+        assert!(!path.join("tool-write").exists());
+        tokio::fs::remove_dir_all(&path).await.unwrap();
+    }
+
     fn schema(value: Value) -> Schema {
         serde_json::from_value(value).unwrap()
     }
@@ -1128,6 +1475,554 @@ mod tests {
             ));
         }
         drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// Run `echo hi` twice as an owner tool with `rules` as the owner's policy, answering every
+    /// prompt with "Allow identical action this run". Returns the prompts, both results, and the
+    /// folder that holds the project, the policy, and its audit log.
+    #[cfg(unix)]
+    async fn echo_twice(
+        isolation: Isolation,
+        rules: &str,
+    ) -> (Vec<AgentEvent>, Vec<Result<String, ToolError>>, PathBuf) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) =
+            load(r#"{"tools":[{"name":"echo_hi","description":"Echo","command":["echo","hi"]}]}"#)
+                .await;
+        tokio::fs::write(directory.join(crate::policy::POLICY_FILE), rules)
+            .await
+            .unwrap();
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let (captured, decisions) = (events.clone(), approvals.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = &event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id: request_id.clone(),
+                        approval_id: approval_id.clone(),
+                        decision: ApprovalDecision::AlwaysAllow,
+                    })
+                    .unwrap();
+                captured.lock().unwrap().push(event);
+            }
+        };
+        let tool = tools.get("echo_hi").unwrap();
+        let mut results = vec![];
+        for _ in 0..2 {
+            results.push(
+                tool.run(
+                    &workspace,
+                    "{}",
+                    "run",
+                    &approvals,
+                    &emit,
+                    Duration::from_secs(10),
+                    &Default::default(),
+                )
+                .await,
+            );
+        }
+        let events = events.lock().unwrap().clone();
+        (events, results, directory)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_asks_every_time_despite_allow_rule_and_remember() {
+        let (events, results, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest { remember: false, outside_sandbox: true, detail, .. }
+                if detail.starts_with(OUTSIDE_NOTE)
+                    && !detail.contains("Approval cannot expand this boundary")
+        )));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_marks_an_allow_rule_an_outside_tool_overrode() {
+        let last = |directory: &Path| -> Value {
+            let audit = std::fs::read_to_string(directory.join("policy-audit.jsonl")).unwrap();
+            serde_json::from_str(audit.lines().last().unwrap()).unwrap()
+        };
+        let (_, _, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        let line = last(&directory);
+        assert_eq!(line["decision"], "ask", "{line}");
+        assert_eq!(line["rule"]["index"], 0, "{line}");
+        assert_eq!(line["overridden"], true, "{line}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        // Without a matching allow rule there is nothing to override.
+        let (_, _, directory) = echo_twice(Isolation::Outside, r#"{"rules":[]}"#).await;
+        let line = last(&directory);
+        assert!(line.get("overridden").is_none(), "{line}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_deny_rule_still_denies_without_asking() {
+        let (events, results, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"deny","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        assert_eq!(events.len(), 0, "{events:?}");
+        assert!(matches!(results[0], Err(ToolError::Denied)));
+        assert!(matches!(results[1], Err(ToolError::Denied)));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_prompt_names_a_broken_policy_after_the_note() {
+        let (events, _, directory) = echo_twice(Isolation::Outside, "{").await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest { detail, .. }
+                if detail.starts_with(&format!("{OUTSIDE_NOTE}\n\nThe policy file is not valid."))
+                    && detail.contains("\n\nProject: ")
+        )), "{events:?}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_runs_on_tool_still_asks_every_time() {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"review","description":"Review","command":["cat"],"stdin":"json","parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]}"#,
+        )
+        .await;
+        tokio::fs::write(
+            directory.join(crate::policy::POLICY_FILE),
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"cat"}]}"#,
+        )
+        .await
+        .unwrap();
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = Isolation::Sandboxed;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let (captured, decisions) = (events.clone(), approvals.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = &event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id: request_id.clone(),
+                        approval_id: approval_id.clone(),
+                        decision: ApprovalDecision::AlwaysAllow,
+                    })
+                    .unwrap();
+                captured.lock().unwrap().push(event);
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        for _ in 0..2 {
+            tool.delegate(
+                &workspace,
+                "Review the diff",
+                "run",
+                &approvals,
+                &emit,
+                Duration::from_secs(10),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest {
+                remember: false,
+                off_device: true,
+                outside_sandbox: false,
+                ..
+            }
+        )));
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_records_the_resolved_absolute_program() {
+        let (_, results, directory) = echo_twice(Isolation::Outside, r#"{"rules":[]}"#).await;
+        assert!(results[0].is_ok(), "{results:?}");
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        let program = line["program"].as_str().unwrap();
+        // The configured `echo` is recorded as the absolute path that ran.
+        assert!(
+            program.starts_with('/') && program.ends_with("/echo"),
+            "{line}"
+        );
+        assert_eq!(line["subject"], "echo hi");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// The audit line for one approved call of a tool that sends `arguments` on standard
+    /// input, passes `HOME` through, and puts `{label}` on its command line.
+    #[cfg(unix)]
+    async fn audited(isolation: Isolation, subagent: bool, arguments: &str) -> Value {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let body = json!({"tools":[{"name":"review","description":"Review","command":["sh","-c","cat",
+            if subagent { "fixed" } else { "{label}" }],"stdin":"json","env":["HOME","BLACKWALL_TEST_NEVER_SET"],
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"},"label":{"type":"string"}},
+            "required": if subagent { json!(["prompt"]) } else { json!(["prompt","label"]) }}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let decisions = approvals.clone();
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        match subagent {
+            true => tool
+                .delegate(
+                    &workspace, arguments, "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+            false => tool
+                .run(
+                    &workspace, arguments, "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+        };
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        serde_json::from_str(audit.lines().last().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_records_the_approved_call_without_secret_values() {
+        let sha = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let arguments = r#"{"prompt":"Review","label":"token=abc123"}"#;
+        let stdin = serde_json::to_vec(&json!({
+            "arguments": serde_json::from_str::<Value>(arguments).unwrap()
+        }))
+        .unwrap();
+        for (isolation, env) in [
+            (Isolation::Outside, json!(["HOME"])),
+            (Isolation::Sandboxed, json!([])),
+        ] {
+            let line = audited(isolation, false, arguments).await;
+            assert_eq!(line["tool"], "review", "{line}");
+            assert_eq!(line["isolation"], isolation.name(), "{line}");
+            // The secret-looking argument is redacted, as the subject is.
+            assert_eq!(
+                line["args"],
+                json!(["-c", "cat", "token=[redacted]"]),
+                "{line}"
+            );
+            assert_eq!(line["env"], env, "{line}");
+            assert_eq!(line["stdinSha256"], sha(&stdin), "{line}");
+            assert!(!line.to_string().contains("abc123"), "{line}");
+            // The fields there before are kept.
+            assert_eq!(line["subject"], "sh -c cat {label}", "{line}");
+            assert!(line["program"].as_str().unwrap().ends_with("/sh"), "{line}");
+            assert_eq!(line["allowed"], true, "{line}");
+            // A subagent's runs-on tool is recorded the same way; its prompt is on stdin.
+            let line = audited(isolation, true, "Review the diff").await;
+            let stdin = serde_json::to_vec(&json!({"arguments":{"prompt":"Review the diff"}}));
+            assert_eq!(line["tool"], "review", "{line}");
+            assert_eq!(line["args"], json!(["-c", "cat", "fixed"]), "{line}");
+            assert_eq!(line["stdinSha256"], sha(&stdin.unwrap()), "{line}");
+        }
+    }
+
+    /// Write an executable script at `path` that prints `text`, then creates `marker`.
+    #[cfg(unix)]
+    fn script(path: &Path, text: &str, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let body = format!(
+            "#!/bin/sh\ncat >/dev/null\necho {text}\ntouch '{}'\n",
+            marker.display()
+        );
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Run (or, with `subagent`, delegate to) a tool whose program, outside the project, `swap`
+    /// replaces while its prompt is open, then approve it. Returns the result and whether the
+    /// replacement ran.
+    #[cfg(unix)]
+    async fn swapped_while_asking(
+        isolation: Isolation,
+        subagent: bool,
+        swap: fn(&Path, &Path),
+    ) -> (Result<String, ToolError>, bool) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let root = std::env::temp_dir().join(format!("blackwall-swap-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let program = root.join("bin").join("review");
+        let marker = root.join("replacement-ran");
+        script(&program, "original", &root.join("original-ran"));
+        let body = json!({"tools":[{"name":"review","description":"Review","command":[program],"stdin":"json",
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let (target, replacement) = (program.clone(), marker.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                swap(&target, &replacement);
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        let result = match subagent {
+            true => {
+                tool.delegate(
+                    &workspace, "Review", "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+            }
+            false => {
+                tool.run(
+                    &workspace,
+                    r#"{"prompt":"Review"}"#,
+                    "run",
+                    &approvals,
+                    &emit,
+                    timeout,
+                    &output,
+                )
+                .await
+            }
+        };
+        let ran = marker.exists();
+        drop(workspace);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::remove_dir_all(&root).unwrap();
+        (result, ran)
+    }
+
+    /// The prompt a `cat` tool that passes `env` through asks with, run or delegated to.
+    #[cfg(unix)]
+    async fn prompt_detail(isolation: Isolation, subagent: bool, env: &[&str]) -> String {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let body = json!({"tools":[{"name":"review","description":"Review","command":["cat"],"stdin":"json","env":env,
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let details = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let captured = details.clone();
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                detail,
+                ..
+            } = event
+            {
+                captured.lock().unwrap().push(detail);
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        match subagent {
+            true => tool
+                .delegate(
+                    &workspace, "Review", "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+            false => tool
+                .run(
+                    &workspace,
+                    r#"{"prompt":"Review"}"#,
+                    "run",
+                    &approvals,
+                    &emit,
+                    timeout,
+                    &output,
+                )
+                .await
+                .unwrap(),
+        };
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        let detail = details.lock().unwrap()[0].clone();
+        detail
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_prompt_names_the_variables_passed_through_never_their_values() {
+        const LINE: &str = "Gets these variables from your environment:";
+        for subagent in [false, true] {
+            // Only names set here are listed: an unset one is not passed, so it is not shown.
+            let env = ["HOME", "BLACKWALL_TEST_NEVER_SET", "USER"];
+            let detail = prompt_detail(Isolation::Outside, subagent, &env).await;
+            let lines: Vec<&str> = detail.lines().collect();
+            let at = lines.iter().position(|line| line.starts_with("Program: "));
+            let names = at.and_then(|at| lines.get(at + 1)).copied();
+            let expected = match std::env::var_os("USER") {
+                Some(_) => format!("{LINE} HOME, USER"),
+                None => format!("{LINE} HOME"),
+            };
+            assert_eq!(names, Some(expected.as_str()), "{detail}");
+            assert!(!detail.contains("BLACKWALL_TEST_NEVER_SET"), "{detail}");
+            // Nothing to list, no line.
+            let detail =
+                prompt_detail(Isolation::Outside, subagent, &["BLACKWALL_TEST_NEVER_SET"]).await;
+            assert!(!detail.contains(LINE), "{detail}");
+            // A sandboxed program never gets them, so its prompt names none.
+            let detail = prompt_detail(Isolation::Sandboxed, subagent, &env).await;
+            assert!(!detail.contains(LINE), "{detail}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_replaced_after_its_prompt_is_not_run() {
+        // Another file renamed over the program, as an installer or an attacker would.
+        fn rename_over(program: &Path, marker: &Path) {
+            let fresh = program.with_extension("new");
+            script(&fresh, "replaced", marker);
+            std::fs::rename(&fresh, program).unwrap();
+        }
+        // The same file rewritten in place, keeping its inode.
+        fn rewrite(program: &Path, marker: &Path) {
+            script(program, "rewritten", marker);
+        }
+        fn untouched(_: &Path, _: &Path) {}
+        for isolation in [Isolation::Outside, Isolation::Sandboxed] {
+            for subagent in [false, true] {
+                for swap in [rename_over as fn(&Path, &Path), rewrite] {
+                    let (result, ran) = swapped_while_asking(isolation, subagent, swap).await;
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.ends_with("changed after you approved it. The command was not run."),
+                        "{isolation:?} {subagent} {error}"
+                    );
+                    assert!(!ran, "{isolation:?} {subagent}");
+                }
+                let (result, _) = swapped_while_asking(isolation, subagent, untouched).await;
+                assert!(
+                    result.unwrap().contains("original"),
+                    "{isolation:?} {subagent}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_owner_tool_keeps_todays_remembered_approval() {
+        let (events, results, directory) =
+            echo_twice(Isolation::Sandboxed, r#"{"rules":[]}"#).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ApprovalRequest { remember: true, outside_sandbox: false, detail, .. }
+                if !detail.contains(OUTSIDE_NOTE)
+                    && detail.ends_with("UNSANDBOXED: full account filesystem and network access.")
+        ));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert!(line["program"].as_str().unwrap().starts_with('/'), "{line}");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 

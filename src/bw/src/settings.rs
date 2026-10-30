@@ -1,3 +1,4 @@
+use blackwall_core::command_tools::Isolation;
 use blackwall_core::instructions::InstructionSettings;
 use blackwall_core::subagents::{RunsOn, SubagentSettings};
 use blackwall_core::{
@@ -18,6 +19,8 @@ pub struct Settings {
     pub web_enabled: bool,
     pub execution_profile: blackwall_core::sandbox::ExecutionProfile,
     pub command_network: bool,
+    /// Where owner command tools run; outside the sandbox (always ask) unless set otherwise.
+    pub command_tools_isolation: Isolation,
     pub memory_enabled: bool,
     pub recall_enabled: bool,
     pub budget: blackwall_core::context::ContextBudget,
@@ -100,6 +103,7 @@ impl Settings {
             "webEnabled": validated.web_enabled,
             "executionProfile": validated.execution_profile,
             "commandNetwork": validated.command_network,
+            "commandToolsIsolation": validated.command_tools_isolation,
             "memoryEnabled": validated.memory_enabled,
             "recallEnabled": validated.recall_enabled,
             "contextBudget": validated.budget,
@@ -133,6 +137,7 @@ impl Settings {
             "web" => updated.web_enabled = on_or_off(value)?,
             "profile" => updated.execution_profile = value.parse()?,
             "command-network" => updated.command_network = on_or_off(value)?,
+            "command-tools-isolation" => updated.command_tools_isolation = value.parse()?,
             "memory" => updated.memory_enabled = on_or_off(value)?,
             "recall" => updated.recall_enabled = on_or_off(value)?,
             "traces" => updated.trace.enabled = on_or_off(value)?,
@@ -236,7 +241,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, instruction-file-kib, instruction-total-kib, instruction-files, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
+                "Choose a setting: model, endpoint, profile, command-network, command-tools-isolation, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, instruction-file-kib, instruction-total-kib, instruction-files, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
                     .into(),
             ),
         }
@@ -253,7 +258,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\ninstructions: {}\nexecution profile: {}\ncommand network: {}\notlp export: {}\nusage history: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\ninstructions: {}\nexecution profile: {}\ncommand network: {}\ncommand tools: {}\notlp export: {}\nusage history: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -268,6 +273,10 @@ impl Settings {
             describe_instructions(&self.instructions),
             self.execution_profile.name(),
             if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
+            match self.command_tools_isolation {
+                Isolation::Outside => "outside the sandbox (always ask)",
+                Isolation::Sandboxed => "sandboxed (Commands profile)",
+            },
             describe_export(&self.export),
             self.retention,
         )
@@ -405,6 +414,8 @@ fn load_with_environment(
         web_enabled: false,
         execution_profile: Default::default(),
         command_network: false,
+        command_tools_isolation: blackwall_core::command_tools::isolation_from_preferences(object)
+            .map_err(|_| "The saved desktop command tools setting is invalid.")?,
         memory_enabled,
         recall_enabled: object
             .get("recallEnabled")
@@ -488,6 +499,7 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
                 | "webEnabled"
                 | "executionProfile"
                 | "commandNetwork"
+                | "commandToolsIsolation"
                 | "memoryEnabled"
                 | "recallEnabled"
                 | "contextBudget"
@@ -514,6 +526,11 @@ fn saved_settings(body: &str) -> Result<Settings, String> {
             .map(|v| v.as_bool().ok_or(invalid))
             .transpose()?
             .unwrap_or(false),
+        command_tools_isolation: object
+            .get("commandToolsIsolation")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
+            .transpose()?
+            .unwrap_or_default(),
         budget: object
             .get("contextBudget")
             .map(|value| serde_json::from_value(value.clone()).map_err(|_| invalid))
@@ -641,6 +658,37 @@ mod tests {
     }
 
     #[test]
+    fn cli_sets_and_persists_command_tools_isolation() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        assert_eq!(settings.command_tools_isolation, Isolation::Outside);
+        assert!(settings
+            .describe()
+            .contains("command tools: outside the sandbox (always ask)"));
+        assert!(settings
+            .set(&store, "command-tools-isolation", "inside")
+            .is_err());
+        settings
+            .set_with_persistence("command-tools-isolation", "sandboxed", |_| Ok(()))
+            .unwrap();
+        assert_eq!(settings.command_tools_isolation, Isolation::Sandboxed);
+        assert!(settings
+            .describe()
+            .contains("command tools: sandboxed (Commands profile)"));
+        settings
+            .set(&store, "command-tools-isolation", "sandboxed")
+            .unwrap();
+        assert_eq!(
+            defaults(&store).command_tools_isolation,
+            Isolation::Sandboxed
+        );
+        let saved: Value =
+            serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
+        assert_eq!(saved["commandToolsIsolation"], "sandboxed");
+    }
+
+    #[test]
     fn absent_settings_use_offline_defaults() {
         let directory = TestDirectory::new();
         let store = LocalStore::open(&directory.0).unwrap();
@@ -652,6 +700,7 @@ mod tests {
                 web_enabled: false,
                 execution_profile: Default::default(),
                 command_network: false,
+                command_tools_isolation: Isolation::Outside,
                 memory_enabled: false,
                 recall_enabled: false,
                 budget: Default::default(),
@@ -783,7 +832,7 @@ mod tests {
         assert_eq!(defaults(&reopened), settings);
         let saved: Value =
             serde_json::from_str(&reopened.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(saved.as_object().unwrap().len(), 15);
+        assert_eq!(saved.as_object().unwrap().len(), 16);
         assert_eq!(
             (
                 saved["tracesEnabled"].clone(),
@@ -930,6 +979,7 @@ mod tests {
             web_enabled: true,
             execution_profile: Default::default(),
             command_network: false,
+            command_tools_isolation: Default::default(),
             memory_enabled: false,
             recall_enabled: false,
             budget: Default::default(),
