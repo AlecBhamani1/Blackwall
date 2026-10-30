@@ -463,7 +463,7 @@ impl CommandTool {
                 .await
                 .map(|text| output.trim_text(text));
         }
-        let (program, args, input) = self.prepared(&values, &workspace.path)?;
+        let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
         let outside = workspace.execution.command_tools == Isolation::Outside;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
@@ -495,6 +495,7 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
+        self.unchanged(&program, &identity, &workspace.path)?;
         crate::tools::program_with_timeout(
             workspace, &program, &args, &self.env, input, timeout, output,
         )
@@ -547,7 +548,7 @@ impl CommandTool {
         if let Some(schema) = &self.parameters {
             validate_arguments(schema, &values)?;
         }
-        let (program, args, input) = self.prepared(&values, &workspace.path)?;
+        let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
         let outside = workspace.execution.command_tools == Isolation::Outside;
         let mut detail = format!(
             "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
@@ -576,13 +577,35 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
+        self.unchanged(&program, &identity, &workspace.path)?;
         crate::tools::program_with_timeout(
             workspace, &program, &args, &self.env, input, timeout, output,
         )
         .await
     }
 
-    /// The resolved program, its arguments, and its standard input for checked `values`.
+    /// Refuses to run when `program` is no longer the file the prompt named: the configured
+    /// name now resolves elsewhere, or the file was replaced or rewritten while the owner was
+    /// asked. Checked just before the program starts, after any wait for an answer.
+    fn unchanged(
+        &self,
+        program: &Path,
+        identity: &ProgramIdentity,
+        project: &Path,
+    ) -> Result<(), ToolError> {
+        let same = resolve_program(&self.command[0], project).is_ok_and(|again| again == program)
+            && ProgramIdentity::of(program).as_ref() == Some(identity);
+        match same {
+            true => Ok(()),
+            false => Err(ToolError::Execution(format!(
+                "{} changed after you approved it. The command was not run.",
+                program.display()
+            ))),
+        }
+    }
+
+    /// The resolved program, its identity, its arguments, and its standard input for checked
+    /// `values`.
     fn prepared(&self, values: &Value, project: &Path) -> Result<Prepared, ToolError> {
         let args = self.command[1..]
             .iter()
@@ -609,7 +632,10 @@ impl CommandTool {
             }
         };
         let program = resolve_program(&self.command[0], project)?;
-        Ok((program, args, input))
+        let identity = ProgramIdentity::of(&program).ok_or_else(|| {
+            ToolError::Execution(not_resolved_message(&self.command[0], NotResolved::Missing))
+        })?;
+        Ok((program, identity, args, input))
     }
 }
 
@@ -622,8 +648,39 @@ fn outside_prefix(outside: bool) -> String {
     }
 }
 
-/// A command tool's resolved program, its arguments, and its standard input.
-type Prepared = (PathBuf, Vec<String>, Option<Vec<u8>>);
+/// A command tool's resolved program, its identity, its arguments, and its standard input.
+type Prepared = (PathBuf, ProgramIdentity, Vec<String>, Option<Vec<u8>>);
+
+/// The file a resolved program names when its prompt is built: where it really is (through
+/// symlinks), and its size and modification time, plus its device, inode and change time on Unix.
+/// A file renamed over it, a retargeted link, or a rewrite in place changes it.
+#[derive(Debug, PartialEq, Eq)]
+struct ProgramIdentity {
+    canonical: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl ProgramIdentity {
+    fn of(program: &Path) -> Option<Self> {
+        let canonical = std::fs::canonicalize(program).ok()?;
+        let meta = std::fs::metadata(&canonical).ok()?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        Some(Self {
+            canonical,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode,
+        })
+    }
+}
 
 /// Size, digest, and the start of a payload for an approval prompt. The digest keeps a
 /// remembered approval exact when the shown text is clipped.
@@ -1563,6 +1620,122 @@ mod tests {
         );
         assert_eq!(line["subject"], "echo hi");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// Write an executable script at `path` that prints `text`, then creates `marker`.
+    #[cfg(unix)]
+    fn script(path: &Path, text: &str, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let body = format!(
+            "#!/bin/sh\ncat >/dev/null\necho {text}\ntouch '{}'\n",
+            marker.display()
+        );
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Run (or, with `subagent`, delegate to) a tool whose program, outside the project, `swap`
+    /// replaces while its prompt is open, then approve it. Returns the result and whether the
+    /// replacement ran.
+    #[cfg(unix)]
+    async fn swapped_while_asking(
+        isolation: Isolation,
+        subagent: bool,
+        swap: fn(&Path, &Path),
+    ) -> (Result<String, ToolError>, bool) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let root = std::env::temp_dir().join(format!("blackwall-swap-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let program = root.join("bin").join("review");
+        let marker = root.join("replacement-ran");
+        script(&program, "original", &root.join("original-ran"));
+        let body = json!({"tools":[{"name":"review","description":"Review","command":[program],"stdin":"json",
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let (target, replacement) = (program.clone(), marker.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                swap(&target, &replacement);
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        let result = match subagent {
+            true => {
+                tool.delegate(
+                    &workspace, "Review", "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+            }
+            false => {
+                tool.run(
+                    &workspace,
+                    r#"{"prompt":"Review"}"#,
+                    "run",
+                    &approvals,
+                    &emit,
+                    timeout,
+                    &output,
+                )
+                .await
+            }
+        };
+        let ran = marker.exists();
+        drop(workspace);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::remove_dir_all(&root).unwrap();
+        (result, ran)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_replaced_after_its_prompt_is_not_run() {
+        // Another file renamed over the program, as an installer or an attacker would.
+        fn rename_over(program: &Path, marker: &Path) {
+            let fresh = program.with_extension("new");
+            script(&fresh, "replaced", marker);
+            std::fs::rename(&fresh, program).unwrap();
+        }
+        // The same file rewritten in place, keeping its inode.
+        fn rewrite(program: &Path, marker: &Path) {
+            script(program, "rewritten", marker);
+        }
+        fn untouched(_: &Path, _: &Path) {}
+        for isolation in [Isolation::Outside, Isolation::Sandboxed] {
+            for subagent in [false, true] {
+                for swap in [rename_over as fn(&Path, &Path), rewrite] {
+                    let (result, ran) = swapped_while_asking(isolation, subagent, swap).await;
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.ends_with("changed after you approved it. The command was not run."),
+                        "{isolation:?} {subagent} {error}"
+                    );
+                    assert!(!ran, "{isolation:?} {subagent}");
+                }
+                let (result, _) = swapped_while_asking(isolation, subagent, untouched).await;
+                assert!(
+                    result.unwrap().contains("original"),
+                    "{isolation:?} {subagent}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
