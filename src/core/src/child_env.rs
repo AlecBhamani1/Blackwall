@@ -154,7 +154,7 @@ pub(crate) fn build(
             .find(|(k, _)| k.to_str().is_some_and(|k| same_name(k, name)))
             .map(|(_, v)| v)
     };
-    let appdir = valid_appdir(lookup("APPDIR").map(Path::new));
+    let appdir = lookup("APPIMAGE").and_then(|_| valid_appdir(lookup("APPDIR").map(Path::new)));
     let mut vars: Vec<(OsString, OsString)> = Vec::new();
     for (key, value) in &source {
         let Some(name) = key.to_str() else { continue };
@@ -164,7 +164,7 @@ pub(crate) fn build(
             || match scope {
                 Scope::Shell => {
                     !same_name(name, "PATH")
-                        && !shell_refuses(name)
+                        && !shell_refuses(name, appdir.is_some())
                         // Whatever the AppRun hooks exported that points into the mount.
                         && (name == "XDG_DATA_DIRS"
                             || !holds_appdir(value, appdir))
@@ -298,19 +298,32 @@ fn keep_entries(list: &OsStr, appdir: Option<&Path>, project: Option<&Path>) -> 
 
 /// Whether `value` contains the AppImage mount path.
 fn holds_appdir(value: &OsStr, appdir: Option<&Path>) -> bool {
-    appdir
-        .and_then(Path::to_str)
-        .is_some_and(|dir| value.to_str().is_some_and(|value| value.contains(dir)))
+    let Some(appdir) = appdir else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = appdir.as_os_str().as_bytes();
+        value.as_bytes().windows(dir.len()).any(|part| part == dir)
+    }
+    #[cfg(not(unix))]
+    {
+        appdir
+            .to_str()
+            .is_some_and(|dir| value.to_string_lossy().contains(dir))
+    }
 }
 
 /// Whether a shell command must not inherit `name`: Blackwall's secrets, variables that load
 /// code, and the AppImage runtime's. Compared without regard to case, which only errs on the safe
 /// side.
-fn shell_refuses(name: &str) -> bool {
+fn shell_refuses(name: &str, appimage: bool) -> bool {
     let upper = name.to_ascii_uppercase();
     SECRET_ENV.contains(&upper.as_str())
         || INJECTION.contains(&upper.as_str())
-        || APPIMAGE_ENV.contains(&upper.as_str())
+        || (appimage && APPIMAGE_ENV.contains(&upper.as_str()))
         || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
 }
@@ -418,11 +431,8 @@ mod tests {
 
     #[test]
     fn injection_and_secret_variables_never_pass_even_by_name() {
-        let mut names = vec![
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-            "BLACKWALL_MODEL_API_KEY",
-        ];
+        let mut names = vec!["PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
+        names.extend(SECRET_ENV);
         names.extend(INJECTION);
         for name in [
             "BASH_ENV",
@@ -443,11 +453,13 @@ mod tests {
             assert!(INJECTION.contains(&name), "{name}");
         }
         for name in names {
-            assert!(valid_pass_through(name).is_err(), "{name}");
-            assert!(
-                valid_pass_through(&name.to_ascii_lowercase()).is_err(),
-                "{name}"
-            );
+            for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+                assert!(valid_pass_through(&spelling).is_err(), "{name}");
+                assert!(
+                    valid_pass_through_list(&[spelling]).is_err(),
+                    "valid_pass_through_list accepted {name}"
+                );
+            }
         }
     }
 
@@ -458,6 +470,7 @@ mod tests {
         let env = build(
             vars(&[
                 ("APPDIR", "/tmp/.mount_x"),
+                ("APPIMAGE", "/a.AppImage"),
                 ("XDG_DATA_DIRS", "/tmp/.mount_x/usr/share"),
                 ("PATH", "/tmp/.mount_x/usr/bin:/usr/bin"),
                 ("PYTHONHOME", "/tmp/.mount_x/usr"),
@@ -530,6 +543,7 @@ mod tests {
         let env = build(
             vars(&[
                 ("APPDIR", "/tmp/.mount_x"),
+                ("APPIMAGE", "/a.AppImage"),
                 ("FOO_MODULE_DIR", "/tmp/.mount_x/lib"),
                 ("GTK_DATA_PREFIX", "/tmp/.mount_x"),
                 ("SOME_LIST", "/opt/a:/tmp/.mount_x/usr/share"),
@@ -557,6 +571,63 @@ mod tests {
             &[],
         );
         assert_eq!(names(&env), ["FOO_MODULE_DIR"]);
+    }
+
+    // Unix paths: `/usr/bin` is not absolute on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn appdir_alone_does_not_trigger_appimage_filtering() {
+        let env = build(
+            vars(&[
+                ("APPDIR", "/tmp"),
+                ("GTK_THEME", "Adwaita"),
+                ("GDK_BACKEND", "x11"),
+                ("POINTS_INTO_APPDIR", "/tmp/lib"),
+                ("XDG_DATA_DIRS", "/tmp/share:/usr/share"),
+                ("PATH", "/tmp/bin:/usr/bin"),
+            ]),
+            Scope::Shell,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert!(env.dropped().is_empty());
+        assert_eq!(
+            names(&env),
+            [
+                "APPDIR",
+                "GDK_BACKEND",
+                "GTK_THEME",
+                "PATH",
+                "POINTS_INTO_APPDIR",
+                "XDG_DATA_DIRS"
+            ]
+        );
+        assert_eq!(get(&env, "PATH"), Some("/tmp/bin:/usr/bin"));
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some("/tmp/share:/usr/share"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_scope_drops_non_utf8_values_that_hold_the_appdir() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let env = build(
+            [
+                (OsString::from("APPDIR"), OsString::from("/tmp/.mount_x")),
+                (OsString::from("APPIMAGE"), OsString::from("/a.AppImage")),
+                (
+                    OsString::from("NON_UTF8"),
+                    OsString::from_vec(b"\xff/tmp/.mount_x/lib".to_vec()),
+                ),
+            ],
+            Scope::Shell,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert_eq!(names(&env), Vec::<String>::new());
+        assert!(env.dropped().contains(&"NON_UTF8".to_owned()));
     }
 
     #[cfg(unix)]
@@ -706,7 +777,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn passed_through_xdg_data_dirs_is_cleaned_and_dropped_when_nothing_is_left() {
-        let host = |dirs: &str| vars(&[("APPDIR", "/tmp/.mount_x"), ("XDG_DATA_DIRS", dirs)]);
+        let host = |dirs: &str| {
+            vars(&[
+                ("APPDIR", "/tmp/.mount_x"),
+                ("APPIMAGE", "/a.AppImage"),
+                ("XDG_DATA_DIRS", dirs),
+            ])
+        };
         let pass = ["XDG_DATA_DIRS".to_owned()];
         let env = build(
             host("/tmp/.mount_x/usr/share:/var/lib/snapd/desktop:/usr/share"),
