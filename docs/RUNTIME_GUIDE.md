@@ -595,7 +595,10 @@ files (certificates, `resolv.conf`, `hosts`, `passwd` and the like) and a privat
 `~/.pyenv`, `~/.local/bin` and `~/.local/share/uv`, read-only, each where it is a real folder (not
 a link, and not reached through one), so tools installed there run. `~/.cargo/credentials` and
 `~/.cargo/credentials.toml` are hidden inside them; if either is anything but a plain file,
-`~/.cargo` is left out. Nothing else in your home folder is there, and no command can write to any
+`~/.cargo` is left out. `~/.local/share/uv/credentials` is hidden too (it shows as an empty
+folder); if it is anything but a real folder, `~/.local/share/uv` is left out. Keep registry
+tokens in `credentials.toml`, which is hidden, not in `config.toml`, which the command can read.
+Nothing else in your home folder is there, and no command can write to any
 of it. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
 `.blackwall`, `.ssh`, `.aws`, `.gnupg`, `.config`, `.codex`, `.claude` and `.agents` are hidden.
 The exception is `node_modules`, `target`, `.venv`, `venv`, `__pycache__`, `dist` and `build`:

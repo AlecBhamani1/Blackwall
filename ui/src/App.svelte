@@ -330,6 +330,7 @@
         <p class="sandbox-note" role="status">
           {sandbox.note}<button
             class="sandbox-help"
+            onmousedown={(event) => event.preventDefault()}
             onclick={() => void setupClient.openLink('sandbox-docs').catch(() => {})}
             >Learn more</button
           >

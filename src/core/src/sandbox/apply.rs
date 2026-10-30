@@ -76,6 +76,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The deepest folder nesting applied or deleted. Each level holds a descriptor open.
 const MAX_DEPTH: usize = 256;
+/// The longest path (in bytes, without the NUL) the start walk can read: PATH_MAX - 1. It walks
+/// by path, so a longer one would fail every later command in the project.
+const PATH_LIMIT: usize = 4095;
 /// How many paths each list in the report shows (and keeps).
 const LIST_LIMIT: usize = 50;
 /// How many characters of each path the report shows; a longer one loses its middle.
@@ -102,6 +105,8 @@ pub(crate) enum Refusal {
     NoSafeReplace,
     /// More staged entries than [`MAX_ENTRIES`].
     TooMany,
+    /// The path is too long for the start walk to read on a later run.
+    TooLong,
     /// The project folder is not the one the command started with.
     ProjectChanged,
     Io,
@@ -118,6 +123,7 @@ impl Refusal {
             Self::Unavailable => "staging unavailable: this system can't open files safely",
             Self::NoSafeReplace => "this file system can't replace files safely",
             Self::TooMany => "too many changes to check safely",
+            Self::TooLong => "path too long to check on later runs",
             Self::ProjectChanged => "the project folder changed while the command ran",
             Self::Io => "couldn't be read or written safely",
         }
@@ -352,6 +358,7 @@ pub(crate) fn apply(
         names: Names::new(instruction_names),
         limit: MAX_ENTRIES,
         umask: process_umask(),
+        project_len: project.as_os_str().len(),
     };
     apply_within(upper, project, expected_root, &rules)
 }
@@ -365,6 +372,8 @@ struct Rules<'a> {
     limit: usize,
     /// Taken off a new file's or folder's mode.
     umask: u32,
+    /// The project path's length in bytes, to keep every applied path within [`PATH_LIMIT`].
+    project_len: usize,
 }
 
 /// The process umask, from `/proc/self/status` (Linux 4.7 and later): `umask(2)` can only read
@@ -907,6 +916,10 @@ impl Planner<'_> {
         name: &OsStr,
         depth: usize,
     ) -> Result<Node, Refusal> {
+        // Before anything is opened, so a refused folder's contents are never read.
+        if self.rules.project_len + 1 + path.as_os_str().len() > PATH_LIMIT {
+            return Err(Refusal::TooLong);
+        }
         let stat = stat_at(dir, name).map_err(|_| Refusal::Io)?;
         let file_type = kind(&stat);
         let is_dir = file_type == FileType::Directory;
@@ -1327,7 +1340,7 @@ impl Applier<'_> {
     }
 
     /// Apply a new folder's entries, then give it its staged mode less the umask (no set-id
-    /// bits).
+    /// bits), always with the owner's rwx so the start walk can read it on later runs.
     fn fill<'p>(
         &mut self,
         at: &At<'_>,
@@ -1344,7 +1357,10 @@ impl Applier<'_> {
             fresh: true,
         };
         self.entries(fd.as_fd(), &at.path, entries, pin, false, deletes);
-        match fs::fchmod(&fd, Mode::from_raw_mode(mode & 0o777 & !self.rules.umask)) {
+        match fs::fchmod(
+            &fd,
+            Mode::from_raw_mode((mode & 0o777 & !self.rules.umask) | 0o700),
+        ) {
             Ok(()) => self.report.applied.push(at.path.clone()),
             Err(_) => self.report.refuse(&at.path, Refusal::Io),
         }
@@ -1772,6 +1788,7 @@ mod tests {
                 names: Names::new(&names),
                 limit,
                 umask: 0o022,
+                project_len: self.project.as_os_str().len(),
             };
             apply_within(&self.upper, &self.project, run.root, &rules)
         }
@@ -2910,8 +2927,8 @@ mod tests {
     }
 
     /// A chain of `depth` folders with 255-byte names in `base`, made one level at a time from
-    /// the folder above (the whole path is far longer than PATH_MAX), with `files` empty files in
-    /// the deepest.
+    /// the folder above (past 16 levels the whole path is longer than PATH_MAX), with `files`
+    /// empty files in the deepest.
     fn deep_chain(base: &Path, depth: usize, files: usize) {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         let mut dir = fs::open(base, flags, Mode::empty()).unwrap();
@@ -2936,9 +2953,11 @@ mod tests {
     fn apply_report_stays_small_for_a_deep_tree_of_long_names() {
         let t = Tree::new();
         let run = t.run();
-        // About 51 KB a path at the bottom: unclipped, 200 of them would be 5 MB of report.
-        deep_chain(&t.upper, 200, 3);
+        // About 3.9 KB a path at the bottom (the most the start walk can read): unclipped, 200
+        // of them would be 780 KB of report.
+        deep_chain(&t.upper, 14, 186);
         let r = t.apply(&run);
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
         assert_eq!((r.applied.total, r.applied.first.len()), (200, LIST_LIMIT));
         let kept: usize = [&r.applied, &r.deleted, &r.conflicted, &r.held_back]
             .iter()
@@ -2958,6 +2977,37 @@ mod tests {
         }
         assert!(text.len() < 5 * (LIST_LIMIT + 2) * 300, "{}", text.len());
         assert!(text.contains("  … and 150 more"));
+    }
+
+    #[test]
+    fn apply_refuses_paths_the_next_start_walk_could_not_read() {
+        let t = Tree::new();
+        let run = t.run();
+        // 20 levels of 256 bytes: the path passes PATH_MAX after 15.
+        deep_chain(&t.upper, 20, 1);
+        let r = t.apply(&run);
+        assert_eq!(r.refused.total, 1, "{:?}", r.refused);
+        assert!(r.refused.first.iter().all(|(_, why)| *why == TooLong));
+        assert!(r
+            .to_string()
+            .contains("path too long to check on later runs"));
+        // What was applied is the part that fits, and the next run still starts.
+        assert_eq!(r.applied.total, 15);
+        assert!(walk_with_files(&t.project, MAX_ENTRIES).is_ok());
+    }
+
+    #[test]
+    fn apply_gives_a_new_folder_the_owners_rwx() {
+        let t = Tree::new();
+        let run = t.run();
+        t.up("closed/inner", "x");
+        // A mode that still lets the planner read it, but not the next walk's children.
+        chmod(&t.upper.join("closed"), 0o500);
+        let r = t.apply(&run);
+        chmod(&t.upper.join("closed"), 0o755);
+        assert!(r.refused.is_empty(), "{r:?}");
+        assert_eq!(mode(&t.project.join("closed")), 0o700);
+        assert!(walk_with_files(&t.project, MAX_ENTRIES).is_ok());
     }
 
     #[test]

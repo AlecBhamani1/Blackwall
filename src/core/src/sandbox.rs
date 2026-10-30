@@ -1626,9 +1626,10 @@ mod tests {
             assert!(project.staged_left().is_empty());
         }
 
-        /// A chain of `depth` folders with 255-byte names in `base`, made a level at a time (the
-        /// whole path is far past PATH_MAX).
-        fn deep_chain(base: &Path, depth: usize) {
+        /// A chain of `depth` folders with 255-byte names in `base`, made a level at a time, with
+        /// `files` empty files in the deepest. About 3.8 KB a path at 14 levels: close to what
+        /// the start walk can read.
+        fn deep_chain(base: &Path, depth: usize, files: usize) {
             use rustix::fs::{Mode, OFlags};
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
             let mut dir = rustix::fs::open(base, flags, Mode::empty()).unwrap();
@@ -1636,6 +1637,16 @@ mod tests {
                 let name = format!("{level:03}{}", "d".repeat(252));
                 rustix::fs::mkdirat(&dir, name.as_str(), Mode::from_raw_mode(0o755)).unwrap();
                 dir = rustix::fs::openat(&dir, name.as_str(), flags, Mode::empty()).unwrap();
+            }
+            let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+            for n in 0..files {
+                rustix::fs::openat(
+                    &dir,
+                    format!("f{n}").as_str(),
+                    create,
+                    Mode::from_raw_mode(0o644),
+                )
+                .unwrap();
             }
         }
 
@@ -1672,7 +1683,7 @@ mod tests {
                 .unwrap();
                 // A deep tree of long names, and a refused name that sorts after all of it.
                 let upper = guard.staged.as_ref().unwrap().staging.upper.clone();
-                deep_chain(&upper, 200);
+                deep_chain(&upper, 14, 186);
                 std::fs::create_dir(upper.join("~.ssh")).unwrap();
                 std::fs::create_dir(upper.join("~.ssh/.ssh")).unwrap();
                 let outcome = crate::tools::run_with_input(
@@ -1906,6 +1917,8 @@ mod tests {
             for (path, text) in [
                 (".rustup/marker", "RUSTUP-MARKER"),
                 (".cargo/credentials.toml", "TOKEN-CONTENT"),
+                (".local/share/uv/credentials/token", "UV-TOKEN"),
+                (".local/share/uv/python/marker", "UV-PYTHON"),
                 (".ssh/id", "KEY-CONTENT"),
             ] {
                 std::fs::create_dir_all(home.join(path).parent().unwrap()).unwrap();
@@ -1931,7 +1944,7 @@ mod tests {
                 // The rest of home is still not there, and the credentials can't be read.
                 let listing = project.run(&format!("ls -A {h}"), &bw).await.unwrap();
                 assert!(
-                    listing.starts_with("Exit: 0\n.cargo\n.rustup\n"),
+                    listing.starts_with("Exit: 0\n.cargo\n.local\n.rustup\n"),
                     "{listing}"
                 );
                 let ssh = project.run(&format!("cat {h}/.ssh/id"), &bw).await;
@@ -1944,6 +1957,22 @@ mod tests {
                 // file mask), rather than reading as empty.
                 assert!(!token.contains("TOKEN-CONTENT"), "{token}");
                 assert!(token.contains("Permission denied"), "{token}");
+                // uv's own files are readable; its credentials folder is empty, and writes into
+                // it are thrown away.
+                let uv = format!("{h}/.local/share/uv");
+                let python = project.run(&format!("cat {uv}/python/marker"), &bw).await;
+                assert!(
+                    python.as_ref().unwrap().starts_with("Exit: 0\nUV-PYTHON"),
+                    "{python:?}"
+                );
+                let folder = project
+                    .run(&format!("ls -A {uv}/credentials; echo end"), &bw)
+                    .await;
+                let folder = folder.unwrap();
+                assert!(folder.starts_with("Exit: 0\nend\n"), "{folder}");
+                let write = format!("printf x > {uv}/credentials/new || echo REFUSED");
+                assert!(project.run(&write, &bw).await.unwrap().contains("REFUSED"));
+                assert!(!home.join(".local/share/uv/credentials/new").exists());
             }
             assert!(project.staged_left().is_empty());
             TEST_HOME.with(|test| *test.borrow_mut() = None);

@@ -19,7 +19,7 @@
 //! session bus, docker.sock); the one thing from there that can appear is a single regular `/etc`
 //! file reached through a link, such as `resolv.conf` (see [`etc_at`]). The data folder and the
 //! host root are not mounted, and of the home folder only the toolchain folders in
-//! [`HOME_TOOLCHAINS`] are, read-only, with their credential files masked (see
+//! [`HOME_TOOLCHAINS`] are, read-only, with their credential files and folders masked (see
 //! [`toolchains_at`]).
 //!
 //! Masks: a directory becomes an empty read-only tmpfs; a file becomes a read-only bind of
@@ -91,6 +91,8 @@ pub(crate) const HOME_TOOLCHAINS: [&str; 6] = [
 ];
 /// Credential files inside [`HOME_TOOLCHAINS`], each hidden behind a read-only `/dev/null`.
 const HOME_CREDENTIALS: [&str; 2] = [".cargo/credentials", ".cargo/credentials.toml"];
+/// Credential folders inside [`HOME_TOOLCHAINS`], each hidden behind an empty read-only tmpfs.
+const HOME_CREDENTIAL_DIRS: [&str; 1] = [".local/share/uv/credentials"];
 /// Where host pathname sockets live. Nothing that resolves under these is ever mounted, with
 /// one exception: a single regular file (see [`etc_at`]).
 const SOCKET_DIRS: [&str; 2] = ["run", "var/run"];
@@ -136,17 +138,20 @@ pub(crate) enum Root {
 }
 
 /// What of the home folder a sandbox gets: [`HOME_TOOLCHAINS`] folders, bound read-only at their
-/// own paths, and the credential files in them to mask.
+/// own paths, and the credential files and folders in them to mask.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Toolchains {
     pub binds: Vec<PathBuf>,
     pub masks: Vec<PathBuf>,
+    pub dir_masks: Vec<PathBuf>,
 }
 
 /// Each of [`HOME_TOOLCHAINS`] under the absolute `home` that is a real folder, reached from
 /// `home` through real folders only (a symlink anywhere below `home` leaves it out), with each of
-/// [`HOME_CREDENTIALS`] in it that is a regular file to mask. A credential name that is anything
-/// else (a link, a folder), or can't be checked, leaves its toolchain folder out: fail closed.
+/// [`HOME_CREDENTIALS`] in it that is a regular file, and each of [`HOME_CREDENTIAL_DIRS`] that is
+/// a real folder, to mask. A credential name that is anything else (a link, or a file where a
+/// folder belongs and the other way round), or can't be checked, leaves its toolchain folder out:
+/// fail closed.
 pub(crate) fn toolchains_at(home: &Path) -> Toolchains {
     let mut found = Toolchains::default();
     if !home.is_absolute() {
@@ -162,6 +167,7 @@ pub(crate) fn toolchains_at(home: &Path) -> Toolchains {
             continue;
         }
         let mut masks = Vec::new();
+        let mut dir_masks = Vec::new();
         let mut safe = true;
         for credential in HOME_CREDENTIALS.iter().map(Path::new) {
             if credential.parent() != Some(dir) {
@@ -174,9 +180,21 @@ pub(crate) fn toolchains_at(home: &Path) -> Toolchains {
                 _ => safe = false,
             }
         }
+        for credential in HOME_CREDENTIAL_DIRS.iter().map(Path::new) {
+            if credential.parent() != Some(dir) {
+                continue;
+            }
+            let path = home.join(credential);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => dir_masks.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => safe = false,
+            }
+        }
         if safe {
             found.binds.push(home.join(dir));
             found.masks.extend(masks);
+            found.dir_masks.extend(dir_masks);
         }
     }
     found
@@ -348,6 +366,10 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
     }
     for file in &plan.toolchains.masks {
         push(&[s("--ro-bind"), s("/dev/null"), file.as_os_str()]);
+    }
+    for dir in &plan.toolchains.dir_masks {
+        let dir = dir.as_os_str();
+        push(&[s("--tmpfs"), dir, s("--remount-ro"), dir]);
     }
     let bound: Vec<&Path> = plan
         .roots
@@ -648,6 +670,38 @@ mod tests {
         assert!(found.masks.is_empty());
         // Only an absolute home counts.
         assert_eq!(toolchains_at(Path::new("relative")), Toolchains::default());
+    }
+
+    #[test]
+    fn uv_credentials_are_masked_with_an_empty_read_only_tmpfs() {
+        let home = Temp::new();
+        let h = &home.0;
+        std::fs::create_dir_all(h.join(".local/share/uv/python")).unwrap();
+        // Absent: uv is bound as it is, with nothing masked.
+        let found = toolchains_at(h);
+        assert_eq!(found.binds, [h.join(".local/share/uv")]);
+        assert!(found.dir_masks.is_empty());
+        // A real folder: bound, then masked.
+        std::fs::create_dir(h.join(".local/share/uv/credentials")).unwrap();
+        let found = toolchains_at(h);
+        assert_eq!(found.dir_masks, [h.join(".local/share/uv/credentials")]);
+        let project = h.join("work/p");
+        let plan = MountPlan {
+            toolchains: found,
+            ..plan(&project, false, &[])
+        };
+        let a = strs(&args(&plan));
+        let uv = h.join(".local/share/uv").display().to_string();
+        let masked = format!("--tmpfs {uv}/credentials --remount-ro {uv}/credentials");
+        assert!(pos(&a, &format!("--ro-bind {uv} {uv}")) < pos(&a, &masked));
+        assert!(pos(&a, &masked) < pos(&a, &format!("--ro-bind-fd 10 {}", project.display())));
+        // A link, or a file, in its place keeps the whole folder out (fail closed).
+        std::fs::remove_dir(h.join(".local/share/uv/credentials")).unwrap();
+        symlink(h.join("work"), h.join(".local/share/uv/credentials")).unwrap();
+        assert_eq!(toolchains_at(h), Toolchains::default());
+        std::fs::remove_file(h.join(".local/share/uv/credentials")).unwrap();
+        std::fs::write(h.join(".local/share/uv/credentials"), "x").unwrap();
+        assert_eq!(toolchains_at(h), Toolchains::default());
     }
 
     const UPPER: &str = "/d/staging/0123456789abcdef/upper";
