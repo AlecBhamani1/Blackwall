@@ -554,6 +554,9 @@ credentials from reaching a program that does not need them.
 - Programs you run for yourself (unsandboxed shell commands and command tools, MCP servers) get
   `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`,
   plus the names you list under `env` in `mcp.json` or `tools.json`.
+- An unsandboxed shell command gets that list but no `env` names, since the shell has no `env`
+  list: `SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE`, `DISPLAY` and similar are not inherited. On
+  Linux every shell command currently runs unsandboxed, so this applies to all of them.
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
 - `PATH` is your login shell's, with relative and empty entries, the project folder and the

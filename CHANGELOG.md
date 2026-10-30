@@ -180,6 +180,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is owner-only (not allowed in project servers), is refused on URL servers and HTTP tools, is
   ignored for sandboxed commands, and cannot name `PATH`, loader-injection variables or
   Blackwall's own secrets.
+  Unsandboxed shell commands lose inherited variables the same way: only the list above reaches
+  them, so `SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE`, `DISPLAY` and similar no longer arrive.
+  On Linux every shell command currently runs unsandboxed, so this applies to all of them. The
+  shell has no `env` list.
 
 - A first launch with no saved connection lists the servers found on this computer and connects
   only to the one chosen, instead of connecting to the first that answered.
