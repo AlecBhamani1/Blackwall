@@ -1047,8 +1047,9 @@ mod tests {
     /// A tool config whose program creates `tool-write` in the project folder.
     #[cfg(unix)]
     const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#;
+    // PowerShell, not cmd.exe, which rejects the verbatim `\\?\` working directory.
     #[cfg(windows)]
-    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["cmd","/C","type nul > tool-write"]}]}"#;
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["powershell","-NoProfile","-Command","Set-Content -Path tool-write -Value x"]}]}"#;
 
     /// Run a tool that creates `tool-write` in the project, approving its prompt.
     #[cfg(any(unix, windows))]
