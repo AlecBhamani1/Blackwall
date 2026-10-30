@@ -14,6 +14,12 @@
     scope = 'tool';
     place = 'project';
   }
+  const OUTSIDE_NOTE = 'Runs outside the sandbox with your account permissions.';
+  // The label already says it, so the details do not repeat it; the event keeps it for others.
+  $: shownDetail =
+    approval.outsideSandbox && approval.detail.startsWith(OUTSIDE_NOTE)
+      ? approval.detail.slice(OUTSIDE_NOTE.length).replace(/^\n+/, '')
+      : approval.detail;
   $: toolName = approval.tool?.tool.slice(approval.tool.server.length + 2) ?? '';
   $: saved = (
     place === 'project' ? `allow_${scope}_in_project` : `allow_${scope}`
@@ -48,13 +54,11 @@
       Sends data off this device. The program below may pass this prompt to an online service.
       Blackwall asks every time.
     </p>{/if}
-  {#if approval.outsideSandbox}<p class="outside">
-      Runs outside the sandbox with your account permissions.
-    </p>{/if}
+  {#if approval.outsideSandbox}<p class="outside">{OUTSIDE_NOTE}</p>{/if}
   <!-- Scrollable action details need a keyboard focus target. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="action-details" role="region" aria-label="Proposed action details" tabindex="0">
-    <pre>{approval.detail}</pre>
+    <pre>{shownDetail}</pre>
   </div>
   <div class="actions">
     <button class="deny" disabled={busy} onclick={() => decide('deny')}>Deny</button><span

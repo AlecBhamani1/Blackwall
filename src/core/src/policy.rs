@@ -468,27 +468,26 @@ impl Policy {
         saved: Option<&ToolRule>,
         rule: Option<MatchedRule>,
     ) {
-        let _ = tokio::time::timeout(
-            IO_TIMEOUT,
-            self.append(kind, subject, None, decision, allowed, saved, rule),
-        )
-        .await;
+        self.record_program(kind, subject, None, decision, allowed, saved, rule)
+            .await;
     }
 
-    /// [`Self::record`] for an owner command tool: `program` is the absolute path that runs,
+    /// [`Self::record`] that also names `program`, the absolute path an owner command tool runs,
     /// which `subject` (the configured command) may name only by a bare name.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_program(
         &self,
         kind: ApprovalKind,
         subject: &str,
-        program: &Path,
+        program: Option<&Path>,
         decision: Decision,
         allowed: bool,
+        saved: Option<&ToolRule>,
         rule: Option<MatchedRule>,
     ) {
         let _ = tokio::time::timeout(
             IO_TIMEOUT,
-            self.append(kind, subject, Some(program), decision, allowed, None, rule),
+            self.append(kind, subject, program, decision, allowed, saved, rule),
         )
         .await;
     }

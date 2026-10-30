@@ -197,15 +197,29 @@ impl Approvals {
                     .record_program(
                         ApprovalKind::Exec,
                         subject,
-                        program,
+                        Some(program),
                         Decision::Deny,
                         false,
+                        None,
                         verdict.matched,
                     )
                     .await;
                 return Ok(false);
             }
         }
+        // A broken policy file drops its deny rules, so the owner is told. The outside note
+        // stays first, where clients look for it.
+        let detail = match policy.as_ref().and_then(|policy| policy.error.as_ref()) {
+            Some(error) => match detail.strip_prefix(crate::command_tools::OUTSIDE_NOTE) {
+                Some(rest) => format!(
+                    "{}\n\n{error}\n\n{}",
+                    crate::command_tools::OUTSIDE_NOTE,
+                    rest.trim_start()
+                ),
+                None => format!("{error}\n\n{detail}"),
+            },
+            None => detail,
+        };
         let allowed = self
             .ask(
                 request_id,
@@ -224,9 +238,10 @@ impl Approvals {
                 .record_program(
                     ApprovalKind::Exec,
                     subject,
-                    program,
+                    Some(program),
                     Decision::Ask,
                     allowed,
+                    None,
                     verdict.matched,
                 )
                 .await;
@@ -327,25 +342,17 @@ impl Approvals {
                 answer != ApprovalDecision::Deny
             }
         };
-        match program {
-            Some(program) => {
-                policy
-                    .record_program(kind, subject, program, decision, allowed, verdict.matched)
-                    .await
-            }
-            None => {
-                policy
-                    .record(
-                        kind,
-                        subject,
-                        decision,
-                        allowed,
-                        saved.as_ref(),
-                        verdict.matched,
-                    )
-                    .await
-            }
-        }
+        policy
+            .record_program(
+                kind,
+                subject,
+                program,
+                decision,
+                allowed,
+                saved.as_ref(),
+                verdict.matched,
+            )
+            .await;
         Ok(allowed)
     }
     /// Save the rule the owner chose and apply it to the rest of the run. A rule that cannot be

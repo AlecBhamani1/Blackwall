@@ -1405,6 +1405,91 @@ mod tests {
         .await;
         assert_eq!(events.len(), 0, "{events:?}");
         assert!(matches!(results[0], Err(ToolError::Denied)));
+        assert!(matches!(results[1], Err(ToolError::Denied)));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_prompt_names_a_broken_policy_after_the_note() {
+        let (events, _, directory) = echo_twice(Isolation::Outside, "{").await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest { detail, .. }
+                if detail.starts_with(&format!("{OUTSIDE_NOTE}\n\nThe policy file is not valid."))
+                    && detail.contains("\n\nProject: ")
+        )), "{events:?}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_runs_on_tool_still_asks_every_time() {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"review","description":"Review","command":["cat"],"stdin":"json","parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]}"#,
+        )
+        .await;
+        tokio::fs::write(
+            directory.join(crate::policy::POLICY_FILE),
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"cat"}]}"#,
+        )
+        .await
+        .unwrap();
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = Isolation::Sandboxed;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let (captured, decisions) = (events.clone(), approvals.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = &event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id: request_id.clone(),
+                        approval_id: approval_id.clone(),
+                        decision: ApprovalDecision::AlwaysAllow,
+                    })
+                    .unwrap();
+                captured.lock().unwrap().push(event);
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        for _ in 0..2 {
+            tool.delegate(
+                &workspace,
+                "Review the diff",
+                "run",
+                &approvals,
+                &emit,
+                Duration::from_secs(10),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest {
+                remember: false,
+                off_device: true,
+                outside_sandbox: false,
+                ..
+            }
+        )));
+        drop(workspace);
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
