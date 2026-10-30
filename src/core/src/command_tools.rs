@@ -15,7 +15,7 @@ use std::{
 };
 
 mod http;
-pub use http::{delete_secret, save_secret, SECRET_SERVICE};
+pub use http::{delete_secret, save_secret, save_secret_with, SECRET_SERVICE};
 
 pub const COMMAND_TOOLS_FILE: &str = "tools.json";
 const MAX_FILE_BYTES: usize = 64 * 1024;

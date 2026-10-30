@@ -33,6 +33,9 @@ pub(crate) struct AppState {
     default_endpoint: String,
     api_key: Option<String>,
     pub(crate) share_hub: ShareManager,
+    /// Access keys kept for this run only, by origin, when there is no keyring to save them in.
+    /// Never written to disk.
+    pub(crate) session_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl AppState {
@@ -50,6 +53,7 @@ impl AppState {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             share_hub: ShareManager::new(),
+            session_keys: Default::default(),
         })
     }
 }
@@ -59,7 +63,7 @@ pub(crate) async fn scoped_api_key(
     state: &AppState,
     endpoint: &str,
 ) -> Result<Option<String>, CommandError> {
-    if let Some(key) = crate::credentials::model_key(endpoint)
+    if let Some(key) = crate::credentials::model_key(state, endpoint)
         .await
         .map_err(|message| CommandError {
             code: "credential_error",

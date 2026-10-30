@@ -21,6 +21,12 @@ pub const RECOVER: &str = if cfg!(target_os = "macos") {
 
 const UNAVAILABLE: &str = "No system keyring is available. Install and unlock a Secret Service provider such as GNOME Keyring or KWallet, then try again.";
 
+/// What a save that only the keyring can hold says when there is no keyring.
+pub const KEYRING_OFF_NOTE: &str = "No system keyring is available, so this can't be saved. Start GNOME Keyring or KWallet, then restart Blackwall.";
+
+/// A secret write, replaceable in tests.
+pub type SetSecret = fn(&str, &str, &str) -> Result<(), SecretError>;
+
 #[derive(Debug, PartialEq)]
 pub enum SecretError {
     /// The saved value is not valid UTF-8.
@@ -39,6 +45,13 @@ impl SecretError {
             Self::TooLong => format!("This access key is too long for {STORE}."),
             Self::Unavailable => UNAVAILABLE.into(),
             Self::Failed => failure.into(),
+        }
+    }
+    /// Like [`explain`](Self::explain) for a save that cannot be kept anywhere else.
+    pub fn explain_save(self, failure: impl Into<String>) -> String {
+        match self {
+            Self::Unavailable => KEYRING_OFF_NOTE.into(),
+            other => other.explain(failure),
         }
     }
 }

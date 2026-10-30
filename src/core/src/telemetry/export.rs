@@ -325,6 +325,8 @@ pub enum ExportError {
         crate::secrets::RECOVER
     )]
     CredentialStore,
+    #[error("{}", crate::secrets::KEYRING_OFF_NOTE)]
+    KeyringOff,
     #[error("Export is off. Set an OTLP endpoint first.")]
     Off,
     #[error("The collector could not be reached.")]
@@ -351,6 +353,7 @@ impl ExportError {
             Self::HeaderOtherOrigin(..) => "header_other_origin",
             Self::InvalidSettings => "invalid_settings",
             Self::CredentialStore => "credential_store",
+            Self::KeyringOff => "keyring_off",
             Self::Off => "off",
             Self::Connect => "connect",
             Self::Timeout => "timeout",
@@ -381,14 +384,26 @@ pub fn keychain_header(account: &str) -> Result<Option<String>, crate::secrets::
 /// Save a header value for the origin of `endpoint`. Blocking. Returns the header to list in the
 /// settings.
 pub fn save_header(endpoint: &str, name: &str, value: &str) -> Result<SavedHeader, ExportError> {
+    save_header_with(endpoint, name, value, crate::secrets::set)
+}
+
+/// [`save_header`] with the secret write supplied by the caller.
+pub fn save_header_with(
+    endpoint: &str,
+    name: &str,
+    value: &str,
+    set: crate::secrets::SetSecret,
+) -> Result<SavedHeader, ExportError> {
     let origin = origin_of(&normalize_endpoint(endpoint)?)?;
     let name = header_name(name)?;
     let value = header_value(value)?;
     let text = value
         .to_str()
         .map_err(|_| ExportError::InvalidHeaderValue)?;
-    crate::secrets::set(SECRET_SERVICE, &account(&origin, &name), text)
-        .map_err(|_| ExportError::CredentialStore)?;
+    set(SECRET_SERVICE, &account(&origin, &name), text).map_err(|error| match error {
+        crate::secrets::SecretError::Unavailable => ExportError::KeyringOff,
+        _ => ExportError::CredentialStore,
+    })?;
     Ok(SavedHeader { name, origin })
 }
 
