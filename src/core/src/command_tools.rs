@@ -481,6 +481,8 @@ impl CommandTool {
             detail.push_str(&format!("\nStandard input: JSON, {}", shown_bytes(input)));
         }
         if !outside {
+            // Never ask to approve a command that can't run in the sandbox.
+            crate::sandbox::ready(workspace).await?;
             detail.push_str(&format!("\n\n{}", workspace.execution.description()));
         }
         if !approvals
@@ -565,6 +567,8 @@ impl CommandTool {
             prompt.len(),
         );
         if !outside {
+            // Never ask to approve a command that can't run in the sandbox.
+            crate::sandbox::ready(workspace).await?;
             detail.push_str(&format!("\n\n{}", workspace.execution.description()));
         }
         if !approvals

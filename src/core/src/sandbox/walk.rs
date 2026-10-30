@@ -167,7 +167,7 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
     Ok(Walk { masks })
 }
 
-pub(crate) const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
+const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
 const DATA_INSIDE_PROJECT: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
 const NO_HOME: &str = "Blackwall couldn't find your home folder, so it won't sandbox this command.";
 const UNRESOLVED: &str =

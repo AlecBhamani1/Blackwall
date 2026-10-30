@@ -513,6 +513,8 @@ pub async fn execute(
             if command.trim().is_empty() || command.len() > 8000 {
                 return Err(ToolError::Arguments);
             }
+            // Never ask to approve a command that can't run under the owner's profile.
+            crate::sandbox::ready(workspace).await?;
             let detail = format!(
                 "Project: {}\nCommand: {command}\n\n{}",
                 workspace.path.display(),

@@ -466,12 +466,14 @@ fn exit_130_interrupted() {
 #[test]
 fn result_line_has_reason_denied_and_usage() {
     let fixture = Fixture::new();
+    // A file edit always asks, whether or not this computer can sandbox commands (on Linux without
+    // bubblewrap a shell command fails before its prompt).
     let server = Server::start(vec![
-        tool_call("shell", json!({"command":"echo hi"})),
+        tool_call("write_file", json!({"path":"notes.txt","content":"hi"})),
         answer("The command was denied."),
     ]);
     fixture.connect(&server);
-    let output = fixture.run(&["run", "--json", "run echo hi"]);
+    let output = fixture.run(&["run", "--json", "write notes.txt"]);
     assert_eq!(output.status.code(), Some(3));
     let result = result_line(&output);
     assert_eq!(result["status"], "complete");

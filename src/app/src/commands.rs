@@ -329,15 +329,16 @@ impl BridgeError {
     }
 }
 
-/// Whether sandboxed command profiles can run on this computer, and why not when they can't.
-/// The first call on Linux looks for a working bubblewrap, so it runs off the async workers.
+/// Whether sandboxed command profiles can run on this computer, and why not when they can't, for
+/// the profile selector. `None` on every OS but Linux, where nothing is gated. The first call on
+/// Linux looks for a working bubblewrap, so it runs off the async workers.
 #[tauri::command]
 pub(crate) async fn sandbox_status(
     app: AppHandle,
-) -> Result<blackwall_core::sandbox::SandboxStatus, String> {
+) -> Result<Option<blackwall_core::sandbox::SandboxStatus>, String> {
     let directory = crate::identity::data_directory(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        blackwall_core::sandbox::sandbox_status(&directory)
+        blackwall_core::sandbox::selector_status(&directory)
     })
     .await
     .map_err(|_| "Blackwall couldn't check the command sandbox.".to_owned())

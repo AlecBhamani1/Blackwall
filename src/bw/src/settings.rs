@@ -125,31 +125,33 @@ impl Settings {
         self.set_with_persistence(key, value, |updated| updated.save(store))
     }
 
-    /// [`Settings::set`], refusing a sandboxed `profile` that `sandbox` says can't run on this
-    /// computer, with the reason. `sandbox` is asked only for a sandboxed profile.
+    /// [`Settings::set`], checking a sandboxed `profile` against `sandbox`, which is `None` where
+    /// nothing is gated (every OS but Linux). Workspace-write is refused where it can't run yet.
+    /// Read-only is always accepted, since it is the safe default: when the sandbox is unavailable
+    /// the note comes back as a warning, and commands fail closed until it is fixed.
     pub fn set_with_sandbox(
         &mut self,
         store: &LocalStore,
         key: &str,
         value: &str,
-        sandbox: impl FnOnce() -> SandboxStatus,
-    ) -> Result<(), String> {
+        sandbox: impl FnOnce() -> Option<SandboxStatus>,
+    ) -> Result<Option<&'static str>, String> {
+        let mut warning = None;
         if key == "profile" {
             let profile: ExecutionProfile = value.parse()?;
             if profile != ExecutionProfile::Unsandboxed {
-                let status = sandbox();
-                if !status.available {
-                    return Err(status
-                        .note
-                        .unwrap_or("Sandboxed commands can't run on this computer.")
-                        .into());
-                }
-                if profile == ExecutionProfile::WorkspaceWrite && !status.workspace_write {
-                    return Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into());
+                if let Some(status) = sandbox() {
+                    if profile == ExecutionProfile::WorkspaceWrite && !status.workspace_write {
+                        return Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into());
+                    }
+                    if !status.available {
+                        warning = status.note;
+                    }
                 }
             }
         }
-        self.set(store, key, value)
+        self.set(store, key, value)?;
+        Ok(warning)
     }
 
     fn set_with_persistence(
@@ -922,45 +924,67 @@ mod tests {
         let store = LocalStore::open(&directory.0).unwrap();
         let mut settings = defaults(&store);
         settings.set(&store, "profile", "unsandboxed").unwrap();
-        let unavailable = || SandboxStatus {
-            available: false,
-            note: Some("Install Bubblewrap."),
-            workspace_write: false,
+        let unavailable = || {
+            Some(SandboxStatus {
+                available: false,
+                note: Some("Install Bubblewrap."),
+                workspace_write: false,
+            })
         };
+        // Workspace-write can't run here yet: refused, nothing changes or is saved.
         let before = settings.clone();
-        for profile in ["read-only", "workspace-write"] {
-            assert_eq!(
-                settings.set_with_sandbox(&store, "profile", profile, unavailable),
-                Err("Install Bubblewrap.".into())
-            );
-            assert_eq!(settings, before);
-            assert_eq!(defaults(&store), before, "nothing saved");
-        }
-        // Unsandboxed never needs the sandbox, so it isn't even asked.
-        settings
-            .set_with_sandbox(&store, "profile", "unsandboxed", || unreachable!())
-            .unwrap();
-        // Read-only alone, as on Linux until Workspace-write arrives.
-        let read_only = || SandboxStatus {
-            available: true,
-            note: None,
-            workspace_write: false,
-        };
         assert_eq!(
-            settings.set_with_sandbox(&store, "profile", "workspace-write", read_only),
+            settings.set_with_sandbox(&store, "profile", "workspace-write", unavailable),
             Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into())
         );
-        settings
-            .set_with_sandbox(&store, "profile", "read-only", read_only)
-            .unwrap();
+        assert_eq!(settings, before);
+        assert_eq!(defaults(&store), before, "nothing saved");
+        // Read-only is the safe default, so it is accepted, with the note as a warning.
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "read-only", unavailable),
+            Ok(Some("Install Bubblewrap."))
+        );
         assert_eq!(
             defaults(&store).execution_profile,
             ExecutionProfile::ReadOnly
         );
-        // Other settings don't ask either.
-        settings
-            .set_with_sandbox(&store, "web", "on", || unreachable!())
-            .unwrap();
+        // Unsandboxed and other settings never ask.
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "unsandboxed", || unreachable!()),
+            Ok(None)
+        );
+        assert_eq!(
+            settings.set_with_sandbox(&store, "web", "on", || unreachable!()),
+            Ok(None)
+        );
+        // Available, Read-only only (Linux until Workspace-write arrives).
+        let read_only = || {
+            Some(SandboxStatus {
+                available: true,
+                note: None,
+                workspace_write: false,
+            })
+        };
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "read-only", read_only),
+            Ok(None)
+        );
+        assert!(settings
+            .set_with_sandbox(&store, "profile", "workspace-write", read_only)
+            .is_err());
+        // Where nothing is gated (every OS but Linux), every profile is accepted as before.
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "workspace-write", || None),
+            Ok(None)
+        );
+        assert_eq!(
+            defaults(&store).execution_profile,
+            ExecutionProfile::WorkspaceWrite
+        );
+        assert_eq!(
+            blackwall_core::sandbox::selector_status(&directory.0).is_some(),
+            cfg!(target_os = "linux")
+        );
     }
 
     #[test]

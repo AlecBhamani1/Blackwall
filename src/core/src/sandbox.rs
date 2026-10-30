@@ -61,6 +61,19 @@ pub fn sandbox_status(data_directory: &Path) -> SandboxStatus {
         }
     }
 }
+/// [`sandbox_status`] where the owner's choice of profile depends on it: Linux only, since there
+/// whether bubblewrap works varies by computer. Elsewhere it is `None` and nothing is gated.
+pub fn selector_status(data_directory: &Path) -> Option<SandboxStatus> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(sandbox_status(data_directory))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = data_directory;
+        None
+    }
+}
 #[cfg(target_os = "linux")]
 fn linux_status(availability: &linux::Availability) -> SandboxStatus {
     SandboxStatus {
@@ -168,14 +181,7 @@ pub(crate) async fn prepare(
             // Unsandboxed needs no bubblewrap.
             &linux::Availability::Unavailable
         } else {
-            let data = workspace
-                .execution
-                .data_directory
-                .clone()
-                .ok_or_else(|| ToolError::Execution(NO_DATA_FOLDER.into()))?;
-            tokio::task::spawn_blocking(move || linux::availability(&data))
-                .await
-                .map_err(|_| ToolError::Execution(PREPARE_FAILED.into()))?
+            find_availability(workspace).await?
         };
         prepare_with(workspace, process, unsandboxed, pass_through, availability).await
     }
@@ -190,12 +196,58 @@ pub(crate) async fn prepare(
     }
 }
 
+/// Whether a command under the owner's profile could start now, so the owner is never asked to
+/// approve one that can't. Linux only: elsewhere the backend checks when the command starts, as
+/// before. [`prepare`] checks again.
+pub(crate) async fn ready(workspace: &Workspace) -> Result<(), ToolError> {
+    #[cfg(target_os = "linux")]
+    {
+        if workspace.execution.profile == ExecutionProfile::Unsandboxed {
+            return Ok(());
+        }
+        ready_with(workspace, find_availability(workspace).await?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = workspace;
+        Ok(())
+    }
+}
+/// Bubblewrap is there and the profile is one Linux can sandbox.
+#[cfg(target_os = "linux")]
+fn ready_with(workspace: &Workspace, availability: &linux::Availability) -> Result<(), ToolError> {
+    if !matches!(availability, linux::Availability::Available { .. }) {
+        let note = availability.note().unwrap_or(linux::LINUX_UNAVAILABLE);
+        return Err(ToolError::Execution(note.into()));
+    }
+    if workspace.execution.profile == ExecutionProfile::WorkspaceWrite {
+        return Err(ToolError::Execution(LINUX_WORKSPACE_WRITE_LATER.into()));
+    }
+    Ok(())
+}
+/// [`linux::availability`] for the workspace's data folder, off the async workers.
+#[cfg(target_os = "linux")]
+async fn find_availability(
+    workspace: &Workspace,
+) -> Result<&'static linux::Availability, ToolError> {
+    let data = workspace
+        .execution
+        .data_directory
+        .clone()
+        .ok_or_else(|| ToolError::Execution(NO_DATA_FOLDER.into()))?;
+    tokio::task::spawn_blocking(move || linux::availability(&data))
+        .await
+        .map_err(|_| ToolError::Execution(PREPARE_FAILED.into()))
+}
+
 #[cfg(target_os = "linux")]
 const PREPARE_FAILED: &str =
     "Blackwall couldn't prepare the sandbox for this command. The command was not run.";
 #[cfg(target_os = "linux")]
 const NO_DATA_FOLDER: &str =
     "Blackwall couldn't find its data folder, so it won't sandbox this command.";
+#[cfg(target_os = "linux")]
+const WHOLE_COMPUTER: &str = "Blackwall won't sandbox the whole computer. Choose a project folder.";
 
 /// [`prepare`] with `availability` given, rather than found. Linux only: Read-only runs under
 /// bubblewrap, and anything that can't be checked or set up fails closed without running.
@@ -213,20 +265,15 @@ pub(crate) async fn prepare_with(
         from_process(unsandboxed, &workspace.path, pass_through).apply(&mut process);
         return Ok((process, RunGuard::empty()));
     }
-    let bwrap = match availability {
-        linux::Availability::Available { bwrap, .. } => bwrap.clone(),
-        other => {
-            let note = other.note().unwrap_or(linux::LINUX_UNAVAILABLE);
-            return Err(ToolError::Execution(note.into()));
-        }
+    ready_with(workspace, availability)?;
+    let linux::Availability::Available { bwrap, .. } = availability else {
+        return Err(ToolError::Execution(linux::LINUX_UNAVAILABLE.into()));
     };
-    if execution.profile == ExecutionProfile::WorkspaceWrite {
-        return Err(ToolError::Execution(LINUX_WORKSPACE_WRITE_LATER.into()));
-    }
+    let bwrap = bwrap.clone();
     // `Workspace::open` canonicalizes, so `/` is the whole file system however it was named. The
     // location check refuses it too (it holds the home folder); this doesn't depend on that.
     if workspace.path.parent().is_none() {
-        return Err(ToolError::Execution(walk::OUTSIDE_HOME.into()));
+        return Err(ToolError::Execution(WHOLE_COMPUTER.into()));
     }
     let data = execution
         .data_directory
@@ -431,6 +478,30 @@ mod tests {
         assert!(serde_json::from_str::<ExecutionProfile>("\"unknown\"").is_err());
     }
 
+    #[test]
+    fn only_linux_gates_the_profile_selector() {
+        let data =
+            std::env::temp_dir().join(format!("blackwall-selector-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&data).unwrap();
+        assert_eq!(selector_status(&data).is_some(), cfg!(target_os = "linux"));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn the_pre_approval_check_changes_nothing_off_linux() {
+        // The backend still decides when the command starts, as before.
+        let mut workspace = Workspace::open(&std::env::temp_dir()).unwrap();
+        for profile in [
+            ExecutionProfile::ReadOnly,
+            ExecutionProfile::WorkspaceWrite,
+            ExecutionProfile::Unsandboxed,
+        ] {
+            workspace.execution.profile = profile;
+            assert!(ready(&workspace).await.is_ok());
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn unsupported_platform_fails_closed_but_explicit_opt_out_is_available() {
@@ -580,7 +651,10 @@ mod tests {
             project.workspace.execution = execution;
             project.workspace.execution.data_directory = Some(project.data());
             let error = project.run("printf x > ran", &fake).await.unwrap_err();
-            assert!(error.to_string().starts_with("Choose a project folder"));
+            assert_eq!(
+                error.to_string(),
+                "Blackwall won't sandbox the whole computer. Choose a project folder."
+            );
             assert!(!ran.exists());
             assert!(project.runs_left().is_empty());
             // Choosing Unsandboxed still runs, without bubblewrap.
@@ -670,6 +744,83 @@ mod tests {
             assert_eq!(project.runs_left().len(), 1);
             drop(guard);
             assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_command_that_cannot_be_sandboxed_fails_before_any_approval_prompt() {
+            use crate::{approvals::Approvals, command_tools::Isolation, protocol::AgentEvent};
+            let mut project = Project::new();
+            for availability in [Availability::Unavailable, Availability::Retrying] {
+                assert_eq!(
+                    ready_with(&project.workspace, &availability)
+                        .unwrap_err()
+                        .to_string(),
+                    availability.note().unwrap()
+                );
+            }
+            let prompts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = prompts.clone();
+            let emit = move |event| {
+                if matches!(event, AgentEvent::ApprovalRequest { .. }) {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            };
+            let approvals = Approvals::default();
+            let shell = crate::model::ToolCall {
+                id: "shell".into(),
+                function: crate::model::ToolFunction {
+                    name: "shell".into(),
+                    arguments: r#"{"command":"printf x > ran"}"#.into(),
+                },
+            };
+            let tool: crate::command_tools::CommandTool = serde_json::from_value(serde_json::json!({"name":"touch_probe", "description":"Linux fixture", "command":["/usr/bin/touch", "ran"]})).unwrap();
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
+            // Whatever this host has: no data folder to stage in, and Workspace-write (not on
+            // Linux yet, or no bubblewrap at all) both stop the command before the prompt.
+            let no_data = project.workspace.execution.clone();
+            project.workspace.execution.data_directory = None;
+            let mut cases = vec![project.workspace.execution.clone()];
+            project.workspace.execution = no_data;
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            cases.push(project.workspace.execution.clone());
+            for execution in cases {
+                project.workspace.execution = execution;
+                let timeout = Duration::from_secs(5);
+                let cap = Default::default();
+                // An unanswered prompt would wait forever, so a time limit means one was shown.
+                let shell_result = tokio::time::timeout(
+                    timeout,
+                    crate::tools::execute(
+                        &project.workspace,
+                        &shell,
+                        "run",
+                        &approvals,
+                        &emit,
+                        timeout,
+                        &cap,
+                    ),
+                )
+                .await
+                .expect("the shell asked for approval");
+                assert!(shell_result.is_err());
+                let tool_result = tokio::time::timeout(
+                    timeout,
+                    tool.run(
+                        &project.workspace,
+                        "{}",
+                        "run",
+                        &approvals,
+                        &emit,
+                        timeout,
+                        &cap,
+                    ),
+                )
+                .await
+                .expect("the command tool asked for approval");
+                assert!(tool_result.is_err());
+            }
+            assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(!project.workspace.path.join("ran").exists());
         }
 
         #[test]

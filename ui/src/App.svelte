@@ -125,11 +125,29 @@
       authBusy = false;
     }
   }
-  // Unknown (the browser preview, or no answer) leaves every profile on offer; a command that
-  // can't be sandboxed still fails closed and says why.
+  // Only Linux reports a status. Unknown (other systems, the browser preview, or no answer)
+  // leaves every profile on offer; a command that can't be sandboxed still fails closed and says
+  // why. Read-only, the safe default, stays selectable even when the sandbox is unavailable.
   let sandbox: SandboxStatus | null = null;
-  $: sandboxed = sandbox?.available ?? true;
-  $: workspaceWrite = sandboxed && (sandbox?.workspaceWrite ?? true);
+  $: workspaceWrite = sandbox?.workspaceWrite ?? true;
+  const SANDBOX_RECHECK_MS = 30_000;
+  let sandboxRecheck: ReturnType<typeof setTimeout> | undefined;
+  /** Ask again; when the sandbox is unavailable (bubblewrap may have failed only for a moment,
+   * or been installed since), ask once more about 30 seconds later. */
+  async function checkSandbox(recheck = false) {
+    if (!isDesktop()) return;
+    const status = await sandboxClient.status();
+    sandbox = status;
+    clearTimeout(sandboxRecheck);
+    sandboxRecheck = undefined;
+    if (!recheck && status && !status.available) {
+      sandboxRecheck = setTimeout(() => void checkSandbox(true), SANDBOX_RECHECK_MS);
+    }
+  }
+  $: if ($agentMode) void checkSandbox();
+  function windowFocused() {
+    if ($agentMode) void checkSandbox();
+  }
   let setupOpen = false;
   let startupServers: LocalService[] | null = null;
   $: if (!setupOpen) startupServers = null;
@@ -172,14 +190,16 @@
 
   onMount(() => {
     void initializeApp();
-    if (isDesktop()) void sandboxClient.status().then((status) => (sandbox = status));
     void updateController.initialize();
     window.addEventListener('keydown', keydown);
+    window.addEventListener('focus', windowFocused);
   });
 
   onDestroy(() => {
     stopPairing();
     window.removeEventListener('keydown', keydown);
+    window.removeEventListener('focus', windowFocused);
+    clearTimeout(sandboxRecheck);
     controller.destroy();
   });
 </script>
@@ -269,7 +289,7 @@
                 bind:value={$executionProfile}
                 disabled={$runState !== 'idle'}
               >
-                <option value="read-only" disabled={!sandboxed}>Read-only</option>
+                <option value="read-only">Read-only</option>
                 <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
                 <option value="unsandboxed">Unsandboxed (full access)</option>
               </select>

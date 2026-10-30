@@ -49,7 +49,7 @@ fn run() -> Result<(), StartupError> {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 if let Ok(directory) = identity::data_directory(&handle) {
-                    let _ = blackwall_core::sandbox::sandbox_status(&directory);
+                    let _ = blackwall_core::sandbox::selector_status(&directory);
                 }
             });
             Ok(())

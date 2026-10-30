@@ -429,9 +429,11 @@ fn set_setting(
         )?;
     }
     let recording = settings.trace.enabled;
-    settings.set_with_sandbox(store, key, value, || {
-        blackwall_core::sandbox::sandbox_status(directory)
-    })?;
+    if let Some(note) = settings.set_with_sandbox(store, key, value, || {
+        blackwall_core::sandbox::selector_status(directory)
+    })? {
+        eprintln!("Note: {note}");
+    }
     if settings.trace.enabled != recording {
         blackwall_core::usage::mark_recording(
             directory,

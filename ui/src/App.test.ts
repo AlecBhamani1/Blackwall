@@ -148,7 +148,7 @@ it('sends the selected command boundary and resets full access on a new session'
   expect(network).not.toBeChecked();
 });
 
-it('disables sandboxed profiles and shows the bubblewrap note when unavailable', async () => {
+it('keeps Read-only, disables Workspace-write and shows the bubblewrap note when unavailable', async () => {
   const user = userEvent.setup();
   const note =
     "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
@@ -165,18 +165,58 @@ it('disables sandboxed profiles and shows the bubblewrap note when unavailable',
     within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
   );
   const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
-  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeDisabled();
+  expect(await screen.findByText(note)).toBeInTheDocument();
+  // Read-only is the safe default and stays on offer; commands fail closed until it works.
+  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  expect(profile).toHaveValue('read-only');
   expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled();
   expect(within(profile).getByRole('option', { name: 'Unsandboxed (full access)' })).toBeEnabled();
-  expect(await screen.findByText(note)).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Learn more' }));
   expect(native.invoke).toHaveBeenCalledWith('open_setup_link', {
     kind: 'sandbox-docs',
     invitation: null,
   });
-  // Choosing Unsandboxed is still possible, and explicit.
   await user.selectOptions(profile, 'unsandboxed');
-  expect(profile).toHaveValue('unsandboxed');
+  await user.selectOptions(profile, 'read-only');
+  expect(profile).toHaveValue('read-only');
+});
+
+it('checks the sandbox again on focus and about 30 seconds after it was unavailable', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const note = "Bubblewrap didn't start just now. Try again in a moment.";
+    let available = false;
+    const fallback = native.invoke.getMockImplementation();
+    native.invoke.mockImplementation(async (command, args) =>
+      command === 'sandbox_status'
+        ? { available, note: available ? null : note, workspaceWrite: false }
+        : fallback?.(command, args),
+    );
+    const checks = () =>
+      native.invoke.mock.calls.filter(([command]) => command === 'sandbox_status').length;
+    render(App);
+    await screen.findByRole('combobox', { name: 'Model' });
+    expect(checks()).toBe(0);
+    await fireEvent.click(
+      within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+    );
+    expect(await screen.findByText(note)).toBeInTheDocument();
+    expect(checks()).toBe(1);
+    // Still failing 30 seconds later: asked once more, and not again after that.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(checks()).toBe(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(checks()).toBe(2);
+    // Coming back to the window asks again, and a working sandbox clears the note.
+    available = true;
+    await fireEvent.focus(window);
+    await waitFor(() => expect(screen.queryByText(note)).not.toBeInTheDocument());
+    expect(checks()).toBe(3);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(checks()).toBe(3);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it('offers Read-only but not yet Workspace-write where only Read-only is sandboxed', async () => {
