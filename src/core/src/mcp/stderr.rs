@@ -84,6 +84,19 @@ pub(crate) fn sanitize(bytes: &[u8], secrets: &[String]) -> String {
     text.to_owned()
 }
 
+/// Characters that draw nothing or reorder text (bidi overrides and isolates, zero-width marks,
+/// the byte order mark, tag characters and the like: general category Cf plus the default-ignorable
+/// code points), which could make a card look like something it is not.
+fn is_invisible_format(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{34F}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}'
+        | '\u{8E2}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
 fn strip(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -116,7 +129,7 @@ fn strip(text: &str) -> String {
                 _ => {}
             },
             '\n' | '\t' => out.push(c),
-            c if c.is_control() => {}
+            c if c.is_control() || is_invisible_format(c) => {}
             c => out.push(c),
         }
     }
@@ -148,6 +161,17 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_removes_invisible_formatting_characters() {
+        let raw = "ok \u{202E}gnp.exe\u{202C} \u{2066}a\u{2069}\u{200B}b\u{200D}c\u{200F}\u{FEFF}d\u{AD}e\u{2060}f\u{E0041}g\u{FE0F}h";
+        assert_eq!(sanitize(raw.as_bytes(), &[]), "ok gnp.exe abcdefgh");
+        // Ordinary non-ASCII text stays.
+        assert_eq!(
+            sanitize("caf\u{e9} \u{4e2d}\u{6587}".as_bytes(), &[]),
+            "caf\u{e9} \u{4e2d}\u{6587}"
+        );
+    }
+
+    #[test]
     fn sanitize_keeps_the_last_forty_lines_and_redacts_across_the_cut() {
         let raw: String = (0..100).map(|n| format!("line {n}\n")).collect();
         let text = sanitize(raw.as_bytes(), &[]);
@@ -176,7 +200,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let pieces: [&[u8]; 10] = [
+        let pieces: [&[u8]; 12] = [
             b"\x1b[",
             b"\x1b]",
             b"\x07",
@@ -187,6 +211,8 @@ mod tests {
             b"s3c",
             b"secret",
             b"\xe2\x82",
+            "\u{202E}".as_bytes(),
+            "\u{200B}".as_bytes(),
         ];
         let secrets = ["secret".to_owned(), "s3c".to_owned(), "\u{20ac}".to_owned()];
         for _ in 0..2000 {
@@ -194,12 +220,13 @@ mod tests {
             for _ in 0..(next() % 400) {
                 match next() % 3 {
                     0 => input.push(next() as u8),
-                    _ => input.extend_from_slice(pieces[(next() % 10) as usize]),
+                    _ => input.extend_from_slice(pieces[(next() % 12) as usize]),
                 }
             }
             let text = sanitize(&input, &secrets);
             assert!(text.len() <= TAIL_BYTES && text.lines().count() <= TAIL_LINES);
             assert!(!text.contains('\x1b') && !text.contains("secret"));
+            assert!(!text.chars().any(is_invisible_format));
         }
     }
 }

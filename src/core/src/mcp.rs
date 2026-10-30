@@ -501,7 +501,15 @@ impl McpServers {
             let secrets: Vec<String> = environment.iter().map(|(_, value)| value.clone()).collect();
             let launched = tokio::time::timeout(
                 STARTUP_TIMEOUT,
-                launch(&config, directory, &env, environment, pinned, &tail),
+                launch(
+                    &config,
+                    directory,
+                    project,
+                    &env,
+                    environment,
+                    pinned,
+                    &tail,
+                ),
             )
             .await;
             let failure = match launched {
@@ -973,6 +981,7 @@ async fn project_servers(directory: &Path, workspace: &Path) -> Vec<ServerConfig
 async fn launch(
     config: &ServerConfig,
     directory: &Path,
+    project: &Path,
     env: &crate::child_env::ChildEnv,
     environment: Vec<(String, String)>,
     pinned: Option<http::Pinned>,
@@ -984,7 +993,7 @@ async fn launch(
             http::headers(&environment)?,
             pinned,
         )?),
-        None => start_process(config, directory, env, &environment, tail)?,
+        None => start_process(config, directory, project, env, &environment, tail)?,
     };
     let secrets = environment.into_iter().map(|(_, value)| value).collect();
     let mut connection = Connection::new(transport, secrets);
@@ -996,14 +1005,15 @@ async fn launch(
 fn start_process(
     config: &ServerConfig,
     directory: &Path,
+    project: &Path,
     env: &crate::child_env::ChildEnv,
     secrets: &[(String, String)],
     tail: &StdMutex<Option<StderrTail>>,
 ) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
-        let program =
-            crate::command_tools::resolve_program(&config.command[0]).ok_or_else(|| {
+        let program = crate::command_tools::resolve_program(&config.command[0], project)
+            .ok_or_else(|| {
                 ToolError::Execution(format!(
                     "{} was not found on this computer.",
                     config.command[0]
@@ -1022,7 +1032,7 @@ fn start_process(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (config, directory, env, secrets, tail);
+        let _ = (config, directory, project, env, secrets, tail);
         Err(ToolError::Execution(
             "MCP servers are not supported on this platform.".into(),
         ))
@@ -1509,6 +1519,7 @@ mod tests {
         let transport = start_process(
             &config,
             &std::env::temp_dir(),
+            Path::new(""),
             &env,
             &[],
             &Default::default(),

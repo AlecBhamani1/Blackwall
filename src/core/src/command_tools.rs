@@ -413,7 +413,7 @@ impl CommandTool {
                 .await
                 .map(|text| output.trim_text(text));
         }
-        let (program, args, input) = self.prepared(&values)?;
+        let (program, args, input) = self.prepared(&values, &workspace.path)?;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
             "Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
@@ -491,7 +491,7 @@ impl CommandTool {
         if let Some(schema) = &self.parameters {
             validate_arguments(schema, &values)?;
         }
-        let (program, args, input) = self.prepared(&values)?;
+        let (program, args, input) = self.prepared(&values, &workspace.path)?;
         let detail = format!(
             "A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}\n\n{}",
             workspace.path.display(),
@@ -515,7 +515,7 @@ impl CommandTool {
     }
 
     /// The resolved program, its arguments, and its standard input for checked `values`.
-    fn prepared(&self, values: &Value) -> Result<Prepared, ToolError> {
+    fn prepared(&self, values: &Value, project: &Path) -> Result<Prepared, ToolError> {
         let args = self.command[1..]
             .iter()
             .map(|arg| match placeholder(arg) {
@@ -540,7 +540,7 @@ impl CommandTool {
                 Some(input)
             }
         };
-        let program = resolve_program(&self.command[0]).ok_or_else(|| {
+        let program = resolve_program(&self.command[0], project).ok_or_else(|| {
             ToolError::Execution(format!(
                 "{} was not found on this computer.",
                 self.command[0]
@@ -573,10 +573,28 @@ fn is_option(value: &str) -> bool {
     value.starts_with('-') || (cfg!(windows) && value.starts_with('/'))
 }
 
-/// An absolute program, or a bare name found in an absolute `PATH` directory, so a relative
-/// `PATH` entry can never select a program from the project folder. On Windows the `.exe` is
-/// resolved here, so the approved path is exactly the one that runs.
-pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
+/// An absolute program, or a bare name found in the child's validated `PATH`: absolute entries
+/// outside the AppImage mount and `project`, whose directory also does not resolve (through
+/// symlinks) into `project`. A repository can therefore never plant the program that an owner
+/// command tool or MCP server starts. On Windows the `.exe` is resolved here, so the approved path
+/// is exactly the one that runs.
+pub(crate) fn resolve_program(program: &str, project: &Path) -> Option<PathBuf> {
+    let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    resolve_in(
+        program,
+        &crate::tools::search_path()?,
+        crate::child_env::valid_appdir(appdir.as_deref()),
+        &project,
+    )
+}
+
+fn resolve_in(
+    program: &str,
+    search_path: &std::ffi::OsStr,
+    appdir: Option<&Path>,
+    project: &Path,
+) -> Option<PathBuf> {
     let name = if cfg!(windows) && Path::new(program).extension().is_none() {
         format!("{program}.exe")
     } else {
@@ -586,10 +604,15 @@ pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
     if path.is_absolute() {
         return executable(path).then(|| path.to_path_buf());
     }
-    std::env::split_paths(&crate::tools::search_path()?)
-        .filter(|directory| directory.is_absolute())
+    let outside_project = |directory: &Path| {
+        project.as_os_str().is_empty()
+            || std::fs::canonicalize(directory).is_ok_and(|real| !real.starts_with(project))
+    };
+    let directories = crate::child_env::validated_path(search_path, appdir, project)?;
+    std::env::split_paths(&directories)
+        .filter(|directory| directory.is_absolute() && outside_project(directory))
         .map(|directory| directory.join(&name))
-        .find(|candidate| candidate.is_absolute() && executable(candidate))
+        .find(|candidate| executable(candidate))
 }
 
 fn executable(path: &Path) -> bool {
@@ -722,6 +745,67 @@ fn validate_schema(schema: &Schema) -> Result<(), &'static str> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A fixture directory under the temp folder with a `bin` that holds an executable `tool`.
+    #[cfg(unix)]
+    fn plant(root: &Path, dir: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(dir);
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_names_skip_project_directories_on_path_even_through_symlinks() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("blackwall-resolve-{}", rand::random::<u64>()));
+        let project = root.join("project");
+        let planted = plant(&project, "node_modules/.bin");
+        let system = plant(&root, "system/bin");
+        std::os::unix::fs::symlink(&planted, root.join("alias")).unwrap();
+        let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        // The project directory is on PATH first, but the system one is chosen.
+        assert_eq!(
+            resolve_in("tool", &join(&[&planted, &system]), None, &project),
+            Some(system.join("tool"))
+        );
+        // A symlink that leads back into the project does not count either.
+        assert_eq!(
+            resolve_in(
+                "tool",
+                &join(&[&root.join("alias"), &system]),
+                None,
+                &project
+            ),
+            Some(system.join("tool"))
+        );
+        // With only project entries, nothing is found.
+        assert_eq!(
+            resolve_in(
+                "tool",
+                &join(&[&planted, &root.join("alias")]),
+                None,
+                &project
+            ),
+            None
+        );
+        // An absolute path in the configuration is the owner's explicit choice.
+        assert_eq!(
+            resolve_in(
+                planted.join("tool").to_str().unwrap(),
+                &join(&[&system]),
+                None,
+                &project
+            ),
+            Some(planted.join("tool"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     async fn load(body: &str) -> (CommandTools, std::path::PathBuf) {
         let directory =

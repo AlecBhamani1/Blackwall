@@ -861,6 +861,7 @@ mod tests {
         let connection = super::super::launch(
             &config,
             &std::env::temp_dir(),
+            std::path::Path::new(""),
             &env,
             environment,
             None,
