@@ -1193,7 +1193,14 @@ mod tests {
             assert_eq!((summary.model_calls, summary.tool_calls), (2, 3));
             assert_eq!((summary.input_tokens, summary.output_tokens), (220, 15));
             assert_eq!(summary.model.as_deref(), Some("fixture-model"));
-            assert!(summary.error.is_none());
+            assert_eq!(
+                summary.error.as_deref(),
+                Some(if content {
+                    "The run was denied."
+                } else {
+                    "denied"
+                })
+            );
             let spans = crate::trace::read(&directory.join("user"), &summary.id).unwrap();
             let write = spans
                 .iter()

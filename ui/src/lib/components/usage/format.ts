@@ -31,7 +31,7 @@ export const modeNames: Record<string, string> = {
 /** Run outcomes other than `complete`, as the Run success tile words them. */
 export const outcomeNames: Record<string, [string, string]> = {
   error: ['error', 'errors'],
-  iterations: ['stopped at step limit', 'stopped at step limit'],
+  iterations: ['hit the step limit', 'hit the step limit'],
   cancelled: ['stopped', 'stopped'],
   denied: ['denied', 'denied'],
 };

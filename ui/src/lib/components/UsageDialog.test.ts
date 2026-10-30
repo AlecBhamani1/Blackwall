@@ -27,7 +27,7 @@ describe('usage dialog', () => {
     expect(tiles.getByText('4.82M')).toBeInTheDocument();
     expect(tiles.getByText('143 runs · 38 sessions · 1,206 model calls')).toBeInTheDocument();
     expect(tiles.getByText('96.5%')).toBeInTheDocument();
-    expect(tiles.getByText('3 errors · 2 stopped at step limit')).toBeInTheDocument();
+    expect(tiles.getByText('3 errors · 2 hit the step limit')).toBeInTheDocument();
     expect(tiles.getByText('41 tok/s')).toBeInTheDocument();
     expect(tiles.getByText('median · qwen3.6')).toBeInTheDocument();
     expect(tiles.getByText('612k')).toBeInTheDocument();

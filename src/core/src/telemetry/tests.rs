@@ -475,9 +475,11 @@ fn metrics_file_has_token_usage_and_duration_per_call() {
         1.0
     );
     assert_eq!(
-        count(names::RUN_OUTCOMES, "blackwall.run.outcome", "complete"),
+        count(names::RUN_OUTCOMES, "blackwall.run.outcome", "denied"),
         1.0
     );
+    let spans = read(&directory, &list(&directory, 1)[0].id).unwrap();
+    assert_eq!(spans[0].error.as_deref(), Some("denied"));
     let body = std::fs::read_to_string(directory.join(METRICS_DIRECTORY).join(&files[0])).unwrap();
     let first: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(first["resourceMetrics"][0]["schemaUrl"], names::SCHEMA_URL);
