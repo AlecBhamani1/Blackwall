@@ -14,27 +14,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   folders, only their direct children), there is no home folder, only the system folders (without
   `/usr/local/etc` or Linuxbrew's `etc`) and a short list of `/etc` files are visible, `/tmp` is
   private, Unix-domain sockets are blocked and the network is off unless Command network is on.
-  The project is mounted from the folder that was checked, by descriptor. It uses the bundled
-  bubblewrap, or a root-owned system one of version 0.12.0 or newer. Without one, the note asks
-  you to install Blackwall's `.deb` or AppImage or a newer bubblewrap; when the system won't let
-  bubblewrap start a sandbox (the AppImage on Ubuntu 24.04), the note suggests the `.deb`. Commands
-  fail closed either way. A project that is your home folder, contains it, contains another
-  mounted file system, has more than 500,000 files outside the skipped folders, or takes more than
-  10 seconds to check is refused. With command network on, sandboxed commands can reach localhost
-  and the local network, and the desktop app says so.
+  In Read-only the project is mounted from the folder that was checked, by descriptor. It uses
+  the bundled bubblewrap, or a root-owned system one of version 0.12.0 or newer. Without one, the
+  note asks you to install Blackwall's `.deb` or AppImage or a newer bubblewrap; when the system
+  won't let bubblewrap start a sandbox (the AppImage on Ubuntu 24.04), the note suggests the
+  `.deb`. Commands fail closed either way. A project that is your home folder, contains it,
+  contains another mounted file system, has more than 500,000 files outside the skipped folders, or
+  takes more than 10 seconds to check is refused. With command network on, sandboxed commands can
+  reach localhost and the local network, and the desktop app says so.
 - On Linux, Workspace-write commands now run in a sandbox. The command writes to a private staged
   copy of the project; when it has exited, Blackwall checks the changes and copies them into the
   project: new and changed files, deletes and new folders. It refuses protected names (`.git`,
   `.ssh` and the others) and instruction files in any letter case, links that lead outside the
-  project, set-user-ID, set-group-ID and file-capability files, devices, pipes and sockets, and
-  overlay metadata it can't apply safely, and the output says why next to each path. Anything you
-  changed in the project meanwhile is a conflict and your version stays; deletes are held back when
-  anything else was refused or conflicted. Nothing is applied after a time limit, a cancel or the
-  output-size stop, and a command that exits with any code, including one killed by the sandbox,
-  has its finished changes applied. Staged changes that weren't all applied are kept for 24 hours,
-  in a folder the output names. One Workspace-write command runs per project at a time. It needs
-  Linux 5.11 or newer with overlay mounts; a project on an overlay file system, inside Blackwall's
-  data folder, or containing the bundled bubblewrap or the app's own files is refused, and
+  project, set-user-ID, set-group-ID and file-capability files, devices, pipes and sockets, and the
+  output says why next to each path. Overlay metadata it can't apply safely, or more than 500,000
+  changed entries, refuses the whole batch. Writes into the hidden folders succeed inside the
+  sandbox but are thrown away. Anything you changed in the project meanwhile is a conflict and your
+  version stays; deletes are held back when anything else was refused or conflicted. Nothing is
+  applied after a time limit, a cancel, the output-size stop or a launcher killed from outside, and
+  a command that exits with any code, including one killed inside the sandbox, has its finished
+  changes applied. Staged changes that weren't all applied are kept for at least 24 hours, in a
+  folder the output names. One Workspace-write command runs per project at a time. It needs Linux
+  5.11 or newer with overlay mounts; a project on an overlay file system, inside Blackwall's data
+  folder, or containing the bubblewrap Blackwall uses or the app's own files is refused, and
   Read-only keeps working where Workspace-write isn't available.
 - The Linux packages bundle bubblewrap 0.13.1 for sandboxed commands at `/usr/lib/blackwall/bwrap`
   (not setuid, built in CI from the release tarball whose SHA-256 is pinned; LGPL-2.0-or-later,
