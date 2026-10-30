@@ -601,8 +601,8 @@ network is off unless Command network is on. The project cannot be your home fol
 that contains it, or `/`; Blackwall's data folder cannot be inside the project; a project that
 contains another mounted file system is refused; and so is a project with more than 500,000 files
 and folders, not counting the contents of the skipped folders, with the message naming its largest
-folder. If the check takes more than 10 seconds, the command doesn't run. Workspace-write is not
-available on Linux yet: the selector turns it off and `bw` refuses it.
+folder. If the check takes more than 10 seconds, the command doesn't run. Workspace-write has
+extra rules, [below](#workspace-write-on-linux).
 
 The sandbox mounts the project folder that was checked, by its descriptor, so a folder swapped in
 at the project's path after the check is not what the command sees. Inside the project the check
@@ -617,6 +617,49 @@ and so is the project's location. Blackwall runs a real sandboxed command when t
 on `bw`'s first sandboxed command; if that fails for a moment, the note says "Bubblewrap didn't
 start just now. Try again in a moment." A blocked or momentary failure is checked again after 30
 seconds; a missing or old bubblewrap needs a restart once it is installed.
+
+#### Workspace-write on Linux
+
+A Workspace-write command doesn't write to the project. It sees the project through a private
+overlay, and its writes go to a staged copy in Blackwall's data folder. When the command has
+exited, Blackwall checks the staged changes and copies them into the project. The output ends with
+a report: how many files were applied, deleted, refused and conflicted, and each path.
+
+New and changed files, deletes and new folders are copied. Blackwall refuses, and says why next
+to the path:
+
+- a protected name (`.git`, `.ssh` and the others listed above) in any letter case, at any depth;
+- an instruction file: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or an extra file you
+  configured (see [Project instructions](#project-instructions)), in any letter case;
+- a link that leads outside the project, or that could stand in for an instruction file's folder;
+- a set-user-ID or set-group-ID file, or one with file capabilities;
+- a device, pipe or socket;
+- overlay metadata Blackwall can't apply safely.
+
+A file you changed in the project while the command ran is a conflict: your version stays and the
+path is listed. Deletes are held back, and listed as such, when anything else was refused or
+conflicted, because a refused change can make a delete lose it. Applying is not atomic: if
+Blackwall stops part way, what was done stays.
+
+Nothing is applied when the command hits its time limit, is cancelled, or is stopped for too much
+output, or when it can't start. A command that exits with any code still has its changes checked
+and applied, including one killed inside the sandbox (for example by running out of memory, exit
+128 plus the signal number). When anything was refused, conflicted, held back or not applied, the
+staged copy is kept for 24 hours and the output names its folder, so you can take what you need
+from it; Blackwall removes it after that. When everything was applied, nothing is kept.
+
+One Workspace-write command runs in a project at a time. A second waits for the first, then fails
+with a note that another is still running.
+
+It needs Linux 5.11 or newer with overlay mounts allowed. Without them, the selector turns
+Workspace-write off with a note, `bw` refuses it, and Read-only keeps working. A project on an
+overlay file system (as inside a container), inside Blackwall's data folder, or holding the
+bundled `bwrap` or the app's own files is refused up front with a plain note.
+
+One gap remains: a process of your user, outside the sandbox, that renames the project folder in
+the instant before the command starts makes the sandbox read the folder that was put there. It
+never writes to it, and Blackwall applies nothing if the project is no longer the folder the
+command started with.
 
 ### Child environments
 

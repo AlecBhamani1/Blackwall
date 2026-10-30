@@ -20,9 +20,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bubblewrap start a sandbox (the AppImage on Ubuntu 24.04), the note suggests the `.deb`. Commands
   fail closed either way. A project that is your home folder, contains it, contains another
   mounted file system, has more than 500,000 files outside the skipped folders, or takes more than
-  10 seconds to check is refused. Workspace-write is not available on Linux yet and is turned off
-  there. With command network on, sandboxed commands can reach localhost and the local network,
-  and the desktop app says so.
+  10 seconds to check is refused. With command network on, sandboxed commands can reach localhost
+  and the local network, and the desktop app says so.
+- On Linux, Workspace-write commands now run in a sandbox. The command writes to a private staged
+  copy of the project; when it has exited, Blackwall checks the changes and copies them into the
+  project: new and changed files, deletes and new folders. It refuses protected names (`.git`,
+  `.ssh` and the others) and instruction files in any letter case, links that lead outside the
+  project, set-user-ID, set-group-ID and file-capability files, devices, pipes and sockets, and
+  overlay metadata it can't apply safely, and the output says why next to each path. Anything you
+  changed in the project meanwhile is a conflict and your version stays; deletes are held back when
+  anything else was refused or conflicted. Nothing is applied after a time limit, a cancel or the
+  output-size stop, and a command that exits with any code, including one killed by the sandbox,
+  has its finished changes applied. Staged changes that weren't all applied are kept for 24 hours,
+  in a folder the output names. One Workspace-write command runs per project at a time. It needs
+  Linux 5.11 or newer with overlay mounts; a project on an overlay file system, inside Blackwall's
+  data folder, or containing the bundled bubblewrap or the app's own files is refused, and
+  Read-only keeps working where Workspace-write isn't available.
 - The Linux packages bundle bubblewrap 0.13.1 for sandboxed commands at `/usr/lib/blackwall/bwrap`
   (not setuid, built in CI from the release tarball whose SHA-256 is pinned; LGPL-2.0-or-later,
   license text under `/usr/share/doc/blackwall/bubblewrap/`, see `NOTICE`). Where the system's
