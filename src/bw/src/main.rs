@@ -45,6 +45,7 @@ const COMMANDS: &str = "SLASH COMMANDS (settings are saved for future CLI launch
   /settings iterations <n>  Limit model/tool iterations per Agent run
   /settings profile <read-only|workspace-write|unsandboxed>  Set command access (default read-only)
   /settings command-network on|off  Command network access (default off; unsandboxed always on)
+  /settings command-tools-isolation outside|sandboxed  Where command tools run (default outside)
   /settings timeout <n>     Limit each shell command in seconds
   /settings text-tool-calls on|off  Read tool calls the model writes as text (default off; always asks)
   /settings otlp-endpoint <url|off>  Export traces and metrics over OTLP/HTTP (default off)
