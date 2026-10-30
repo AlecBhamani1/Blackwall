@@ -207,7 +207,7 @@ mod tests {
         let matches = workspace
             .find_files("GUIDE", FileSearchMode::Names)
             .unwrap();
-        assert_eq!(matches.matches[0].entry.path, "./docs/guide.md");
+        assert_eq!(matches.matches[0].entry.path, "docs/guide.md");
         let matches = workspace
             .find_files("NEEDLE", FileSearchMode::Contents)
             .unwrap();

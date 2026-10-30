@@ -666,7 +666,8 @@ mod tests {
         );
         assert!(!instructions.for_tool(&workspace, &call("read_file", "escape/file.rs")));
         assert!(instructions.sources().is_empty());
-        assert!(instructions.warnings.len() >= 3);
+        // checked() rejects the tool target before instruction discovery follows its symlink.
+        assert!(instructions.warnings.len() >= 2);
         assert!(!instructions.warnings.join(" ").contains("outside secret"));
     }
 
