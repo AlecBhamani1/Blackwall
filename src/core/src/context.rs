@@ -21,6 +21,8 @@ pub struct ContextBudget {
 }
 /// The default command output cap, which was the hard limit before it was configurable.
 pub const DEFAULT_OUTPUT_BYTES: u32 = 64 * 1024;
+/// The longest a command's time limit can be set to, in seconds. Nothing sandboxed runs longer.
+pub const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3600;
 /// The range a command output cap can take.
 pub const OUTPUT_BYTES_RANGE: std::ops::RangeInclusive<u32> = 4096..=1_048_576;
 impl Default for ContextBudget {
@@ -42,7 +44,7 @@ impl ContextBudget {
             || self.output_tokens > 32768
             || u64::from(self.output_tokens) + self.safety_tokens() >= self.context_window
             || !(1..=100).contains(&self.max_iterations)
-            || !(10..=3600).contains(&self.command_timeout_seconds)
+            || !(10..=MAX_COMMAND_TIMEOUT_SECONDS).contains(&self.command_timeout_seconds)
             || !OUTPUT_BYTES_RANGE.contains(&self.max_output_bytes)
         {
             return Err(ContextError::Budget);

@@ -426,12 +426,13 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// A fresh private `<data>/staging/probe-<random>` directory. A symlinked data directory or
-/// staging directory is refused. Probe directories left over from crashes are removed after a day.
+/// staging directory is refused. Staging folders left over from crashes are removed after a day
+/// by the general sweep ([`super::staging::sweep`]).
 fn prepare_scratch(data_directory: &Path) -> std::io::Result<PathBuf> {
     private_scratch(data_directory, "probe-")
 }
 /// A fresh private (0700) `<data>/staging/run-<random>` directory for one sandboxed command's
-/// files, with the same checks and clean-up as the probe's.
+/// files, with the same checks and the same staging sweep as the probe's.
 pub(crate) fn run_directory(data_directory: &Path) -> std::io::Result<PathBuf> {
     private_scratch(data_directory, "run-")
 }
