@@ -1,0 +1,66 @@
+# AppArmor profile for the bubblewrap that the Blackwall .deb bundles at /usr/lib/blackwall/bwrap.
+#
+# Ubuntu 24.04 and later stop programs without a profile from using capabilities in a new user
+# namespace (kernel.apparmor_restrict_unprivileged_userns), which bubblewrap needs for the sandbox.
+# This profile lets only the bundled bwrap do that, following Ubuntu's bwrap-userns-restrict model:
+# bwrap is confined, and every program it starts is stacked with blackwall-bwrap-child, which has
+# no capabilities and cannot create user namespaces or mounts. bwrap sets no_new_privs before it
+# runs the command, so the children stay inside the stack.
+#
+# The rules are the smallest set that bubblewrap 0.13.1 needed on Ubuntu 24.04 for the sandbox
+# Blackwall builds (read-only binds, masks, overlays, seccomp, with or without network):
+#   - capabilities: sys_admin (namespaces, mounts), net_admin (loopback), dac_override (overlay
+#     upper and work directories), setpcap (dropping the bounding set). dac_read_search (an
+#     optional overlayfs feature probe) and sys_ptrace (namespace IDs for --info-fd) are denied
+#     without a log entry; bwrap works without both.
+#   - files: everything, because sandboxed commands run arbitrary programs. What a command can see
+#     is decided by the mounts bwrap builds, not here.
+#   - unix sockets, sent signals and ptrace reads: only between bwrap and its own children. Any
+#     process may signal the sandbox (Blackwall's Stop and timeouts). Pathname sockets follow the
+#     file rules.
+#   - no D-Bus, POSIX message queue or io_uring access, and no network family other than IP and
+#     netlink.
+#
+# The .deb installs this file to /usr/share/blackwall/apparmor/ and its postinst copies it into
+# /etc/apparmor.d/ only when the system's AppArmor can load it (see src/app/linux/deb/).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile blackwall-bwrap /usr/lib/blackwall/bwrap flags=(attach_disconnected) {
+  userns,
+  capability dac_override net_admin setpcap sys_admin,
+  deny capability dac_read_search sys_ptrace,
+  mount,
+  umount,
+  pivot_root,
+
+  file rwlkm /{**,},
+  network inet,
+  network inet6,
+  network netlink,
+  unix (create, bind, listen, accept, shutdown, getattr, setattr, getopt, setopt),
+  unix peer=(label="blackwall-bwrap{,//&blackwall-bwrap-child}"),
+  signal (receive),
+  signal (send) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
+  ptrace (read, readby) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
+
+  pix /** -> &blackwall-bwrap//&blackwall-bwrap-child,
+}
+
+profile blackwall-bwrap-child flags=(attach_disconnected) {
+  deny capability,
+
+  file rwlkm /{**,},
+  network inet,
+  network inet6,
+  network netlink,
+  unix (create, bind, listen, accept, shutdown, getattr, setattr, getopt, setopt),
+  unix peer=(label="blackwall-bwrap{,//&blackwall-bwrap-child}"),
+  signal (receive),
+  signal (send) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
+  ptrace (read, readby) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
+
+  pix /** -> &blackwall-bwrap-child,
+}

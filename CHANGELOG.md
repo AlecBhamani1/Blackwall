@@ -9,6 +9,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The Linux packages bundle bubblewrap 0.13.1 for sandboxed commands at `/usr/lib/blackwall/bwrap`
+  (not setuid, built in CI from the release tarball whose SHA-256 is pinned; LGPL-2.0-or-later,
+  license text under `/usr/share/doc/blackwall/bubblewrap/`, see `NOTICE`). Where the system's
+  AppArmor supports it (Ubuntu 24.04 and later, Debian 13), the `.deb` installs and loads
+  `/etc/apparmor.d/blackwall-bwrap`, which lets only that bwrap create user namespaces and gives
+  the programs it runs no capabilities. Removing the package unloads and deletes it. Older AppArmor
+  releases (Ubuntu 22.04, Debian 12) are left unchanged. The AppImage ships no profile.
 - When an MCP server does not start, the tool card's details now show the last lines of its error
   output and the environment variable names it was not given, and `bw` prints them under the
   warning as `  details: …`. The text is cleaned of terminal escape sequences, capped at 2 KiB and
