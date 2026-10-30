@@ -37,6 +37,9 @@ pub(crate) const PROTECTED: [&str; 11] = [
     ".claude",
     ".agents",
 ];
+/// Agent instruction files a command must not create or change through Workspace-write (compared
+/// ASCII case-insensitively, like [`PROTECTED`]).
+pub(crate) const INSTRUCTION_FILES: [&str; 3] = ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"];
 pub(crate) const SKIP_BELOW_ROOT: [&str; 7] = [
     "node_modules",
     "target",
@@ -69,13 +72,15 @@ pub(crate) struct Mask {
 }
 
 /// What identifies a regular file's content at one moment: where it is, how big, and when it was
-/// last changed.
+/// last changed. `ctime_ns` is in it because a process can put back a file's size and mtime after
+/// changing its content, but it cannot put back its ctime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Fingerprint {
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
     pub mtime_ns: i128,
+    pub ctime_ns: i128,
 }
 impl Fingerprint {
     fn of(meta: &std::fs::Metadata) -> Self {
@@ -84,6 +89,7 @@ impl Fingerprint {
             ino: meta.ino(),
             size: meta.size(),
             mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ctime_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
         }
     }
 }

@@ -115,6 +115,7 @@ mod tests {
             ino: 2,
             size: 3,
             mtime_ns: 4,
+            ctime_ns: 5,
         };
         let start = HashMap::from([(PathBuf::from("a.txt"), fingerprint)]);
         let staging = create(&data, start).unwrap();

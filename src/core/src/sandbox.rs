@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
+mod apply;
+#[cfg(target_os = "linux")]
 mod bwrap;
 #[cfg(target_os = "linux")]
 pub mod linux;
