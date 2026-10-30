@@ -621,17 +621,17 @@ fn normalize_children(body: &mut Value) {
     }
 }
 
-fn simulate(seed: u64) -> (Value, Vec<String>, Tally) {
+fn simulate(seed: u64, tag: u64) -> (Value, Vec<String>, Tally) {
     let mut rng = StdRng::seed_from_u64(seed);
     let shape = if rng.random_range(0..5) == 0 {
         AssistantShape::Cli
     } else {
         AssistantShape::Desktop
     };
+    // Fixed width: the path is in the model's instructions, so its length is in `contextReport`.
     let directory = std::env::temp_dir().join(format!(
-        "blackwall-sim-{}-{seed}-{}",
-        std::process::id(),
-        nonce()
+        "blackwall-sim-{:010}-{seed:016x}-{tag:020}",
+        std::process::id()
     ));
     std::fs::create_dir_all(&directory).unwrap();
     if rng.random_range(0..3) == 0 {
@@ -684,8 +684,13 @@ fn simulate(seed: u64) -> (Value, Vec<String>, Tally) {
     (body, markers, sim.tally)
 }
 
+/// `tag` makes the workspace directory unique. Its spelling must not change the chat.
+fn simulate_tagged(seed: u64, tag: u64) -> (Value, Vec<String>, Tally) {
+    std::thread::scope(|scope| scope.spawn(|| simulate(seed, tag)).join().unwrap())
+}
+
 fn simulate_tallied(seed: u64) -> (Value, Vec<String>, Tally) {
-    std::thread::scope(|scope| scope.spawn(|| simulate(seed)).join().unwrap())
+    simulate_tagged(seed, nonce())
 }
 
 /// A v5 chat produced by the real agent for `seed`, and the unique texts (each at least 24 bytes)
@@ -951,4 +956,21 @@ fn replay_one_seed() {
         println!("{seq} {kind} {body}");
     }
     println!("{result:?}");
+}
+
+/// The workspace path is in the model's instructions, so its length reaches `contextReport`
+/// (a token estimate of the prompt). Directory names that differ in length, as the process-wide
+/// counter's do at 10, 100, 1,000..., made the same seed produce different chats.
+#[test]
+fn the_directory_name_does_not_change_the_chat() {
+    for seed in 0..30 {
+        for (before, after) in [(9, 10), (99, 100), (999, 1000), (999_999, 1_000_000)] {
+            let (one, two) = (simulate_tagged(seed, before), simulate_tagged(seed, after));
+            assert_eq!(
+                (&one.0, &one.1),
+                (&two.0, &two.1),
+                "seed {seed}, directories {before} and {after}"
+            );
+        }
+    }
 }
