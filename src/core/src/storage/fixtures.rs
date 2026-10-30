@@ -931,6 +931,12 @@ pub(crate) fn build_v5(directory: &Path, bodies: &[Value], version: i64) -> Path
         "no v5 shape for version {version}"
     );
     fs::create_dir_all(directory).unwrap();
+    // A data folder is private whatever the umask; the backups folder check relies on it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let path = directory.join(DATABASE_FILE);
     let connection = Connection::open(&path).unwrap();
     // `sqlite_master` records the file's whitespace, so a CRLF checkout must not change it.

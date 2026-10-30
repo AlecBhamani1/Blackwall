@@ -746,6 +746,12 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("blackwall-backup-{:016x}", rand::random::<u64>()));
             fs::create_dir_all(&path).unwrap();
+            // The data folder must be private whatever the umask (Ubuntu and Debian use 002).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             let data = Self(path);
             let db = Connection::open(data.db()).unwrap();
             db.execute_batch(
