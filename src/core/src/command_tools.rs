@@ -1242,9 +1242,8 @@ mod tests {
     /// A tool config whose program creates `tool-write` in the project folder.
     #[cfg(unix)]
     const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#;
-    // PowerShell, not cmd.exe, which rejects the verbatim `\\?\` working directory.
     #[cfg(windows)]
-    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["powershell","-NoProfile","-NonInteractive","-Command","Set-Content -Path tool-write -Value x"]}]}"#;
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["cmd.exe","/D","/C","cd>tool-cwd && echo x>tool-write"]}]}"#;
 
     /// Run a tool that creates `tool-write` in the project, approving its prompt.
     #[cfg(any(unix, windows))]
@@ -1302,6 +1301,13 @@ mod tests {
         .await;
         result.unwrap();
         assert!(path.join("tool-write").exists());
+        #[cfg(windows)]
+        {
+            let reported = tokio::fs::read_to_string(path.join("tool-cwd"))
+                .await
+                .unwrap();
+            assert_eq!(std::fs::canonicalize(reported.trim()).unwrap(), path);
+        }
         tokio::fs::remove_dir_all(&path).await.unwrap();
     }
 

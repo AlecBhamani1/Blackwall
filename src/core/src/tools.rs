@@ -841,6 +841,81 @@ impl Stream {
         pieces.push(Piece::Bytes(second));
     }
 }
+
+/// Return a Win32-compatible spelling when a verbatim drive path can be represented without
+/// changing its meaning. `cmd.exe` treats a `\\?\C:\...` current directory as a UNC path and
+/// falls back to `C:\Windows`.
+#[cfg(windows)]
+fn child_current_dir(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        path::Prefix,
+    };
+
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => drive,
+            _ => return std::borrow::Cow::Borrowed(path),
+        },
+        _ => return std::borrow::Cow::Borrowed(path),
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+
+    let mut simplified = vec![u16::from(drive), u16::from(b':'), u16::from(b'\\')];
+    for component in components {
+        let Component::Normal(component) = component else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let name: Vec<u16> = component.encode_wide().collect();
+        if name.last().is_some_and(|last| matches!(*last, 0x20 | 0x2e))
+            || name
+                .iter()
+                .any(|unit| matches!(*unit, 0..=31 | 0x22 | 0x2a | 0x2f | 0x3a | 0x3c..=0x3e | 0x3f | 0x5c | 0x7c))
+            || is_reserved_windows_name(&name)
+        {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        if simplified.len() > 3 {
+            simplified.push(u16::from(b'\\'));
+        }
+        simplified.extend(name);
+    }
+
+    // MAX_PATH includes the terminating NUL.
+    if simplified.len() >= 260 {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(&simplified)))
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_name(name: &[u16]) -> bool {
+    let stem = &name[..name
+        .iter()
+        .position(|unit| *unit == u16::from(b'.'))
+        .unwrap_or(name.len())];
+    let Ok(stem) = stem
+        .iter()
+        .map(|unit| u8::try_from(*unit))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    let Ok(stem) = std::str::from_utf8(&stem) else {
+        return false;
+    };
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$"
+    ) || stem.len() == 4
+        && matches!(stem[..3].to_ascii_uppercase().as_str(), "COM" | "LPT")
+        && matches!(stem.as_bytes()[3], b'1'..=b'9')
+}
+
 /// Bounded, time-limited capture with the same descendant cleanup for every process, writing
 /// `input` to standard input while output is captured. Output over the cap is trimmed to its start
 /// and end. The command brings its own environment; this never adds to or inherits one on its behalf. It runs in
@@ -857,6 +932,9 @@ pub(crate) async fn run_with_input(
     guard: Option<&mut crate::sandbox::RunGuard>,
 ) -> Result<String, ToolError> {
     if process.as_std().get_current_dir().is_none() {
+        #[cfg(windows)]
+        process.current_dir(child_current_dir(directory).as_ref());
+        #[cfg(not(windows))]
         process.current_dir(directory);
     }
     process
@@ -998,6 +1076,34 @@ pub(crate) async fn run_with_input(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn child_current_dir_only_simplifies_safe_verbatim_drive_paths() {
+        assert_eq!(
+            child_current_dir(Path::new(r"\\?\C:\work\project")),
+            Path::new(r"C:\work\project")
+        );
+        assert_eq!(
+            child_current_dir(Path::new(r"\\?\UNC\server\share\project")),
+            Path::new(r"\\?\UNC\server\share\project")
+        );
+        for unsafe_path in [
+            r"\\?\C:\work\CON",
+            r"\\?\C:\work\com1.txt",
+            r"\\?\C:\work\trailing.",
+            r"\\?\C:\work\trailing ",
+            r"\\?\C:\work\question?mark",
+        ] {
+            assert_eq!(
+                child_current_dir(Path::new(unsafe_path)),
+                Path::new(unsafe_path)
+            );
+        }
+
+        let long = format!(r"\\?\C:\{}", "a".repeat(256));
+        assert_eq!(child_current_dir(Path::new(&long)), Path::new(&long));
+    }
+
     #[test]
     fn trim_keeps_whole_characters_and_counts_what_it_leaves_out() {
         let (text, trimmed) = trim_output(b"short", 4096);
