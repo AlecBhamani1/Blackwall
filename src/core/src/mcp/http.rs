@@ -738,10 +738,8 @@ mod tests {
             "ftp://mcp.example.com/",
             "mcp.example.com",
         ] {
-            assert!(
-                validate(vec![url_server("a", refused)]).is_err(),
-                "{refused}"
-            );
+            let error = validate(vec![url_server("a", refused)]).unwrap_err();
+            assert!(!error.contains("localhost"), "{error}");
         }
         let mut both = url_server("a", "https://mcp.example.com/mcp");
         both.command = vec!["server".into()];

@@ -165,6 +165,7 @@ fn usage_success_rate_from_run_outcomes() {
             RunOutcome::Complete,
             RunOutcome::Error,
             RunOutcome::Iterations,
+            RunOutcome::Denied,
         ] {
             t.run("r", Mode::Agent).finish(outcome);
         }
@@ -177,22 +178,44 @@ fn usage_success_rate_from_run_outcomes() {
         scope.finish(RunOutcome::Cancelled);
     });
     let summary = summary(&directory, Day(D), Day(D), 0);
-    assert_eq!(summary.totals.runs, 7);
+    assert_eq!(summary.totals.runs, 8);
     assert_eq!(summary.totals.completed_runs, 4);
     assert_eq!(summary.totals.runs_by_outcome["iterations"], 1);
+    assert_eq!(summary.totals.runs_by_outcome["denied"], 1);
     let rate = summary.totals.run_success.unwrap();
-    assert!((rate - 4.0 / 7.0).abs() < 1e-9, "{rate}");
+    assert!((rate - 4.0 / 8.0).abs() < 1e-9, "{rate}");
     let agent = summary
         .per_mode
         .iter()
         .find(|row| row.mode == "agent")
         .unwrap();
-    assert_eq!(agent.runs, 6);
+    assert_eq!(agent.runs, 7);
     let shell = &summary.tools[0];
     assert_eq!(
         (shell.name.as_str(), shell.calls, shell.errors, shell.denied),
         ("shell", 3, 1, 1)
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn usage_keeps_unknown_stored_run_outcomes_readable() {
+    let directory = folder();
+    record(&directory, Day(D), |telemetry| {
+        telemetry
+            .run("old", Mode::Agent)
+            .finish(RunOutcome::Complete);
+    });
+    let file = directory.join(METRICS_DIRECTORY).join(Day(D).file_name());
+    let body = std::fs::read_to_string(&file).unwrap().replace(
+        r#""stringValue":"complete""#,
+        r#""stringValue":"old-value""#,
+    );
+    std::fs::write(&file, body).unwrap();
+
+    let summary = summary(&directory, Day(D), Day(D), 0);
+    assert_eq!(summary.totals.runs_by_outcome["old-value"], 1);
+    assert_eq!(summary.totals.completed_runs, 0);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

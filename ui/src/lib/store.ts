@@ -1122,6 +1122,7 @@ export function createChatController(
   async function newChat(
     mode: ConversationMode = get(agentMode) ? 'agent' : 'chat',
   ): Promise<boolean> {
+    const currentWorkspace = get(workspace);
     const navigation = ++sessionNavigation;
     stop();
     const generation = runGeneration;
@@ -1141,7 +1142,7 @@ export function createChatController(
     messages.set([]);
     contextState.set(undefined);
     contextReport.set(undefined);
-    workspace.set('');
+    workspace.set(mode === 'agent' ? currentWorkspace : '');
     agentMode.set(mode === 'agent');
     webEnabled.set(false);
     executionProfile.set('read-only');

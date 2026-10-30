@@ -48,13 +48,13 @@ impl Workspace {
         path: &str,
         limit: usize,
     ) -> Result<(DirectoryListing, usize), ToolError> {
-        let root = Self::checked(path)?;
+        let root = self.checked(path)?;
         let mut entries = Vec::new();
         let mut truncated = false;
         let mut scanned = 0;
         for (index, entry) in self
             .directory
-            .read_dir(root)
+            .read_dir(&root)
             .map_err(|_| ToolError::File)?
             .enumerate()
         {
@@ -80,7 +80,7 @@ impl Workspace {
             let Some(label) = super::label(&relative) else {
                 continue;
             };
-            if Self::checked(&label).is_err() {
+            if self.checked(&label).is_err() {
                 continue;
             }
             entries.push(FileEntry {
@@ -207,7 +207,7 @@ mod tests {
         let matches = workspace
             .find_files("GUIDE", FileSearchMode::Names)
             .unwrap();
-        assert_eq!(matches.matches[0].entry.path, "./docs/guide.md");
+        assert_eq!(matches.matches[0].entry.path, "docs/guide.md");
         let matches = workspace
             .find_files("NEEDLE", FileSearchMode::Contents)
             .unwrap();

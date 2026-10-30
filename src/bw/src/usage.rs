@@ -182,7 +182,11 @@ pub fn text(summary: &UsageSummary, days: u16, offset_minutes: i32) -> String {
             .runs_by_outcome
             .iter()
             .filter(|(outcome, _)| *outcome != "complete")
-            .map(|(outcome, count)| format!("{count} {outcome}"))
+            .map(|(outcome, count)| match outcome.as_str() {
+                "error" => format!("{count} error{}", if *count == 1 { "" } else { "s" }),
+                "iterations" => format!("{count} hit the step limit"),
+                _ => format!("{count} {outcome}"),
+            })
             .collect();
         let detail = if others.is_empty() {
             String::new()
@@ -325,6 +329,26 @@ mod tests {
         assert!(text(&summary, 7, -420).contains("2024-10-04 to 2024-10-10, UTC-07:00)"));
         summary.telemetry_enabled = false;
         assert!(text(&summary, 7, 0).contains("Telemetry is off"));
+    }
+
+    #[test]
+    fn run_outcomes_use_plain_language_and_pluralize() {
+        let mut summary = usage::summary(
+            std::path::Path::new("/nonexistent-blackwall-usage"),
+            Day(20_000),
+            Day(20_000),
+            0,
+        );
+        summary.totals.total = 1;
+        summary.totals.run_success = Some(0.6);
+        summary.totals.runs_by_outcome.insert("error".into(), 1);
+        summary
+            .totals
+            .runs_by_outcome
+            .insert("iterations".into(), 1);
+        summary.totals.runs_by_outcome.insert("denied".into(), 2);
+        assert!(text(&summary, 1, 0)
+            .contains("Run success: 60.0% (2 denied, 1 error, 1 hit the step limit)"));
     }
 
     #[test]

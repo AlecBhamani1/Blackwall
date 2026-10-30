@@ -84,6 +84,15 @@ fn now() -> Result<u64, String> {
         .as_millis() as u64)
 }
 
+fn run_id() -> Result<String, String> {
+    Ok(format!(
+        "cli_run_{}_{}_{}",
+        std::process::id(),
+        now()?,
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 pub struct Conversation {
     session: Value,
     pub workspace: PathBuf,
@@ -594,7 +603,18 @@ async fn execute(
         approvals: approvals.clone(),
         emit,
     };
-    let request_id = format!("cli_run_{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let request_id = match run_id() {
+        Ok(id) => id,
+        Err(error) => {
+            return Executed {
+                answer: String::new(),
+                snapshot: None,
+                result: Err(error.into()),
+                denied: 0,
+                usage: TokenUsage::default(),
+            };
+        }
+    };
     let project = agent.workspace.path.clone();
     run.trace = Some(run_scope(
         directory,
@@ -624,7 +644,7 @@ async fn execute(
                     match line {
                         Ok(line) => {
                             if let Some(mut request) = pending.take() {
-                                request.decision = if line.as_deref().is_some_and(|line| line.trim() == "yes") { ApprovalDecision::Allow } else { ApprovalDecision::Deny };
+                                request.decision = if line.as_deref().is_some_and(approval_allowed) { ApprovalDecision::Allow } else { ApprovalDecision::Deny };
                                 if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
                             }
                         }
@@ -688,6 +708,10 @@ fn count_denied(event: &AgentEvent, denied: &mut u32) {
     if matches!(event, AgentEvent::ToolResult { denied: true, .. }) {
         *denied = denied.saturating_add(1);
     }
+}
+
+fn approval_allowed(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Sum each model call's usage as it arrives, so a run that fails or stops still reports the
@@ -888,7 +912,7 @@ fn approval_prompt(detail: &str, outside_sandbox: bool) -> String {
         false => detail.to_owned(),
     };
     format!(
-        "\n{}\n\nAllow this action once? Type yes to allow; anything else denies.",
+        "\n{}\n\nAllow this action once? Type y or yes to allow; anything else denies.",
         safe(&detail)
     )
 }
@@ -911,6 +935,24 @@ fn execution_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_approval_accepts_y_or_yes_only() {
+        for allowed in ["y", "Y", "yes", " YES "] {
+            assert!(approval_allowed(allowed), "{allowed:?}");
+        }
+        for denied in ["", "n", "yeah", "yes please"] {
+            assert!(!approval_allowed(denied), "{denied:?}");
+        }
+    }
+
+    #[test]
+    fn cli_run_ids_are_readable_and_unique() {
+        let first = run_id().unwrap();
+        let second = run_id().unwrap();
+        assert!(first.starts_with(&format!("cli_run_{}_", std::process::id())));
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn outside_sandbox_prompts_say_so_above_the_detail() {
@@ -949,7 +991,7 @@ mod tests {
         );
         assert!(text.contains("\\u{202E}gnp.exe"), "{text}");
         assert!(
-            text.ends_with("Type yes to allow; anything else denies."),
+            text.ends_with("Type y or yes to allow; anything else denies."),
             "{text}"
         );
     }

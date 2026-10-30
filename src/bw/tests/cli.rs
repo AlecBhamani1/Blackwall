@@ -484,6 +484,15 @@ fn setup_commits_all_settings_together_and_cancels_without_partial_changes() {
 }
 
 #[test]
+fn config_set_prints_only_the_changed_line() {
+    let fixture = Fixture::new();
+    let changed = fixture.success(&["config", "set", "web", "on"], "");
+    assert_eq!(changed, "web: on\n");
+    let changed = fixture.success(&["config", "set", "model", "fixture-model"], "");
+    assert_eq!(changed, "model: fixture-model\n");
+}
+
+#[test]
 fn interactive_chat_streams_multiple_turns_and_retains_history() {
     let fixture = Fixture::new();
     fixture.configure_model();

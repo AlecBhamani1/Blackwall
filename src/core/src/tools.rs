@@ -220,14 +220,52 @@ impl Workspace {
             execution: Default::default(),
         })
     }
-    pub(crate) fn checked(path: &str) -> Result<&Path, ToolError> {
-        let path = Path::new(path);
-        if path.as_os_str().len() > 2048
-            || path.is_absolute()
-            || path
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-            || path.components().any(|c| c.as_os_str() == ".git")
+    pub(crate) fn checked(&self, path: &str) -> Result<PathBuf, ToolError> {
+        let input = Path::new(path);
+        if input.as_os_str().len() > 2048 {
+            return Err(ToolError::Path);
+        }
+
+        // New write targets cannot themselves be canonicalized. Canonicalize their nearest
+        // existing ancestor, then restore the missing suffix before enforcing the boundary.
+        let target = if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            self.path.join(input)
+        };
+        let mut ancestor = target.as_path();
+        let mut suffix = Vec::new();
+        loop {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(ancestor.file_name().ok_or(ToolError::Path)?.to_owned());
+                    ancestor = ancestor.parent().ok_or(ToolError::Path)?;
+                }
+                Err(_) => return Err(ToolError::Path),
+            }
+        }
+        let mut resolved = std::fs::canonicalize(ancestor).map_err(|_| ToolError::Path)?;
+        for component in suffix.iter().rev() {
+            resolved.push(component);
+        }
+        let mut path = resolved
+            .strip_prefix(&self.path)
+            .map_err(|_| ToolError::Path)?
+            .to_path_buf();
+        if path.as_os_str().is_empty() {
+            path = PathBuf::from(".");
+        }
+
+        if path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+            || path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+            })
         {
             return Err(ToolError::Path);
         }
@@ -235,7 +273,7 @@ impl Workspace {
     }
     /// Literal, bounded project search. Symlinks and generated dependency folders are skipped.
     pub fn search(&self, path: &str, query: &str) -> Result<String, ToolError> {
-        let root = Self::checked(path)?;
+        let root = self.checked(path)?;
         if query.is_empty() || query.len() > 256 {
             return Err(ToolError::Arguments);
         }
@@ -299,7 +337,7 @@ impl Workspace {
         })
     }
     pub fn read(&self, path: &str) -> Result<String, ToolError> {
-        let path = Self::checked(path)?;
+        let path = self.checked(path)?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -324,7 +362,7 @@ impl Workspace {
         String::from_utf8(bytes).map_err(|_| ToolError::Limit)
     }
     pub(crate) fn original(&self, path: &str) -> Result<Option<String>, ToolError> {
-        let checked = Self::checked(path)?;
+        let checked = self.checked(path)?;
         match self.directory.symlink_metadata(checked) {
             Ok(metadata) if metadata.file_type().is_symlink() => Err(ToolError::Path),
             Ok(_) => self.read(path).map(Some),
@@ -346,7 +384,7 @@ impl Workspace {
         if self.original(path)?.as_deref() != expected {
             return Err(ToolError::Changed);
         }
-        let path = Self::checked(path)?;
+        let path = self.checked(path)?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -382,7 +420,7 @@ impl Workspace {
         let mut names = vec![];
         for entry in self
             .directory
-            .read_dir(Self::checked(path)?)
+            .read_dir(self.checked(path)?)
             .map_err(|_| ToolError::File)?
             .take(500)
         {
@@ -478,7 +516,8 @@ pub async fn execute(
             argument(&arguments, "query")?,
         ),
         "write_file" => {
-            let path = argument(&arguments, "path")?;
+            let path = workspace.checked(argument(&arguments, "path")?)?;
+            let path = path.to_str().ok_or(ToolError::Path)?;
             let content = argument(&arguments, "content")?;
             let original = workspace.original(path)?;
             let diff = similar::TextDiff::from_lines(original.as_deref().unwrap_or(""), content)
@@ -1338,14 +1377,26 @@ mod tests {
         let workspace = Workspace::open(&path).unwrap();
         assert!(workspace.read("../outside").is_err());
         std::fs::write(path.join("search.txt"), "first line\nneedle here").unwrap();
+        assert_eq!(
+            workspace
+                .read(path.join("search.txt").to_str().unwrap())
+                .unwrap(),
+            "first line\nneedle here"
+        );
         assert!(workspace
             .search(".", "needle")
             .unwrap()
             .contains("search.txt:2: needle here"));
         assert!(workspace.search("../", "needle").is_err());
         assert!(workspace.read("/etc/passwd").is_err());
+        assert_eq!(
+            workspace
+                .checked(path.join("file.txt").to_str().unwrap())
+                .unwrap(),
+            Path::new("file.txt")
+        );
         workspace
-            .write_reviewed("file.txt", None, "before")
+            .write_reviewed(path.join("file.txt").to_str().unwrap(), None, "before")
             .unwrap();
         assert!(matches!(
             workspace.write_reviewed("file.txt", Some("other"), "after"),
@@ -1358,14 +1409,89 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/etc", path.join("escape")).unwrap();
-            assert!(workspace.read("escape/passwd").is_err());
             assert!(workspace
-                .write_reviewed("escape/new.txt", None, "no")
+                .read(path.join("escape/passwd").to_str().unwrap())
+                .is_err());
+            assert!(workspace
+                .write_reviewed(path.join("escape/new.txt").to_str().unwrap(), None, "no")
                 .is_err());
         }
         // Close the directory handle first; Windows cannot delete an open directory.
         drop(workspace);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_reject_protected_names_and_symlink_aliases() {
+        let path = std::env::temp_dir().join(format!(
+            "blackwall-tools-protected-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(path.join(".git")).unwrap();
+        std::fs::write(path.join(".git/config"), "private").unwrap();
+        std::os::unix::fs::symlink(".git", path.join("hooks")).unwrap();
+        std::os::unix::fs::symlink("missing", path.join("dangling")).unwrap();
+        let workspace = Workspace::open(&path).unwrap();
+        for target in [".GIT/config", "hooks/config"] {
+            assert!(workspace.checked(target).is_err());
+            assert!(workspace.read(target).is_err());
+            assert!(workspace
+                .write_reviewed(target, Some("private"), "changed")
+                .is_err());
+        }
+        assert!(workspace.checked("dangling/file").is_err());
+        drop(workspace);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn absolute_write_uses_resolved_path_for_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-tools-policy-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        let (data, project) = (root.join("data"), root.join("project"));
+        std::fs::create_dir_all(project.join(".blackwall")).unwrap();
+        std::fs::create_dir_all(project.join("denied")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            project.join(".blackwall/project.json"),
+            r#"{"policy":{"rules":[{"decision":"deny","kind":"file","path":"denied"}]}}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::open(&project).unwrap();
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &data, &workspace.path)
+            .await
+            .unwrap();
+        let target = workspace.path.join("denied/file.txt");
+        let call = ToolCall {
+            id: "write".into(),
+            function: crate::model::ToolFunction {
+                name: "write_file".into(),
+                arguments: json!({"path":target,"content":"secret"}).to_string(),
+            },
+        };
+        let never = |_| panic!("a denied absolute path must not prompt");
+        assert!(matches!(
+            execute(
+                &workspace,
+                &call,
+                "run",
+                &approvals,
+                &never,
+                Duration::from_secs(1),
+                &OutputCap::default(),
+            )
+            .await,
+            Err(ToolError::Denied)
+        ));
+        assert!(!target.exists());
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn reviewed_write_rechecks_after_the_workspace_lock() {

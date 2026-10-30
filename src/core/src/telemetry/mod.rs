@@ -38,7 +38,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -541,6 +541,7 @@ impl Telemetry {
             root: SpanId(Some(context.span_id())),
             open: Mutex::new(open),
             root_error: Mutex::new(None),
+            denied: AtomicBool::new(false),
             count: AtomicUsize::new(1),
             finished: false,
             labels: vec![],
@@ -642,6 +643,7 @@ pub struct RunScope {
     root: SpanId,
     open: Mutex<HashMap<opentelemetry::trace::SpanId, Open>>,
     root_error: Mutex<Option<String>>,
+    denied: AtomicBool,
     count: AtomicUsize,
     finished: bool,
     /// `blackwall.project` and `blackwall.session`, added to this run's metrics.
@@ -716,6 +718,7 @@ impl RunScope {
             root: SpanId(None),
             open: Mutex::new(HashMap::new()),
             root_error: Mutex::new(None),
+            denied: AtomicBool::new(false),
             count: AtomicUsize::new(0),
             finished: true,
             labels: vec![],
@@ -1063,6 +1066,9 @@ impl RunScope {
 
     /// Count one tool call. MCP tools are named `server__tool`.
     pub fn record_tool(&self, name: &str, outcome: ToolOutcome) {
+        if outcome == ToolOutcome::Denied {
+            self.denied.store(true, Ordering::Relaxed);
+        }
         if let Some(telemetry) = &self.telemetry {
             telemetry.inner.instruments.tools.add(
                 1,
@@ -1077,6 +1083,11 @@ impl RunScope {
     /// End the run: spans still open are marked cancelled, the root ends with the outcome, the
     /// buffered run is written, and its metrics are flushed.
     pub fn finish(mut self, outcome: RunOutcome) {
+        let outcome = if outcome == RunOutcome::Complete && self.denied.load(Ordering::Relaxed) {
+            RunOutcome::Denied
+        } else {
+            outcome
+        };
         self.close_run(outcome);
     }
 

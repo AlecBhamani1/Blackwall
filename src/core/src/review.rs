@@ -266,7 +266,8 @@ impl ReviewSnapshot {
             }
             for file in files {
                 let name = std::str::from_utf8(file).map_err(|_| ReviewError::Git)?;
-                let supported = Workspace::checked(name)
+                let supported = workspace
+                    .checked(name)
                     .ok()
                     .and_then(|path| workspace.directory.symlink_metadata(path).ok())
                     .is_some_and(|meta| meta.is_file());
