@@ -866,7 +866,9 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
 /// Today's session JSON for a chat: the typed columns, each `metadata` key at the top level, the
 /// messages, and a `contextState` only when the stored context is valid. That value is
 /// `build_view`'s own, not a re-serialized `ContextState`.
-/// Top-level session JSON keys that metadata may not carry.
+/// Top-level session JSON keys that metadata may not carry. `contextState` is reserved only for
+/// a non-null value: a literal `contextState:null` is how v5 saved "no context", and metadata may
+/// keep it (see [`reserved_in_metadata`]).
 const RESERVED_KEYS: [&str; 7] = [
     "id",
     "title",
@@ -877,12 +879,20 @@ const RESERVED_KEYS: [&str; 7] = [
     "contextState",
 ];
 
+fn reserved_in_metadata(key: &str, value: &Value) -> bool {
+    RESERVED_KEYS.contains(&key) && !(key == "contextState" && value.is_null())
+}
+
 fn chat_json(loaded: &Loaded) -> Value {
     let chat = &loaded.chat;
     let mut json = Map::new();
     for (key, value) in &chat.metadata {
         // A reserved key is owned by a column, the log or the context, so metadata never shows it.
-        if !RESERVED_KEYS.contains(&key.as_str()) {
+        // The one exception is a literal `contextState:null`, shown only while the chat has no
+        // context row; a real context always wins.
+        let null_context =
+            key == "contextState" && value.is_null() && matches!(chat.context, StoredContext::None);
+        if null_context || !RESERVED_KEYS.contains(&key.as_str()) {
             json.insert(key.clone(), value.clone());
         }
     }
@@ -956,11 +966,10 @@ impl LocalStore {
         if let Some(title) = &patch.title {
             check_title(title)?;
         }
-        if patch
-            .metadata
-            .as_ref()
-            .is_some_and(|map| map.keys().any(|key| RESERVED_KEYS.contains(&key.as_str())))
-        {
+        if patch.metadata.as_ref().is_some_and(|map| {
+            map.iter()
+                .any(|(key, value)| reserved_in_metadata(key, value))
+        }) {
             return Err(StorageError::Invalid(
                 "These conversation details use a name that is reserved, so they were not saved.",
             ));
@@ -2139,12 +2148,79 @@ mod tests {
             .unwrap();
         let json = db.load_json_v6("bare").unwrap().unwrap();
         assert!(json.get("mode").is_none() && json.get("workspace").is_none());
-        assert!(json.get("contextState").is_none());
+        // Only the literal null is allowed through, and only with no context row.
+        assert_eq!(json.get("contextState"), Some(&Value::Null));
         assert_eq!(json["id"], "bare");
         assert_eq!(json["title"], "Chat bare");
         assert_eq!(json["updatedAt"], 1000);
         assert_eq!(json["messages"], json!([]));
         assert_eq!(json["ok"], 1);
+    }
+
+    #[test]
+    fn a_null_context_state_survives_through_metadata_until_a_real_context_exists() {
+        // A1's `null_context_extra_key`: v5 saved `contextState:null` and two other extra keys.
+        let fixture = crate::storage::fixtures::v5_sessions()
+            .into_iter()
+            .find(|s| s["id"] == "null_context_extra_key")
+            .unwrap();
+        assert_eq!(fixture["contextState"], Value::Null);
+        let metadata: Map<String, Value> = fixture
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| {
+                !["id", "title", "updatedAt", "mode", "workspace", "messages"]
+                    .contains(&key.as_str())
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert!(metadata.contains_key("contextState") && metadata.contains_key("pinned"));
+        let db = v6_in_memory();
+        make(&db, "s");
+        let patch = MetadataPatch {
+            title: None,
+            metadata: Some(metadata.clone()),
+        };
+        db.update_session_metadata("s", &patch, 1).unwrap();
+        let json = db.load_json_v6("s").unwrap().unwrap();
+        assert_eq!(json["contextState"], Value::Null);
+        assert!(json.as_object().unwrap().contains_key("contextState"));
+        assert_eq!(json["contextReport"], Value::Null);
+        assert_eq!(json["pinned"], true);
+        // A non-null contextState is still refused, whatever else the patch holds.
+        let mut bad = metadata;
+        bad.insert("contextState".into(), json!({"transcript": []}));
+        let refused = db.update_session_metadata(
+            "s",
+            &MetadataPatch {
+                title: None,
+                metadata: Some(bad),
+            },
+            2,
+        );
+        assert!(
+            matches!(refused, Err(StorageError::Invalid(_))),
+            "{refused:?}"
+        );
+        assert_eq!(db.load_chat("s").unwrap().unwrap().revision, 2);
+        // A real context row wins over the stored null.
+        let user = json!({"role": "user", "content": "hello 0"});
+        write(&db, "s", |tx, c| {
+            append_ui_user(tx, "s", c, &user_message(0))?;
+            append_model(tx, "s", c, &user)?;
+            let row = ContextRow {
+                model_from: 0,
+                model_len: 1,
+                covered_messages: 1,
+                source_hash: fingerprint(std::slice::from_ref(&user)),
+                server_usage: None,
+            };
+            write_context(tx, "s", c, &row, &[], false)
+        })
+        .unwrap();
+        let json = db.load_json_v6("s").unwrap().unwrap();
+        assert_eq!(json["contextState"]["transcript"], json!([user]));
     }
 
     #[test]
