@@ -205,14 +205,15 @@ impl Instructions {
         let Some(path) = arguments["path"].as_str() else {
             return false;
         };
-        let Ok(path) = Workspace::checked(path) else {
-            self.warn("Instructions: target is outside the project boundary or invalid.".into());
+        // Tool validation reports invalid targets. Guidance discovery is auxiliary and must not
+        // create a second failed tool card for the same bad argument.
+        let Ok(path) = workspace.checked(path) else {
             return false;
         };
         let directory = if is_file {
             path.parent().unwrap_or(Path::new("."))
         } else {
-            path
+            path.as_path()
         };
         if directory.components().count() > MAX_DEPTH {
             self.warn("Instructions: target exceeds the 32-directory depth limit.".into());
@@ -612,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn traversal_absolute_and_git_targets_cannot_load_instructions() {
+    fn invalid_targets_skip_instructions_without_an_error_card() {
         let fixture = Fixture::new();
         fixture.write("AGENTS.md", "outside secret");
         let workspace = fixture.workspace();
@@ -622,7 +623,21 @@ mod tests {
         }
         assert!(instructions.sources().is_empty());
         assert!(!instructions.prompt().contains("outside secret"));
-        assert!(!instructions.warnings.is_empty());
+        assert!(instructions.warnings.is_empty());
+    }
+
+    #[test]
+    fn absolute_in_project_target_loads_ancestor_instructions() {
+        let fixture = Fixture::new();
+        fixture.write("project/src/AGENTS.md", "src conventions");
+        fixture.write("project/src/file.rs", "fn main() {}");
+        let workspace = fixture.workspace();
+        let target = fixture.0.join("project/src/file.rs");
+        let mut instructions = Instructions::discover(&workspace, None, &Default::default());
+
+        assert!(instructions.for_tool(&workspace, &call("read_file", target.to_str().unwrap())));
+        assert_eq!(instructions.sources(), ["src/AGENTS.md"]);
+        assert!(instructions.warnings.is_empty());
     }
 
     #[cfg(unix)]
