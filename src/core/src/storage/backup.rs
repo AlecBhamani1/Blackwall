@@ -532,14 +532,58 @@ fn copy_and_verify(
         return Err(StorageError::BackupFailed);
     }
     open_plain(partial, true)?.sync_all()?;
-    // A hard link fails if `finished` exists, so nothing is ever overwritten.
-    fs::hard_link(partial, finished)?;
-    fs::remove_file(partial)
-        .and_then(|()| sync_dir(dir))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(finished);
-        })?;
+    publish(dir, partial, finished)?;
     Ok(())
+}
+
+/// Moves the finished partial to its final name without ever replacing a file. A hard link fails
+/// if `finished` exists, so it cannot overwrite. On a filesystem without hard links it falls
+/// back to `rename` after checking that `finished` is absent. That fallback has a small race
+/// (something could create `finished` between the check and the rename), accepted for the
+/// filesystems that cannot link, because a failed backup would block the upgrade for good.
+/// Any other link error is a failure.
+fn publish(dir: &Path, partial: &Path, finished: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    let no_links = inject(dir, Fault::NoHardLinks).is_err();
+    #[cfg(not(test))]
+    let no_links = false;
+    let linked = if no_links {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    } else {
+        fs::hard_link(partial, finished)
+    };
+    let drop_finished = |_: &io::Error| {
+        let _ = fs::remove_file(finished);
+    };
+    match linked {
+        Ok(()) => fs::remove_file(partial)
+            .and_then(|()| sync_dir(dir))
+            .inspect_err(drop_finished),
+        Err(error) if links_unsupported(&error) => {
+            if fs::symlink_metadata(finished).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(partial, finished)?;
+            sync_dir(dir).inspect_err(drop_finished)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a failed `hard_link` means "this filesystem or volume cannot", not "this name is taken".
+fn links_unsupported(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let codes = [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV];
+    // ERROR_INVALID_FUNCTION (FAT, exFAT) and ERROR_NOT_SUPPORTED.
+    #[cfg(windows)]
+    let codes = [1, 50];
+    codes.contains(&code)
 }
 
 /// Test fault hook, keyed by the data folder, which is the backups folder's parent.
@@ -628,6 +672,8 @@ pub(crate) enum Fault {
     BackupCopy,
     /// The same point, but the thread panics.
     BackupPanic,
+    /// Hard links report "unsupported" when a backup is moved into its final name.
+    NoHardLinks,
     /// The conversion with this number (from 0) hits an SQL error after writing its rows.
     ConvertError(usize),
     /// The whole-session check reports a difference.
@@ -1185,6 +1231,61 @@ mod tests {
             assert_eq!(padded.len(), size);
             fs::write(&file, padded).unwrap();
             assert_eq!(read_state(&dir).is_some(), ok, "{size} bytes");
+        }
+    }
+
+    #[test]
+    fn without_hard_links_the_backup_still_completes_and_never_overwrites() {
+        let data = Data::new();
+        let dir = backups_dir(&data.0).unwrap();
+        set_fault(&data.0, Some(Fault::NoHardLinks));
+        let name = create_backup(&data.source(), &dir, 5).unwrap();
+        assert_eq!(
+            names(&dir),
+            std::slice::from_ref(&name),
+            "no partial remains"
+        );
+        let copy = Connection::open(dir.join(&name)).unwrap();
+        let kept: String = copy.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "kept");
+        drop(copy);
+        // The fallback checks first, so an existing name is left alone and the call fails.
+        let taken = backup_name(at(NOW), 11);
+        fs::write(dir.join(&taken), b"precious").unwrap();
+        let error = create_named_backup(&data.source(), &dir, &taken, 5).unwrap_err();
+        assert!(matches!(error, StorageError::BackupFailed));
+        assert_eq!(fs::read(dir.join(&taken)).unwrap(), b"precious");
+        assert_eq!(names(&dir).len(), 2, "and no partial is left");
+    }
+
+    #[test]
+    fn only_filesystem_limits_trigger_the_rename_fallback() {
+        assert!(links_unsupported(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(!links_unsupported(&io::Error::from(
+            io::ErrorKind::AlreadyExists
+        )));
+        assert!(!links_unsupported(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(!links_unsupported(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        #[cfg(unix)]
+        {
+            for code in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV] {
+                assert!(
+                    links_unsupported(&io::Error::from_raw_os_error(code)),
+                    "{code}"
+                );
+            }
+            for code in [libc::EEXIST, libc::ENOENT, libc::EACCES, libc::ENOSPC] {
+                assert!(
+                    !links_unsupported(&io::Error::from_raw_os_error(code)),
+                    "{code}"
+                );
+            }
         }
     }
 }
