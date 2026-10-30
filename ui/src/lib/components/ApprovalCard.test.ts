@@ -46,7 +46,7 @@ describe('action approval', () => {
           ...approval,
           kind: 'exec',
           detail:
-            'Runs outside the sandbox with your account permissions.\n\nTool: review\nProgram: /usr/local/bin/claude',
+            'Runs outside the sandbox with your account permissions.\n\nTool: review\nProgram: /usr/local/bin/claude\nGets these variables from your environment: GITHUB_TOKEN',
           tool: { server: 'docs', tool: 'docs__search' },
           remember: false,
           outsideSandbox: true,
@@ -60,7 +60,7 @@ describe('action approval', () => {
     // The note is shown once, as the label, not again at the top of the details.
     expect(screen.getAllByText(/Runs outside the sandbox/)).toHaveLength(1);
     expect(screen.getByRole('region', { name: 'Proposed action details' }).textContent).toMatch(
-      /^Tool: review\nProgram: \/usr\/local\/bin\/claude$/,
+      /^Tool: review\nProgram: \/usr\/local\/bin\/claude\nGets these variables from your environment: GITHUB_TOKEN$/,
     );
     expect(
       screen.queryByRole('button', { name: 'Allow identical action this run' }),

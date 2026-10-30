@@ -467,11 +467,12 @@ impl CommandTool {
         let outside = workspace.execution.command_tools == Isolation::Outside;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
-            "{}Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
+            "{}Project: {}\nTool: {}\nProgram: {}\n{}Arguments: {}",
             outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
+            passed_line(&self.passed_env(outside)),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
         );
         if let Some(input) = &input {
@@ -551,11 +552,12 @@ impl CommandTool {
         let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
         let outside = workspace.execution.command_tools == Isolation::Outside;
         let mut detail = format!(
-            "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
+            "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\n{}Arguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
             outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
+            passed_line(&self.passed_env(outside)),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
             prompt.len(),
         );
@@ -582,6 +584,15 @@ impl CommandTool {
             workspace, &program, &args, &self.env, input, timeout, output,
         )
         .await
+    }
+
+    /// The `env` names the program gets: those set in Blackwall's environment, when it runs
+    /// outside the sandbox. A sandboxed program gets none.
+    fn passed_env(&self, outside: bool) -> Vec<String> {
+        match outside {
+            true => crate::child_env::passed_through(&self.env),
+            false => Vec::new(),
+        }
     }
 
     /// Refuses to run when `program` is no longer the file the prompt named: the configured
@@ -645,6 +656,18 @@ fn outside_prefix(outside: bool) -> String {
     match outside {
         true => format!("{OUTSIDE_NOTE}\n\n"),
         false => String::new(),
+    }
+}
+
+/// The approval line naming the variables a program gets from the owner's environment, never
+/// their values; empty when it gets none.
+fn passed_line(names: &[String]) -> String {
+    match names.is_empty() {
+        true => String::new(),
+        false => format!(
+            "Gets these variables from your environment: {}\n",
+            names.join(", ")
+        ),
     }
 }
 
@@ -1702,6 +1725,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::remove_dir_all(&root).unwrap();
         (result, ran)
+    }
+
+    /// The prompt a `cat` tool that passes `env` through asks with, run or delegated to.
+    #[cfg(unix)]
+    async fn prompt_detail(isolation: Isolation, subagent: bool, env: &[&str]) -> String {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let body = json!({"tools":[{"name":"review","description":"Review","command":["cat"],"stdin":"json","env":env,
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let details = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let captured = details.clone();
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                detail,
+                ..
+            } = event
+            {
+                captured.lock().unwrap().push(detail);
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        match subagent {
+            true => tool
+                .delegate(
+                    &workspace, "Review", "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+            false => tool
+                .run(
+                    &workspace,
+                    r#"{"prompt":"Review"}"#,
+                    "run",
+                    &approvals,
+                    &emit,
+                    timeout,
+                    &output,
+                )
+                .await
+                .unwrap(),
+        };
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        let detail = details.lock().unwrap()[0].clone();
+        detail
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_prompt_names_the_variables_passed_through_never_their_values() {
+        const LINE: &str = "Gets these variables from your environment:";
+        for subagent in [false, true] {
+            // Only names set here are listed: an unset one is not passed, so it is not shown.
+            let env = ["HOME", "BLACKWALL_TEST_NEVER_SET", "USER"];
+            let detail = prompt_detail(Isolation::Outside, subagent, &env).await;
+            let lines: Vec<&str> = detail.lines().collect();
+            let at = lines.iter().position(|line| line.starts_with("Program: "));
+            let names = at.and_then(|at| lines.get(at + 1)).copied();
+            let expected = match std::env::var_os("USER") {
+                Some(_) => format!("{LINE} HOME, USER"),
+                None => format!("{LINE} HOME"),
+            };
+            assert_eq!(names, Some(expected.as_str()), "{detail}");
+            assert!(!detail.contains("BLACKWALL_TEST_NEVER_SET"), "{detail}");
+            // Nothing to list, no line.
+            let detail =
+                prompt_detail(Isolation::Outside, subagent, &["BLACKWALL_TEST_NEVER_SET"]).await;
+            assert!(!detail.contains(LINE), "{detail}");
+            // A sandboxed program never gets them, so its prompt names none.
+            let detail = prompt_detail(Isolation::Sandboxed, subagent, &env).await;
+            assert!(!detail.contains(LINE), "{detail}");
+        }
     }
 
     #[cfg(unix)]

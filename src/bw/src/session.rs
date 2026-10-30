@@ -914,11 +914,16 @@ mod tests {
 
     #[test]
     fn outside_sandbox_prompts_say_so_above_the_detail() {
-        let detail =
-            format!("{OUTSIDE_NOTE}\n\nProject: /p\nTool: review\nProgram: /usr/bin/claude");
+        let detail = format!(
+            "{OUTSIDE_NOTE}\n\nProject: /p\nTool: review\nProgram: /usr/bin/claude\nGets these variables from your environment: GITHUB_TOKEN"
+        );
         let text = approval_prompt(&detail, true);
         assert!(
             text.starts_with(&format!("\n{OUTSIDE_NOTE}\n\nProject: /p")),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nProgram: /usr/bin/claude\nGets these variables from your environment: GITHUB_TOKEN\n"),
             "{text}"
         );
         assert_eq!(text.matches(OUTSIDE_NOTE).count(), 1, "{text}");
