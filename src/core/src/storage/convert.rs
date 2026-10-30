@@ -28,6 +28,26 @@ use std::{
 
 /// The reason a chat is set aside when its rebuilt copy is not its v5 body. It is a bug.
 const CHECK_FAILED: &str = "upgrade check failed";
+/// The reason for a legacy shape the v6 log cannot hold. Data, not a conversion bug: it is not
+/// counted in `upgrade_inline_values`.
+const UNSUPPORTED: &str = "unsupported legacy shape";
+/// The reason when a body's id is not its row's.
+const ID_MISMATCH: &str = "The saved conversation's identifier does not match its record.";
+/// What an upgrade that would write a row it did not plan returns. It rolls everything back.
+const PLAN_BROKEN: &str =
+    "Blackwall could not upgrade a conversation safely. Your existing data has been left in place.";
+/// The `contextState` keys v5 writes. `serverUsage` may be absent.
+const CONTEXT_KEYS: [&str; 5] = [
+    "transcript",
+    "checkpoints",
+    "coveredMessages",
+    "sourceHash",
+    "serverUsage",
+];
+/// The most set-aside chats the compatibility save adds to; past it, it refuses instead.
+const MAX_QUARANTINED: i64 = 100;
+/// What the compatibility save says when it cannot save a chat and has no room to set it aside.
+const NO_ROOM: &str = "This conversation could not be saved as it is. Nothing was saved.";
 /// What the compatibility save says when it set a new chat aside instead of saving it.
 const SET_ASIDE: &str =
     "This conversation could not be saved as it is, so Blackwall set it aside. Nothing was deleted.";
@@ -232,7 +252,17 @@ fn convert(conn: &Connection, id: &str, updated_at: i64, raw: &str) -> Result<Co
     }
     let mut session: Value = serde_json::from_str(raw)?;
     check_caps(&session)?;
+    // Before `validate_session`, whose strict parse would report it as invalid JSON.
+    if !context_keys_supported(&session) {
+        return Err(unsupported(id, "contextState keys"));
+    }
     validate_session(&session)?;
+    if session["id"] != id {
+        return Err(Fail::SetAside(ID_MISMATCH.into()));
+    }
+    if let Some(what) = unsupported_shape(&session) {
+        return Err(unsupported(id, what));
+    }
     let mut report = ConvertReport::default();
     // 1. Ids. The renamed body is what the rebuilt chat must equal.
     if let Some(messages) = session.get_mut("messages").and_then(Value::as_array_mut) {
@@ -244,18 +274,25 @@ fn convert(conn: &Connection, id: &str, updated_at: i64, raw: &str) -> Result<Co
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     for message in messages {
-        validate_ui_message(message, message["role"].as_str().unwrap_or_default())?;
+        // A cap keeps its own name (F9); any other refusal is a v5 value v6 does not accept.
+        match validate_ui_message(message, message["role"].as_str().unwrap_or_default()) {
+            Err(StorageError::Invalid(_)) => return Err(unsupported(id, "message")),
+            result => result?,
+        }
     }
 
     // The session row: mode and workspace columns, the other keys in metadata, the v5 body emptied.
-    let text = |key: &str, invalid: &'static str| match session.get(key) {
+    // v6 refuses a mode or workspace that is not a string, or that `fill_mode_workspace` rejects.
+    let text = |key: &'static str| match session.get(key) {
         None => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.as_str())),
-        Some(_) => Err(StorageError::Invalid(invalid)),
+        Some(_) => Err(unsupported(id, key)),
     };
-    let mode = text("mode", "Invalid conversation mode.")?;
-    let workspace = text("workspace", "Invalid conversation workspace.")?;
-    fill_mode_workspace(conn, id, mode, workspace)?;
+    let (mode, workspace) = (text("mode")?, text("workspace")?);
+    match fill_mode_workspace(conn, id, mode, workspace) {
+        Err(StorageError::Invalid(_)) => return Err(unsupported(id, "mode or workspace")),
+        result => result?,
+    }
     let metadata: Map<String, Value> = session
         .as_object()
         .into_iter()
@@ -291,10 +328,14 @@ fn convert(conn: &Connection, id: &str, updated_at: i64, raw: &str) -> Result<Co
         let seq = match row.kind {
             Kind::UiUser => append_ui_user(conn, id, &mut c, &row.body)?,
             Kind::UiAssistant => append_ui_assistant(conn, id, &mut c, &row.body)?,
-            // The plan makes no progress rows: an upgraded chat has no runs.
-            Kind::Model | Kind::UiProgress => append_model(conn, id, &mut c, &row.body)?,
+            Kind::Model => append_model(conn, id, &mut c, &row.body)?,
+            // An upgraded chat has no runs, so the plan never makes one.
+            Kind::UiProgress => return Err(Fail::Storage(StorageError::Invalid(PLAN_BROKEN))),
         };
-        debug_assert_eq!(seq, row.seq, "a planned seq moved");
+        // Every reference was proved against the planned seqs.
+        if seq != row.seq {
+            return Err(Fail::Storage(StorageError::Invalid(PLAN_BROKEN)));
+        }
     }
     if let Some(context) = context {
         let row = ContextRow {
@@ -354,6 +395,62 @@ fn convert(conn: &Connection, id: &str, updated_at: i64, raw: &str) -> Result<Co
     Ok(report)
 }
 
+/// Sets a chat aside as an unsupported legacy shape, logging which part (never its content).
+fn unsupported(id: &str, what: &str) -> Fail {
+    eprintln!("warn: chat {id} is set aside: unsupported legacy shape ({what})");
+    Fail::SetAside(UNSUPPORTED.into())
+}
+
+/// Whether a non-null `contextState` is an object with exactly the keys v5 writes.
+fn context_keys_supported(session: &Value) -> bool {
+    let Some(context) = session.get("contextState").filter(|value| !value.is_null()) else {
+        return true;
+    };
+    context.as_object().is_some_and(|context| {
+        context
+            .keys()
+            .all(|key| CONTEXT_KEYS.contains(&key.as_str()))
+            && CONTEXT_KEYS[..4]
+                .iter()
+                .all(|key| context.contains_key(*key))
+    })
+}
+
+/// A legacy shape that A4's view would read as something else: an assistant with a `run` key
+/// (a run terminal), `tools` that are not a list, a tool that is not an object or has a `call`
+/// key (a reference), or a transcript entry with a `ref` key. Returns which, for the log.
+fn unsupported_shape(session: &Value) -> Option<&'static str> {
+    for message in session["messages"].as_array().into_iter().flatten() {
+        if message["role"] != "assistant" {
+            continue;
+        }
+        if message.get("run").is_some() {
+            return Some("an assistant with a run key");
+        }
+        match message.get("tools") {
+            None => {}
+            Some(Value::Array(tools)) => {
+                if tools
+                    .iter()
+                    .any(|tool| !tool.is_object() || tool.get("call").is_some())
+                {
+                    return Some("a tool with a call key");
+                }
+            }
+            Some(_) => return Some("tools that are not a list"),
+        }
+    }
+    let transcript = session["contextState"]["transcript"].as_array();
+    if transcript
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.get("ref").is_some())
+    {
+        return Some("a transcript entry with a ref key");
+    }
+    None
+}
+
 /// The caps v5 never checked, each named by its own reason (F9). The rest are checked where they
 /// are enforced: attachments by `validate_ui_message`, bodies and totals by the appends.
 fn check_caps(session: &Value) -> Result<(), StorageError> {
@@ -405,20 +502,28 @@ fn assign_ids(messages: &mut [Value]) -> u32 {
 // ---- the matcher ----
 
 /// A reference the matcher proposed. It is kept only once it resolves to the value it replaces.
+/// `inline` is the stored size of that value, and `net` what the reference saves (ruling, Minor
+/// 3: a reference is proposed only when it is smaller than the value).
 enum Proposal {
     /// The `model` row at `row` as `{"ref"}` to the UI message at `message`.
     Model {
         row: usize,
         message: usize,
-        bytes: u64,
+        inline: u64,
+        net: u64,
     },
-    /// An assistant's `content` as `{turns, tail?}`, covering `covered` bytes.
-    Content { message: usize, covered: u64 },
+    /// An assistant's `content` as `{turns, tail?}`.
+    Content {
+        message: usize,
+        inline: u64,
+        net: u64,
+    },
     /// An assistant's tool at `tool` as a call/result residual.
     Tool {
         message: usize,
         tool: usize,
-        bytes: u64,
+        inline: u64,
+        net: u64,
     },
 }
 
@@ -426,11 +531,16 @@ fn role(entry: &Value) -> Option<&str> {
     entry.get("role")?.as_str()
 }
 
-fn value_bytes(value: &Value) -> u64 {
-    value.as_str().map_or_else(
-        || serde_json::to_string(value).map_or(0, |text| text.len()),
-        str::len,
-    ) as u64
+/// A value's stored size: its JSON.
+fn json_len(value: &Value) -> u64 {
+    serde_json::to_string(value).map_or(0, |text| text.len()) as u64
+}
+
+/// What a reference saves over the value it replaces, when it saves anything.
+fn saving(value: &Value, reference: &Value) -> Option<(u64, u64)> {
+    let (inline, stored) = (json_len(value), json_len(reference));
+    // `then`, not `then_some`: the difference is only taken when it is positive.
+    (stored < inline).then(|| (inline, inline - stored))
 }
 
 fn set(body: &mut Value, key: &str, value: Value) {
@@ -442,6 +552,27 @@ fn set(body: &mut Value, key: &str, value: Value) {
 fn set_tool(body: &mut Value, tool: usize, value: Value) {
     if let Some(slot) = body.get_mut("tools").and_then(|tools| tools.get_mut(tool)) {
         *slot = value;
+    }
+}
+
+/// Proposes the `model` row at `row` as a ref to the UI message at `message`, if that is smaller.
+fn propose_ref(
+    proposals: &mut Vec<Proposal>,
+    target: &mut [Option<usize>],
+    entry: &Value,
+    base: i64,
+    row: usize,
+    message: usize,
+) {
+    let reference = json!({ "ref": base + message as i64 });
+    if let Some((inline, net)) = saving(entry, &reference) {
+        target[row] = Some(message);
+        proposals.push(Proposal::Model {
+            row,
+            message,
+            inline,
+            net,
+        });
     }
 }
 
@@ -477,22 +608,24 @@ fn plan(
         if role(entry) != Some("user") {
             continue;
         }
-        let Ok(key) = serde_json::to_string(entry) else {
-            continue;
-        };
-        let Some(candidates) = forms.get(&key) else {
+        let Some(candidates) = serde_json::to_string(entry)
+            .ok()
+            .and_then(|key| forms.get(&key))
+        else {
             continue;
         };
         let at = candidates.partition_point(|&index| index < next);
         let Some(&message) = candidates.get(at).or(candidates.first()) else {
             continue;
         };
-        target[row] = Some(message);
-        proposals.push(Proposal::Model {
+        propose_ref(
+            &mut proposals,
+            &mut target,
+            &transcript[row],
+            base,
             row,
             message,
-            bytes: key.len() as u64,
-        });
+        );
         next = message + 1;
     }
     let mut last_ref = HashMap::new();
@@ -523,17 +656,20 @@ fn plan(
             .clone()
             .filter(|&r| role(&transcript[r]) == Some("assistant"))
             .collect();
-        let content = message["content"].as_str().unwrap_or_default();
+        let content = &message["content"];
+        let text = content.as_str().unwrap_or_default();
         // Only a run that did not complete shows text that is in no model row (correction 2).
         let may_tail = message["status"] != "complete";
-        let (tail, echo, unproven) = content_form(transcript, &mut turns, content, may_tail);
+        let (tail, echo, unproven) = content_form(transcript, &mut turns, text, may_tail);
         if let Some(echo) = echo {
-            target[echo] = Some(index);
-            proposals.push(Proposal::Model {
-                row: echo,
-                message: index,
-                bytes: value_bytes(&transcript[echo]),
-            });
+            propose_ref(
+                &mut proposals,
+                &mut target,
+                &transcript[echo],
+                base,
+                echo,
+                index,
+            );
         }
         match tail {
             Some(tail) => {
@@ -542,13 +678,17 @@ fn plan(
                 if !tail.is_empty() {
                     form["tail"] = json!(tail);
                 }
-                set(&mut bodies[index], "content", form);
-                proposals.push(Proposal::Content {
-                    message: index,
-                    covered: (content.len() - tail.len()) as u64,
-                });
+                // Too short to be worth a reference: inline, and not a failure.
+                if let Some((inline, net)) = saving(content, &form) {
+                    set(&mut bodies[index], "content", form);
+                    proposals.push(Proposal::Content {
+                        message: index,
+                        inline,
+                        net,
+                    });
+                }
             }
-            None if unproven => report.inline("content", content.len() as u64),
+            None if unproven => report.inline("content", json_len(content)),
             None => {}
         }
         for (position, tool) in message["tools"]
@@ -563,14 +703,11 @@ fn plan(
             };
             let function = &transcript[turn]["tool_calls"][call]["function"];
             let output = result.map(|row| &transcript[row]["content"]);
-            let bytes = value_bytes(&function["name"])
-                + value_bytes(&function["arguments"])
-                + output.map_or(0, value_bytes);
             if tool.get("name") != Some(&function["name"])
                 || tool.get("arguments") != Some(&function["arguments"])
                 || tool.get("output") != output
             {
-                report.inline("tool", bytes);
+                report.inline("tool", json_len(tool));
                 continue;
             }
             let mut residual = tool.as_object().cloned().unwrap_or_default();
@@ -584,12 +721,16 @@ fn plan(
                 "result".into(),
                 result.map_or(Value::Null, |row| json!(model_seq(row))),
             );
-            set_tool(&mut bodies[index], position, Value::Object(residual));
-            proposals.push(Proposal::Tool {
-                message: index,
-                tool: position,
-                bytes,
-            });
+            let residual = Value::Object(residual);
+            if let Some((inline, net)) = saving(tool, &residual) {
+                set_tool(&mut bodies[index], position, residual);
+                proposals.push(Proposal::Tool {
+                    message: index,
+                    tool: position,
+                    inline,
+                    net,
+                });
+            }
         }
     }
 
@@ -614,12 +755,24 @@ fn plan(
             None => entry.clone(),
         },
     }));
+    settle(&mut rows, &proposals, messages, transcript, base, report);
+    rows
+}
 
-    // Prove the UI side first: a `model` ref to an assistant resolves through its content.
+/// Proves every proposal in `rows`, puts each disproved one back inline, and reports the result.
+/// The UI side is proved first, since a `model` ref to an assistant resolves through its content.
+fn settle(
+    rows: &mut [EventRow],
+    proposals: &[Proposal],
+    messages: &[Value],
+    transcript: &[Value],
+    base: i64,
+    report: &mut ConvertReport,
+) {
+    let n = messages.len();
     let mut kept = vec![true; proposals.len()];
     for model_side in [false, true] {
-        let failed = disproved(&rows, &proposals, model_side, messages, transcript, base);
-        for at in failed {
+        for at in disproved(rows, proposals, model_side, messages, transcript, base) {
             kept[at] = false;
             match proposals[at] {
                 Proposal::Model { row, .. } => rows[n + row].body = transcript[row].clone(),
@@ -641,30 +794,25 @@ fn plan(
         }
     }
     for (proposal, kept) in proposals.iter().zip(kept) {
-        match *proposal {
-            Proposal::Model { bytes, .. }
-            | Proposal::Content { covered: bytes, .. }
-            | Proposal::Tool { bytes, .. }
-                if kept =>
-            {
-                report.deduplicated_bytes += bytes;
+        let (reason, inline, net) = match *proposal {
+            Proposal::Model {
+                message,
+                inline,
+                net,
+                ..
+            } => {
+                let user = messages[message]["role"] == "user";
+                (if user { "user" } else { "echo" }, inline, net)
             }
-            Proposal::Model { message, bytes, .. } => {
-                let reason = if messages[message]["role"] == "user" {
-                    "user"
-                } else {
-                    "echo"
-                };
-                report.inline(reason, bytes);
-            }
-            Proposal::Content { message, .. } => {
-                let content = messages[message]["content"].as_str().unwrap_or_default();
-                report.inline("content", content.len() as u64);
-            }
-            Proposal::Tool { bytes, .. } => report.inline("tool", bytes),
+            Proposal::Content { inline, net, .. } => ("content", inline, net),
+            Proposal::Tool { inline, net, .. } => ("tool", inline, net),
+        };
+        if kept {
+            report.deduplicated_bytes += net;
+        } else {
+            report.inline(reason, inline);
         }
     }
-    rows
 }
 
 /// How an assistant's content can be written: `(Some(tail), …)` for `{turns, tail?}` over the
@@ -914,11 +1062,21 @@ pub(crate) fn import_session(store: &LocalStore, session: &Value) -> Result<(), 
         "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,'')",
     )?
     .execute(params![id, title, updated_at])?;
-    let outcome = convert_session_in_tx(&tx, id, title, updated_at, &raw, now_ms())?;
-    tx.commit()?;
-    match outcome {
-        ConvertOutcome::Kept(_) => Ok(()),
-        ConvertOutcome::SetAside { .. } => Err(StorageError::Invalid(SET_ASIDE)),
+    let quarantined: i64 =
+        stmt(&tx, "SELECT count(*) FROM quarantined_sessions")?.query_row([], |row| row.get(0))?;
+    match convert_session_in_tx(&tx, id, title, updated_at, &raw, now_ms())? {
+        ConvertOutcome::Kept(_) => {
+            tx.commit()?;
+            Ok(())
+        }
+        // Dropping the transaction rolls the set-aside back: the table stays bounded.
+        ConvertOutcome::SetAside { .. } if quarantined >= MAX_QUARANTINED => {
+            Err(StorageError::Invalid(NO_ROOM))
+        }
+        ConvertOutcome::SetAside { .. } => {
+            tx.commit()?;
+            Err(StorageError::Invalid(SET_ASIDE))
+        }
     }
 }
 
@@ -982,7 +1140,7 @@ mod tests {
     use crate::storage::chats::{
         counter_repairs, read_counters, recount, v6_in_memory, write_tx, MetadataPatch,
     };
-    use crate::storage::fixtures::{golden, v5_sessions, RECALL_QUERIES};
+    use crate::storage::fixtures::{golden, platform_neutral, v5_sessions, RECALL_QUERIES};
     use crate::storage::search::search_v6;
     use crate::storage::RecallQuery;
     use rusqlite::params;
@@ -1042,6 +1200,26 @@ mod tests {
         }
         tx.commit().unwrap();
         outcomes
+    }
+
+    /// Converts `body` under the row id `id`, on a row inserted for it.
+    fn convert_one(db: &LocalStore, id: &str, body: &Value) -> ConvertOutcome {
+        let tx = write_tx(db.connection()).unwrap();
+        tx.execute(
+            "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,'T',1,'')",
+            [id],
+        )
+        .unwrap();
+        let raw = serde_json::to_string(body).unwrap();
+        let outcome = convert_session_in_tx(&tx, id, "T", 1, &raw, NOW).unwrap();
+        tx.commit().unwrap();
+        outcome
+    }
+
+    fn set_aside_for(reason: &str) -> ConvertOutcome {
+        ConvertOutcome::SetAside {
+            reason: reason.into(),
+        }
     }
 
     fn kept(outcome: &ConvertOutcome) -> &ConvertReport {
@@ -1106,15 +1284,16 @@ mod tests {
     fn a_reference_that_does_not_resolve_is_stored_inline() {
         // The call has no `arguments`, so the tool's proposed reference cannot resolve, and the
         // assistant's proposals are all disproved and put back inline. The user ref still holds.
+        let text = "an answer long enough that a reference to it is smaller";
         let messages = vec![
-            json!({"id":"u","role":"user","content":"q","attachments":[]}),
-            json!({"id":"a","role":"assistant","content":"x","attachments":[],"status":"complete",
-                "tools":[{"id":"0_0_c1","name":"f","arguments":null,"status":"complete"}]}),
+            json!({"id":"u","role":"user","content":"a question","attachments":[]}),
+            json!({"id":"a","role":"assistant","content":text,"attachments":[],"status":"complete",
+                "tools":[{"id":"0_0_c1","name":"a_tool_with_a_long_name","arguments":null,"status":"complete"}]}),
         ];
         let transcript = vec![
-            json!({"role":"user","content":"q"}),
-            json!({"role":"assistant","content":"x",
-                "tool_calls":[{"id":"c1","type":"function","function":{"name":"f"}}]}),
+            json!({"role":"user","content":"a question"}),
+            json!({"role":"assistant","content":text,
+                "tool_calls":[{"id":"c1","type":"function","function":{"name":"a_tool_with_a_long_name"}}]}),
         ];
         let mut report = ConvertReport::default();
         let rows = plan(10, &messages, &transcript, &mut report);
@@ -1122,14 +1301,173 @@ mod tests {
             report.inline_reasons,
             BTreeMap::from([("content", 1), ("tool", 1)])
         );
-        // "x", then the tool's "f" and its `null` arguments as JSON.
-        assert_eq!(report.inline_bytes, 1 + 1 + 4);
+        assert_eq!(
+            report.inline_bytes,
+            json_len(&messages[1]["content"]) + json_len(&messages[1]["tools"][0])
+        );
         assert_eq!(rows[1].body, messages[1]);
         assert_eq!(rows[2].body, json!({"ref": 10}));
         assert_eq!(rows[3].body, transcript[1]);
-        assert_eq!(report.deduplicated_bytes, value_bytes(&transcript[0]));
+        // Net: the entry's bytes less the reference's.
+        assert_eq!(
+            report.deduplicated_bytes,
+            json_len(&transcript[0]) - json_len(&json!({"ref": 10}))
+        );
         let view = crate::storage::view::build_view(&rows, None, &[]).unwrap();
         assert_eq!(view.messages, messages);
+    }
+
+    #[test]
+    fn a_disproved_model_ref_is_put_back_inline() {
+        // A stopped run's echo carries an extra key, so its reference (which resolves to just
+        // role and content) is disproved on the model side and put back verbatim.
+        let content = "Looking at the files in the project folder.\n\nThe text streamed after the last saved turn";
+        let messages = vec![
+            json!({"id":"u","role":"user","content":"look at the files","attachments":[]}),
+            json!({"id":"a","role":"assistant","content":content,"attachments":[],"status":"stopped"}),
+            json!({"id":"v","role":"user","content":"go on","attachments":[]}),
+        ];
+        let transcript = vec![
+            json!({"role":"user","content":"look at the files"}),
+            json!({"role":"assistant","content":"Looking at the files in the project folder.",
+                "tool_calls":[{"id":"c1","type":"function","function":{"name":"ls","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"a.txt"}),
+            json!({"role":"assistant","content":content,"name":"extra"}),
+            json!({"role":"user","content":"go on"}),
+        ];
+        let mut report = ConvertReport::default();
+        let rows = plan(0, &messages, &transcript, &mut report);
+        assert_eq!(report.inline_reasons, BTreeMap::from([("echo", 1)]));
+        assert_eq!(report.inline_bytes, json_len(&transcript[3]));
+        assert_eq!(rows[3 + 3].body, transcript[3]);
+        // The content kept its turns and a tail; the two user refs held.
+        assert_eq!(
+            rows[1].body["content"],
+            json!({"turns": [4], "tail": "\n\nThe text streamed after the last saved turn"})
+        );
+        assert_eq!(rows[3].body, json!({"ref": 0}));
+        assert_eq!(rows[7].body, json!({"ref": 2}));
+        let context = ContextRow {
+            model_from: 3,
+            model_len: 5,
+            covered_messages: 0,
+            source_hash: String::new(),
+            server_usage: None,
+        };
+        let view = crate::storage::view::build_view(&rows, Some(&context), &[]).unwrap();
+        assert_eq!(view.messages, messages);
+        assert_eq!(view.context.unwrap()["transcript"], json!(transcript));
+
+        // A user ref that does not resolve to its entry is put back the same way. The matcher
+        // never proposes one (an entry with an extra key is not any message's form), so the
+        // proof step is driven directly.
+        let user = json!({"id":"u","role":"user","content":"q","attachments":[]});
+        let entry = json!({"role":"user","content":"q","name":"extra"});
+        let mut report = ConvertReport::default();
+        let planned = plan(
+            0,
+            std::slice::from_ref(&user),
+            std::slice::from_ref(&entry),
+            &mut report,
+        );
+        assert_eq!(planned[1].body, entry);
+        assert_eq!(report, ConvertReport::default());
+        let mut rows = vec![
+            EventRow {
+                seq: 0,
+                kind: Kind::UiUser,
+                body: user.clone(),
+            },
+            EventRow {
+                seq: 1,
+                kind: Kind::Model,
+                body: json!({"ref": 0}),
+            },
+        ];
+        let (inline, net) = saving(&entry, &json!({"ref": 0})).unwrap();
+        let proposals = [Proposal::Model {
+            row: 0,
+            message: 0,
+            inline,
+            net,
+        }];
+        let mut report = ConvertReport::default();
+        settle(
+            &mut rows,
+            &proposals,
+            &[user],
+            std::slice::from_ref(&entry),
+            0,
+            &mut report,
+        );
+        assert_eq!(rows[1].body, entry);
+        assert_eq!(report.inline_reasons, BTreeMap::from([("user", 1)]));
+        assert_eq!(report.deduplicated_bytes, 0);
+    }
+
+    #[test]
+    fn a_user_entry_matches_backwards_when_nothing_later_does() {
+        let messages = vec![
+            json!({"id":"one","role":"user","content":"the first question","attachments":[]}),
+            json!({"id":"two","role":"user","content":"the second question","attachments":[]}),
+        ];
+        // The second message's entry comes first; the first one's is then found from 0.
+        let transcript = vec![
+            json!({"role":"user","content":"the second question"}),
+            json!({"role":"user","content":"the first question"}),
+        ];
+        let mut report = ConvertReport::default();
+        let rows = plan(5, &messages, &transcript, &mut report);
+        assert_eq!(rows[2].body, json!({"ref": 6}));
+        assert_eq!(rows[3].body, json!({"ref": 5}));
+        assert!(report.inline_reasons.is_empty());
+        let context = ContextRow {
+            model_from: 7,
+            model_len: 2,
+            covered_messages: 0,
+            source_hash: String::new(),
+            server_usage: None,
+        };
+        let view = crate::storage::view::build_view(&rows, Some(&context), &[]).unwrap();
+        assert_eq!(view.context.unwrap()["transcript"], json!(transcript));
+    }
+
+    #[test]
+    fn a_reference_is_made_only_when_it_saves_space() {
+        // `"ok"` is smaller than any `{"turns":[…]}`: it stays inline, and that is no failure.
+        let messages = vec![
+            json!({"id":"u","role":"user","content":"is it fine?","attachments":[]}),
+            json!({"id":"a","role":"assistant","content":"ok","attachments":[],"status":"complete"}),
+        ];
+        let transcript = vec![
+            json!({"role":"user","content":"is it fine?"}),
+            json!({"role":"assistant","content":"ok"}),
+        ];
+        let mut report = ConvertReport::default();
+        let rows = plan(0, &messages, &transcript, &mut report);
+        assert_eq!(rows[1].body, messages[1]);
+        assert_eq!(rows[2].body, json!({"ref": 0}));
+        // Only the user ref saved anything, and the stats count what it saved, net.
+        assert_eq!(report.inline_bytes, 0);
+        assert!(report.inline_reasons.is_empty());
+        assert_eq!(
+            report.deduplicated_bytes,
+            json_len(&transcript[0]) - json_len(&json!({"ref": 0}))
+        );
+        // A long one is referenced, and counted net of its form.
+        let long = "a reply long enough that its turns reference is the smaller copy";
+        let mut messages = messages;
+        messages[1]["content"] = json!(long);
+        let mut transcript = transcript;
+        transcript[1]["content"] = json!(long);
+        let mut report = ConvertReport::default();
+        let rows = plan(0, &messages, &transcript, &mut report);
+        assert_eq!(rows[1].body["content"], json!({"turns": [3]}));
+        assert_eq!(
+            report.deduplicated_bytes,
+            json_len(&transcript[0]) - json_len(&json!({"ref": 0})) + json_len(&json!(long))
+                - json_len(&json!({"turns": [3]}))
+        );
     }
 
     #[test]
@@ -1183,7 +1521,7 @@ mod tests {
         }
         assert_eq!(db.list_v6().unwrap(), v5.list_sessions().unwrap());
         // Recall is v5's, from the index the conversion wrote.
-        assert_eq!(v6_recall(&db), golden("v5_recall.json"));
+        assert_eq!(platform_neutral(v6_recall(&db)), golden("v5_recall.json"));
         // The chat v5 refused is kept whole, set aside.
         let raw = serde_json::to_string(&fixture("bad_role")).unwrap();
         assert_eq!(
@@ -1310,13 +1648,17 @@ mod tests {
                     .iter()
                     .map(|text| text.split("\n\n").filter(|piece| *piece == marker).count())
                     .sum();
-                assert_eq!(found, 1, "{id}: {marker:?} is stored {found} times");
+                // A reference costs at least `{"turns":[n]}`, so a text this short is cheaper stored
+                // again than referenced (ruling, Minor 3).
+                let short = marker.len() < 16;
+                assert!(
+                    found == 1 || (short && found == 2),
+                    "{id}: {marker:?} is stored {found} times"
+                );
             }
         }
-        // The stopped run's echo is a reference to its message, and its unsaved text is a tail.
+        // The stopped run's echo is a reference to its message.
         let rows = event_bodies(&db, "stopped_then_continued");
-        let assistant = &rows[1].1;
-        assert_eq!(assistant["content"]["tail"], "\n\nReading the build script");
         assert!(rows
             .iter()
             .any(|(kind, body)| kind == "model" && body == &json!({"ref": 1})));
@@ -1331,7 +1673,7 @@ mod tests {
         assert_eq!(report.inline_reasons, BTreeMap::from([("content", 1)]));
         assert_eq!(
             report.inline_bytes,
-            "Checking\n\nAll good, edited after the run".len() as u64
+            json_len(&json!("Checking\n\nAll good, edited after the run"))
         );
         assert_eq!(
             db.load_json_v6("text_tool_mismatch").unwrap().unwrap(),
@@ -1576,5 +1918,156 @@ mod tests {
             Err(StorageError::Conflict { current: 2 })
         ));
         assert_eq!(compat_saves(), saves + 1);
+    }
+
+    #[test]
+    fn each_count_cap_is_named_when_a_legacy_chat_is_over_it() {
+        let db = v6_in_memory();
+        let mut messages = fixture("desktop_plain");
+        let one = messages["messages"][0].clone();
+        messages["messages"] = json!(vec![one; 2001]);
+        assert_eq!(
+            convert_one(&db, "desktop_plain", &messages),
+            set_aside_for(Cap::UiMessages.message())
+        );
+        let mut entries = fixture("agent_tools");
+        let entry = json!({"role":"user","content":"x"});
+        entries["contextState"]["transcript"] = json!(vec![entry; 20_001]);
+        assert_eq!(
+            convert_one(&db, "agent_tools", &entries),
+            set_aside_for(Cap::ModelEntries.message())
+        );
+        let mut checkpoints = fixture("compacted");
+        let checkpoint = checkpoints["contextState"]["checkpoints"][0].clone();
+        checkpoints["contextState"]["checkpoints"] = json!(vec![checkpoint; 101]);
+        assert_eq!(
+            convert_one(&db, "compacted", &checkpoints),
+            set_aside_for(Cap::Checkpoints.message())
+        );
+    }
+
+    #[test]
+    fn an_unsupported_legacy_shape_is_set_aside_and_not_counted_as_a_bug() {
+        let mut cases: Vec<(&str, Value)> = vec![];
+        let mut case = |name: &'static str, base: &str, edit: &dyn Fn(&mut Value)| {
+            let mut session = fixture(base);
+            edit(&mut session);
+            cases.push((name, session));
+        };
+        case("run key", "agent_tools", &|s| {
+            s["messages"][1]["run"] = json!(1)
+        });
+        case("tool call key", "agent_tools", &|s| {
+            s["messages"][1]["tools"][0]["call"] = json!([0, 0]);
+        });
+        case("tool not an object", "agent_tools", &|s| {
+            s["messages"][1]["tools"][0] = json!("tool");
+        });
+        case("tools not a list", "agent_tools", &|s| {
+            s["messages"][1]["tools"] = json!({});
+        });
+        case("transcript ref key", "desktop_plain", &|s| {
+            s["contextState"]["transcript"][1]["ref"] = json!(0);
+        });
+        case("extra context key", "desktop_plain", &|s| {
+            s["contextState"]["extra"] = json!(1);
+        });
+        case("missing context key", "desktop_plain", &|s| {
+            s["contextState"]
+                .as_object_mut()
+                .unwrap()
+                .remove("coveredMessages");
+        });
+        case("context not an object", "desktop_plain", &|s| {
+            s["contextState"] = json!("state");
+        });
+        case("relative workspace", "agent_tools", &|s| {
+            s["workspace"] = json!("relative/dir");
+        });
+        case("null mode", "desktop_plain", &|s| s["mode"] = Value::Null);
+        case("empty mode", "desktop_plain", &|s| s["mode"] = json!(""));
+        case("attachment not an object", "desktop_plain", &|s| {
+            s["messages"][0]["attachments"] = json!([1]);
+        });
+        let db = v6_in_memory();
+        let bugs = upgrade_inline_values();
+        for (at, (name, session)) in cases.iter().enumerate() {
+            let id = format!("case_{at}");
+            let mut session = session.clone();
+            session["id"] = json!(id);
+            assert_eq!(
+                convert_one(&db, &id, &session),
+                set_aside_for(UNSUPPORTED),
+                "{name}"
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) FROM chat_events WHERE session_id=?1",
+                    &id
+                ),
+                0
+            );
+        }
+        assert_eq!(upgrade_inline_values(), bugs);
+        // An optional `serverUsage` may be absent: still supported.
+        let mut session = fixture("desktop_plain");
+        session["contextState"]
+            .as_object_mut()
+            .unwrap()
+            .remove("serverUsage");
+        let outcomes = upgrade(&db, std::slice::from_ref(&session));
+        kept(&outcomes["desktop_plain"]);
+        assert_eq!(db.load_json_v6("desktop_plain").unwrap().unwrap(), session);
+    }
+
+    #[test]
+    fn a_body_whose_id_is_not_its_rows_is_set_aside() {
+        let db = v6_in_memory();
+        assert_eq!(
+            convert_one(&db, "other_row", &fixture("desktop_plain")),
+            set_aside_for(ID_MISMATCH)
+        );
+        assert_eq!(upgrade_inline_values(), 0);
+    }
+
+    #[test]
+    fn the_compatibility_save_stops_setting_aside_at_its_cap() {
+        let db = v6_in_memory();
+        let mut broken = fixture("desktop_plain");
+        broken["messages"][0]["attachments"] = json!(vec![json!({"name":"a.txt"}); 9]);
+        for n in 0..MAX_QUARANTINED - 1 {
+            db.connection()
+                .execute(
+                    "INSERT INTO quarantined_sessions(id,title,body,reason,found_at) VALUES (?1,'T','{}','r',1)",
+                    [format!("old_{n}")],
+                )
+                .unwrap();
+        }
+        let total = || -> i64 {
+            db.connection()
+                .query_row("SELECT count(*) FROM quarantined_sessions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        // Below the cap a bad chat is still set aside.
+        broken["id"] = json!("broken_one");
+        assert!(matches!(
+            import_session(&db, &broken),
+            Err(StorageError::Invalid(SET_ASIDE))
+        ));
+        assert_eq!(total(), MAX_QUARANTINED);
+        // At the cap it is refused, and nothing is written.
+        broken["id"] = json!("broken_two");
+        assert!(matches!(
+            import_session(&db, &broken),
+            Err(StorageError::Invalid(NO_ROOM))
+        ));
+        assert_eq!(total(), MAX_QUARANTINED);
+        assert!(quarantined(&db, "broken_two").is_none());
+        assert!(db.load_json_v6("broken_two").unwrap().is_none());
+        // A good chat still saves.
+        import_session(&db, &fixture("desktop_plain")).unwrap();
     }
 }

@@ -41,7 +41,40 @@ pub(crate) const RECALL_QUERIES: [&str; 7] = [
     "stopped",
 ];
 
-const WORKSPACE: &str = "/work/project";
+/// The agent fixtures' workspace. v6 refuses a relative workspace, and `/work/project` is not
+/// absolute on Windows, so each platform gets its own absolute spelling. The goldens always say
+/// [`GOLDEN_WORKSPACE`]; compare through [`platform_neutral`].
+#[cfg(not(windows))]
+pub(crate) const WORKSPACE: &str = "/work/project";
+#[cfg(windows)]
+pub(crate) const WORKSPACE: &str = r"C:\work\project";
+/// The workspace as the goldens spell it on every platform.
+pub(crate) const GOLDEN_WORKSPACE: &str = "/work/project";
+
+/// A test path written from the root, POSIX-style, as an absolute path on this platform:
+/// `/p` stays `/p`, and on Windows becomes `C:\p`.
+pub(crate) fn abs(path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", path.replace('/', "\\"))
+    } else {
+        path.to_owned()
+    }
+}
+
+/// `value` with this platform's [`WORKSPACE`] spelled as the goldens spell it, so one golden
+/// serves every platform. Identity off Windows.
+pub(crate) fn platform_neutral(value: Value) -> Value {
+    match value {
+        Value::String(text) if text == WORKSPACE => Value::String(GOLDEN_WORKSPACE.into()),
+        Value::Array(items) => Value::Array(items.into_iter().map(platform_neutral).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, platform_neutral(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // The simulator
@@ -998,7 +1031,7 @@ fn capture_v5_goldens() {
             store.save_session(&session).unwrap();
         }
     }
-    let recall = recall_results(&store);
+    let recall = platform_neutral(recall_results(&store));
     drop(store);
     let master = master(&directory.join(DATABASE_FILE));
     for (name, value) in [("v5_master.json", master), ("v5_recall.json", recall)] {
@@ -1265,4 +1298,32 @@ fn non_continuable_fixtures_are_exactly_those_v5_cannot_restore() {
     for id in NON_CONTINUABLE {
         assert!(v5_sessions().iter().any(|s| s["id"] == *id));
     }
+}
+
+#[test]
+fn test_paths_are_absolute_on_this_platform_and_goldens_are_neutral() {
+    // v6 refuses a relative workspace (`chats::check_mode_workspace`), so every workspace the
+    // fixtures and the A5-A7 tests store must be absolute here.
+    assert!(Path::new(WORKSPACE).is_absolute());
+    for path in [
+        "/p", "/w", "/work", "/work/a", "/project", "/first", "/second", "/old",
+    ] {
+        assert!(Path::new(&abs(path)).is_absolute(), "{path}");
+    }
+    assert_eq!(
+        platform_neutral(json!({"hits": [{"project": WORKSPACE}], "other": "/elsewhere"})),
+        json!({"hits": [{"project": GOLDEN_WORKSPACE}], "other": "/elsewhere"})
+    );
+    assert!(golden("v5_recall.json")
+        .to_string()
+        .contains(GOLDEN_WORKSPACE));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_spells_test_paths_with_a_drive() {
+    assert_eq!(WORKSPACE, r"C:\work\project");
+    assert_eq!(abs("/work/a"), r"C:\work\a");
+    assert!(!Path::new(GOLDEN_WORKSPACE).is_absolute());
+    assert_ne!(platform_neutral(json!(WORKSPACE)), json!(WORKSPACE));
 }

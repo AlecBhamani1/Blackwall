@@ -1134,6 +1134,7 @@ mod tests {
     use crate::protocol::{
         MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
     };
+    use crate::storage::fixtures::abs;
     use crate::storage::{configure, FOREIGN_KEYS_OFF};
     use crate::storage::{
         MAX_CHECKPOINTS, MAX_CHECKPOINT_BYTES, MAX_EVENT_BYTES, MAX_METADATA_BYTES,
@@ -1908,27 +1909,27 @@ mod tests {
         assert_eq!(read(), (None, None));
         fill(Some("agent"), None).unwrap();
         assert_eq!(read(), (Some("agent".into()), None));
-        fill(Some("chat"), Some("/work/a")).unwrap();
-        assert_eq!(read(), (Some("agent".into()), Some("/work/a".into())));
-        fill(Some("chat"), Some("/work/b")).unwrap();
-        assert_eq!(read(), (Some("agent".into()), Some("/work/a".into())));
+        fill(Some("chat"), Some(&abs("/work/a"))).unwrap();
+        assert_eq!(read(), (Some("agent".into()), Some(abs("/work/a"))));
+        fill(Some("chat"), Some(&abs("/work/b"))).unwrap();
+        assert_eq!(read(), (Some("agent".into()), Some(abs("/work/a"))));
         assert!(matches!(
             fill(None, Some("relative/path")),
             Err(StorageError::Invalid(_))
         ));
         assert!(matches!(
-            fill(None, Some(&format!("/{}", "w".repeat(2048)))),
+            fill(None, Some(&abs(&format!("/{}", "w".repeat(2048))))),
             Err(StorageError::Invalid(_))
         ));
         // create_session takes both once, and checks them.
         let mut full = new_session("full");
         full.mode = Some("agent".into());
-        full.workspace = Some("/work".into());
+        full.workspace = Some(abs("/work"));
         db.create_session(&full).unwrap();
         let chat = db.load_chat("full").unwrap().unwrap();
         assert_eq!(
             (chat.mode, chat.workspace),
-            (Some("agent".into()), Some("/work".into()))
+            (Some("agent".into()), Some(abs("/work")))
         );
         for bad in [
             NewSession {
@@ -1977,7 +1978,7 @@ mod tests {
         let db = v6_in_memory();
         let mut agent = new_session("b");
         agent.mode = Some("agent".into());
-        agent.workspace = Some("/w".into());
+        agent.workspace = Some(abs("/w"));
         agent.updated_at = 2_000;
         db.create_session(&agent).unwrap();
         make(&db, "a");
@@ -1987,7 +1988,7 @@ mod tests {
         assert_eq!(
             before,
             vec![
-                json!({"id":"b","title":"Chat b","updatedAt":2000,"messages":[],"mode":"agent","workspace":"/w"}),
+                json!({"id":"b","title":"Chat b","updatedAt":2000,"messages":[],"mode":"agent","workspace":abs("/w")}),
                 json!({"id":"a","title":"Chat a","updatedAt":1000,"messages":[],"mode":"chat","workspace":null}),
             ]
         );
@@ -2116,7 +2117,7 @@ mod tests {
         let db = v6_in_memory();
         let mut s = new_session("s");
         s.mode = Some("agent".into());
-        s.workspace = Some("/w".into());
+        s.workspace = Some(abs("/w"));
         db.create_session(&s).unwrap();
         run(&db, "s", 0);
         let patch = MetadataPatch {
@@ -2129,7 +2130,7 @@ mod tests {
         assert_eq!(json["title"], "Chat s");
         assert_eq!(json["updatedAt"], 1000);
         assert_eq!(json["mode"], "agent");
-        assert_eq!(json["workspace"], "/w");
+        assert_eq!(json["workspace"], abs("/w"));
         assert_eq!(json["extra"], json!([1]));
         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
         assert_eq!(json["messages"][1]["content"], "hi");

@@ -246,7 +246,7 @@ mod tests {
         append_model, append_run_start, append_ui_assistant, append_ui_user, read_counters,
         recount, v6_in_memory, write_counters, write_tx, NewSession,
     };
-    use crate::storage::fixtures::{golden, v5_sessions, RECALL_QUERIES};
+    use crate::storage::fixtures::{abs, golden, platform_neutral, v5_sessions, RECALL_QUERIES};
     use serde_json::{json, Map};
 
     /// Stores a chat as the writers will: one UI message per event, each indexed in the same
@@ -265,7 +265,8 @@ mod tests {
             id: id.into(),
             title: title.into(),
             mode: mode.map(Into::into),
-            workspace: workspace.map(Into::into),
+            // Written POSIX-style; stored absolute for this platform, as v6 requires.
+            workspace: workspace.map(abs),
             updated_at,
         })
         .unwrap();
@@ -355,7 +356,7 @@ mod tests {
             MemoryClient::Cli,
             &RecallQuery {
                 query: "historical".into(),
-                project: Some("/project".into()),
+                project: Some(abs("/project")),
                 ..Default::default()
             },
         )
@@ -372,7 +373,7 @@ mod tests {
         );
         assert_eq!(reply.excerpt, "historical response");
         assert_eq!(reply.title, "Saved conversation");
-        assert_eq!(reply.project.as_deref(), Some("/project"));
+        assert_eq!(reply.project, Some(abs("/project")));
         // Deleting a chat takes its hits with it.
         db.delete_v6("desktop").unwrap();
         assert_eq!(find(&db, "needle").results.len(), 1);
@@ -390,7 +391,7 @@ mod tests {
         }
         let mut query = RecallQuery {
             query: "saved needle".into(),
-            project: Some("/first".into()),
+            project: Some(abs("/first")),
             after: Some(200),
             before: Some(200),
             limit: Some(1),
@@ -752,7 +753,10 @@ mod tests {
             .unwrap();
             results.insert(query.into(), serde_json::to_value(hits).unwrap());
         }
-        assert_eq!(Value::Object(results), golden("v5_recall.json"));
+        assert_eq!(
+            platform_neutral(Value::Object(results)),
+            golden("v5_recall.json")
+        );
     }
 
     #[test]
@@ -889,7 +893,7 @@ mod tests {
         let v5 = LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap();
         for (id, mode, updated_at, messages) in chats {
             let mut session = json!({"id": id, "title": "T", "updatedAt": updated_at,
-                "workspace": "/p", "messages": messages});
+                "workspace": abs("/p"), "messages": messages});
             if let Some(mode) = mode {
                 session["mode"] = json!(mode);
             }
