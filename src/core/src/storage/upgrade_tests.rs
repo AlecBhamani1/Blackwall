@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::MemoryClient;
-use crate::storage::backup::{backup_name, backups_dir, set_fault, Fault, BACKUPS_DIR};
+use crate::storage::backup::{backup_name, backups_dir, set_fault, AbortAt, Fault, BACKUPS_DIR};
 use crate::storage::fixtures::{
     build_v5, golden, master, platform_neutral, v5_sessions, RECALL_QUERIES,
 };
@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use std::{
     fs,
     path::PathBuf,
+    process::Child,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -718,4 +719,445 @@ fn a_changed_source_after_a_stop_gets_a_new_backup_and_count() {
         }
     );
     assert_eq!(baks(&dir).len(), 2);
+}
+
+// ---- crashes, two processes and stale writers (A11) ----
+//
+// A child is this test binary run again on one `#[ignore]`d test, so it has `cfg(test)` and the
+// data-folder-keyed faults, which an in-process thread-local could not give it. A test that finds
+// the child's env missing (someone ran the ignored test by hand) does nothing.
+
+const CRASH_AT: &str = "BLACKWALL_TEST_CRASH_AT";
+const CHILD_DIR: &str = "BLACKWALL_TEST_CHILD_DIR";
+const CHILD_SYNC: &str = "BLACKWALL_TEST_CHILD_SYNC";
+const CHILD_NAME: &str = "BLACKWALL_TEST_CHILD_NAME";
+/// Not an abort: the crash child reached the end of its open.
+const SURVIVED: i32 = 42;
+/// Far longer than any runner needs; a wait only ever ends early, on the thing it waits for.
+const WAIT: Duration = Duration::from_secs(120);
+
+const CRASH_POINTS: [(&str, AbortAt); 5] = [
+    ("DuringBackup", AbortAt::DuringBackup),
+    ("AfterBackup", AbortAt::AfterBackup),
+    ("DuringConvert", AbortAt::DuringConvert),
+    ("BeforeCommit", AbortAt::BeforeCommit),
+    ("AfterCommit", AbortAt::AfterCommit),
+];
+
+/// Waits for `path`, failing fast if a child dies first and at `WAIT` if nothing ever comes.
+fn wait_for(path: &Path, children: &mut [Child]) {
+    let start = Instant::now();
+    while !path.exists() {
+        for child in children.iter_mut() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "a child exited while the test waited for {}",
+                path.display()
+            );
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Kills any child still running when the test ends, however it ends.
+struct Reaper(Vec<Child>);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Starts this binary on the ignored test `name`, its output in `log` (a file, so no pipe can fill
+/// and block the child).
+fn spawn_child(name: &str, log: &Path, env: &[(&str, &str)]) -> Child {
+    let log = fs::File::create(log).unwrap();
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("RUST_BACKTRACE", "0")
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap()
+}
+
+fn wait_exit(mut child: Child) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > WAIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("a child did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn table_exists(database: &Path, name: &str) -> bool {
+    Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Every chat but the deliberately invalid one loads as it did in v5.
+fn assert_chats_intact(db: &LocalStore, sessions: &[Value]) {
+    for session in sessions.iter().filter(|s| s["id"] != "bad_role") {
+        let id = session["id"].as_str().unwrap();
+        assert_eq!(
+            db.load_json_v6(id).unwrap().unwrap(),
+            expected(session),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn a_crash_after_backup_during_convert_or_before_commit_reopens_as_whole_v5_then_upgrades_reusing_the_backup(
+) {
+    // The process is killed (SIGABRT, or the Windows fast-fail) at each point, with no cleanup.
+    for (name, at) in CRASH_POINTS {
+        let dir = Scratch::new("crash");
+        let sessions = v5_sessions();
+        build_v5(&dir, &sessions, 5);
+        let before = session_rows(&dir.database());
+        let sync = Scratch::new("crash-sync");
+        fs::create_dir_all(&sync.0).unwrap();
+
+        let child = spawn_child(
+            "storage::upgrade::tests::crash_child",
+            &sync.0.join("child.log"),
+            &[(CRASH_AT, name), (CHILD_DIR, dir.to_str().unwrap())],
+        );
+        let status = wait_exit(child);
+        let log = fs::read_to_string(sync.0.join("child.log")).unwrap_or_default();
+        assert!(!status.success(), "{name}: the child did not crash\n{log}");
+        assert_ne!(
+            status.code(),
+            Some(SURVIVED),
+            "{name}: no abort fired\n{log}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(6), "{name}: not an abort\n{log}");
+        }
+        assert!(
+            !matches!(
+                LocalStore::upgrade_status(&dir).unwrap(),
+                UpgradeStatus::Current
+            ) || at == AbortAt::AfterCommit,
+            "{name}"
+        );
+
+        if at == AbortAt::AfterCommit {
+            // Committed, then killed before the integrity check and the pruning.
+            assert_eq!(version_of(&dir.database()), V6, "{name}");
+        } else {
+            // Reading the file rolls its hot journal back: the whole v5 database, untouched.
+            assert_eq!(version_of(&dir.database()), 5, "{name}");
+            assert_eq!(session_rows(&dir.database()), before, "{name}");
+            assert!(!table_exists(&dir.database(), "chat_events"), "{name}");
+        }
+
+        let db = open6(&dir).unwrap();
+        assert_chats_intact(&db, &sessions);
+        drop(db);
+        assert_eq!(baks(&dir).len(), 1, "{name}: {:?}", backup_files(&dir));
+        // Whatever the crash left in the backups folder is gone or still one backup's own.
+        assert!(
+            backup_files(&dir).iter().all(|f| !f.contains("partial")),
+            "{name}: {:?}",
+            backup_files(&dir)
+        );
+        // Opening again neither upgrades nor backs up.
+        drop(open6(&dir).unwrap());
+        assert_eq!(baks(&dir).len(), 1, "{name}");
+        assert_eq!(
+            LocalStore::upgrade_status(&dir).unwrap(),
+            UpgradeStatus::Current,
+            "{name}"
+        );
+    }
+}
+
+/// The crash test's child: arms the abort and opens at v6.
+#[test]
+#[ignore = "child of the crash test"]
+fn crash_child() {
+    let (Ok(at), Ok(dir)) = (std::env::var(CRASH_AT), std::env::var(CHILD_DIR)) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let (_, at) = CRASH_POINTS.iter().find(|(name, _)| *name == at).unwrap();
+    set_fault(&dir, Some(Fault::Abort(*at)));
+    let _ = open6(&dir);
+    std::process::exit(SURVIVED);
+}
+
+// BLOCKED on Unix by a production bug this test found: `backup::source_id` opens the database with
+// `File::open` while `upgrade` holds SQLite's write lock, and closing that descriptor drops every
+// POSIX lock the process holds on the file. A second process then takes the write lock and makes
+// its own backup mid-upgrade. Windows locks belong to the handle, so it runs there. Remove the
+// `ignore` when `source_id` stops releasing the lock (see task-A11-report.md).
+#[test]
+#[cfg_attr(
+    unix,
+    ignore = "fails until backup::source_id stops dropping the POSIX write lock (task-A11-report.md)"
+)]
+fn two_processes_opening_one_v5_database_one_migrates_and_the_other_waits() {
+    let dir = Scratch::new("two");
+    let sessions = v5_sessions();
+    build_v5(&dir, &sessions, 5);
+    let sync = Scratch::new("two-sync");
+    fs::create_dir_all(&sync.0).unwrap();
+    let data = dir.to_str().unwrap();
+    let sync_path = sync.to_str().unwrap();
+    let mut children = Reaper(
+        ["a", "b"]
+            .iter()
+            .map(|name| {
+                spawn_child(
+                    "storage::upgrade::tests::upgrade_child",
+                    &sync.0.join(format!("{name}.log")),
+                    &[
+                        (CHILD_DIR, data),
+                        (CHILD_SYNC, sync_path),
+                        (CHILD_NAME, name),
+                    ],
+                )
+            })
+            .collect(),
+    );
+    // Both are up and about to open; only then do they go, together.
+    for name in ["a", "b"] {
+        wait_for(&sync.0.join(format!("{name}.ready")), &mut children.0);
+    }
+    fs::write(sync.0.join("go"), b"").unwrap();
+    // One of them is now inside the upgrade, holding the write lock with its backup made.
+    wait_for(&dir.0.join(backup::GATE_HELD), &mut children.0);
+    // The other cannot be done: it can only be waiting for the lock (or still on its way to it).
+    for child in &mut children.0 {
+        assert!(child.try_wait().unwrap().is_none());
+    }
+    assert_eq!(version_of(&dir.database()), 5);
+    assert_eq!(baks(&dir).len(), 1, "{:?}", backup_files(&dir));
+    fs::write(dir.0.join(backup::GATE_RELEASE), b"").unwrap();
+
+    let logs: Vec<String> = ["a", "b"]
+        .iter()
+        .zip(children.0.drain(..))
+        .map(|(name, child)| {
+            let status = wait_exit(child);
+            let log = fs::read_to_string(sync.0.join(format!("{name}.log"))).unwrap();
+            assert!(status.success(), "{name} failed: {status:?}\n{log}");
+            log
+        })
+        .collect();
+    let migrations: usize = logs
+        .iter()
+        .map(|log| log.matches("chats upgraded to v6").count())
+        .sum();
+    assert_eq!(migrations, 1, "{logs:?}");
+    assert_eq!(baks(&dir).len(), 1);
+    assert_eq!(version_of(&dir.database()), V6);
+    assert_chats_intact(&open6(&dir).unwrap(), &sessions);
+    assert_eq!(
+        LocalStore::upgrade_status(&dir).unwrap(),
+        UpgradeStatus::Current
+    );
+}
+
+/// One of the two openers of the two-process test. The one that wins the lock parks at the gate.
+#[test]
+#[ignore = "child of the two-process test"]
+fn upgrade_child() {
+    let (Ok(dir), Ok(sync), Ok(name)) = (
+        std::env::var(CHILD_DIR),
+        std::env::var(CHILD_SYNC),
+        std::env::var(CHILD_NAME),
+    ) else {
+        return;
+    };
+    let (dir, sync) = (PathBuf::from(dir), PathBuf::from(sync));
+    set_fault(&dir, Some(Fault::Gate));
+    fs::write(sync.join(format!("{name}.ready")), b"").unwrap();
+    let start = Instant::now();
+    while !sync.join("go").exists() {
+        assert!(start.elapsed() < WAIT, "never told to go");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let db = open6(&dir).unwrap();
+    assert_eq!(user_version(db.connection()).unwrap(), V6);
+}
+
+/// Every row of every v6 table that holds a chat, for comparing before and after.
+fn v6_dump(database: &Path) -> Vec<(String, Vec<String>)> {
+    let connection = Connection::open(database).unwrap();
+    [
+        "sessions ORDER BY id",
+        "chat_events ORDER BY session_id, seq",
+        "chat_context ORDER BY session_id",
+        "chat_checkpoints ORDER BY session_id, ordinal",
+        "chat_search_keys ORDER BY id",
+        "quarantined_sessions ORDER BY id",
+        "settings ORDER BY key",
+    ]
+    .iter()
+    .map(|table| {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((0..columns)
+                    .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (table.to_string(), rows)
+    })
+    .collect()
+}
+
+fn count(database: &Path, sql: &str, id: &str) -> i64 {
+    Connection::open(database)
+        .unwrap()
+        .query_row(sql, [id], |row| row.get(0))
+        .unwrap()
+}
+
+/// A v5 window that was open before the upgrade, and a v6 database it now points at.
+fn stale_v5_writer(name: &str) -> (Scratch, LocalStore, Vec<Value>) {
+    let dir = Scratch::new(name);
+    let sessions = v5_sessions();
+    build_v5(&dir, &sessions, 5);
+    let stale = LocalStore::open(&dir).unwrap();
+    drop(open6(&dir).unwrap());
+    assert_eq!(version_of(&dir.database()), V6);
+    (dir, stale, sessions)
+}
+
+#[test]
+fn a_v5_writer_left_open_across_the_upgrade_fails_without_touching_v6_rows() {
+    let (dir, stale, sessions) = stale_v5_writer("stale-save");
+    let before = v6_dump(&dir.database());
+    // `save_session` indexes into `session_messages`, which the upgrade dropped (F25).
+    let existing = fixture("ids_missing_and_duplicate");
+    assert!(stale.save_session(&existing).is_err());
+    let mut new = existing.clone();
+    new["id"] = json!("a_chat_only_the_stale_window_knows");
+    assert!(stale.save_session(&new).is_err());
+    assert_eq!(v6_dump(&dir.database()), before);
+    assert_chats_intact(&open6(&dir).unwrap(), &sessions);
+}
+
+#[test]
+fn a_v5_delete_on_v6_cascades_cleanly() {
+    let (dir, stale, sessions) = stale_v5_writer("stale-delete");
+    let tables = [
+        "chat_events",
+        "chat_context",
+        "chat_checkpoints",
+        "chat_search_keys",
+    ];
+    let rows = |id: &str| -> Vec<i64> {
+        tables
+            .iter()
+            .map(|table| {
+                count(
+                    &dir.database(),
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id=?1"),
+                    id,
+                )
+            })
+            .collect()
+    };
+    // The chat with the most rows, so every table that can hold some does.
+    let id = sessions
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .max_by_key(|id| rows(id).iter().sum::<i64>())
+        .unwrap()
+        .to_owned();
+    let id = id.as_str();
+    let before = rows(id);
+    assert!(before[0] > 0 && before[3] > 0, "{id}: {before:?}");
+    let others = v6_dump(&dir.database());
+    let search_before = count(
+        &dir.database(),
+        "SELECT COUNT(*) FROM chat_search WHERE ?1=?1",
+        id,
+    );
+
+    stale.delete_session(id).unwrap();
+
+    assert_eq!(rows(id), vec![0; tables.len()]);
+    assert_eq!(
+        count(
+            &dir.database(),
+            "SELECT COUNT(*) FROM sessions WHERE id=?1",
+            id
+        ),
+        0
+    );
+    // Its search entries went with its keys, and nothing else did.
+    assert_eq!(
+        count(
+            &dir.database(),
+            "SELECT COUNT(*) FROM chat_search WHERE ?1=?1",
+            id
+        ),
+        search_before - before[3]
+    );
+    let after = v6_dump(&dir.database());
+    for ((table, kept), (_, all)) in after.iter().zip(&others) {
+        assert!(
+            kept.iter().all(|row| all.contains(row)),
+            "{table} gained a row"
+        );
+    }
+    let connection = Connection::open(dir.database()).unwrap();
+    assert!(connection
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query([])
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_none());
+    let check: String = connection
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    // Every other chat is whole.
+    let rest: Vec<Value> = sessions.into_iter().filter(|s| s["id"] != id).collect();
+    assert_chats_intact(&open6(&dir).unwrap(), &rest);
 }

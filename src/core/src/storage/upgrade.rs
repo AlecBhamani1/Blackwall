@@ -265,6 +265,11 @@ fn upgrade(directory: &Path, connection: &Connection) -> Result<(), StorageError
         .map_err(failed)?;
     }
     tx.commit().map_err(|error| failed(error.into()))?;
+    #[cfg(test)]
+    backup::fault(
+        directory,
+        backup::Fault::Abort(backup::AbortAt::AfterCommit),
+    )?;
     summary.log();
     after_commit(directory, connection, backup.as_ref(), now);
     Ok(())

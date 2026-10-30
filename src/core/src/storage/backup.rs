@@ -525,6 +525,7 @@ fn copy_and_verify(
     {
         inject(dir, Fault::BackupCopy)?;
         inject(dir, Fault::BackupPanic)?;
+        inject(dir, Fault::Abort(AbortAt::DuringBackup))?;
     }
     copy_all_pages(&backup)?;
     drop(backup);
@@ -718,14 +719,32 @@ pub(crate) enum Fault {
     IntegrityCheck,
     /// The process dies at this point.
     Abort(AbortAt),
+    /// At the upgrade's slow point (the backup is made, the write lock held) the process creates
+    /// [`GATE_HELD`] in the data folder and waits until [`GATE_RELEASE`] exists there. Files, not
+    /// sleeps, so a test that drives several processes can order them on any runner.
+    Gate,
 }
+
+/// The file the gated process creates once it is holding the upgrade's write lock.
+#[cfg(test)]
+pub(crate) const GATE_HELD: &str = "gate-held";
+/// The file whose appearance lets the gated process go on.
+#[cfg(test)]
+pub(crate) const GATE_RELEASE: &str = "gate-release";
+/// A gated process that is never released goes on after this, so a dead test cannot hang a runner.
+#[cfg(test)]
+const GATE_DEADLINE: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AbortAt {
+    /// The backup is half copied: its `.partial` exists.
+    DuringBackup,
     AfterBackup,
     DuringConvert,
     BeforeCommit,
+    /// The upgrade is committed; the integrity check and the pruning have not run.
+    AfterCommit,
 }
 
 #[cfg(test)]
@@ -754,6 +773,14 @@ pub(crate) fn fault(data_directory: &Path, point: Fault) -> Result<(), StorageEr
     match (armed, point) {
         (Some(Fault::Slow(pause)), Fault::Slow(_)) => {
             std::thread::sleep(pause);
+            Ok(())
+        }
+        (Some(Fault::Gate), Fault::Slow(_)) => {
+            let _ = fs::write(data_directory.join(GATE_HELD), b"");
+            let deadline = Instant::now() + GATE_DEADLINE;
+            while !data_directory.join(GATE_RELEASE).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Ok(())
         }
         (Some(Fault::Abort(at)), Fault::Abort(here)) if at == here => std::process::abort(),
