@@ -292,7 +292,12 @@ shows the problem. Each rule decision and approval outcome is appended to `polic
 common credential forms redacted; the log rotates at 1 MiB. Each record's `rule` names the rule that
 decided, as `{"source":"user"|"project","index":N,"mode":"strictest"|"ordered"}` (`index` counts
 from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default. A
-record for an owner command tool also has `program`, the absolute path of the program it ran.
+record for an owner command tool also has `program`, the absolute path of the program it ran;
+`tool`; `isolation` (`outside` or `sandboxed`); `args`, the arguments after the program, redacted
+like the rest and each cut at 1,000 characters; `env`, the names of the variables it was passed
+(never their values); and `stdinSha256` when it was sent standard input. When an allow rule
+matches a tool that always asks, `rule` names that rule and `"overridden": true` says it did not
+decide.
 
 To let Agent mode call other programs, such as another coding assistant's command line, list them
 in `tools.json` in the same data folder:
@@ -304,7 +309,10 @@ in `tools.json` in the same data folder:
 ```
 
 Each tool runs its program directly, without a shell, in the project folder. The program must be a
-name found in an absolute `PATH` directory or an absolute path. Batch files (`.bat`, `.cmd`) are
+name found in an absolute `PATH` directory or an absolute path, outside the project: an absolute
+path that is, or resolves through a symlink into, the project is refused. If the program changes
+between the prompt and the run (another file put in its place, the file rewritten, or the name now
+found elsewhere), the call is refused and the program does not run. Batch files (`.bat`, `.cmd`) are
 refused, and on Windows the program must be an `.exe`. An argument written as a whole `{name}` becomes a text parameter the model
 fills in; values that start with `-` (or `/` on Windows) are rejected so the model cannot add
 options. Every call needs Exec approval and is matched by rules
@@ -343,7 +351,9 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 names: `"env":["GITHUB_TOKEN","HTTPS_PROXY"]`. Names only, never values; at most 32 distinct names,
 and the variable must be set where Blackwall runs. Only you can write this list, and HTTP tools
 take no `env`. A command tool run sandboxed ignores `env` and gets only the sandbox set; the names
-apply when it runs outside the sandbox, which is the default. A name that loads code into a program
+apply when it runs outside the sandbox, which is the default. Then its prompt names the listed
+variables that are set, after the program, never their values: "Gets these variables from your
+environment: GITHUB_TOKEN, HTTPS_PROXY". A name that loads code into a program
 (`LD_*`, `DYLD_*`, `PYTHONPATH`, `NODE_OPTIONS`, `BASH_ENV` and similar), `PATH`, or one of
 Blackwall's own secrets is refused, and the file is invalid.
 
@@ -584,7 +594,8 @@ credentials from reaching a program that does not need them.
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
 - A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and
-  never in a directory that resolves into the project. An absolute path is used as written.
+  never in a directory that resolves into the project. An absolute path is used as written, unless
+  it is, or resolves through a symlink into, the project, which is refused.
 - `PATH` is your login shell's, with relative and empty entries, the project folder and the
   AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
 - Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.

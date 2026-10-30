@@ -189,6 +189,9 @@ trimmed to its start and end above a configurable cap (64 KiB by default) with a
 past 64 MiB, and a process-group guard that kills descendants on cancellation. Known model,
 relay, and signing secrets are removed from the inherited environment. In the unsandboxed profile other
 account access remains possible and is covered by the explicit command approval.
+Owner command tools, including a subagent's runs-on tool, run outside the profile with the owner's
+account permissions unless the owner picks `sandboxed`. They always ask: an allow rule never skips
+the prompt, a deny rule still denies, and the audit records the program that ran.
 
 `core::approvals` binds decisions to an active request and exact action. “Allow identical action this
 run” expires when the run ends. Dropping a pending action invalidates its decision handle.

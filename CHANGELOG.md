@@ -234,11 +234,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that look like the prompt's `BEGIN GUIDANCE`, `END GUIDANCE`, `Source:` or `Scope:` markers are
   prefixed with `> `.
 
-- Run command tools from `tools.json` outside the sandbox by default, on every system including
-  Windows, in the project folder with the allow-listed environment plus the tool's `env` names,
-  whatever the Commands profile is. They always ask: an owner allow rule or "allow identical action
-  this run" no longer skips the prompt, and a deny rule still denies. The prompt shows the resolved
-  program, and the audit log records it as `program`. To keep the old behavior, choose
+- Run command tools from `tools.json`, including a subagent's runs-on tool, outside the sandbox by
+  default, on every system including Windows, in the project folder with the allow-listed
+  environment plus the tool's `env` names, whatever the Commands profile is. They always ask: an
+  owner allow rule or "allow identical action this run" no longer skips the prompt, and a deny rule
+  still denies. The prompt says the program can run code from this project and use your files and
+  network, and shows the resolved program and the names (never values) of the `env` variables it
+  gets. The audit log records the program as `program`, with `tool`, `isolation`, `args`, `env`
+  names and `stdinSha256`, and marks an allow rule that did not skip the prompt
+  `"overridden": true`. An absolute program inside the project is refused, for command tools and
+  MCP servers, and so is a program that changed after you approved it. To keep the old behavior,
+  choose
   **Command tools → Inside the Commands profile** (Memory → Advanced · Subagents) or
   `bw config set command-tools-isolation sandboxed`; a project file cannot set it. `bw run --json`
   denies every prompt, so it cannot run an outside tool even with an allow rule; use `sandboxed`
