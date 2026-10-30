@@ -84,6 +84,13 @@
                 >{/if}
               <pre>{tool.output}</pre>
             {/if}
+            {#each tool.diagnostics ?? [] as diagnostic}
+              <small>Details for {diagnostic.server}, shown only to you</small>
+              {#if diagnostic.notPassed?.length}
+                <pre>Not passed to it: {diagnostic.notPassed.join(', ')}</pre>
+              {/if}
+              {#if diagnostic.stderr}<pre>{diagnostic.stderr}</pre>{/if}
+            {/each}
           </div>
         </details>
       {/each}

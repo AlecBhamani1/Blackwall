@@ -2,16 +2,18 @@
 //! Agent runs behind Blackwall approvals.
 use crate::{
     approvals::Approvals,
-    protocol::{AgentEvent, ApprovalTool},
+    protocol::{AgentEvent, ApprovalTool, ServerDiagnostic},
     tools::ToolError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Mutex as StdMutex, time::Duration};
+use stderr::StderrTail;
 use tokio::{io::BufReader, sync::Mutex};
 use transport::{StdioTransport, Transport};
 
 mod http;
+mod stderr;
 mod transport;
 
 pub const MCP_FILE: &str = "mcp.json";
@@ -361,6 +363,9 @@ struct Server {
 pub struct McpServers {
     servers: Vec<Server>,
     pub warnings: Vec<String>,
+    /// What a server that did not start printed, for the owner only: never in `warnings`, which
+    /// reach saved conversations and the model's view of the run, and never traced.
+    pub diagnostics: Vec<ServerDiagnostic>,
 }
 
 impl McpServers {
@@ -481,30 +486,47 @@ impl McpServers {
                 &config.env,
             );
             // Names only: what a failing local server may have been missing.
-            let missing = match env.dropped() {
-                dropped if config.url.is_none() && !dropped.is_empty() => format!(
-                    " Not passed to it: {}. List names in \"env\" to pass them.",
-                    dropped.join(", ")
-                ),
-                _ => String::new(),
+            let not_passed = match config.url {
+                None => env.dropped().to_vec(),
+                Some(_) => vec![],
             };
-            match tokio::time::timeout(
+            let hint = if not_passed.is_empty() {
+                ""
+            } else {
+                " If it needs one of your environment variables, add its name to \"env\" in mcp.json."
+            };
+            // Kept outside `launch`, so a server that never answers can still be read.
+            let tail = StdMutex::new(None);
+            let secrets: Vec<String> = environment.iter().map(|(_, value)| value.clone()).collect();
+            let launched = tokio::time::timeout(
                 STARTUP_TIMEOUT,
-                launch(&config, directory, &env, environment, pinned),
+                launch(&config, directory, &env, environment, pinned, &tail),
             )
-            .await
-            {
+            .await;
+            let failure = match launched {
                 Ok(Ok(connection)) => {
                     self.add(config, connection, names).await;
+                    continue;
                 }
-                Ok(Err(error)) => self.warnings.push(format!(
-                    "MCP server {} did not start: {error}{missing}",
-                    config.name
-                )),
-                Err(_) => self.warnings.push(format!(
-                    "MCP server {} did not start within 15 seconds.{missing}",
-                    config.name
-                )),
+                Ok(Err(error)) => format!("did not start: {error}"),
+                Err(_) => "did not start within 15 seconds.".to_owned(),
+            };
+            self.warnings
+                .push(format!("MCP server {} {failure}{hint}", config.name));
+            let tail = tail.into_inner().unwrap_or_else(|p| p.into_inner());
+            let stderr = match tail {
+                Some(tail) => {
+                    tail.settle().await;
+                    tail.text(&secrets)
+                }
+                None => String::new(),
+            };
+            if !stderr.is_empty() || !not_passed.is_empty() {
+                self.diagnostics.push(ServerDiagnostic {
+                    server: config.name,
+                    stderr,
+                    not_passed,
+                });
             }
         }
     }
@@ -953,6 +975,7 @@ async fn launch(
     env: &crate::child_env::ChildEnv,
     environment: Vec<(String, String)>,
     pinned: Option<http::Pinned>,
+    tail: &StdMutex<Option<StderrTail>>,
 ) -> Result<Connection, ToolError> {
     let transport: Box<dyn Transport> = match &config.url {
         Some(url) => Box::new(http::HttpTransport::new(
@@ -960,7 +983,7 @@ async fn launch(
             http::headers(&environment)?,
             pinned,
         )?),
-        None => start_process(config, directory, env, &environment)?,
+        None => start_process(config, directory, env, &environment, tail)?,
     };
     let secrets = environment.into_iter().map(|(_, value)| value).collect();
     let mut connection = Connection::new(transport, secrets);
@@ -974,6 +997,7 @@ fn start_process(
     directory: &Path,
     env: &crate::child_env::ChildEnv,
     secrets: &[(String, String)],
+    tail: &StdMutex<Option<StderrTail>>,
 ) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
@@ -986,11 +1010,9 @@ fn start_process(
             })?;
         let (process, stdin, stdout, stderr) =
             crate::tools::spawn_server(directory, &program, &config.command[1..], env, secrets)?;
-        // Server logs are not shown; draining them keeps a chatty server from blocking.
-        tokio::spawn(async move {
-            let mut stderr = stderr;
-            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
-        });
+        // Draining the logs keeps a chatty server from blocking. Their end is kept for the owner
+        // when the server does not start.
+        *tail.lock().unwrap_or_else(|p| p.into_inner()) = Some(StderrTail::spawn_reader(stderr));
         Ok(Box::new(StdioTransport {
             reader: Box::new(BufReader::new(stdout)),
             writer: Box::new(stdin),
@@ -999,7 +1021,7 @@ fn start_process(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (config, directory, env, secrets);
+        let _ = (config, directory, env, secrets, tail);
         Err(ToolError::Execution(
             "MCP servers are not supported on this platform.".into(),
         ))
@@ -1483,7 +1505,14 @@ mod tests {
             env: vec![],
             secret_origins: BTreeMap::new(),
         };
-        let transport = start_process(&config, &std::env::temp_dir(), &env, &[]).unwrap();
+        let transport = start_process(
+            &config,
+            &std::env::temp_dir(),
+            &env,
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
         let mut connection = Connection::new(transport, vec![]);
         tokio::time::timeout(Duration::from_secs(10), connection.initialize())
             .await
@@ -1588,6 +1617,59 @@ mod tests {
         let disabled = McpServers::start(&directory, None, &[]).await;
         assert!(disabled.warnings.is_empty() && disabled.definitions().is_empty());
         tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// Start the one server in `mcp.json` whose command is `/bin/sh -c <script>`.
+    #[cfg(unix)]
+    async fn start_failing_fixture(script: &str) -> McpServers {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-fail-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let body = json!({"servers":[{"name":"broken","command":["/bin/sh","-c",script]}]});
+        tokio::fs::write(directory.join(MCP_FILE), body.to_string())
+            .await
+            .unwrap();
+        let servers = McpServers::start(&directory, None, &[]).await;
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        servers
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_server_reports_stderr_to_owner_but_not_in_warnings_or_model() {
+        let servers =
+            start_failing_fixture("printf 'Traceback: no module named x' >&2; exit 1").await;
+        assert!(
+            servers.warnings[0].contains("did not start")
+                && !servers.warnings[0].contains("Traceback")
+        );
+        assert!(servers.diagnostics[0].stderr.contains("no module named x"));
+        assert_eq!(servers.diagnostics[0].server, "broken");
+        assert!(servers.definitions().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_that_never_answers_still_shows_its_stderr() {
+        let servers = start_failing_fixture("echo 'bad token abc' >&2; sleep 30").await;
+        assert!(servers.warnings[0].contains("within 15 seconds"));
+        assert!(servers.diagnostics[0].stderr.contains("bad token abc"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_variables_are_named_for_the_owner_and_only_hinted_in_the_warning() {
+        let servers = start_failing_fixture("exit 1").await;
+        let dropped = &servers.diagnostics.first().map(|d| d.not_passed.clone());
+        let warning = &servers.warnings[0];
+        match dropped {
+            // Whatever this machine's environment dropped is listed for the owner, not the model.
+            Some(names) if !names.is_empty() => {
+                assert!(warning.contains("add its name to \"env\" in mcp.json"));
+                assert!(names.iter().all(|name| !warning.contains(name.as_str())));
+            }
+            _ => assert!(!warning.contains("add its name")),
+        }
     }
 
     #[tokio::test]

@@ -121,6 +121,13 @@ export interface ChatRequest {
   textToolCalls?: boolean;
 }
 
+/** Why an MCP server did not start. Shown to the owner only: never sent, saved or traced. */
+export interface ServerDiagnostic {
+  server: string;
+  stderr: string;
+  notPassed?: string[];
+}
+
 export type AgentEvent =
   | {
       type: 'instructions_loaded';
@@ -128,6 +135,7 @@ export type AgentEvent =
       agentId?: string;
       sources: string[];
       warnings: string[];
+      diagnostics?: ServerDiagnostic[];
     }
   | { type: 'context_report'; requestId: string; report: ContextReport }
   | { type: 'context_updated'; requestId: string; state: ContextState }
@@ -179,6 +187,8 @@ export interface ToolEntry {
   output?: string;
   /** The output was trimmed to fit the command output cap. */
   truncated?: boolean;
+  /** Owner-only server details; dropped before a conversation is saved or exported. */
+  diagnostics?: ServerDiagnostic[];
   status: 'running' | 'complete' | 'error' | 'stopped';
 }
 /** The MCP tool an approval is for; `tool` is the namespaced `server__tool` name. */

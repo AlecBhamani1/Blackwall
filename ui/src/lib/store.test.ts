@@ -981,6 +981,36 @@ describe('native conversation persistence', () => {
     expect(client.streamChat).not.toHaveBeenCalled();
     expect(get(controller.persistenceError)).toContain('unavailable');
   });
+  it('keeps server diagnostics on the card but never persists or sends them', async () => {
+    const storage = await nativeStorage();
+    const client = mockClient();
+    client.streamChat = vi.fn(async (request, callbacks) => {
+      callbacks.onEvent?.({
+        type: 'instructions_loaded',
+        requestId: request.requestId,
+        sources: [],
+        warnings: ['MCP server docs did not start: The MCP server stopped responding.'],
+        diagnostics: [{ server: 'docs', stderr: 'no module named x', notPassed: ['TOKEN'] }],
+      });
+      callbacks.onDelta('Done.');
+    });
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    await controller.send('Start', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    expect(get(controller.messages).at(-1)?.tools?.[0].diagnostics).toEqual([
+      { server: 'docs', stderr: 'no module named x', notPassed: ['TOKEN'] },
+    ]);
+    await controller.send('Again', []);
+    await vi.waitFor(() => expect(client.streamChat).toHaveBeenCalledTimes(2));
+    const sent = JSON.stringify(vi.mocked(client.streamChat).mock.calls[1][0]);
+    expect(sent).not.toContain('no module named x');
+    expect(storage.save).toHaveBeenCalled();
+    for (const [session] of storage.save.mock.calls)
+      expect(JSON.stringify(session)).not.toContain('no module named x');
+    controller.destroy();
+  });
+
   it('flushes active work before clearing private state for the app lock', async () => {
     const storage = await nativeStorage();
     const client = mockClient();

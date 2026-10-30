@@ -85,6 +85,42 @@ describe('native chat failure boundary', () => {
     });
   });
 
+  it('keeps well-formed server diagnostics on instruction events and drops malformed ones', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({
+        payload: {
+          type: 'instructions_loaded',
+          requestId: 'diag',
+          sources: [],
+          warnings: [],
+          diagnostics: [
+            { server: 'docs', stderr: 'boom', notPassed: ['TOKEN', 7] },
+            { server: 'bad' },
+            'nope',
+          ],
+        },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'diag' } });
+      return { requestId: 'diag' };
+    });
+    await localModelClient.streamChat(
+      { requestId: 'diag', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith({
+      type: 'instructions_loaded',
+      requestId: 'diag',
+      sources: [],
+      warnings: [],
+      diagnostics: [{ server: 'docs', stderr: 'boom', notPassed: ['TOKEN'] }],
+    });
+  });
+
   it('marks a prompt for a call written as text as one that cannot be remembered', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);

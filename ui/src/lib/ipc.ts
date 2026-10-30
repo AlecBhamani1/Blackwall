@@ -12,6 +12,7 @@ import { normalizeEndpoint } from './setup';
 import { nativeModelError } from './modelError';
 import type {
   AgentEvent,
+  ServerDiagnostic,
   ApprovalTool,
   AttachmentPayload,
   ChatRequest,
@@ -445,6 +446,19 @@ function estimateForThreshold(
   );
 }
 
+function serverDiagnostics(value: unknown): ServerDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): ServerDiagnostic[] => {
+    if (!item || typeof item !== 'object') return [];
+    const { server, stderr, notPassed } = item as Record<string, unknown>;
+    if (typeof server !== 'string' || typeof stderr !== 'string') return [];
+    const names = Array.isArray(notPassed)
+      ? notPassed.filter((name): name is string => typeof name === 'string')
+      : [];
+    return [{ server, stderr, ...(names.length ? { notPassed: names } : {}) }];
+  });
+}
+
 function normalizeEvent(payload: unknown): AgentEvent | null {
   if (!payload || typeof payload !== 'object') return null;
   const event = payload as Record<string, unknown>;
@@ -458,12 +472,14 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
     Array.isArray(event.warnings) &&
     event.warnings.every((warning) => typeof warning === 'string')
   ) {
+    const diagnostics = serverDiagnostics(event.diagnostics);
     return {
       type,
       requestId,
       ...(typeof event.agentId === 'string' ? { agentId: event.agentId } : {}),
       sources: event.sources,
       warnings: event.warnings,
+      ...(diagnostics.length ? { diagnostics } : {}),
     };
   }
   if (type === 'context_report' && event.report && typeof event.report === 'object')

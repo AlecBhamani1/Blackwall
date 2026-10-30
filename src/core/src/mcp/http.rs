@@ -858,10 +858,16 @@ mod tests {
         assert_eq!(accounts[0].2, format!("docs/{origin}/API_TOKEN"));
         let environment = vec![("Authorization".to_owned(), token.to_owned())];
         let env = crate::child_env::ChildEnv::default();
-        let connection =
-            super::super::launch(&config, &std::env::temp_dir(), &env, environment, None)
-                .await
-                .unwrap();
+        let connection = super::super::launch(
+            &config,
+            &std::env::temp_dir(),
+            &env,
+            environment,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
         let approvals = Approvals::default();

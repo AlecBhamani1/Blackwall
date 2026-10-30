@@ -4,6 +4,22 @@ import { describe, expect, it } from 'vitest';
 import ToolActivity from './ToolActivity.svelte';
 
 describe('agent actions', () => {
+  it("shows a failed server's output and unpassed variables in its details", async () => {
+    const user = userEvent.setup();
+    const instructions = {
+      id: 'instructions',
+      name: 'project_instructions',
+      arguments: '{}',
+      output: 'Loaded instructions: None\nWarning: MCP server docs did not start.',
+      diagnostics: [{ server: 'docs', stderr: 'no module named x', notPassed: ['TOKEN'] }],
+      status: 'error' as const,
+    };
+    render(ToolActivity, { props: { tools: [instructions] } });
+    await user.click(screen.getByText('1 tool call'));
+    await user.click(screen.getByText('Project instructions'));
+    expect(screen.getByText('no module named x')).toBeVisible();
+    expect(screen.getByText(/TOKEN/)).toBeVisible();
+  });
   it('shows startup warnings without expanding and keeps rows as the owner left them', async () => {
     const user = userEvent.setup();
     const instructions = {

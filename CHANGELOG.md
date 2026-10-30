@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- When an MCP server does not start, the tool card's details now show the last lines of its error
+  output and the environment variable names it was not given, and `bw` prints them under the
+  warning as `  details: …`. The text is cleaned of terminal escape sequences, capped at 2 KiB and
+  redacted of the server's secrets. Only you see it: it is not sent to the model, saved in the
+  conversation or traced.
 - A configurable command output cap (`maxOutputBytes`, 4 KiB to 1 MiB, default 64 KiB; Memory →
   Advanced, or `bw config set output-bytes`). Output over it keeps its first 40% and last 60%
   around a `[… N bytes omitted …]` line, cut on character boundaries after redaction, and the tool

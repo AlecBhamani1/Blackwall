@@ -130,6 +130,10 @@ function storedConnections(): Preferences {
 function persistedMessages(messages: ChatMessage[], retainContents = false): ChatMessage[] {
   return messages.map((message) => ({
     ...message,
+    // Server details are for the owner's screen; they are not saved or exported.
+    ...(message.tools
+      ? { tools: message.tools.map(({ diagnostics: _diagnostics, ...tool }) => tool) }
+      : {}),
     attachments: message.attachments.map((attachment) => ({
       id: attachment.id,
       name: attachment.name,
@@ -924,6 +928,7 @@ export function createChatController(
                               ].join('\n'),
                               // Warnings, such as an MCP server that did not start, stay visible.
                               status: event.warnings.length ? 'error' : 'complete',
+                              ...(event.diagnostics ? { diagnostics: event.diagnostics } : {}),
                             },
                           ],
                         }

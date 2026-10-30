@@ -407,6 +407,17 @@ pub enum SubagentState {
     Interrupted,
 }
 
+/// Why an MCP server did not start, for the owner: its error output's last lines and the
+/// environment variable names it was not given.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerDiagnostic {
+    pub server: String,
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_passed: Vec<String>,
+}
+
 /// Typed event emitted on the single `blackwall://event` channel.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -419,6 +430,9 @@ pub enum AgentEvent {
         agent_id: Option<String>,
         sources: Vec<String>,
         warnings: Vec<String>,
+        /// Shown to the owner only: never sent to the model, saved or traced.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        diagnostics: Vec<ServerDiagnostic>,
     },
     /// Latest estimated request budget, distinct from endpoint-reported usage.
     ContextReport {
@@ -773,6 +787,11 @@ mod tests {
                 agent_id: None,
                 sources: vec!["AGENTS.md".into()],
                 warnings: vec!["Nested guidance was skipped.".into()],
+                diagnostics: vec![ServerDiagnostic {
+                    server: "docs".into(),
+                    stderr: "no module named x".into(),
+                    not_passed: vec!["TOKEN".into()],
+                }],
             },
             AgentEvent::ContextReport {
                 request_id: "r1".to_owned(),

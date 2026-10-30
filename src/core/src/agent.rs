@@ -342,7 +342,7 @@ impl Agent<'_> {
                         .is_some_and(|text| text.trim() == "/init")
             })
         {
-            self.report_instructions(request_id, &guidance);
+            self.report_instructions(request_id, &guidance, &[]);
             let answer = self.init(request_id).await?;
             (self.emit)(AgentEvent::AssistantDelta {
                 request_id: request_id.into(),
@@ -459,7 +459,7 @@ impl Agent<'_> {
             _ => Default::default(),
         };
         guidance.warnings.extend(mcp.warnings.iter().cloned());
-        self.report_instructions(request_id, &guidance);
+        self.report_instructions(request_id, &guidance, &mcp.diagnostics);
         definitions.extend(mcp.definitions());
         if compact {
             let checkpoint = state
@@ -600,7 +600,7 @@ impl Agent<'_> {
             .await?;
             guidance = updated;
             if guidance.sources() != previous_sources || guidance.warnings != previous_warnings {
-                self.report_instructions(request_id, &guidance);
+                self.report_instructions(request_id, &guidance, &mcp.diagnostics);
             }
             let prompt = guidance.prompt();
             if !prompt.is_empty() {
@@ -888,12 +888,14 @@ impl Agent<'_> {
         &self,
         request_id: &str,
         instructions: &crate::instructions::Instructions,
+        diagnostics: &[crate::protocol::ServerDiagnostic],
     ) {
         (self.emit)(AgentEvent::InstructionsLoaded {
             request_id: request_id.into(),
             agent_id: None,
             sources: instructions.sources(),
             warnings: instructions.warnings.clone(),
+            diagnostics: diagnostics.to_vec(),
         });
     }
 

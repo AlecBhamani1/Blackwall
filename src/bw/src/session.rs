@@ -6,7 +6,7 @@ use blackwall_core::{
     context::{ContextRun, ContextState},
     memory::{MemoryClient, MemoryTools},
     model::{self, HttpModel},
-    protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+    protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest, ServerDiagnostic},
     skills::SkillStore,
     storage::LocalStore,
     storage::MemorySource,
@@ -771,6 +771,7 @@ fn render_event(
         AgentEvent::InstructionsLoaded {
             sources,
             warnings,
+            diagnostics,
             agent_id,
             ..
         } => {
@@ -787,6 +788,12 @@ fn render_event(
             );
             for warning in warnings {
                 eprintln!("Instruction warning: {}", safe(&warning));
+            }
+            // For the owner at this terminal only; the model never sees them.
+            for diagnostic in diagnostics {
+                for line in diagnostic_lines(&diagnostic) {
+                    eprintln!("  details: {}", safe(&line));
+                }
             }
         }
         AgentEvent::ToolCall { name, .. } => eprintln!("\n[{}]", safe(&name)),
@@ -822,6 +829,20 @@ fn render_event(
 }
 
 /// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
+/// What to print under a server's warning: the variables it was not given, then its last output.
+fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
+    let mut lines = vec![];
+    if !diagnostic.not_passed.is_empty() {
+        lines.push(format!(
+            "{}: not passed: {}",
+            diagnostic.server,
+            diagnostic.not_passed.join(", ")
+        ));
+    }
+    lines.extend(diagnostic.stderr.lines().map(str::to_owned));
+    lines
+}
+
 fn approval_prompt(detail: &str) -> String {
     format!(
         "\n{}\n\nAllow this action once? Type yes to allow; anything else denies.",
@@ -860,6 +881,29 @@ mod tests {
             text.ends_with("Type yes to allow; anything else denies."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn server_details_list_unpassed_variables_then_stderr_lines() {
+        let diagnostic = ServerDiagnostic {
+            server: "docs".into(),
+            stderr: "Traceback\nno module named x".into(),
+            not_passed: vec!["TOKEN".into(), "HOME_KEY".into()],
+        };
+        assert_eq!(
+            diagnostic_lines(&diagnostic),
+            [
+                "docs: not passed: TOKEN, HOME_KEY",
+                "Traceback",
+                "no module named x"
+            ]
+        );
+        let quiet = ServerDiagnostic {
+            not_passed: vec![],
+            stderr: String::new(),
+            ..diagnostic
+        };
+        assert!(diagnostic_lines(&quiet).is_empty());
     }
 
     #[test]

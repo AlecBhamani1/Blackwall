@@ -477,6 +477,7 @@ async fn local(
                 agent_id: Some(id.into()),
                 sources: instructions.sources(),
                 warnings: instructions.warnings.clone(),
+                diagnostics: vec![],
             });
         }
         messages[0]["content"] = json!(format!("{policy}\n{}", instructions.prompt()));
