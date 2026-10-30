@@ -139,6 +139,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Unsandboxed shell commands keep variables such as `GTK_THEME` when you have `APPDIR` set
+  yourself. Only a running AppImage, which sets both `APPDIR` and `APPIMAGE`, has its variables
+  removed, including values that are not valid text.
+
 - Python and other runtimes now start from the Linux AppImage. Programs it launches no longer get
   the AppImage's own `PYTHONHOME` and library paths. A Python MCP server that fails to start now
   shows why in the tool card's details.
