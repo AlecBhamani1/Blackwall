@@ -17,11 +17,9 @@
 use super::*;
 use crate::{
     context::{fingerprint, Checkpoint, ContextBudget, ContextState, Summary},
-    memory::MemoryClient,
     model::{self, ToolCall, ToolFunction},
     protocol::{ChatRequest, TokenUsage},
 };
-use serde_json::Map;
 use std::path::PathBuf;
 
 /// Fixtures that v5 cannot continue: restoring the saved context against the rows plus a new user
@@ -1006,25 +1004,6 @@ pub(crate) fn golden(name: &str) -> Value {
     serde_json::from_str(&fs::read_to_string(golden_path(name)).unwrap()).unwrap()
 }
 
-/// The search results of a store that holds the sessions, one entry per query.
-pub(crate) fn recall_results(store: &LocalStore) -> Value {
-    let mut results = Map::new();
-    for query in RECALL_QUERIES {
-        let hits = store
-            .search_messages(
-                MemoryClient::Cli,
-                &recall::RecallQuery {
-                    query: query.into(),
-                    limit: Some(10),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        results.insert(query.into(), serde_json::to_value(hits).unwrap());
-    }
-    Value::Object(results)
-}
-
 /// One scripted model response.
 pub(crate) enum Step {
     /// A reply: its text streams as deltas, then the turn is returned.
@@ -1098,34 +1077,6 @@ fn fixture(id: &str) -> Value {
         .into_iter()
         .find(|s| s["id"] == id)
         .unwrap_or_else(|| panic!("no fixture {id}"))
-}
-
-#[test]
-#[ignore = "writes goldens; run once at 7b44c6b"]
-fn capture_v5_goldens() {
-    assert!(
-        std::env::var_os("BLACKWALL_WRITE_GOLDENS").is_some(),
-        "set BLACKWALL_WRITE_GOLDENS=1 to write the goldens"
-    );
-    let directory = scratch("capture");
-    // The real v5 open and the real v5 save_session. bad_role is refused by v5 validation.
-    let store = LocalStore::open(&directory).unwrap();
-    for session in v5_sessions() {
-        if session["id"] != "bad_role" {
-            store.save_session(&session).unwrap();
-        }
-    }
-    let recall = platform_neutral(recall_results(&store));
-    drop(store);
-    let master = master(&directory.join(DATABASE_FILE));
-    for (name, value) in [("v5_master.json", master), ("v5_recall.json", recall)] {
-        fs::write(
-            golden_path(name),
-            serde_json::to_string_pretty(&value).unwrap() + "\n",
-        )
-        .unwrap();
-    }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

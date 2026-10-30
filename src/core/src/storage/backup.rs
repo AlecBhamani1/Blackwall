@@ -341,6 +341,14 @@ pub(crate) fn write_state(dir: &Path, state: &UpgradeState) -> Result<(), Storag
     Ok(())
 }
 
+/// Removes the state once the upgrade has committed. A link there is removed, not followed.
+pub(crate) fn clear_state(dir: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(dir.join(STATE_FILE)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 impl UpgradeState {
     /// Whether this state describes `source` and its backup is still there. The size and header
     /// hash decide; the mtime never does (it changes when nothing else has).

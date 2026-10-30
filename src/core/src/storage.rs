@@ -30,13 +30,14 @@ pub const MAX_SESSION_BYTES: u64 = 48 << 20;
 pub const MAX_METADATA_BYTES: usize = 64 << 10;
 const MAX_SESSIONS: i64 = 500;
 /// How long the v5 to v6 upgrade waits for another window's writer lock.
-#[allow(dead_code)] // used by the upgrade, which lands after this dormant schema
 const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SCHEMA_VERSION: i64 = 5;
 /// The schema version `open` upgrades to. It stays at v5 until the v6 event log goes live.
 const OPEN_TARGET: i64 = 5;
+const NEWER_VERSION: &str =
+    "This data was created by a newer Blackwall version. Update the app to open it.";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -62,9 +63,13 @@ pub enum StorageError {
     UpgradeBusy,
     #[error("Couldn't back up your chats before upgrading them, so nothing was changed. Check free disk space and folder permissions, then try again.")]
     BackupFailed,
-    /// The backup is `None` when a fresh database failed to create its schema: nothing existed to copy.
-    #[error("{}", upgrade_text(.0))]
-    UpgradeFailed(Option<PathBuf>),
+    /// The backup is `None` when a fresh database failed to create its schema: nothing existed to
+    /// copy. `source` is the typed error that stopped the upgrade (P2-2).
+    #[error("{}", upgrade_text(.backup))]
+    UpgradeFailed {
+        backup: Option<PathBuf>,
+        source: Box<StorageError>,
+    },
     #[error("{}", upgrade_text(&Some(.0.clone())))]
     UpgradeStopped(PathBuf),
 }
@@ -82,7 +87,6 @@ fn upgrade_text(backup: &Option<PathBuf>) -> String {
 pub struct LocalStore {
     connection: Connection,
 }
-#[allow(dead_code)] // used by the upgrade, which lands after this dormant module
 mod backup;
 mod chats;
 mod convert;
@@ -93,12 +97,14 @@ mod memory;
 mod property_tests;
 mod recall;
 mod search;
+mod upgrade;
 mod view;
 pub use chats::{Cap, MetadataPatch, NewSession, StoredChat, StoredContext};
 /// Moved to `convert`; re-exported here for the v5 save path until B6.
 pub(crate) use convert::validate_session;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 pub use recall::{RecallHit, RecallQuery, RecallResults};
+pub use upgrade::{StorageNotice, UpgradeStatus};
 
 impl LocalStore {
     pub(crate) fn connection(&self) -> &Connection {
@@ -107,9 +113,10 @@ impl LocalStore {
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
         Self::open_at(directory, OPEN_TARGET)
     }
-    /// Opens the database at schema version `target`. Only v5 can be opened until the upgrade lands.
+    /// Opens the database at schema version `target`: 5, or 6, which upgrades an older database
+    /// first (see `upgrade`). `open` stays at v5 until the switch-over.
     pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
-        if target != SCHEMA_VERSION {
+        if target != SCHEMA_VERSION && target != upgrade::V6 {
             return Err(StorageError::Invalid(
                 "This version of Blackwall cannot open that storage format yet.",
             ));
@@ -160,15 +167,16 @@ impl LocalStore {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         }
         let connection = Connection::open(path)?;
+        if target == upgrade::V6 {
+            return upgrade::open_v6(directory, connection);
+        }
         Self::initialize(connection)
     }
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
         configure(&connection, BUSY_TIMEOUT)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(
-                "This data was created by a newer Blackwall version. Update the app to open it.",
-            ));
+            return Err(StorageError::Invalid(NEWER_VERSION));
         }
         if version == SCHEMA_VERSION {
             let store = Self { connection };
@@ -189,14 +197,21 @@ impl LocalStore {
         connection.execute_batch("BEGIN IMMEDIATE;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(
-                "This data was created by a newer Blackwall version. Update the app to open it.",
-            ));
+            return Err(StorageError::Invalid(NEWER_VERSION));
         }
         if version == SCHEMA_VERSION {
             connection.execute_batch("ROLLBACK;")?;
             return Ok(Self { connection });
         }
+        Self::legacy_schema(&connection, version)?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        connection.execute_batch("COMMIT;")?;
+        // Defer legacy message indexing until a later open so the migration winner releases the
+        // writer lock directly to any other openers waiting to observe the new schema.
+        Ok(Self { connection })
+    }
+    /// Brings a database below v5 to the v5 tables, inside the caller's write transaction.
+    fn legacy_schema(connection: &Connection, version: i64) -> Result<(), StorageError> {
         connection.execute_batch("
             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -219,12 +234,8 @@ impl LocalStore {
                 PRAGMA user_version=3;",
             )?;
         }
-        recall::schema(&connection)?;
-        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        connection.execute_batch("COMMIT;")?;
-        // Defer legacy message indexing until a later open so the migration winner releases the
-        // writer lock directly to any other openers waiting to observe the new schema.
-        Ok(Self { connection })
+        recall::schema(connection)?;
+        Ok(())
     }
     pub fn paired_devices(&self) -> Result<Vec<crate::pairing::PairedDevice>, StorageError> {
         let mut query = self
@@ -352,6 +363,12 @@ impl LocalStore {
         Ok(())
     }
     pub fn migrate_sessions(&mut self, sessions: &[Value]) -> Result<(), StorageError> {
+        let version: i64 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= upgrade::V6 {
+            return upgrade::migrate(self, sessions);
+        }
         if self.setting("legacy_sessions_migrated")?.is_some() {
             return Ok(());
         }
