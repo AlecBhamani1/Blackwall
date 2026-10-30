@@ -87,6 +87,8 @@ mod convert;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod memory;
+#[cfg(test)]
+mod property_tests;
 mod recall;
 mod search;
 mod view;

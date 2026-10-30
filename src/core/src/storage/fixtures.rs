@@ -1002,6 +1002,67 @@ pub(crate) fn recall_results(store: &LocalStore) -> Value {
     Value::Object(results)
 }
 
+/// One scripted model response.
+pub(crate) enum Step {
+    /// A reply: its text streams as deltas, then the turn is returned.
+    Say(model::ModelTurn),
+    /// The model streams `partial` and then fails.
+    Fail {
+        partial: String,
+        error: model::ModelError,
+    },
+}
+
+/// A model backend that answers from a fixed script, one step per `generate` call. The real
+/// agent loop runs against it, so everything it records is what v5 records.
+pub(crate) struct ScriptedBackend {
+    steps: std::sync::Mutex<std::collections::VecDeque<Step>>,
+}
+
+impl ScriptedBackend {
+    pub(crate) fn new(steps: Vec<Step>) -> Self {
+        Self {
+            steps: std::sync::Mutex::new(steps.into()),
+        }
+    }
+}
+
+impl model::ModelBackend for ScriptedBackend {
+    fn generate<'a>(
+        &'a self,
+        _: &'a [Value],
+        _: &'a [Value],
+        delta: &'a mut (dyn FnMut(String) + Send),
+    ) -> futures_util::future::BoxFuture<'a, Result<model::ModelTurn, model::ModelError>> {
+        Box::pin(async move {
+            let step = self.steps.lock().unwrap().pop_front();
+            // A text arrives in two deltas when it can be split, as a stream would deliver it.
+            let mut stream = |text: &str| {
+                let middle = text.char_indices().nth(text.chars().count() / 2);
+                match middle {
+                    Some((at, _)) if at > 0 => {
+                        delta(text[..at].to_owned());
+                        delta(text[at..].to_owned());
+                    }
+                    _ if !text.is_empty() => delta(text.to_owned()),
+                    _ => {}
+                }
+            };
+            match step {
+                Some(Step::Say(turn)) => {
+                    stream(&turn.content);
+                    Ok(turn)
+                }
+                Some(Step::Fail { partial, error }) => {
+                    stream(&partial);
+                    Err(error)
+                }
+                None => Err(model::ModelError::Invalid),
+            }
+        })
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "blackwall-fixtures-{name}-{:016x}",
