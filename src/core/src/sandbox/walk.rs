@@ -68,10 +68,34 @@ pub(crate) struct Mask {
     pub kind: MaskKind,
 }
 
+/// What identifies a regular file's content at one moment: where it is, how big, and when it was
+/// last changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fingerprint {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_ns: i128,
+}
+impl Fingerprint {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Walk {
     /// Sorted by path.
     pub masks: Vec<Mask>,
+    /// Relative path to start fingerprint, for every regular file that is not masked, below a
+    /// skipped directory or a symlink. Empty unless [`walk_with_files`] was used.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub files: HashMap<PathBuf, Fingerprint>,
     /// The walked folder's device and inode (from the `lstat` it started with), to check against
     /// the pinned project.
     pub root: (u64, u64),
@@ -130,6 +154,15 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
 }
 /// [`walk`] with its own time limit.
 pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<Walk, WalkError> {
+    scan(root, limit, time, false)
+}
+/// [`walk`] that also records the start fingerprint of every regular file it can see, for
+/// Workspace-write staging. Read-only runs use [`walk`] and don't pay for the extra work.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn walk_with_files(root: &Path, limit: usize) -> Result<Walk, WalkError> {
+    scan(root, limit, TIME_LIMIT, true)
+}
+fn scan(root: &Path, limit: usize, time: Duration, record: bool) -> Result<Walk, WalkError> {
     let deadline = Instant::now() + time;
     let late = || Instant::now() >= deadline;
     let unreadable_root = || WalkError::Unreadable {
@@ -140,6 +173,7 @@ pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<W
         return Err(unreadable_root());
     }
     let mut masks = Vec::new();
+    let mut files = HashMap::new();
     let mut count = 0usize;
     let mut per_top: HashMap<OsString, usize> = HashMap::new();
     // (relative directory, whether only its direct children are checked)
@@ -209,12 +243,15 @@ pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<W
                 }
                 let skipped = SKIP_BELOW_ROOT.iter().any(|s| name == OsStr::new(s));
                 pending.push((path, skipped));
+            } else if record && file_type.is_file() && !shallow {
+                files.insert(path, Fingerprint::of(&meta));
             }
         }
     }
     masks.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Walk {
         masks,
+        files,
         root: (top.dev(), top.ino()),
     })
 }
@@ -337,6 +374,26 @@ mod tests {
                 ("a/b/.ssh", &MaskKind::Dir),
             ]
         );
+    }
+
+    #[test]
+    fn walk_records_fingerprints_only_when_asked() {
+        let root = Root::new();
+        root.file("a/keep.txt");
+        root.file(".git/config");
+        root.file(".codex");
+        root.file("node_modules/x/index.js");
+        root.file("node_modules/top.js");
+        symlink(root.0.join("a/keep.txt"), root.0.join("link")).unwrap();
+        assert!(walk(&root.0, MAX_ENTRIES).unwrap().files.is_empty());
+        let w = walk_with_files(&root.0, MAX_ENTRIES).unwrap();
+        let mut names: Vec<_> = w.files.keys().map(|p| p.to_str().unwrap()).collect();
+        names.sort_unstable();
+        // Masked, skipped-below-root and symlinked entries are not recorded.
+        assert_eq!(names, ["a/keep.txt"]);
+        let meta = std::fs::symlink_metadata(root.0.join("a/keep.txt")).unwrap();
+        assert_eq!(w.files[Path::new("a/keep.txt")], Fingerprint::of(&meta));
+        assert_eq!(w.files[Path::new("a/keep.txt")].size, 1);
     }
 
     #[test]

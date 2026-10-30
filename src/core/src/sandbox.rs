@@ -10,6 +10,8 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 mod seccomp;
 #[cfg(target_os = "linux")]
+mod staging;
+#[cfg(target_os = "linux")]
 mod walk;
 
 #[cfg(target_os = "macos")]

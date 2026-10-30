@@ -43,7 +43,6 @@ pub const LINUX_BLOCKED: &str = "Bubblewrap is installed but this system won't l
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
 /// After a Retrying or Blocked answer, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-const STALE_PROBE_DIRECTORY: Duration = Duration::from_secs(24 * 60 * 60);
 /// The lowest number a descriptor handed to bubblewrap gets: clear of the standard streams and of
 /// the seccomp (3) and argument (4) files that the launcher opens.
 const FIRST_HANDED_FD: RawFd = 10;
@@ -436,24 +435,18 @@ fn prepare_scratch(data_directory: &Path) -> std::io::Result<PathBuf> {
 pub(crate) fn run_directory(data_directory: &Path) -> std::io::Result<PathBuf> {
     private_scratch(data_directory, "run-")
 }
-fn private_scratch(data_directory: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+/// A fresh private (0700) `<data>/staging/<prefix><16 hex digits from the system's random
+/// source>` directory, after the same checks and the one sweep of old folders as the probe's.
+pub(crate) fn private_scratch(data_directory: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    use rand::rand_core::TryRng;
     real_directory(data_directory)?;
     let staging = data_directory.join("staging");
     private_directory(&staging)?;
-    for entry in std::fs::read_dir(&staging)?.flatten() {
-        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
-            && entry
-                .metadata()
-                .ok()
-                .filter(|meta| meta.is_dir())
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age > STALE_PROBE_DIRECTORY);
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-    let scratch = staging.join(format!("{prefix}{:016x}", rand::random::<u64>()));
+    super::staging::sweep(data_directory, SystemTime::now());
+    let random = rand::rngs::SysRng
+        .try_next_u64()
+        .map_err(|_| std::io::Error::other("no system randomness"))?;
+    let scratch = staging.join(format!("{prefix}{random:016x}"));
     std::fs::DirBuilder::new().mode(0o700).create(&scratch)?;
     Ok(scratch)
 }
@@ -1098,7 +1091,7 @@ mod tests {
         std::fs::create_dir(&stale).unwrap();
         std::fs::File::open(&stale)
             .unwrap()
-            .set_modified(SystemTime::now() - 2 * STALE_PROBE_DIRECTORY)
+            .set_modified(SystemTime::now() - 2 * crate::sandbox::staging::KEEP_FOR)
             .unwrap();
         prepare_scratch(&data).unwrap();
         assert!(!stale.exists());
