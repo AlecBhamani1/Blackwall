@@ -1045,6 +1045,7 @@ mod tests {
             ("PYTHONHOME", "/py"),
             ("LD_PRELOAD", "/x.so"),
             ("APPDIR", "/tmp/.mount_x"),
+            ("APPIMAGE", "/a.AppImage"),
         ]
         .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
         let env = build(
@@ -1063,6 +1064,7 @@ mod tests {
             "PYTHONHOME",
             "LD_PRELOAD",
             "APPDIR",
+            "APPIMAGE",
         ] {
             assert!(!out.contains(gone), "{out}");
         }
