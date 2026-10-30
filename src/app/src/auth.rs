@@ -328,7 +328,8 @@ pub async fn set_passphrase(
         return Err("Unlock Blackwall first.".into());
     }
     if !inner.keyring {
-        return Err(crate::secrets::SecretError::Unavailable.explain(""));
+        // The keyring is checked once at startup, so only a restart can pick it up.
+        return Err(blackwall_core::secrets::KEYRING_OFF_NOTE.into());
     }
     if inner.hash.is_some() {
         check(&mut inner, current).await?;
