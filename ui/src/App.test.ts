@@ -2,6 +2,7 @@ import userEvent from '@testing-library/user-event';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ChatRequest, StreamCallbacks, SessionSummary } from './lib/types';
+import type { Preferences } from './lib/persistence';
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }));
@@ -80,7 +81,7 @@ it('lets Chat opt into web research without a project and resets access for a ne
   expect(web).not.toBeChecked();
 });
 
-it('uses only sidebar modes, separates histories, and resets and restores locked Agent projects', async () => {
+it('uses only sidebar modes, separates histories, and keeps and restores Agent projects', async () => {
   const user = userEvent.setup();
   render(App);
   const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
@@ -106,10 +107,10 @@ it('uses only sidebar modes, separates histories, and resets and restores locked
     workspace: '/projects/demo',
   });
   await fireEvent.click(screen.getByRole('button', { name: /New chat/ }));
-  expect(await screen.findByRole('button', { name: 'Choose project folder' })).toBeEnabled();
+  expect(await screen.findByRole('button', { name: 'demo' })).toBeEnabled();
   expect(historyModes.getByRole('button', { name: 'Agent' })).toHaveClass('active');
   await fireEvent.click(screen.getByRole('button', { name: /Project task/ }));
-  expect(await screen.findByRole('button', { name: 'demo' })).toBeDisabled();
+  await waitFor(() => expect(screen.getByRole('button', { name: 'demo' })).toBeDisabled());
   await fireEvent.click(historyModes.getByRole('button', { name: 'Chat' }));
   await screen.findByRole('button', { name: /Plain conversation/ });
   expect(screen.queryByRole('button', { name: /Project task/ })).not.toBeInTheDocument();
@@ -358,6 +359,46 @@ it('reconnects a saved connection at startup without asking again', async () => 
   render(App);
   expect(await screen.findByRole('textbox', { name: 'Message Blackwall' })).toBeVisible();
   expect(screen.queryByRole('region', { name: 'Found on this computer' })).not.toBeInTheDocument();
+});
+
+it('persists text tool calls and forgotten connections across a desktop restart', async () => {
+  const user = userEvent.setup();
+  let preferences: Preferences = {
+    endpoint: 'https://model.example/v1',
+    connections: [
+      { endpoint: 'https://model.example/v1', name: 'Current' },
+      { endpoint: 'https://other.example/v1', name: 'Other' },
+    ],
+  };
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === 'load_preferences') return structuredClone(preferences);
+    if (command === 'save_preferences') {
+      preferences = { ...preferences, ...structuredClone(args.preferences) };
+      return;
+    }
+    return fallback?.(command, args);
+  });
+
+  const first = render(App);
+  await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await user.click(screen.getByRole('button', { name: 'Open settings' }));
+  await user.click(screen.getByRole('button', { name: /Model connection/ }));
+  await user.click(screen.getByRole('checkbox', { name: /writes tool calls as text/ }));
+  await user.click(screen.getByRole('button', { name: 'Forget Other' }));
+  await waitFor(() =>
+    expect(preferences.connections).toEqual([
+      { endpoint: 'https://model.example/v1', name: 'Current', textToolCalls: true },
+    ]),
+  );
+  first.unmount();
+
+  render(App);
+  await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await user.click(screen.getByRole('button', { name: 'Open settings' }));
+  await user.click(screen.getByRole('button', { name: /Model connection/ }));
+  expect(screen.getByRole('checkbox', { name: /writes tool calls as text/ })).toBeChecked();
+  expect(screen.queryByRole('button', { name: 'Forget Other' })).not.toBeInTheDocument();
 });
 
 it('shows the real error after a keyring retry fails instead of the keyring message', async () => {

@@ -67,7 +67,7 @@ describe('chat controller', () => {
     },
   );
 
-  it('clears projects on new chats and restores each saved Agent conversation after reload', async () => {
+  it('keeps the current project for new Agent chats and restores saved projects after reload', async () => {
     const pick = vi
       .spyOn(agentClient, 'chooseWorkspace')
       .mockResolvedValueOnce('/projects/first')
@@ -84,7 +84,7 @@ describe('chat controller', () => {
     controller.webEnabled.set(true);
     await controller.newChat();
     expect(get(controller.agentMode)).toBe(true);
-    expect(get(controller.workspace)).toBe('');
+    expect(get(controller.workspace)).toBe('/projects/first');
     expect(get(controller.webEnabled)).toBe(false);
     expect(get(controller.sessionLocked)).toBe(false);
     await controller.chooseWorkspace();
