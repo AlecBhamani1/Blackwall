@@ -85,6 +85,7 @@ mod chats;
 pub(crate) mod fixtures;
 mod memory;
 mod recall;
+mod view;
 pub use chats::Cap;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 pub use recall::{RecallHit, RecallQuery, RecallResults};
