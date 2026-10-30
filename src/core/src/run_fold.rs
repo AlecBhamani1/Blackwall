@@ -29,8 +29,12 @@ pub enum SourceRule {
     Cli,
 }
 
-/// How a run ended. `Failed::message` is what the CLI saves; the desktop shows the copy for
-/// `code` and `detail` instead.
+/// How a run ended. `Failed::message` is what the CLI saves. The desktop shows the copy for
+/// `code` and `detail`, unless the run already sent an `AgentEvent::Error`: the webview keeps the
+/// last such event as `remoteError` and prefers it over the rejection (`ipc.ts` `remoteError ??
+/// nativeModelError(cause)`), and its normalized event has no `detail`, so the desktop then shows
+/// the bare copy for the event's code. That event also fails a run that ends `Complete`. The CLI
+/// never sees `Error` events and saves the failure message as is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEnd {
     Complete,
@@ -231,6 +235,8 @@ pub fn run_source(messages: &[Value], rule: SourceRule) -> Result<Vec<Value>, Co
 pub struct RunFold {
     shape: AssistantShape,
     message: Value,
+    /// The code of the last `AgentEvent::Error` (desktop `remoteError`).
+    error_event: Option<String>,
 }
 
 impl RunFold {
@@ -245,6 +251,7 @@ impl RunFold {
                 "status": "streaming",
                 "createdAt": created_at,
             }),
+            error_event: None,
         }
     }
 
@@ -272,6 +279,7 @@ impl RunFold {
                 }
             }
             _ if shape == AssistantShape::Cli => {}
+            AgentEvent::Error { code, .. } => self.error_event = Some(code.clone()),
             AgentEvent::ToolCall {
                 tool_call_id,
                 name,
@@ -381,6 +389,12 @@ impl RunFold {
             return;
         }
         match (self.shape, end) {
+            (AssistantShape::Desktop, RunEnd::Complete | RunEnd::Failed { .. })
+                if self.error_event.is_some() =>
+            {
+                let code = self.error_event.take().unwrap_or_default();
+                self.fail(model_error_text(&code, None));
+            }
             (AssistantShape::Desktop, RunEnd::Complete) if js_trim(self.content()).is_empty() => {
                 self.fail(model_error_text("empty_model_response", None));
             }

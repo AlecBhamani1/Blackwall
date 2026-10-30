@@ -221,8 +221,7 @@
         {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
         {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
         {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_b", "name": "shell", "arguments": "{}"},
-        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"},
-        {"type": "error", "requestId": "r", "code": "model_unavailable", "message": "The model server is unavailable.", "retryable": true, "detail": "llama.cpp:\n\t Loading   model\u0000"}
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"}
       ],
       "end": {"type": "failed", "code": "model_unavailable", "message": "The model server is unavailable.", "detail": "llama.cpp:\n\t Loading   model\u0000"},
       "expected": {
@@ -236,6 +235,47 @@
           {"id": "k1", "state": "interrupted", "summary": "The parent task ended."}
         ]
       }
+    },
+    {
+      "name": "failed_after_error_event",
+      "id": "message_h4",
+      "createdAt": 1700000007800,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Partial"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "shell", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_b", "name": "shell", "arguments": "{}"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"},
+        {"type": "error", "requestId": "r", "code": "model_busy", "message": "busy", "retryable": true},
+        {"type": "error", "requestId": "r", "code": "model_unavailable", "message": "The model server is unavailable.", "retryable": true, "detail": "llama.cpp:\n\t Loading   model\u0000"}
+      ],
+      "end": {"type": "failed", "code": "storage_error", "message": "The model server is unavailable.", "detail": "a different detail"},
+      "expected": {
+        "id": "message_h4", "role": "assistant", "content": "Partial\n\n", "attachments": [], "status": "error", "createdAt": 1700000007800,
+        "error": "The model computer is unavailable. Open and unlock Blackwall on that computer, keep its model running, and reconnect.",
+        "tools": [
+          {"id": "0_0_a", "name": "shell", "arguments": "{}", "contentOffset": 7, "status": "complete", "output": "x"},
+          {"id": "1_0_b", "name": "shell", "arguments": "{}", "contentOffset": 9, "status": "error"}
+        ],
+        "children": [
+          {"id": "k1", "state": "interrupted", "summary": "The parent task ended."}
+        ]
+      }
+    },
+    {
+      "name": "complete_after_error_event",
+      "id": "message_h5",
+      "createdAt": 1700000007900,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Answer"},
+        {"type": "error", "requestId": "r", "code": "model_timeout", "message": "slow", "retryable": true, "detail": "upstream timeout"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Answer"}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_h5", "role": "assistant", "content": "Answer", "attachments": [], "status": "error", "createdAt": 1700000007900, "error": "The model took too long to respond. Check that its computer is awake and connected, then try again."}
     },
     {
       "name": "failed_unknown_code",
