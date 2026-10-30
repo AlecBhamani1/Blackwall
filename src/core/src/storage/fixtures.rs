@@ -52,20 +52,37 @@ pub(crate) const WORKSPACE: &str = r"C:\work\project";
 pub(crate) const GOLDEN_WORKSPACE: &str = "/work/project";
 
 /// A test path written from the root, POSIX-style, as an absolute path on this platform:
-/// `/p` stays `/p`, and on Windows becomes `C:\p`.
+/// `/p` stays `/p`, and on Windows becomes `C:\p`. A path already in this platform's form (such
+/// as [`WORKSPACE`]) is returned as it is.
 pub(crate) fn abs(path: &str) -> String {
     if cfg!(windows) {
+        to_windows(path)
+    } else {
+        path.to_owned()
+    }
+}
+
+/// The Windows spelling of a POSIX absolute path: `/a/b` is `C:\a\b`. Anything else, including
+/// a path already spelled this way, is unchanged, so it is idempotent.
+fn to_windows(path: &str) -> String {
+    if path.starts_with('/') {
         format!("C:{}", path.replace('/', "\\"))
     } else {
         path.to_owned()
     }
 }
 
-/// `value` with this platform's [`WORKSPACE`] spelled as the goldens spell it, so one golden
-/// serves every platform. Identity off Windows.
+/// The exact inverse of [`to_windows`] for what it produced: `C:\a\b` is `/a/b`.
+fn from_windows(text: &str) -> Option<String> {
+    text.strip_prefix("C:\\")
+        .map(|rest| format!("/{}", rest.replace('\\', "/")))
+}
+
+/// `value` with every path [`abs`] spelled for this platform spelled as the goldens spell it, so
+/// one golden serves every platform: the inverse of [`abs`]. Identity off Windows.
 pub(crate) fn platform_neutral(value: Value) -> Value {
     match value {
-        Value::String(text) if text == WORKSPACE => Value::String(GOLDEN_WORKSPACE.into()),
+        Value::String(text) if cfg!(windows) => Value::String(from_windows(&text).unwrap_or(text)),
         Value::Array(items) => Value::Array(items.into_iter().map(platform_neutral).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
@@ -1366,11 +1383,37 @@ fn test_paths_are_absolute_on_this_platform_and_goldens_are_neutral() {
     // v6 refuses a relative workspace (`chats::check_mode_workspace`), so every workspace the
     // fixtures and the A5-A7 tests store must be absolute here.
     assert!(Path::new(WORKSPACE).is_absolute());
-    for path in [
-        "/p", "/w", "/work", "/work/a", "/project", "/first", "/second", "/old",
-    ] {
+    // Every POSIX path the A5-A7 tests store, and the fixture workspace itself, which the A6
+    // recall test passes through `abs` a second time (CI run 41131851570 on Windows).
+    let paths = [
+        "/p",
+        "/w",
+        "/work",
+        "/work/a",
+        "/work/b",
+        "/project",
+        "/first",
+        "/second",
+        "/old",
+        GOLDEN_WORKSPACE,
+    ];
+    for path in paths.into_iter().chain([WORKSPACE]) {
         assert!(Path::new(&abs(path)).is_absolute(), "{path}");
+        assert_eq!(abs(&abs(path)), abs(path), "{path}");
     }
+    assert_eq!(abs(GOLDEN_WORKSPACE), WORKSPACE);
+    // The Windows mapping itself, checked on every platform: idempotent, and undone exactly.
+    for path in paths {
+        let windows = to_windows(path);
+        assert!(
+            windows.starts_with("C:\\") && !windows.contains('/'),
+            "{windows}"
+        );
+        assert_eq!(to_windows(&windows), windows);
+        assert_eq!(from_windows(&windows).as_deref(), Some(path));
+    }
+    assert_eq!(to_windows("relative/dir"), "relative/dir");
+    assert_eq!(from_windows("/work/project"), None);
     assert_eq!(
         platform_neutral(json!({"hits": [{"project": WORKSPACE}], "other": "/elsewhere"})),
         json!({"hits": [{"project": GOLDEN_WORKSPACE}], "other": "/elsewhere"})
@@ -1385,6 +1428,8 @@ fn test_paths_are_absolute_on_this_platform_and_goldens_are_neutral() {
 fn windows_spells_test_paths_with_a_drive() {
     assert_eq!(WORKSPACE, r"C:\work\project");
     assert_eq!(abs("/work/a"), r"C:\work\a");
+    assert_eq!(abs(WORKSPACE), WORKSPACE);
+    assert_eq!(platform_neutral(json!(abs("/p"))), json!("/p"));
     assert!(!Path::new(GOLDEN_WORKSPACE).is_absolute());
     assert_ne!(platform_neutral(json!(WORKSPACE)), json!(WORKSPACE));
 }

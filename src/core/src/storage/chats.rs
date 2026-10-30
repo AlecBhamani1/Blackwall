@@ -2586,12 +2586,22 @@ mod tests {
         tx.commit().unwrap();
         make(&main, "s");
         let path = directory.join(crate::storage::DATABASE_FILE);
-        let workers: Vec<_> = (0..2)
-            .map(|worker| {
-                let path = path.clone();
+        // Opened and configured here, before either worker holds the write lock: `configure`
+        // reads pragmas, and under the 20 ms test timeout it can lose a race with a worker's
+        // commit. Every busy point after this (BEGIN IMMEDIATE, the counter read, the append, the
+        // counter write, COMMIT) is inside `write`, which the loop retries.
+        let connections: Vec<_> = (0..2)
+            .map(|_| {
+                let connection = Connection::open(&path).unwrap();
+                configure(&connection, Duration::from_millis(20)).unwrap();
+                connection
+            })
+            .collect();
+        let workers: Vec<_> = connections
+            .into_iter()
+            .enumerate()
+            .map(|(worker, connection)| {
                 thread::spawn(move || {
-                    let connection = Connection::open(path).unwrap();
-                    configure(&connection, Duration::from_millis(20)).unwrap();
                     let store = LocalStore { connection };
                     for n in 0..200 {
                         let entry = json!({"role": "user", "content": format!("{worker}-{n}")});
