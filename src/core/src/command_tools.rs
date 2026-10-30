@@ -465,6 +465,7 @@ impl CommandTool {
         }
         let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
         let outside = workspace.execution.command_tools == Isolation::Outside;
+        let env = self.passed_env(outside);
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
             "{}Project: {}\nTool: {}\nProgram: {}\n{}Arguments: {}",
@@ -472,7 +473,7 @@ impl CommandTool {
             workspace.path.display(),
             self.name,
             program.display(),
-            passed_line(&self.passed_env(outside)),
+            passed_line(&env),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
         );
         if let Some(input) = &input {
@@ -485,7 +486,7 @@ impl CommandTool {
             .request_owner_tool(
                 request_id,
                 &self.command.join(" "),
-                &program,
+                &self.call(workspace, &program, &args, &env, input.as_deref()),
                 detail,
                 false,
                 outside,
@@ -551,13 +552,14 @@ impl CommandTool {
         }
         let (program, identity, args, input) = self.prepared(&values, &workspace.path)?;
         let outside = workspace.execution.command_tools == Isolation::Outside;
+        let env = self.passed_env(outside);
         let mut detail = format!(
             "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\n{}Arguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
             outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
-            passed_line(&self.passed_env(outside)),
+            passed_line(&env),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
             prompt.len(),
         );
@@ -568,7 +570,7 @@ impl CommandTool {
             .request_owner_tool(
                 request_id,
                 &self.command.join(" "),
-                &program,
+                &self.call(workspace, &program, &args, &env, input.as_deref()),
                 detail,
                 true,
                 outside,
@@ -584,6 +586,25 @@ impl CommandTool {
             workspace, &program, &args, &self.env, input, timeout, output,
         )
         .await
+    }
+
+    /// What the audit records of a call to this tool.
+    fn call<'a>(
+        &'a self,
+        workspace: &crate::tools::Workspace,
+        program: &'a Path,
+        args: &'a [String],
+        env: &'a [String],
+        input: Option<&[u8]>,
+    ) -> crate::policy::ProgramCall<'a> {
+        crate::policy::ProgramCall {
+            program,
+            tool: &self.name,
+            isolation: workspace.execution.command_tools,
+            args,
+            env,
+            stdin_sha256: input.map(sha256_hex),
+        }
     }
 
     /// The `env` names the program gets: those set in Blackwall's environment, when it runs
@@ -713,11 +734,18 @@ fn shown_bytes(bytes: &[u8]) -> String {
     if shown.len() < text.len() {
         shown.push('…');
     }
-    let digest: String = Sha256::digest(bytes)
+    format!(
+        "{} bytes, sha256 {}\n{shown}",
+        bytes.len(),
+        sha256_hex(bytes)
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{} bytes, sha256 {digest}\n{shown}", bytes.len())
+        .collect()
 }
 
 /// A value that could be read as an option the owner did not configure.
@@ -1643,6 +1671,108 @@ mod tests {
         );
         assert_eq!(line["subject"], "echo hi");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// The audit line for one approved call of a tool that sends `arguments` on standard
+    /// input, passes `HOME` through, and puts `{label}` on its command line.
+    #[cfg(unix)]
+    async fn audited(isolation: Isolation, subagent: bool, arguments: &str) -> Value {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let body = json!({"tools":[{"name":"review","description":"Review","command":["sh","-c","cat",
+            if subagent { "fixed" } else { "{label}" }],"stdin":"json","env":["HOME","BLACKWALL_TEST_NEVER_SET"],
+            "parameters":{"type":"object","properties":{"prompt":{"type":"string"},"label":{"type":"string"}},
+            "required": if subagent { json!(["prompt"]) } else { json!(["prompt","label"]) }}}]});
+        let (tools, directory) = load(&body.to_string()).await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let decisions = approvals.clone();
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let tool = tools.get("review").unwrap();
+        let (timeout, output) = (Duration::from_secs(10), Default::default());
+        match subagent {
+            true => tool
+                .delegate(
+                    &workspace, arguments, "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+            false => tool
+                .run(
+                    &workspace, arguments, "run", &approvals, &emit, timeout, &output,
+                )
+                .await
+                .unwrap(),
+        };
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        serde_json::from_str(audit.lines().last().unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_records_the_approved_call_without_secret_values() {
+        let sha = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let arguments = r#"{"prompt":"Review","label":"token=abc123"}"#;
+        let stdin = serde_json::to_vec(&json!({
+            "arguments": serde_json::from_str::<Value>(arguments).unwrap()
+        }))
+        .unwrap();
+        for (isolation, env) in [
+            (Isolation::Outside, json!(["HOME"])),
+            (Isolation::Sandboxed, json!([])),
+        ] {
+            let line = audited(isolation, false, arguments).await;
+            assert_eq!(line["tool"], "review", "{line}");
+            assert_eq!(line["isolation"], isolation.name(), "{line}");
+            // The secret-looking argument is redacted, as the subject is.
+            assert_eq!(
+                line["args"],
+                json!(["-c", "cat", "token=[redacted]"]),
+                "{line}"
+            );
+            assert_eq!(line["env"], env, "{line}");
+            assert_eq!(line["stdinSha256"], sha(&stdin), "{line}");
+            assert!(!line.to_string().contains("abc123"), "{line}");
+            // The fields there before are kept.
+            assert_eq!(line["subject"], "sh -c cat {label}", "{line}");
+            assert!(line["program"].as_str().unwrap().ends_with("/sh"), "{line}");
+            assert_eq!(line["allowed"], true, "{line}");
+            // A subagent's runs-on tool is recorded the same way; its prompt is on stdin.
+            let line = audited(isolation, true, "Review the diff").await;
+            let stdin = serde_json::to_vec(&json!({"arguments":{"prompt":"Review the diff"}}));
+            assert_eq!(line["tool"], "review", "{line}");
+            assert_eq!(line["args"], json!(["-c", "cat", "fixed"]), "{line}");
+            assert_eq!(line["stdinSha256"], sha(&stdin.unwrap()), "{line}");
+        }
     }
 
     /// Write an executable script at `path` that prints `text`, then creates `marker`.

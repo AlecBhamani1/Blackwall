@@ -148,8 +148,8 @@ impl Approvals {
         )
         .await
     }
-    /// An owner command tool about to run `program`, the resolved absolute path; `subject` is
-    /// the tool's configured command, which rules match. The audit records both.
+    /// An owner command tool about to make `call`, which names the resolved absolute program;
+    /// `subject` is the tool's configured command, which rules match. The audit records both.
     ///
     /// With `outside` (it runs outside the sandbox) or `off_device` (a subagent hands it its
     /// prompt), it always asks: an allow rule never skips the prompt, and the answer is never
@@ -157,11 +157,11 @@ impl Approvals {
     /// tightening always wins. Otherwise it asks as any command does, so allow rules and
     /// "allow identical action this run" apply.
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_owner_tool(
+    pub(crate) async fn request_owner_tool(
         &self,
         request_id: &str,
         subject: &str,
-        program: &Path,
+        call: &crate::policy::ProgramCall<'_>,
         detail: String,
         off_device: bool,
         outside: bool,
@@ -173,7 +173,7 @@ impl Approvals {
                     request_id,
                     ApprovalKind::Exec,
                     subject,
-                    Some(program),
+                    Some(call),
                     None,
                     None,
                     detail,
@@ -197,7 +197,7 @@ impl Approvals {
                     .record_program(
                         ApprovalKind::Exec,
                         subject,
-                        Some(program),
+                        Some(call),
                         Decision::Deny,
                         false,
                         None,
@@ -238,7 +238,7 @@ impl Approvals {
                 .record_program(
                     ApprovalKind::Exec,
                     subject,
-                    Some(program),
+                    Some(call),
                     Decision::Ask,
                     allowed,
                     None,
@@ -275,7 +275,7 @@ impl Approvals {
         request_id: &str,
         kind: ApprovalKind,
         subject: &str,
-        program: Option<&Path>,
+        call: Option<&crate::policy::ProgramCall<'_>>,
         tool: Option<ApprovalTool>,
         http_tool: Option<(&str, bool)>,
         detail: String,
@@ -346,7 +346,7 @@ impl Approvals {
             .record_program(
                 kind,
                 subject,
-                program,
+                call,
                 decision,
                 allowed,
                 saved.as_ref(),

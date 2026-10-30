@@ -14,6 +14,10 @@ const MAX_POLICY_BYTES: usize = 64 * 1024;
 const MAX_RULES: usize = 200;
 const MAX_AUDIT_BYTES: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How much of each owner command tool argument the audit keeps.
+const MAX_AUDIT_ARG: usize = 1000;
+/// Options whose next word is a credential.
+const SECRET_OPTIONS: [&str; 5] = ["-u", "--user", "--password", "--token", "--api-key"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -472,14 +476,15 @@ impl Policy {
             .await;
     }
 
-    /// [`Self::record`] that also names `program`, the absolute path an owner command tool runs,
-    /// which `subject` (the configured command) may name only by a bare name.
+    /// [`Self::record`] that also records an owner command tool's `call`: the absolute program it
+    /// runs, which `subject` (the configured command) may name only by a bare name, and what it
+    /// runs with.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_program(
         &self,
         kind: ApprovalKind,
         subject: &str,
-        program: Option<&Path>,
+        call: Option<&ProgramCall<'_>>,
         decision: Decision,
         allowed: bool,
         saved: Option<&ToolRule>,
@@ -487,7 +492,7 @@ impl Policy {
     ) {
         let _ = tokio::time::timeout(
             IO_TIMEOUT,
-            self.append(kind, subject, program, decision, allowed, saved, rule),
+            self.append(kind, subject, call, decision, allowed, saved, rule),
         )
         .await;
     }
@@ -497,7 +502,7 @@ impl Policy {
         &self,
         kind: ApprovalKind,
         subject: &str,
-        program: Option<&Path>,
+        call: Option<&ProgramCall<'_>>,
         decision: Decision,
         allowed: bool,
         saved: Option<&ToolRule>,
@@ -508,8 +513,15 @@ impl Policy {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed,"rule":rule});
-        if let Some(program) = program {
-            entry["program"] = json!(program.to_string_lossy());
+        if let Some(call) = call {
+            entry["program"] = json!(call.program.to_string_lossy());
+            entry["tool"] = json!(call.tool);
+            entry["isolation"] = json!(call.isolation.name());
+            entry["args"] = json!(redact_args(call.args));
+            entry["env"] = json!(call.env);
+            if let Some(digest) = &call.stdin_sha256 {
+                entry["stdinSha256"] = json!(digest);
+            }
         }
         if let Some(rule) = saved {
             entry["saved"] = json!(rule);
@@ -817,6 +829,39 @@ pub(crate) fn normalize(path: &str) -> Option<PathBuf> {
 }
 
 /// Redact credentials line by line, keeping line breaks.
+/// An owner command tool's call, for its audit record: the absolute program, the tool, where it
+/// runs, its arguments after the program, the pass-through names it gets, and the SHA-256 of
+/// its standard input. Never a variable's value; arguments are redacted as a subject is.
+#[derive(Debug)]
+pub(crate) struct ProgramCall<'a> {
+    pub program: &'a Path,
+    pub tool: &'a str,
+    pub isolation: crate::command_tools::Isolation,
+    pub args: &'a [String],
+    pub env: &'a [String],
+    pub stdin_sha256: Option<String>,
+}
+
+/// Each argument [`redact`]ed, and the one after a credential option or `Bearer` hidden whole.
+/// Each is cut at [`MAX_AUDIT_ARG`] characters, so a long prompt cannot crowd out the log.
+fn redact_args(args: &[String]) -> Vec<String> {
+    let mut hide_next = false;
+    args.iter()
+        .map(|arg| {
+            let lower = arg.to_ascii_lowercase();
+            let shown = match hide_next {
+                true => "[redacted]".to_owned(),
+                false => redact(arg),
+            };
+            hide_next = lower.ends_with("bearer") || SECRET_OPTIONS.contains(&lower.as_str());
+            match shown.chars().nth(MAX_AUDIT_ARG) {
+                Some(_) => shown.chars().take(MAX_AUDIT_ARG).chain(['…']).collect(),
+                None => shown,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn redact_text(text: &str) -> String {
     text.lines().map(redact).collect::<Vec<_>>().join("\n")
 }
@@ -836,8 +881,7 @@ fn redact(subject: &str) -> String {
                 return "[redacted]".to_owned();
             }
             let secret = hide_next;
-            hide_next = lower.ends_with("bearer")
-                || ["-u", "--user", "--password", "--token", "--api-key"].contains(&lower.as_str());
+            hide_next = lower.ends_with("bearer") || SECRET_OPTIONS.contains(&lower.as_str());
             // A header name may follow `--header=` and may open a quote: `'X-Api-Key: v`,
             // `--header='Authorization: Bearer v'`, `Authorization:'Bearer v'`.
             let header = word.split_once(':').filter(|(name, _)| {
@@ -899,6 +943,27 @@ fn redact(subject: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audited_arguments_hide_credentials_and_stay_short() {
+        let args: Vec<String> = ["--token", "abc", "Bearer", "xyz", "key=v", "plain"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            redact_args(&args),
+            [
+                "--token",
+                "[redacted]",
+                "Bearer",
+                "[redacted]",
+                "key=[redacted]",
+                "plain"
+            ]
+        );
+        let long = redact_args(&["é".repeat(MAX_AUDIT_ARG + 5)]);
+        assert_eq!(long[0].chars().count(), MAX_AUDIT_ARG + 1);
+        assert!(long[0].ends_with('…'));
+    }
 
     fn policy(body: &str) -> Policy {
         Policy {
