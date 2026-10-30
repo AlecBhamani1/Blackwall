@@ -17,6 +17,21 @@ fn sessions(
     keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+type DeleteSecret = fn(&str, &str) -> Result<(), blackwall_core::secrets::SecretError>;
+/// The credential-store calls a save makes, replaceable in tests.
+#[derive(Clone, Copy)]
+struct Store {
+    set: blackwall_core::secrets::SetSecret,
+    delete: DeleteSecret,
+}
+const SYSTEM_STORE: Store = Store {
+    set: crate::secrets::set,
+    delete: crate::secrets::delete,
+};
+fn session_key(keys: &SessionKeys, endpoint: &str) -> Result<Option<String>, String> {
+    Ok(sessions(keys).get(&account(endpoint)?).cloned())
+}
+
 /// `saved` is false when the key is held for this session only.
 #[derive(Debug, PartialEq, serde::Serialize)]
 pub struct SavedKey {
@@ -35,8 +50,8 @@ pub async fn model_key(
                 "This paired computer's key is missing. Pair it again to restore access.".into()
             });
     }
-    if let Some(key) = sessions(&state.session_keys).get(&account(endpoint)?) {
-        return Ok(Some(key.clone()));
+    if let Some(key) = session_key(&state.session_keys, endpoint)? {
+        return Ok(Some(key));
     }
     read_key("com.blackwall.model", endpoint).await
 }
@@ -126,16 +141,16 @@ pub async fn save_model_key(
         crate::auth::require_unlocked(&app).await?;
     }
     let state = app.state::<crate::commands::AppState>();
-    commit_model_key(&state.session_keys, origin, key, crate::secrets::set).await
+    commit_model_key(&state.session_keys, origin, key, SYSTEM_STORE).await
 }
 /// Saves in the keyring; with none, keeps the key in memory for this run only.
 async fn commit_model_key(
     session_keys: &SessionKeys,
     origin: String,
     key: String,
-    set: blackwall_core::secrets::SetSecret,
+    store: Store,
 ) -> Result<SavedKey, String> {
-    match write_key_with(set, "com.blackwall.model", origin.clone(), key.clone()).await {
+    match write_key_with(store, "com.blackwall.model", origin.clone(), key.clone()).await {
         Ok(()) => {
             sessions(session_keys).remove(&origin);
             Ok(SavedKey { saved: true })
@@ -156,7 +171,7 @@ pub async fn save_relay_key(endpoint: &str, key: String) -> Result<(), String> {
     write_key("com.blackwall.relay", account(endpoint)?, key).await
 }
 async fn write_key(service: &'static str, origin: String, key: String) -> Result<(), String> {
-    write_key_with(crate::secrets::set, service, origin, key)
+    write_key_with(SYSTEM_STORE, service, origin, key)
         .await
         .map_err(|failure| match failure {
             KeyFailure::NoKeyring => crate::secrets::SecretError::Unavailable.explain(""),
@@ -168,7 +183,7 @@ enum KeyFailure {
     Message(String),
 }
 async fn write_key_with(
-    set: blackwall_core::secrets::SetSecret,
+    store: Store,
     service: &'static str,
     origin: String,
     key: String,
@@ -178,16 +193,16 @@ async fn write_key_with(
     }
     let service = crate::identity::keychain_service(service);
     tokio::task::spawn_blocking(move || {
-        let (store, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
+        let (name, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
         let (result, failure) = if key.trim().is_empty() {
             (
-                crate::secrets::delete(&service, &origin),
-                format!("Blackwall could not remove the access key from {store}. {recover}, then try again."),
+                (store.delete)(&service, &origin),
+                format!("Blackwall could not remove the access key from {name}. {recover}, then try again."),
             )
         } else {
             (
-                set(&service, &origin, key.trim()),
-                format!("Blackwall could not save the access key in {store}. {recover}, then try again."),
+                (store.set)(&service, &origin, key.trim()),
+                format!("Blackwall could not save the access key in {name}. {recover}, then try again."),
             )
         };
         result.map_err(|error| match error {
@@ -243,14 +258,9 @@ pub async fn remove_saved_credential(
     if matches!(&kind, CredentialKind::Model) {
         let state = app.state::<crate::commands::AppState>();
         let origin = account(&endpoint)?;
-        return commit_model_key(
-            &state.session_keys,
-            origin,
-            String::new(),
-            crate::secrets::set,
-        )
-        .await
-        .map(|_| ());
+        return commit_model_key(&state.session_keys, origin, String::new(), SYSTEM_STORE)
+            .await
+            .map(|_| ());
     }
     write_key(kind.service(), account(&endpoint)?, String::new()).await
 }
@@ -306,6 +316,13 @@ mod tests {
     fn no_keyring(_: &str, _: &str, _: &str) -> Result<(), blackwall_core::secrets::SecretError> {
         Err(blackwall_core::secrets::SecretError::Unavailable)
     }
+    fn no_keyring_delete(_: &str, _: &str) -> Result<(), blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Unavailable)
+    }
+    const NO_KEYRING: Store = Store {
+        set: no_keyring,
+        delete: no_keyring_delete,
+    };
     #[tokio::test]
     async fn unavailable_keyring_keeps_access_key_for_session_only() {
         let state = crate::commands::AppState::new().unwrap();
@@ -314,7 +331,7 @@ mod tests {
             &state.session_keys,
             account(endpoint).unwrap(),
             "sk-session".into(),
-            no_keyring,
+            NO_KEYRING,
         )
         .await
         .unwrap();
@@ -322,17 +339,15 @@ mod tests {
         // Boolean assertion avoids printing the key on failure.
         assert!(model_key(&state, endpoint).await.unwrap().as_deref() == Some("sk-session"));
         // The key is held per origin, so another origin does not see it.
-        assert!(!state
-            .session_keys
-            .lock()
+        assert!(session_key(&state.session_keys, "https://other.example/v1")
             .unwrap()
-            .contains_key("https://other.example"));
+            .is_none());
         // Clearing the access key drops the session copy as well.
         commit_model_key(
             &state.session_keys,
             account(endpoint).unwrap(),
             String::new(),
-            no_keyring,
+            NO_KEYRING,
         )
         .await
         .unwrap();
