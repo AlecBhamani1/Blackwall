@@ -39,12 +39,37 @@ describe('action approval', () => {
       screen.queryByRole('button', { name: 'Allow identical action this run' }),
     ).not.toBeInTheDocument();
   });
+  it('labels outside-sandbox prompts and offers no remember option', () => {
+    render(ApprovalCard, {
+      props: {
+        approval: {
+          ...approval,
+          kind: 'exec',
+          detail:
+            'Runs outside the sandbox with your account permissions.\n\nTool: review\nProgram: /usr/local/bin/claude',
+          tool: { server: 'docs', tool: 'docs__search' },
+          remember: false,
+          outsideSandbox: true,
+        },
+        onResolve: vi.fn(),
+      },
+    });
+    expect(
+      screen.getByText('Runs outside the sandbox with your account permissions.'),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Allow identical action this run' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
+  });
   it('still offers a run-wide allow for ordinary prompts', () => {
     render(ApprovalCard, { props: { approval, onResolve: vi.fn() } });
     expect(
       screen.getByRole('button', { name: 'Allow identical action this run' }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Sends data off this device/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Runs outside the sandbox/)).not.toBeInTheDocument();
   });
   it('shows the exact proposed action and sends only one decision while pending', async () => {
     const user = userEvent.setup();

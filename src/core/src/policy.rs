@@ -470,15 +470,35 @@ impl Policy {
     ) {
         let _ = tokio::time::timeout(
             IO_TIMEOUT,
-            self.append(kind, subject, decision, allowed, saved, rule),
+            self.append(kind, subject, None, decision, allowed, saved, rule),
         )
         .await;
     }
 
+    /// [`Self::record`] for an owner command tool: `program` is the absolute path that runs,
+    /// which `subject` (the configured command) may name only by a bare name.
+    pub(crate) async fn record_program(
+        &self,
+        kind: ApprovalKind,
+        subject: &str,
+        program: &Path,
+        decision: Decision,
+        allowed: bool,
+        rule: Option<MatchedRule>,
+    ) {
+        let _ = tokio::time::timeout(
+            IO_TIMEOUT,
+            self.append(kind, subject, Some(program), decision, allowed, None, rule),
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn append(
         &self,
         kind: ApprovalKind,
         subject: &str,
+        program: Option<&Path>,
         decision: Decision,
         allowed: bool,
         saved: Option<&ToolRule>,
@@ -489,6 +509,9 @@ impl Policy {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed,"rule":rule});
+        if let Some(program) = program {
+            entry["program"] = json!(program.to_string_lossy());
+        }
         if let Some(rule) = saved {
             entry["saved"] = json!(rule);
         }

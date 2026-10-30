@@ -171,6 +171,7 @@ export type AgentEvent =
       tool?: ApprovalTool;
       remember?: boolean;
       offDevice?: boolean;
+      outsideSandbox?: boolean;
     };
 
 export interface ChildEntry {
@@ -216,6 +217,8 @@ export interface PendingApproval {
   remember?: boolean;
   /** The action hands data to a program that may send it off this device. */
   offDevice?: boolean;
+  /** The program runs outside the sandbox with the owner's account permissions. */
+  outsideSandbox?: boolean;
 }
 
 export interface StreamCallbacks {

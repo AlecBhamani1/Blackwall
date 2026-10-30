@@ -44,6 +44,9 @@ const BUILT_IN: [&str; 13] = [
     "skill_propose",
 ];
 
+/// What an approval for an owner command tool that runs outside the sandbox says first.
+pub const OUTSIDE_NOTE: &str = "Runs outside the sandbox with your account permissions.";
+
 /// Where the owner's command tools run: outside the sandbox, always asking (the default), or
 /// inside the Commands profile. Only the owner chooses; a project file cannot.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -402,8 +405,9 @@ impl CommandTool {
         Ok(text)
     }
 
-    /// Command rules match the configured command template, so `claude -p` can allow every
-    /// prompt. HTTP tools ask with kind Network, and rules match the request's host.
+    /// Command rules match the configured command template, so, for a sandboxed tool,
+    /// `claude -p` can allow every prompt. A tool outside the sandbox always asks; only deny
+    /// rules apply. HTTP tools ask with kind Network, and rules match the request's host.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -460,9 +464,11 @@ impl CommandTool {
                 .map(|text| output.trim_text(text));
         }
         let (program, args, input) = self.prepared(&values, &workspace.path)?;
+        let outside = workspace.execution.command_tools == Isolation::Outside;
         // JSON keeps distinct argument lists distinct, so a remembered approval stays exact.
         let mut detail = format!(
-            "Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
+            "{}Project: {}\nTool: {}\nProgram: {}\nArguments: {}",
+            outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
@@ -471,13 +477,17 @@ impl CommandTool {
         if let Some(input) = &input {
             detail.push_str(&format!("\nStandard input: JSON, {}", shown_bytes(input)));
         }
-        detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        if !outside {
+            detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        }
         if !approvals
-            .request(
+            .request_owner_tool(
                 request_id,
-                ApprovalKind::Exec,
                 &self.command.join(" "),
+                &program,
                 detail,
+                false,
+                outside,
                 emit,
             )
             .await
@@ -538,17 +548,29 @@ impl CommandTool {
             validate_arguments(schema, &values)?;
         }
         let (program, args, input) = self.prepared(&values, &workspace.path)?;
-        let detail = format!(
-            "A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}\n\n{}",
+        let outside = workspace.execution.command_tools == Isolation::Outside;
+        let mut detail = format!(
+            "{}A subagent wants to send its task to another program. It may send this prompt off this device.\n\nProject: {}\nTool: {}\nProgram: {}\nArguments: {}\nPrompt ({} bytes, on standard input):\n{prompt}",
+            outside_prefix(outside),
             workspace.path.display(),
             self.name,
             program.display(),
             serde_json::to_string(&args).map_err(|_| ToolError::Arguments)?,
             prompt.len(),
-            workspace.execution.description(),
         );
+        if !outside {
+            detail.push_str(&format!("\n\n{}", workspace.execution.description()));
+        }
         if !approvals
-            .request_delegate(request_id, &self.command.join(" "), detail, emit)
+            .request_owner_tool(
+                request_id,
+                &self.command.join(" "),
+                &program,
+                detail,
+                true,
+                outside,
+                emit,
+            )
             .await
             .map_err(ToolError::Execution)?
         {
@@ -588,6 +610,15 @@ impl CommandTool {
         };
         let program = resolve_program(&self.command[0], project)?;
         Ok((program, args, input))
+    }
+}
+
+/// What an owner tool's approval detail starts with: [`OUTSIDE_NOTE`] when it runs outside the
+/// sandbox, where the sandbox description would be false.
+fn outside_prefix(outside: bool) -> String {
+    match outside {
+        true => format!("{OUTSIDE_NOTE}\n\n"),
+        false => String::new(),
     }
 }
 
@@ -1280,6 +1311,140 @@ mod tests {
             ));
         }
         drop(workspace);
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    /// Run `echo hi` twice as an owner tool with `rules` as the owner's policy, answering every
+    /// prompt with "Allow identical action this run". Returns the prompts, both results, and the
+    /// folder that holds the project, the policy, and its audit log.
+    #[cfg(unix)]
+    async fn echo_twice(
+        isolation: Isolation,
+        rules: &str,
+    ) -> (Vec<AgentEvent>, Vec<Result<String, ToolError>>, PathBuf) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) =
+            load(r#"{"tools":[{"name":"echo_hi","description":"Echo","command":["echo","hi"]}]}"#)
+                .await;
+        tokio::fs::write(directory.join(crate::policy::POLICY_FILE), rules)
+            .await
+            .unwrap();
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &directory, &workspace.path)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let (captured, decisions) = (events.clone(), approvals.clone());
+        let emit = move |event: AgentEvent| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = &event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id: request_id.clone(),
+                        approval_id: approval_id.clone(),
+                        decision: ApprovalDecision::AlwaysAllow,
+                    })
+                    .unwrap();
+                captured.lock().unwrap().push(event);
+            }
+        };
+        let tool = tools.get("echo_hi").unwrap();
+        let mut results = vec![];
+        for _ in 0..2 {
+            results.push(
+                tool.run(
+                    &workspace,
+                    "{}",
+                    "run",
+                    &approvals,
+                    &emit,
+                    Duration::from_secs(10),
+                    &Default::default(),
+                )
+                .await,
+            );
+        }
+        let events = events.lock().unwrap().clone();
+        (events, results, directory)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_asks_every_time_despite_allow_rule_and_remember() {
+        let (events, results, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| matches!(
+            event,
+            AgentEvent::ApprovalRequest { remember: false, outside_sandbox: true, detail, .. }
+                if detail.starts_with(OUTSIDE_NOTE)
+                    && !detail.contains("Approval cannot expand this boundary")
+        )));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_owner_tool_deny_rule_still_denies_without_asking() {
+        let (events, results, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"deny","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        assert_eq!(events.len(), 0, "{events:?}");
+        assert!(matches!(results[0], Err(ToolError::Denied)));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_records_the_resolved_absolute_program() {
+        let (_, results, directory) = echo_twice(Isolation::Outside, r#"{"rules":[]}"#).await;
+        assert!(results[0].is_ok(), "{results:?}");
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        let program = line["program"].as_str().unwrap();
+        // The configured `echo` is recorded as the absolute path that ran.
+        assert!(
+            program.starts_with('/') && program.ends_with("/echo"),
+            "{line}"
+        );
+        assert_eq!(line["subject"], "echo hi");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_owner_tool_keeps_todays_remembered_approval() {
+        let (events, results, directory) =
+            echo_twice(Isolation::Sandboxed, r#"{"rules":[]}"#).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ApprovalRequest { remember: true, outside_sandbox: false, detail, .. }
+                if !detail.contains(OUTSIDE_NOTE)
+                    && detail.ends_with("UNSANDBOXED: full account filesystem and network access.")
+        ));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let audit = tokio::fs::read_to_string(directory.join("policy-audit.jsonl"))
+            .await
+            .unwrap();
+        let line: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert!(line["program"].as_str().unwrap().starts_with('/'), "{line}");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 

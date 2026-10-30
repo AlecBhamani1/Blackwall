@@ -513,6 +513,14 @@ pub enum AgentEvent {
             skip_serializing_if = "std::ops::Not::not"
         )]
         off_device: bool,
+        /// The program runs outside the sandbox with the owner's account permissions, so the
+        /// prompt always asks and "allow identical action this run" is not offered.
+        #[serde(
+            default,
+            rename = "outsideSandbox",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        outside_sandbox: bool,
     },
     /// Lifecycle update from a child agent.
     SubagentStatus {
@@ -827,6 +835,7 @@ mod tests {
                 tool: None,
                 remember: true,
                 off_device: false,
+                outside_sandbox: false,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -836,6 +845,17 @@ mod tests {
                 tool: None,
                 remember: false,
                 off_device: false,
+                outside_sandbox: false,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "a4".to_owned(),
+                kind: ApprovalKind::Exec,
+                detail: "Runs outside the sandbox".to_owned(),
+                tool: None,
+                remember: false,
+                off_device: true,
+                outside_sandbox: true,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -848,6 +868,7 @@ mod tests {
                 }),
                 remember: true,
                 off_device: false,
+                outside_sandbox: false,
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),
@@ -894,6 +915,27 @@ mod tests {
             assert_eq!(decoded, event);
             assert_eq!(decoded.request_id(), "r1");
         }
+    }
+
+    #[test]
+    fn outside_sandbox_mark_is_sent_only_when_set() {
+        let event = |outside_sandbox| AgentEvent::ApprovalRequest {
+            request_id: "r1".to_owned(),
+            approval_id: "a1".to_owned(),
+            kind: ApprovalKind::Exec,
+            detail: "d".to_owned(),
+            tool: None,
+            remember: false,
+            off_device: false,
+            outside_sandbox,
+        };
+        let marked = serde_json::to_value(event(true)).unwrap();
+        assert_eq!(marked["outsideSandbox"], true);
+        let plain = serde_json::to_value(event(false)).unwrap();
+        assert!(plain.get("outsideSandbox").is_none(), "{plain}");
+        // Events from before the mark existed still load.
+        let old: AgentEvent = serde_json::from_value(plain).unwrap();
+        assert_eq!(old, event(false));
     }
 
     #[test]

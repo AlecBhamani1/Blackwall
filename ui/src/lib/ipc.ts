@@ -568,6 +568,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       ...approvalTool(event.tool),
       ...(event.remember === false ? { remember: false } : {}),
       ...(event.offDevice === true ? { offDevice: true } : {}),
+      ...(event.outsideSandbox === true ? { outsideSandbox: true } : {}),
     };
   return null;
 }

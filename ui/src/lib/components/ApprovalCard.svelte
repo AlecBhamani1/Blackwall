@@ -48,6 +48,9 @@
       Sends data off this device. The program below may pass this prompt to an online service.
       Blackwall asks every time.
     </p>{/if}
+  {#if approval.outsideSandbox}<p class="outside">
+      Runs outside the sandbox with your account permissions.
+    </p>{/if}
   <!-- Scrollable action details need a keyboard focus target. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="action-details" role="region" aria-label="Proposed action details" tabindex="0">
@@ -55,7 +58,7 @@
   </div>
   <div class="actions">
     <button class="deny" disabled={busy} onclick={() => decide('deny')}>Deny</button><span
-    ></span>{#if approval.remember !== false}<button
+    ></span>{#if approval.remember !== false && !approval.outsideSandbox}<button
         class="remember"
         disabled={busy}
         onclick={() => decide('always_allow')}>Allow identical action this run</button
@@ -63,7 +66,7 @@
       >{busy ? 'Sending…' : 'Allow once'}</button
     >
   </div>
-  {#if approval.tool}
+  {#if approval.tool && !approval.outsideSandbox}
     <div class="always">
       <label
         >Always allow <select bind:value={scope} disabled={busy} aria-label="What to allow"
@@ -183,7 +186,8 @@
     display: block;
     margin-top: 6px;
   }
-  .off-device {
+  .off-device,
+  .outside {
     margin: 0 0 8px;
     font-weight: 600;
     color: var(--warn);

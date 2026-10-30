@@ -1185,14 +1185,14 @@ mod settings_tests {
         }
         let prompts = prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts
-            .iter()
-            .all(
-                |(kind, detail, remember, off_device)| *kind == ApprovalKind::Exec
+        assert!(prompts.iter().all(
+            |(kind, detail, remember, off_device)| *kind == ApprovalKind::Exec
                     && !remember
                     && *off_device
                     && detail.contains("off this device")
-            ));
+                    // Runs-on tools follow the command tools setting, outside by default.
+                    && detail.starts_with(crate::command_tools::OUTSIDE_NOTE)
+        ));
         // A denial stops it, and a deny rule stops it without asking.
         let (emit, _) = answer(&approvals, ApprovalDecision::Deny);
         let error = child(
