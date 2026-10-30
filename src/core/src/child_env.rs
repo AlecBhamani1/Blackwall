@@ -1,8 +1,6 @@
 //! The environment every child program starts with: shell commands, owner command tools and MCP
 //! servers. It is built from an allow-list, so the AppImage runtime's variables (`PYTHONHOME`,
 //! `LD_LIBRARY_PATH`, ...) and the owner's unrelated credentials never reach a child.
-// Wired into the spawn sites by the next change; until then only the tests use it.
-#![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -38,11 +36,13 @@ pub(crate) const OWNER_ALLOW: [&str; 9] = [
 pub(crate) const SANDBOX_ALLOW: [&str; 4] = ["HOME", "LANG", "LC_ALL", "TERM"];
 /// Variables that make a program load attacker-chosen code. Besides these, the `LD_` and `DYLD_`
 /// prefixes are refused.
-pub(crate) const INJECTION: [&str; 12] = [
+pub(crate) const INJECTION: &[&str] = &[
     "PYTHONHOME",
     "PYTHONPATH",
     "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
     "NODE_OPTIONS",
+    "NODE_PATH",
     "PERL5LIB",
     "PERLLIB",
     "PERL5OPT",
@@ -51,6 +51,30 @@ pub(crate) const INJECTION: [&str; 12] = [
     "GTK_PATH",
     "GIO_MODULE_DIR",
     "QT_PLUGIN_PATH",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+];
+/// What Windows programs need to start at all. Owner and sandboxed children keep these on Windows.
+pub(crate) const WINDOWS_ALLOW: [&str; 10] = [
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
 ];
 /// Blackwall's model and relay secrets, which child programs never inherit.
 pub(crate) const SECRET_ENV: [&str; 4] = [
@@ -61,11 +85,21 @@ pub(crate) const SECRET_ENV: [&str; 4] = [
 ];
 const MAX_DROPPED: usize = 20;
 
+/// Whether two variable names are the same: Windows ignores case, other systems do not.
+fn same_name(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// Builds the child environment from `source` (normally the process environment).
 ///
 /// `PATH` comes from `search_path` (the owner's login-shell one) when set, otherwise from `source`,
 /// and always goes through [`validated_path`]. `pass_through` names are added for the owner scope
-/// only, and only when [`valid_pass_through`] accepts them.
+/// only, and only when [`valid_pass_through`] accepts them. `project` should be the canonical
+/// absolute project path, so `PATH` entries inside it are recognised.
 pub(crate) fn build(
     source: impl IntoIterator<Item = (OsString, OsString)>,
     scope: Scope,
@@ -74,23 +108,31 @@ pub(crate) fn build(
     pass_through: &[String],
 ) -> ChildEnv {
     let source: Vec<(OsString, OsString)> = source.into_iter().collect();
-    let lookup = |name: &str| source.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let lookup = |name: &str| {
+        source
+            .iter()
+            .find(|(k, _)| k.to_str().is_some_and(|k| same_name(k, name)))
+            .map(|(_, v)| v)
+    };
     let appdir = lookup("APPDIR")
         .map(Path::new)
         .filter(|dir| dir.is_absolute() && dir.parent().is_some());
     let mut vars: Vec<(OsString, OsString)> = Vec::new();
     for (key, value) in &source {
         let Some(name) = key.to_str() else { continue };
-        let allowed = match scope {
-            Scope::Sandboxed => SANDBOX_ALLOW.contains(&name),
-            Scope::Owner => {
-                OWNER_ALLOW.contains(&name)
-                    || name.starts_with("LC_")
-                    || pass_through
-                        .iter()
-                        .any(|wanted| wanted == name && valid_pass_through(name).is_ok())
-            }
-        };
+        let listed = |names: &[&str]| names.iter().any(|allowed| same_name(allowed, name));
+        let on_windows = cfg!(windows) && listed(&WINDOWS_ALLOW);
+        let allowed = on_windows
+            || match scope {
+                Scope::Sandboxed => listed(&SANDBOX_ALLOW),
+                Scope::Owner => {
+                    listed(&OWNER_ALLOW)
+                        || name.starts_with("LC_")
+                        || pass_through.iter().any(|wanted| {
+                            same_name(wanted, name) && valid_pass_through(name).is_ok()
+                        })
+                }
+            };
         if allowed {
             vars.push((key.clone(), value.clone()));
         }
@@ -132,7 +174,8 @@ pub(crate) fn from_process(scope: Scope, project: &Path, pass_through: &[String]
 }
 
 /// Keeps only the `PATH` entries a child may search: absolute ones outside the AppImage mount and
-/// the project. Empty and relative entries would resolve to the current directory, and a project
+/// the project (pass the project's canonical absolute path, which is what symlink-free `PATH`
+/// entries are compared with). Empty and relative entries would resolve to the current directory, and a project
 /// entry would let a repository plant programs that the owner's tools then run.
 pub(crate) fn validated_path(
     path: &OsStr,
@@ -181,6 +224,20 @@ pub(crate) fn valid_pass_through(name: &str) -> Result<(), &'static str> {
     } else {
         Ok(())
     }
+}
+
+/// Checks the `env` list of an MCP server or command tool: at most 32 distinct valid names.
+pub(crate) fn valid_pass_through_list(names: &[String]) -> Result<(), &'static str> {
+    const TOO_MANY: &str = "List at most 32 distinct env names.";
+    if names.len() > 32
+        || names
+            .iter()
+            .enumerate()
+            .any(|(i, name)| names[..i].contains(name))
+    {
+        return Err(TOO_MANY);
+    }
+    names.iter().try_for_each(|name| valid_pass_through(name))
 }
 
 impl ChildEnv {
@@ -240,22 +297,44 @@ mod tests {
 
     #[test]
     fn injection_and_secret_variables_never_pass_even_by_name() {
-        for name in [
+        let mut names = vec![
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
-            "PYTHONHOME",
-            "NODE_OPTIONS",
             "BLACKWALL_MODEL_API_KEY",
+        ];
+        names.extend(INJECTION);
+        for name in [
+            "BASH_ENV",
+            "ENV",
+            "NODE_PATH",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "PYTHONUSERBASE",
+            "PROMPT_COMMAND",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
         ] {
-            assert!(valid_pass_through(name).is_err());
+            assert!(INJECTION.contains(&name), "{name}");
+        }
+        for name in names {
+            assert!(valid_pass_through(name).is_err(), "{name}");
+            assert!(
+                valid_pass_through(&name.to_ascii_lowercase()).is_err(),
+                "{name}"
+            );
         }
     }
 
     #[test]
-    fn appimage_entries_are_stripped_from_path_and_xdg_data_dirs() {
+    fn appimage_entries_are_stripped_from_path_and_not_passed() {
         let env = build(
             vars(&[
                 ("APPDIR", "/tmp/.mount_x"),
+                ("XDG_DATA_DIRS", "/tmp/.mount_x/usr/share"),
                 ("PATH", "/tmp/.mount_x/usr/bin:/usr/bin"),
                 ("PYTHONHOME", "/tmp/.mount_x/usr"),
             ]),
@@ -267,6 +346,52 @@ mod tests {
         assert_eq!(get(&env, "PATH"), Some("/usr/bin"));
         assert_eq!(get(&env, "PYTHONHOME"), None);
         assert_eq!(get(&env, "APPDIR"), None);
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_scope_uses_tmp_on_linux_whatever_the_host_sets() {
+        for host in [vars(&[("TMPDIR", "/var/tmp/x")]), vars(&[])] {
+            let env = build(host, Scope::Sandboxed, None, Path::new("/p"), &[]);
+            assert_eq!(get(&env, "TMPDIR"), Some("/tmp"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_scope_keeps_the_host_tmpdir_on_macos() {
+        let env = build(
+            vars(&[("TMPDIR", "/var/folders/x/T/")]),
+            Scope::Sandboxed,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert_eq!(get(&env, "TMPDIR"), Some("/var/folders/x/T/"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_children_keep_system_variables_and_find_path_in_any_case() {
+        for scope in [Scope::Owner, Scope::Sandboxed] {
+            let env = build(
+                vars(&[
+                    ("SystemRoot", "C:\\Windows"),
+                    ("ComSpec", "C:\\Windows\\System32\\cmd.exe"),
+                    ("PATHEXT", ".EXE"),
+                    ("Path", "C:\\Windows\\System32"),
+                    ("AWS_SECRET_ACCESS_KEY", "x"),
+                ]),
+                scope,
+                None,
+                Path::new("C:\\p"),
+                &[],
+            );
+            assert_eq!(get(&env, "SystemRoot"), Some("C:\\Windows"));
+            assert_eq!(get(&env, "PATH"), Some("C:\\Windows\\System32"));
+            assert_eq!(get(&env, "AWS_SECRET_ACCESS_KEY"), None);
+        }
     }
 
     #[test]

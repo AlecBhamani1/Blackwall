@@ -102,6 +102,10 @@ pub struct CommandTool {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     body: BodyMode,
+    /// Names of the owner's environment variables the program also receives, when it runs
+    /// unsandboxed. A sandboxed program never gets them.
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 /// The JSON Schema subset owners can declare: an object of typed, optionally enumerated values.
@@ -435,7 +439,10 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
-        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout, output).await
+        crate::tools::program_with_timeout(
+            workspace, &program, &args, &self.env, input, timeout, output,
+        )
+        .await
     }
 
     /// Why this tool cannot take a subagent's prompt, or `None` when it can: it must run a
@@ -501,7 +508,10 @@ impl CommandTool {
         {
             return Err(ToolError::Denied);
         }
-        crate::tools::program_with_timeout(workspace, &program, &args, input, timeout, output).await
+        crate::tools::program_with_timeout(
+            workspace, &program, &args, &self.env, input, timeout, output,
+        )
+        .await
     }
 
     /// The resolved program, its arguments, and its standard input for checked `values`.
@@ -639,6 +649,7 @@ fn validate(tools: Vec<CommandTool>) -> Result<Vec<CommandTool>, &'static str> {
         {
             return Err("A tool has an invalid name, description, or command.");
         }
+        crate::child_env::valid_pass_through_list(&tool.env)?;
         match tool.kind {
             ToolKind::Command => {
                 if tool.command.is_empty()
@@ -655,7 +666,12 @@ fn validate(tools: Vec<CommandTool>) -> Result<Vec<CommandTool>, &'static str> {
                     return Err("Only HTTP tools take a url, method, headers, or body.");
                 }
             }
-            ToolKind::Http => http::validate(tool)?,
+            ToolKind::Http => {
+                if !tool.env.is_empty() {
+                    return Err("Only command tools take env.");
+                }
+                http::validate(tool)?
+            }
         }
         if let Some(schema) = &tool.parameters {
             validate_schema(schema)?;
@@ -715,6 +731,33 @@ mod tests {
             .await
             .unwrap();
         (CommandTools::load(&directory).await, directory)
+    }
+
+    #[test]
+    fn mcp_and_tools_files_reject_injection_names_in_env() {
+        let tool = |env: &str, extra: &str| {
+            format!(
+                r#"{{"tools":[{{"name":"t","description":"d","command":["x"],"env":{env}{extra}}}]}}"#
+            )
+        };
+        assert!(parse_file(tool(r#"["GITHUB_TOKEN"]"#, "").as_bytes()).is_ok());
+        for env in [
+            r#"["NODE_OPTIONS"]"#,
+            r#"["LD_PRELOAD"]"#,
+            r#"["PATH"]"#,
+            r#"["A=B"]"#,
+        ] {
+            assert!(parse_file(tool(env, "").as_bytes()).is_err(), "{env}");
+        }
+        let many: Vec<String> = (0..33).map(|i| format!("V{i}")).collect();
+        assert!(parse_file(tool(&serde_json::to_string(&many).unwrap(), "").as_bytes()).is_err());
+        let http = |env: &str| {
+            format!(
+                r#"{{"tools":[{{"name":"t","description":"d","kind":"http","url":"https://example.com/x"{env}}}]}}"#
+            )
+        };
+        assert!(parse_file(http("").as_bytes()).is_ok());
+        assert!(parse_file(http(r#","env":["HOME"]"#).as_bytes()).is_err());
     }
 
     #[tokio::test]

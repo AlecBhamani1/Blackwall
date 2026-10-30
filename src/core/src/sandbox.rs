@@ -52,23 +52,34 @@ impl ExecutionPolicy {
     }
 }
 
+/// Prepare `process` for the owner's execution profile and give it its environment: the minimal
+/// sandbox one, or, when unsandboxed, the owner one plus the `pass_through` variables.
 pub(crate) fn wrap(
     workspace: &Workspace,
     process: tokio::process::Command,
+    pass_through: &[String],
 ) -> Result<tokio::process::Command, ToolError> {
-    wrap_with_backend(workspace, process, Path::new("/usr/bin/sandbox-exec"))
+    wrap_with_backend(
+        workspace,
+        process,
+        Path::new("/usr/bin/sandbox-exec"),
+        pass_through,
+    )
 }
 fn wrap_with_backend(
     workspace: &Workspace,
-    process: tokio::process::Command,
+    mut process: tokio::process::Command,
     backend: &Path,
+    pass_through: &[String],
 ) -> Result<tokio::process::Command, ToolError> {
+    use crate::child_env::{from_process, Scope};
     if workspace.execution.profile == ExecutionProfile::Unsandboxed {
+        from_process(Scope::Owner, &workspace.path, pass_through).apply(&mut process);
         return Ok(process);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (process, backend);
+        let _ = (process, backend, pass_through);
         Err(ToolError::Execution("Sandboxed commands are not supported on this platform. Choose unsandboxed explicitly to run with full account access.".into()))
     }
     #[cfg(target_os = "macos")]
@@ -86,15 +97,8 @@ fn wrap_with_backend(
             .args(original.get_args());
         // Do not hand application credentials, shell startup hooks, or loader injection variables
         // to project programs. The OS policy also blocks credential stores and unrelated IPC.
-        sandbox.env_clear();
-        for key in ["HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"] {
-            if let Some(value) = std::env::var_os(key) {
-                sandbox.env(key, value);
-            }
-        }
-        if let Some(path) = crate::tools::search_path() {
-            sandbox.env("PATH", path);
-        }
+        // Owner pass-through names are not honoured inside the sandbox.
+        from_process(Scope::Sandboxed, &workspace.path, &[]).apply(&mut sandbox);
         Ok(sandbox)
     }
 }
@@ -259,7 +263,7 @@ mod tests {
             ) -> Result<String, ToolError> {
                 let mut process = tokio::process::Command::new("/bin/sh");
                 process.args(["-c", command]);
-                let process = wrap_with_backend(&self.workspace, process, backend)?;
+                let process = wrap_with_backend(&self.workspace, process, backend, &[])?;
                 crate::tools::run_with_timeout(
                     &self.workspace.path,
                     process,
@@ -619,7 +623,7 @@ mod tests {
             assert!(!project.workspace.path.join("escaped").exists());
             let mut process = tokio::process::Command::new("/bin/sh");
             process.args(["-c", "(/bin/sleep 1; printf escaped > timed-out) & wait"]);
-            let process = wrap(&project.workspace, process).unwrap();
+            let process = wrap(&project.workspace, process, &[]).unwrap();
             assert!(crate::tools::run_with_timeout(
                 &project.workspace.path,
                 process,

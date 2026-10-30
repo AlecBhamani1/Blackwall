@@ -55,6 +55,10 @@ pub struct ServerConfig {
     /// Names of environment variables the server receives from the platform credential store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Names of the owner's own environment variables a local server also receives. Everything
+    /// else, including credentials the owner has set, stays out of its environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
     /// For a `url` server, the origin each secret was saved for. A header is sent only when its
     /// secret was saved for the URL's current origin.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -253,6 +257,7 @@ fn add(
         deny_tools: vec![],
         secrets: vec![],
         secret_origins: BTreeMap::new(),
+        env: vec![],
     });
     write_config(directory, servers)?;
     Ok(name.into())
@@ -386,14 +391,18 @@ impl McpServers {
             .filter_map(|definition| definition["function"]["name"].as_str())
             .map(str::to_owned)
             .collect();
+        // Children never search the project for programs; without a project nothing is excluded.
+        let project = workspace
+            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+            .unwrap_or_default();
         started
-            .add_servers(configs, Source::Owner, directory, &mut names)
+            .add_servers(configs, Source::Owner, directory, &project, &mut names)
             .await;
         if let Some(workspace) = workspace {
             let projects = project_servers(directory, workspace).await;
             if !projects.is_empty() {
                 started
-                    .add_servers(projects, Source::Project, directory, &mut names)
+                    .add_servers(projects, Source::Project, directory, &project, &mut names)
                     .await;
             }
         }
@@ -406,6 +415,7 @@ impl McpServers {
         configs: Vec<ServerConfig>,
         source: Source,
         directory: &Path,
+        project: &Path,
         names: &mut Vec<String>,
     ) {
         let configs = match validate_for(configs, source) {
@@ -464,20 +474,35 @@ impl McpServers {
                     }
                 }
             };
+            // The child gets an allow-list, not this process's environment.
+            let env = crate::child_env::from_process(
+                crate::child_env::Scope::Owner,
+                project,
+                &config.env,
+            );
+            // Names only: what a failing local server may have been missing.
+            let missing = match env.dropped() {
+                dropped if config.url.is_none() && !dropped.is_empty() => format!(
+                    " Not passed to it: {}. List names in \"env\" to pass them.",
+                    dropped.join(", ")
+                ),
+                _ => String::new(),
+            };
             match tokio::time::timeout(
                 STARTUP_TIMEOUT,
-                launch(&config, directory, environment, pinned),
+                launch(&config, directory, &env, environment, pinned),
             )
             .await
             {
                 Ok(Ok(connection)) => {
                     self.add(config, connection, names).await;
                 }
-                Ok(Err(error)) => self
-                    .warnings
-                    .push(format!("MCP server {} did not start: {error}", config.name)),
+                Ok(Err(error)) => self.warnings.push(format!(
+                    "MCP server {} did not start: {error}{missing}",
+                    config.name
+                )),
                 Err(_) => self.warnings.push(format!(
-                    "MCP server {} did not start within 15 seconds.",
+                    "MCP server {} did not start within 15 seconds.{missing}",
                     config.name
                 )),
             }
@@ -917,6 +942,7 @@ async fn project_servers(directory: &Path, workspace: &Path) -> Vec<ServerConfig
             deny_tools: server.deny_tools,
             secrets: vec![],
             secret_origins: BTreeMap::new(),
+            env: vec![],
         })
         .collect()
 }
@@ -924,6 +950,7 @@ async fn project_servers(directory: &Path, workspace: &Path) -> Vec<ServerConfig
 async fn launch(
     config: &ServerConfig,
     directory: &Path,
+    env: &crate::child_env::ChildEnv,
     environment: Vec<(String, String)>,
     pinned: Option<http::Pinned>,
 ) -> Result<Connection, ToolError> {
@@ -933,7 +960,7 @@ async fn launch(
             http::headers(&environment)?,
             pinned,
         )?),
-        None => start_process(config, directory, &environment)?,
+        None => start_process(config, directory, env, &environment)?,
     };
     let secrets = environment.into_iter().map(|(_, value)| value).collect();
     let mut connection = Connection::new(transport, secrets);
@@ -945,7 +972,8 @@ async fn launch(
 fn start_process(
     config: &ServerConfig,
     directory: &Path,
-    environment: &[(String, String)],
+    env: &crate::child_env::ChildEnv,
+    secrets: &[(String, String)],
 ) -> Result<Box<dyn Transport>, ToolError> {
     #[cfg(any(unix, windows))]
     {
@@ -957,7 +985,7 @@ fn start_process(
                 ))
             })?;
         let (process, stdin, stdout, stderr) =
-            crate::tools::spawn_server(directory, &program, &config.command[1..], environment)?;
+            crate::tools::spawn_server(directory, &program, &config.command[1..], env, secrets)?;
         // Server logs are not shown; draining them keeps a chatty server from blocking.
         tokio::spawn(async move {
             let mut stderr = stderr;
@@ -971,7 +999,7 @@ fn start_process(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (config, directory, environment);
+        let _ = (config, directory, env, secrets);
         Err(ToolError::Execution(
             "MCP servers are not supported on this platform.".into(),
         ))
@@ -1057,11 +1085,17 @@ fn validate_for(
             Source::Project if !server.secrets.is_empty() || !server.headers.is_empty() => {
                 return Err("Project MCP servers cannot use secrets or headers.");
             }
+            Source::Project if !server.env.is_empty() => {
+                return Err("Project MCP servers cannot use env.");
+            }
             _ => {}
         }
         match &server.url {
             Some(_) if !server.command.is_empty() => {
                 return Err("Give each MCP server either a command or a URL, not both.");
+            }
+            Some(_) if !server.env.is_empty() => {
+                return Err("Only MCP servers with a command take env.");
             }
             Some(url) => {
                 if !http::valid_url(url) {
@@ -1092,6 +1126,7 @@ fn validate_for(
                 }
             }
         }
+        crate::child_env::valid_pass_through_list(&server.env)?;
         if server.secrets.len() > 16
             || server.secrets.iter().enumerate().any(|(index, name)| {
                 !valid_secret_name(name) || server.secrets[..index].contains(name)
@@ -1199,6 +1234,7 @@ mod tests {
             deny_tools: vec!["delete_issue".into()],
             secrets: vec![],
             secret_origins: BTreeMap::new(),
+            env: vec![],
         };
         let mut names: Vec<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
         let mut servers = McpServers::default();
@@ -1255,6 +1291,7 @@ mod tests {
             deny_tools: vec![],
             secrets: vec!["JIRA_API_TOKEN".into()],
             secret_origins: BTreeMap::new(),
+            env: vec![],
         };
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
@@ -1285,6 +1322,7 @@ mod tests {
             deny_tools: vec![],
             secrets: vec!["JIRA_API_TOKEN".into()],
             secret_origins: BTreeMap::new(),
+            env: vec![],
         };
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
@@ -1380,6 +1418,83 @@ mod tests {
     }
 
     #[test]
+    fn mcp_and_tools_files_reject_injection_names_in_env() {
+        assert!(
+            parse(br#"{"servers":[{"name":"a","command":["x"],"env":["LD_PRELOAD"]}]}"#).is_err()
+        );
+        assert!(
+            parse(br#"{"servers":[{"name":"a","command":["x"],"env":["GITHUB_TOKEN"]}]}"#).is_ok()
+        );
+        assert!(parse(br#"{"servers":[{"name":"a","command":["x"],"env":["PATH"]}]}"#).is_err());
+        let many: Vec<String> = (0..33).map(|i| format!("V{i}")).collect();
+        let body = serde_json::json!({"servers":[{"name":"a","command":["x"],"env":many}]});
+        assert!(parse(body.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn project_servers_cannot_carry_env() {
+        let mut server = ServerConfig {
+            name: "p-docs".into(),
+            command: vec![],
+            url: Some("https://docs.example/mcp".into()),
+            headers: BTreeMap::new(),
+            enabled: true,
+            allow_tools: None,
+            deny_tools: vec![],
+            secrets: vec![],
+            env: vec![],
+            secret_origins: BTreeMap::new(),
+        };
+        assert!(validate_for(vec![server.clone()], Source::Project).is_ok());
+        server.env = vec!["HOME".into()];
+        assert!(validate_for(vec![server], Source::Project).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_server_starts_despite_fake_appimage_environment() {
+        use crate::child_env::{build, Scope};
+        let system_path = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+        let Some(python) = std::env::split_paths(system_path)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+        else {
+            eprintln!("skipped: python3 is not on the system PATH");
+            return;
+        };
+        let source = [
+            ("APPDIR", "/nonexistent"),
+            ("PYTHONHOME", "/nonexistent/usr"),
+            ("PYTHONPATH", "/nonexistent"),
+            ("PATH", system_path),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        let env = build(source, Scope::Owner, None, Path::new(""), &[]);
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_echo.py");
+        let config = ServerConfig {
+            name: "echo".into(),
+            command: vec![python.to_string_lossy().into_owned(), script.into()],
+            url: None,
+            headers: BTreeMap::new(),
+            enabled: true,
+            allow_tools: None,
+            deny_tools: vec![],
+            secrets: vec![],
+            env: vec![],
+            secret_origins: BTreeMap::new(),
+        };
+        let transport = start_process(&config, &std::env::temp_dir(), &env, &[]).unwrap();
+        let mut connection = Connection::new(transport, vec![]);
+        tokio::time::timeout(Duration::from_secs(10), connection.initialize())
+            .await
+            .unwrap()
+            .unwrap();
+        let tools = connection.list_tools().await.unwrap();
+        let names: Vec<_> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, ["echo"]);
+    }
+
+    #[test]
     fn secret_names_must_be_unique_environment_names() {
         let server = |secrets: &[&str]| ServerConfig {
             name: "jira".into(),
@@ -1391,6 +1506,7 @@ mod tests {
             deny_tools: vec![],
             secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
             secret_origins: BTreeMap::new(),
+            env: vec![],
         };
         assert!(validate(vec![server(&["JIRA_API_TOKEN", "JIRA_2"])]).is_ok());
         for invalid in [

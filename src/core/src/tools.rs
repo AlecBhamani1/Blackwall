@@ -525,7 +525,7 @@ pub async fn execute(
             }
             run_with_timeout(
                 &workspace.path,
-                crate::sandbox::wrap(workspace, shell_command(command))?,
+                crate::sandbox::wrap(workspace, shell_command(command), &[])?,
                 command_timeout,
                 output,
             )
@@ -602,18 +602,28 @@ async fn shell_with_timeout(
     .await
 }
 /// Run a resolved program with separate arguments, never parsed by a shell. `input`, when
-/// given, is written to its standard input, which is otherwise empty.
+/// given, is written to its standard input, which is otherwise empty. `pass_through` names the
+/// owner's variables the program also receives, unless the profile is sandboxed.
 pub(crate) async fn program_with_timeout(
     workspace: &Workspace,
     program: &Path,
     args: &[String],
+    pass_through: &[String],
     input: Option<Vec<u8>>,
     timeout: Duration,
     output: &OutputCap,
 ) -> Result<String, ToolError> {
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (workspace, program, args, input, timeout, output);
+        let _ = (
+            workspace,
+            program,
+            args,
+            pass_through,
+            input,
+            timeout,
+            output,
+        );
         Err(ToolError::Execution(
             "Owner tools are not supported on this platform.".into(),
         ))
@@ -624,7 +634,7 @@ pub(crate) async fn program_with_timeout(
         process.args(args);
         run_with_input(
             &workspace.path,
-            crate::sandbox::wrap(workspace, process)?,
+            crate::sandbox::wrap(workspace, process, pass_through)?,
             input,
             timeout,
             output,
@@ -645,8 +655,6 @@ pub(crate) fn search_path() -> Option<std::ffi::OsString> {
         .cloned()
         .or_else(|| std::env::var_os("PATH"))
 }
-#[cfg(any(unix, windows))]
-use crate::child_env::SECRET_ENV;
 /// A long-running program with piped standard streams, such as an MCP server. Dropping it stops
 /// the program and its descendants, like a finished or cancelled shell command.
 #[cfg(any(unix, windows))]
@@ -665,14 +673,15 @@ pub(crate) type ServerStreams = (
     tokio::process::ChildStdout,
     tokio::process::ChildStderr,
 );
-/// Start a resolved program without a shell, in `directory`, without Blackwall's secrets but with
-/// the server's own `environment`.
+/// Start a resolved program without a shell, in `directory`, with only `env` and then the
+/// server's own `secrets`.
 #[cfg(any(unix, windows))]
 pub(crate) fn spawn_server(
     directory: &Path,
     program: &Path,
     args: &[String],
-    environment: &[(String, String)],
+    env: &crate::child_env::ChildEnv,
+    secrets: &[(String, String)],
 ) -> Result<ServerStreams, ToolError> {
     let start = || ToolError::Execution("The program could not start.".into());
     let mut process = tokio::process::Command::new(program);
@@ -683,13 +692,8 @@ pub(crate) fn spawn_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for key in SECRET_ENV {
-        process.env_remove(key);
-    }
-    if let Some(path) = SEARCH_PATH.get() {
-        process.env("PATH", path);
-    }
-    process.envs(environment.iter().map(|(name, value)| (name, value)));
+    env.apply(&mut process);
+    process.envs(secrets.iter().map(|(name, value)| (name, value)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -780,7 +784,8 @@ impl Stream {
         pieces.push(Piece::Bytes(second));
     }
 }
-/// [`run_with_timeout`], writing `input` to standard input while output is captured.
+/// [`run_with_timeout`], writing `input` to standard input while output is captured. The command
+/// brings its own environment; this never adds to or inherits one on its behalf.
 #[cfg(any(unix, windows))]
 async fn run_with_input(
     directory: &Path,
@@ -799,12 +804,6 @@ async fn run_with_input(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for key in SECRET_ENV {
-        process.env_remove(key);
-    }
-    if let Some(path) = SEARCH_PATH.get() {
-        process.env("PATH", path);
-    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -947,6 +946,73 @@ mod tests {
             marker.parse::<usize>().unwrap(),
             input.len() - head.len() - tail.len()
         );
+    }
+    #[cfg(unix)]
+    async fn run_env_probe(
+        directory: &Path,
+        env: &crate::child_env::ChildEnv,
+        script: &str,
+    ) -> Result<String, ToolError> {
+        let mut process = shell_command(script);
+        env.apply(&mut process);
+        run_with_timeout(
+            directory,
+            process,
+            Duration::from_secs(30),
+            &OutputCap::default(),
+        )
+        .await
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsandboxed_shell_does_not_inherit_unlisted_variables() {
+        use crate::child_env::{build, Scope};
+        let directory = std::env::temp_dir();
+        let source = [("HOME", "/h"), ("AWS_SECRET_ACCESS_KEY", "leak")]
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        let env = build(
+            source,
+            Scope::Owner,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            &directory,
+            &[],
+        );
+        let out = run_env_probe(&directory, &env, "env").await.unwrap();
+        assert!(!out.contains("AWS_SECRET_ACCESS_KEY"), "{out}");
+        assert!(out.contains("HOME=/h"), "{out}");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_programs_get_only_allow_listed_and_passed_through_variables() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-owner-env-{}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut workspace = Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        let run = |pass: Vec<String>| {
+            let workspace = workspace.clone();
+            async move {
+                program_with_timeout(
+                    &workspace,
+                    Path::new("/usr/bin/env"),
+                    &[],
+                    &pass,
+                    None,
+                    Duration::from_secs(30),
+                    &OutputCap::default(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // Cargo sets this for the test process, so a leak would show.
+        assert!(!run(vec![]).await.contains("CARGO_MANIFEST_DIR"));
+        assert!(run(vec!["CARGO_MANIFEST_DIR".into()])
+            .await
+            .contains("CARGO_MANIFEST_DIR="));
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

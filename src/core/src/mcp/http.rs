@@ -608,6 +608,7 @@ mod tests {
             deny_tools: vec![],
             secrets: vec![],
             secret_origins: BTreeMap::new(),
+            env: vec![],
         }
     }
 
@@ -856,9 +857,11 @@ mod tests {
         let accounts = header_accounts(&config).unwrap();
         assert_eq!(accounts[0].2, format!("docs/{origin}/API_TOKEN"));
         let environment = vec![("Authorization".to_owned(), token.to_owned())];
-        let connection = super::super::launch(&config, &std::env::temp_dir(), environment, None)
-            .await
-            .unwrap();
+        let env = crate::child_env::ChildEnv::default();
+        let connection =
+            super::super::launch(&config, &std::env::temp_dir(), &env, environment, None)
+                .await
+                .unwrap();
         let mut servers = McpServers::default();
         servers.add(config, connection, &mut vec![]).await;
         let approvals = Approvals::default();
