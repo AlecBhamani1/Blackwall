@@ -8,10 +8,10 @@ credentials, and the app-lock verifier use the platform credential store: Keycha
 Credential Manager on Windows, and the Secret Service (GNOME Keyring, KWallet, or a compatible
 provider) on Linux. On Linux, start and unlock a keyring before saving keys. Without one, a new data
 folder still opens and a model access key works for that session only (shown as "Not saved: no
-system keyring"). Saving a lock, telemetry header, MCP secret, tool secret or pairing key is refused
-until you start GNOME Keyring or KWallet and restart Blackwall, and `bw` shows the same note when
-saving a telemetry header, MCP secret or tool secret. Blackwall never falls back to plain-text
-storage. Local data
+system keyring"). Saving a lock, telemetry header, MCP secret or tool secret is refused until you
+start GNOME Keyring or KWallet and restart Blackwall, and `bw` shows the same note when saving a
+telemetry header, MCP secret or tool secret. Pairing and relay keys are also refused until a keyring
+is running. Blackwall never falls back to plain-text storage. Local data
 lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows).
 
 ## Connect a model
