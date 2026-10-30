@@ -64,7 +64,7 @@ pub(crate) const INJECTION: &[&str] = &[
     "GIT_ASKPASS",
 ];
 /// What Windows programs need to start at all. Owner and sandboxed children keep these on Windows.
-pub(crate) const WINDOWS_ALLOW: [&str; 10] = [
+pub(crate) const WINDOWS_ALLOW: [&str; 24] = [
     "SYSTEMROOT",
     "WINDIR",
     "USERPROFILE",
@@ -75,6 +75,20 @@ pub(crate) const WINDOWS_ALLOW: [&str; 10] = [
     "APPDATA",
     "LOCALAPPDATA",
     "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
 ];
 /// Blackwall's model and relay secrets, which child programs never inherit.
 pub(crate) const SECRET_ENV: [&str; 4] = [
@@ -133,7 +147,12 @@ pub(crate) fn build(
                         })
                 }
             };
-        if allowed {
+        if allowed && name == "XDG_DATA_DIRS" {
+            // Passed through only for the desktop openers; the AppImage's own folders are removed.
+            if let Some(dirs) = validated_data_dirs(value, appdir) {
+                vars.push((key.clone(), dirs));
+            }
+        } else if allowed {
             vars.push((key.clone(), value.clone()));
         }
     }
@@ -182,17 +201,28 @@ pub(crate) fn validated_path(
     appdir: Option<&Path>,
     project: &Path,
 ) -> Option<OsString> {
+    keep_entries(path, appdir, Some(project))
+}
+
+/// Keeps only the absolute entries of an `XDG_DATA_DIRS` style list that are outside the AppImage
+/// mount, so `xdg-open` and `gio` still find snap and Flatpak browsers but not the AppImage's
+/// bundled desktop files. Returns `None` when nothing is left, so the variable is left unset.
+pub(crate) fn validated_data_dirs(dirs: &OsStr, appdir: Option<&Path>) -> Option<OsString> {
+    keep_entries(dirs, appdir, None)
+}
+
+fn keep_entries(list: &OsStr, appdir: Option<&Path>, project: Option<&Path>) -> Option<OsString> {
     let inside = |entry: &Path, root: Option<&Path>| {
         root.is_some_and(|root| !root.as_os_str().is_empty() && entry.starts_with(root))
     };
-    let kept: Vec<PathBuf> = std::env::split_paths(path)
+    let kept: Vec<PathBuf> = std::env::split_paths(list)
         .filter(|entry| {
             entry.is_absolute()
                 && !entry
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
                 && !inside(entry, appdir)
-                && !inside(entry, Some(project))
+                && !inside(entry, project)
         })
         .collect();
     if kept.is_empty() {
@@ -378,6 +408,28 @@ mod tests {
         assert_eq!(get(&env, "TMPDIR"), Some("/var/folders/x/T/"));
     }
 
+    #[test]
+    fn windows_allow_list_names_what_installers_and_toolchains_read() {
+        for name in [
+            "SYSTEMDRIVE",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "PROGRAMW6432",
+            "COMMONPROGRAMFILES",
+            "COMMONPROGRAMFILES(X86)",
+            "COMMONPROGRAMW6432",
+            "USERNAME",
+            "USERDOMAIN",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "NUMBER_OF_PROCESSORS",
+            "PROCESSOR_ARCHITECTURE",
+            "OS",
+        ] {
+            assert!(WINDOWS_ALLOW.contains(&name), "{name}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_children_keep_system_variables_and_find_path_in_any_case() {
@@ -388,6 +440,10 @@ mod tests {
                     ("ComSpec", "C:\\Windows\\System32\\cmd.exe"),
                     ("PATHEXT", ".EXE"),
                     ("Path", "C:\\Windows\\System32"),
+                    ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                    ("SystemDrive", "C:"),
+                    ("Username", "me"),
+                    ("OS", "Windows_NT"),
                     ("AWS_SECRET_ACCESS_KEY", "x"),
                 ]),
                 scope,
@@ -396,6 +452,13 @@ mod tests {
                 &[],
             );
             assert_eq!(get(&env, "SystemRoot"), Some("C:\\Windows"));
+            assert_eq!(
+                get(&env, "ProgramFiles(x86)"),
+                Some("C:\\Program Files (x86)")
+            );
+            assert_eq!(get(&env, "SystemDrive"), Some("C:"));
+            assert_eq!(get(&env, "Username"), Some("me"));
+            assert_eq!(get(&env, "OS"), Some("Windows_NT"));
             assert_eq!(get(&env, "PATH"), Some("C:\\Windows\\System32"));
             assert_eq!(get(&env, "AWS_SECRET_ACCESS_KEY"), None);
         }
@@ -415,6 +478,53 @@ mod tests {
             validated_path(OsStr::new("::"), None, Path::new("/p")),
             None
         );
+    }
+
+    #[test]
+    fn data_dirs_lose_appimage_relative_and_empty_entries() {
+        assert_eq!(
+            validated_data_dirs(
+                OsStr::new("/tmp/.mount_x/usr/share::share:/var/lib/snapd/desktop:/usr/share"),
+                Some(Path::new("/tmp/.mount_x"))
+            ),
+            Some("/var/lib/snapd/desktop:/usr/share".into())
+        );
+        assert_eq!(
+            validated_data_dirs(
+                OsStr::new("/tmp/.mount_x/usr/share"),
+                Some(Path::new("/tmp/.mount_x"))
+            ),
+            None
+        );
+        assert_eq!(
+            validated_data_dirs(OsStr::new("/usr/share:/usr/local/share"), None),
+            Some("/usr/share:/usr/local/share".into())
+        );
+    }
+
+    #[test]
+    fn passed_through_xdg_data_dirs_is_cleaned_and_dropped_when_nothing_is_left() {
+        let host = |dirs: &str| vars(&[("APPDIR", "/tmp/.mount_x"), ("XDG_DATA_DIRS", dirs)]);
+        let pass = ["XDG_DATA_DIRS".to_owned()];
+        let env = build(
+            host("/tmp/.mount_x/usr/share:/var/lib/snapd/desktop:/usr/share"),
+            Scope::Owner,
+            None,
+            Path::new("/p"),
+            &pass,
+        );
+        assert_eq!(
+            get(&env, "XDG_DATA_DIRS"),
+            Some("/var/lib/snapd/desktop:/usr/share")
+        );
+        let env = build(
+            host("/tmp/.mount_x/usr/share"),
+            Scope::Owner,
+            None,
+            Path::new("/p"),
+            &pass,
+        );
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), None);
     }
 
     #[test]
