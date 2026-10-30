@@ -1044,17 +1044,20 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
-    /// Run a tool that creates `tool-write` in the project, approving its prompt.
+    /// A tool config whose program creates `tool-write` in the project folder.
     #[cfg(unix)]
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#;
+    #[cfg(windows)]
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["cmd","/C","type nul > tool-write"]}]}"#;
+
+    /// Run a tool that creates `tool-write` in the project, approving its prompt.
+    #[cfg(any(unix, windows))]
     async fn touch_probe(
         isolation: Isolation,
         profile: crate::sandbox::ExecutionProfile,
     ) -> (Result<String, ToolError>, PathBuf) {
         use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
-        let (tools, directory) = load(
-            r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#,
-        )
-        .await;
+        let (tools, directory) = load(TOUCH_TOOL).await;
         let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
         workspace.execution.profile = profile;
         workspace.execution.command_tools = isolation;
@@ -1092,7 +1095,7 @@ mod tests {
         (result, workspace.path.clone())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn outside_tool_runs_even_when_shell_profile_is_read_only() {
         let (result, path) = touch_probe(
@@ -1114,8 +1117,9 @@ mod tests {
         )
         .await;
         let error = result.unwrap_err().to_string();
+        assert!(error.contains("Operation not permitted"), "{error}");
         assert!(
-            error.contains("Blocked by the Read-only sandbox."),
+            error.contains("This may have been blocked by the Read-only sandbox."),
             "{error}"
         );
         assert!(error.contains("Settings → Command tools"), "{error}");
