@@ -645,14 +645,8 @@ pub(crate) fn search_path() -> Option<std::ffi::OsString> {
         .cloned()
         .or_else(|| std::env::var_os("PATH"))
 }
-/// Blackwall's model and relay secrets, which child programs never inherit.
 #[cfg(any(unix, windows))]
-const SECRET_ENV: [&str; 4] = [
-    "BLACKWALL_MODEL_API_KEY",
-    "BLACKWALL_RELAY_TOKEN",
-    "TAURI_SIGNING_PRIVATE_KEY",
-    "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
-];
+use crate::child_env::SECRET_ENV;
 /// A long-running program with piped standard streams, such as an MCP server. Dropping it stops
 /// the program and its descendants, like a finished or cancelled shell command.
 #[cfg(any(unix, windows))]
