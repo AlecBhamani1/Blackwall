@@ -10,12 +10,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - On Linux, Read-only commands now run in a sandbox: the project is read-only with `.git`, `.ssh`
-  and the other protected folders hidden, there is no home folder, only the system folders and a
-  short list of `/etc` files are visible, `/tmp` is private, Unix-domain sockets are blocked and
-  the network is off unless Command network is on. It uses the bundled bubblewrap, or a root-owned
-  system one of version 0.12.0 or newer. Without one, the note asks you to install bubblewrap and
-  commands fail closed. A project that is your home folder, contains it, or has more than 500,000
-  files is refused. Workspace-write is not available on Linux yet and is turned off there.
+  and the other protected folders hidden (below `node_modules`, `target` and the other skipped
+  folders, only their direct children), there is no home folder, only the system folders (without
+  `/usr/local/etc` or Linuxbrew's `etc`) and a short list of `/etc` files are visible, `/tmp` is
+  private, Unix-domain sockets are blocked and the network is off unless Command network is on.
+  The project is mounted from the folder that was checked, by descriptor. It uses the bundled
+  bubblewrap, or a root-owned system one of version 0.12.0 or newer. Without one, the note asks
+  you to install Blackwall's `.deb` or AppImage or a newer bubblewrap; when the system won't let
+  bubblewrap start a sandbox (the AppImage on Ubuntu 24.04), the note suggests the `.deb`. Commands
+  fail closed either way. A project that is your home folder, contains it, contains another
+  mounted file system, has more than 500,000 files outside the skipped folders, or takes more than
+  10 seconds to check is refused. Workspace-write is not available on Linux yet and is turned off
+  there. With command network on, sandboxed commands can reach localhost and the local network,
+  and the desktop app says so.
 - The Linux packages bundle bubblewrap 0.13.1 for sandboxed commands at `/usr/lib/blackwall/bwrap`
   (not setuid, built in CI from the release tarball whose SHA-256 is pinned; LGPL-2.0-or-later,
   license text under `/usr/share/doc/blackwall/bubblewrap/`, see `NOTICE`). Where the system's

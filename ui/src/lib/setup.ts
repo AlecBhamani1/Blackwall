@@ -146,9 +146,9 @@ export function detectedServerLabel(server: DetectedServer): string {
     : `Detected ${name} · no loaded context reported`;
 }
 
-/** Where the runtime guide explains command profiles and what the Linux sandbox needs. */
+/** Where the runtime guide explains what the Linux sandbox needs. */
 const SANDBOX_DOCS =
-  'https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#work-in-a-project';
+  'https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#linux-sandbox';
 
 export const setupClient = {
   /** Which server answers at `endpoint`; the probe sends no credentials. */

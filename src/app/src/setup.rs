@@ -84,9 +84,9 @@ const OLLAMA_DOWNLOAD: &str = if cfg!(target_os = "macos") {
     "https://ollama.com/download/linux"
 };
 
-/// Where the runtime guide explains command profiles and what the Linux sandbox needs.
+/// Where the runtime guide explains what the Linux sandbox needs.
 const SANDBOX_DOCS: &str =
-    "https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#work-in-a-project";
+    "https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#linux-sandbox";
 
 #[tauri::command]
 pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result<(), String> {

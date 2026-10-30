@@ -29,9 +29,10 @@ store access keys through the Secret Service, which needs an unlocked keyring su
 or KWallet. Without one, a data folder with no app lock still opens and a model access key is kept
 for the session only. A folder with a lock, or older data whose lock state Blackwall can't confirm,
 waits for the keyring. Read-only commands run under the bubblewrap that ships in the AppImage and
-`.deb` (Workspace-write isn't available on Linux yet). Windows uses Credential Manager and macOS
-uses Keychain. Windows and macOS builds are not yet publisher-signed, so first launch shows a
-SmartScreen or Gatekeeper warning.
+`.deb` (Workspace-write isn't available on Linux yet). On Ubuntu 24.04 and later, AppArmor stops
+the AppImage's bubblewrap, so use the `.deb` there for sandboxed commands. Windows uses Credential
+Manager and macOS uses Keychain. Windows and macOS builds are not yet publisher-signed, so first
+launch shows a SmartScreen or Gatekeeper warning.
 
 ## What works now
 

@@ -319,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_masks_protected_names_at_every_depth_and_case() {
+    fn walk_masks_nested_protected_names_in_any_case() {
         let root = Root::new();
         root.dir(".git/objects");
         root.dir("a/b/.ssh");
