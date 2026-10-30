@@ -374,7 +374,8 @@ export const persistence = {
   rejectMemory: (id: string) => command<void>('reject_memory_proposal', { id }),
   saveMemory: (entry: MemoryEntry) => command<void>('save_memory', { entry }),
   removeMemory: (id: string) => command<void>('delete_memory', { id }),
-  saveKey: (endpoint: string, key: string) => command<void>('save_model_key', { endpoint, key }),
+  saveKey: (endpoint: string, key: string) =>
+    command<{ saved: boolean }>('save_model_key', { endpoint, key }),
 };
 export type Persistence = typeof persistence;
 

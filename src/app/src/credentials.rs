@@ -2,6 +2,7 @@
 //! normalized origin.
 use blackwall_core::connection::normalize_endpoint;
 use reqwest::Url;
+use tauri::Manager;
 
 fn account(endpoint: &str) -> Result<String, String> {
     let endpoint = normalize_endpoint(endpoint).map_err(|e| e.to_string())?;
@@ -9,7 +10,47 @@ fn account(endpoint: &str) -> Result<String, String> {
     Ok(url.origin().ascii_serialization())
 }
 
-pub async fn model_key(endpoint: &str) -> Result<Option<String>, String> {
+type SessionKeys = std::sync::Mutex<std::collections::HashMap<String, String>>;
+fn sessions(
+    keys: &SessionKeys,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, String>> {
+    keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+type DeleteSecret = fn(&str, &str) -> Result<(), blackwall_core::secrets::SecretError>;
+/// The credential-store calls a save makes, replaceable in tests.
+#[derive(Clone, Copy)]
+struct Store {
+    set: blackwall_core::secrets::SetSecret,
+    delete: DeleteSecret,
+}
+const SYSTEM_STORE: Store = Store {
+    set: crate::secrets::set,
+    delete: crate::secrets::delete,
+};
+fn session_key(keys: &SessionKeys, endpoint: &str) -> Result<Option<String>, String> {
+    Ok(sessions(keys).get(&account(endpoint)?).cloned())
+}
+
+/// `saved` is false when the key is held for this session only.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct SavedKey {
+    pub saved: bool,
+}
+
+type GetSecret = fn(&str, &str) -> Result<Option<String>, blackwall_core::secrets::SecretError>;
+
+pub async fn model_key(
+    state: &crate::commands::AppState,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
+    model_key_with(crate::secrets::get, state, endpoint).await
+}
+async fn model_key_with(
+    get: GetSecret,
+    state: &crate::commands::AppState,
+    endpoint: &str,
+) -> Result<Option<String>, String> {
     if paired_account(endpoint).is_ok() {
         return read_pair_key("client", endpoint)
             .await?
@@ -18,7 +59,14 @@ pub async fn model_key(endpoint: &str) -> Result<Option<String>, String> {
                 "This paired computer's key is missing. Pair it again to restore access.".into()
             });
     }
-    read_key("com.blackwall.model", endpoint).await
+    if let Some(key) = session_key(&state.session_keys, endpoint)? {
+        return Ok(Some(key));
+    }
+    saved_model_key(get, endpoint).await
+}
+/// With no keyring there is no saved key; a store that fails (locked, prompt dismissed) is an error.
+async fn saved_model_key(get: GetSecret, endpoint: &str) -> Result<Option<String>, String> {
+    read_secret_with(get, true, "com.blackwall.model", account(endpoint)?).await
 }
 pub async fn relay_key(endpoint: &str) -> Result<Option<String>, String> {
     read_key("com.blackwall.relay", endpoint).await
@@ -27,15 +75,24 @@ async fn read_key(service: &'static str, endpoint: &str) -> Result<Option<String
     read_secret(service, account(endpoint)?).await
 }
 async fn read_secret(service: &'static str, origin: String) -> Result<Option<String>, String> {
+    read_secret_with(crate::secrets::get, false, service, origin).await
+}
+async fn read_secret_with(
+    get: GetSecret,
+    none_without_keyring: bool,
+    service: &'static str,
+    origin: String,
+) -> Result<Option<String>, String> {
     let service = crate::identity::keychain_service(service);
-    crate::keychain::read(move || {
-        crate::secrets::get(&service, &origin).map_err(|error| {
+    crate::keychain::read(move || match get(&service, &origin) {
+        Err(blackwall_core::secrets::SecretError::Unavailable) if none_without_keyring => Ok(None),
+        result => result.map_err(|error| {
             error.explain(format!(
                 "Blackwall could not read the access key from {}. {}, then try again.",
                 crate::secrets::STORE,
                 crate::secrets::RECOVER
             ))
-        })
+        }),
     })
     .await
 }
@@ -72,7 +129,7 @@ pub async fn save_model_key(
     app: tauri::AppHandle,
     endpoint: String,
     key: String,
-) -> Result<(), String> {
+) -> Result<SavedKey, String> {
     crate::auth::require_unlocked(&app).await?;
     if paired_account(&endpoint).is_ok() {
         return Err("Manage this connection under paired computers; its device key cannot be replaced manually.".into());
@@ -105,34 +162,80 @@ pub async fn save_model_key(
         }
         crate::auth::require_unlocked(&app).await?;
     }
-    write_key("com.blackwall.model", origin, key).await
+    let state = app.state::<crate::commands::AppState>();
+    commit_model_key(&state.session_keys, origin, key, SYSTEM_STORE).await
+}
+/// Saves in the keyring; with none, keeps the key in memory for this run only.
+async fn commit_model_key(
+    session_keys: &SessionKeys,
+    origin: String,
+    key: String,
+    store: Store,
+) -> Result<SavedKey, String> {
+    match write_key_with(store, "com.blackwall.model", origin.clone(), key.clone()).await {
+        Ok(()) => {
+            sessions(session_keys).remove(&origin);
+            Ok(SavedKey { saved: true })
+        }
+        Err(KeyFailure::NoKeyring) => {
+            let mut held = sessions(session_keys);
+            if key.trim().is_empty() {
+                held.remove(&origin);
+            } else {
+                held.insert(origin, key.trim().to_owned());
+            }
+            Ok(SavedKey { saved: false })
+        }
+        Err(KeyFailure::Message(message)) => Err(message),
+    }
 }
 pub async fn save_relay_key(endpoint: &str, key: String) -> Result<(), String> {
     write_key("com.blackwall.relay", account(endpoint)?, key).await
 }
 async fn write_key(service: &'static str, origin: String, key: String) -> Result<(), String> {
+    write_key_with(SYSTEM_STORE, service, origin, key)
+        .await
+        .map_err(|failure| match failure {
+            KeyFailure::NoKeyring => crate::secrets::SecretError::Unavailable.explain(""),
+            KeyFailure::Message(message) => message,
+        })
+}
+enum KeyFailure {
+    NoKeyring,
+    Message(String),
+}
+async fn write_key_with(
+    store: Store,
+    service: &'static str,
+    origin: String,
+    key: String,
+) -> Result<(), KeyFailure> {
     if key.len() > 8192 || key.contains(['\n', '\r']) {
-        return Err("This access key is not valid.".into());
+        return Err(KeyFailure::Message("This access key is not valid.".into()));
     }
     let service = crate::identity::keychain_service(service);
     tokio::task::spawn_blocking(move || {
-        let (store, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
-        if key.trim().is_empty() {
-            crate::secrets::delete(&service, &origin).map_err(|error| {
-                error.explain(format!(
-                    "Blackwall could not remove the access key from {store}. {recover}, then try again."
-                ))
-            })
+        let (name, recover) = (crate::secrets::STORE, crate::secrets::RECOVER);
+        let (result, failure) = if key.trim().is_empty() {
+            (
+                (store.delete)(&service, &origin),
+                format!("Blackwall could not remove the access key from {name}. {recover}, then try again."),
+            )
         } else {
-            crate::secrets::set(&service, &origin, key.trim()).map_err(|error| {
-                error.explain(format!(
-                    "Blackwall could not save the access key in {store}. {recover}, then try again."
-                ))
-            })
-        }
+            (
+                (store.set)(&service, &origin, key.trim()),
+                format!("Blackwall could not save the access key in {name}. {recover}, then try again."),
+            )
+        };
+        result.map_err(|error| match error {
+            crate::secrets::SecretError::Unavailable => KeyFailure::NoKeyring,
+            other => KeyFailure::Message(other.explain(failure)),
+        })
     })
     .await
-    .map_err(|_| format!("Access to {} could not finish.", crate::secrets::STORE))?
+    .map_err(|_| {
+        KeyFailure::Message(format!("Access to {} could not finish.", crate::secrets::STORE))
+    })?
 }
 
 #[derive(serde::Deserialize)]
@@ -160,6 +263,11 @@ pub async fn has_saved_credential(
     if matches!(&kind, CredentialKind::Model) && paired_account(&endpoint).is_ok() {
         return Ok(read_pair_key("client", &endpoint).await?.is_some());
     }
+    if matches!(&kind, CredentialKind::Model) {
+        return Ok(saved_model_key(crate::secrets::get, &endpoint)
+            .await?
+            .is_some());
+    }
     Ok(read_key(kind.service(), &endpoint).await?.is_some())
 }
 #[tauri::command]
@@ -174,17 +282,26 @@ pub async fn remove_saved_credential(
             "Remove this connection under paired computers to remove its device key.".into(),
         );
     }
+    if matches!(&kind, CredentialKind::Model) {
+        let state = app.state::<crate::commands::AppState>();
+        let origin = account(&endpoint)?;
+        return commit_model_key(&state.session_keys, origin, String::new(), SYSTEM_STORE)
+            .await
+            .map(|_| ());
+    }
     write_key(kind.service(), account(&endpoint)?, String::new()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blackwall_core::secrets::KEYRING_OFF_NOTE;
     /// Opt-in because this exercises the signed-in user's credential store, not a mock.
     #[tokio::test]
     #[ignore = "Creates and removes disposable native credential-store device accounts"]
     async fn native_pair_credentials_round_trip_and_removal_are_isolated() {
         use blackwall_core::pairing::secret;
+        let state = crate::commands::AppState::new().unwrap();
         let one = format!("https://pairing-tests.invalid/s/{}/v1", secret("bws_"));
         let two = format!("https://pairing-tests.invalid/s/{}/v1", secret("bws_"));
         struct Cleanup(Vec<(&'static str, String)>);
@@ -208,20 +325,131 @@ mod tests {
         save_pair_key("client", &two, second.clone()).await.unwrap();
         // Boolean assertions avoid printing credential values on failure.
         assert!(read_pair_key("host", &one).await.unwrap().as_deref() == Some(&host));
-        assert!(model_key(&one).await.unwrap().as_deref() == Some(&first));
-        assert!(model_key(&two).await.unwrap().as_deref() == Some(&second));
+        assert!(model_key(&state, &one).await.unwrap().as_deref() == Some(&first));
+        assert!(model_key(&state, &two).await.unwrap().as_deref() == Some(&second));
         assert!(save_pair_key("client", &one, "invalid\nkey".into())
             .await
             .is_err());
-        assert!(model_key(&one).await.unwrap().as_deref() == Some(&first));
+        assert!(model_key(&state, &one).await.unwrap().as_deref() == Some(&first));
         save_pair_key("client", &one, String::new()).await.unwrap();
-        assert!(model_key(&one).await.is_err());
+        assert!(model_key(&state, &one).await.is_err());
         assert!(read_pair_key("host", &one).await.unwrap().as_deref() == Some(&host));
-        assert!(model_key(&two).await.unwrap().as_deref() == Some(&second));
+        assert!(model_key(&state, &two).await.unwrap().as_deref() == Some(&second));
         for (role, endpoint) in [("host", &one), ("client", &two)] {
             save_pair_key(role, endpoint, String::new()).await.unwrap();
             assert!(read_pair_key(role, endpoint).await.unwrap().is_none());
         }
+    }
+    fn no_keyring(_: &str, _: &str, _: &str) -> Result<(), blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Unavailable)
+    }
+    fn no_keyring_delete(_: &str, _: &str) -> Result<(), blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Unavailable)
+    }
+    const NO_KEYRING: Store = Store {
+        set: no_keyring,
+        delete: no_keyring_delete,
+    };
+    #[tokio::test]
+    async fn unavailable_keyring_keeps_access_key_for_session_only() {
+        let state = crate::commands::AppState::new().unwrap();
+        let endpoint = "https://model.example/v1";
+        let saved = commit_model_key(
+            &state.session_keys,
+            account(endpoint).unwrap(),
+            "sk-session".into(),
+            NO_KEYRING,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved, SavedKey { saved: false });
+        // Boolean assertion avoids printing the key on failure.
+        assert!(model_key(&state, endpoint).await.unwrap().as_deref() == Some("sk-session"));
+        // The key is held per origin, so another origin does not see it.
+        assert!(session_key(&state.session_keys, "https://other.example/v1")
+            .unwrap()
+            .is_none());
+        // Clearing the access key drops the session copy as well.
+        commit_model_key(
+            &state.session_keys,
+            account(endpoint).unwrap(),
+            String::new(),
+            NO_KEYRING,
+        )
+        .await
+        .unwrap();
+        assert!(state.session_keys.lock().unwrap().is_empty());
+    }
+    fn get_unavailable(
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Unavailable)
+    }
+    fn get_failed(
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, blackwall_core::secrets::SecretError> {
+        Err(blackwall_core::secrets::SecretError::Failed)
+    }
+    #[tokio::test]
+    async fn keyring_unavailable_reads_as_no_saved_model_key_but_a_failing_store_is_an_error() {
+        let state = crate::commands::AppState::new().unwrap();
+        let endpoint = "https://model.example/v1";
+        assert_eq!(
+            model_key_with(get_unavailable, &state, endpoint).await,
+            Ok(None)
+        );
+        assert_eq!(saved_model_key(get_unavailable, endpoint).await, Ok(None));
+        assert!(model_key_with(get_failed, &state, endpoint).await.is_err());
+        // A session key still wins over the store.
+        state
+            .session_keys
+            .lock()
+            .unwrap()
+            .insert("https://model.example".into(), "sk-session".into());
+        assert!(
+            model_key_with(get_failed, &state, endpoint)
+                .await
+                .unwrap()
+                .as_deref()
+                == Some("sk-session")
+        );
+    }
+    #[test]
+    fn keyring_only_saves_fail_with_the_shared_note() {
+        use blackwall_core::{command_tools, mcp, telemetry::export};
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-keyring-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(command_tools::COMMAND_TOOLS_FILE),
+            r#"{"tools":[{"name":"issues","description":"Issues","kind":"http","url":"https://tools.example/issues"}]}"#,
+        )
+        .unwrap();
+        mcp::add_server(&directory, "docs", vec!["server".into()]).unwrap();
+        assert_eq!(
+            export::save_header_with("https://otel.example", "x-api-key", "k", no_keyring)
+                .unwrap_err()
+                .to_string(),
+            KEYRING_OFF_NOTE
+        );
+        assert_eq!(
+            mcp::save_secret_with(&directory, "docs", "DOCS_TOKEN", "v", no_keyring).unwrap_err(),
+            KEYRING_OFF_NOTE
+        );
+        assert_eq!(
+            command_tools::save_secret_with(&directory, "issues", "GITLAB_TOKEN", "v", no_keyring)
+                .unwrap_err(),
+            KEYRING_OFF_NOTE
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
     #[test]
     fn two_paired_computers_on_one_relay_have_different_credential_accounts() {

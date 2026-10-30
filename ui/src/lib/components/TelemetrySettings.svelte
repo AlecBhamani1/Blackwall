@@ -7,6 +7,7 @@
     type SavedHeader,
     type TelemetryView,
   } from '../persistence';
+  import { authStatus, NO_KEYRING_NOTE } from '../auth';
   import { platform } from '../platform';
 
   export let client = telemetryClient;
@@ -75,7 +76,7 @@
     metrics !== savedExport.metrics ||
     includeProject !== savedExport.includeProject ||
     (saved !== null && retention() !== saved.retention);
-  $: canAddHeader = Boolean(saved?.origin) && !endpointChanged;
+  $: canAddHeader = Boolean(saved?.origin) && !endpointChanged && $authStatus.keyring;
 
   async function load() {
     try {
@@ -355,9 +356,11 @@
       >Add header</button
     >
     <p class="hint">
-      {canAddHeader
-        ? `Saved for ${saved?.origin} only.`
-        : 'Save the endpoint first: a header is saved for that endpoint only.'}
+      {!$authStatus.keyring
+        ? NO_KEYRING_NOTE
+        : canAddHeader
+          ? `Saved for ${saved?.origin} only.`
+          : 'Save the endpoint first: a header is saved for that endpoint only.'}
     </p>
   </form>
   {#if error}<p class="error" role="alert">{error}</p>{/if}

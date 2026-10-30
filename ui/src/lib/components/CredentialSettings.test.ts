@@ -7,7 +7,7 @@ function client() {
     available: () => true,
     status: vi.fn().mockResolvedValue(true),
     remove: vi.fn().mockResolvedValue(undefined),
-    saveModel: vi.fn().mockResolvedValue(undefined),
+    saveModel: vi.fn().mockResolvedValue({ saved: true }),
   };
 }
 
@@ -46,8 +46,8 @@ describe('saved access keys', () => {
     let resolve!: () => void;
     api.saveModel.mockImplementationOnce(
       () =>
-        new Promise<void>((done) => {
-          resolve = done;
+        new Promise<{ saved: boolean }>((done) => {
+          resolve = () => done({ saved: true });
         }),
     );
     render(CredentialSettings, { endpoint: 'https://model.example/v1', client: api });
@@ -102,7 +102,7 @@ describe('saved access keys', () => {
     expect(input).toHaveValue('replacement');
     expect(screen.getByText('Saved in Keychain')).toBeVisible();
     expect(api.remove).not.toHaveBeenCalled();
-    api.saveModel.mockResolvedValue(undefined);
+    api.saveModel.mockResolvedValue({ saved: true });
     await fireEvent.click(screen.getByRole('button', { name: 'Verify and save key' }));
     await screen.findByText('Access key verified and saved in Keychain.');
     expect(input).toHaveValue('');
@@ -143,5 +143,24 @@ describe('saved access keys', () => {
     await Promise.resolve();
     expect(screen.queryByText('Saved in Keychain')).not.toBeInTheDocument();
     expect(screen.getByText('No saved key')).toBeVisible();
+  });
+
+  it('labels a session-only key', async () => {
+    const api = client();
+    api.status.mockResolvedValue(false);
+    api.saveModel.mockResolvedValue({ saved: false });
+    render(CredentialSettings, { endpoint: 'https://model.example/v1', client: api });
+    await screen.findByText('No saved key');
+    await fireEvent.input(screen.getByLabelText('New access key'), {
+      target: { value: 'session-key' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Verify and save key' }));
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent('Not saved: no system keyring');
+    expect(status).toHaveClass('muted');
+    expect(status).not.toHaveClass('feedback');
+    expect(screen.queryByText(/verified and saved/)).not.toBeInTheDocument();
+    expect(screen.getByText('No saved key')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Remove key…' })).not.toBeInTheDocument();
   });
 });

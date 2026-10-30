@@ -8,5 +8,7 @@ export const credentialClient = {
     invoke<boolean>('has_saved_credential', { kind, endpoint }),
   remove: (kind: CredentialKind, endpoint: string) =>
     invoke<void>('remove_saved_credential', { kind, endpoint }),
-  saveModel: (endpoint: string, key: string) => invoke<void>('save_model_key', { endpoint, key }),
+  /** `saved` is false when the key is held for this session because there is no keyring. */
+  saveModel: (endpoint: string, key: string) =>
+    invoke<{ saved: boolean }>('save_model_key', { endpoint, key }),
 };

@@ -28,11 +28,11 @@ describe('guided model setup', () => {
       .spyOn(persistence, 'saveKey')
       .mockImplementationOnce(
         () =>
-          new Promise<void>((_, fail) => {
+          new Promise<{ saved: boolean }>((_, fail) => {
             reject = fail;
           }),
       )
-      .mockResolvedValue(undefined);
+      .mockResolvedValue({ saved: true });
     const onConnect = vi.fn().mockResolvedValue(true);
     render(ConnectionSetup, { props: { desktop: true, onConnect } });
     await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
@@ -105,7 +105,7 @@ describe('guided model setup', () => {
   });
   it('does not apply an abandoned manual access key to a saved computer', async () => {
     const user = userEvent.setup();
-    const saveKey = vi.spyOn(persistence, 'saveKey').mockResolvedValue(undefined);
+    const saveKey = vi.spyOn(persistence, 'saveKey').mockResolvedValue({ saved: true });
     const onConnect = vi.fn().mockResolvedValue(true);
     render(ConnectionSetup, {
       props: {
@@ -233,5 +233,20 @@ describe('guided model setup', () => {
     await user.click(screen.getByRole('button', { name: 'Open invitation' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('complete Blackwall invitation');
     expect(mock.openLink).not.toHaveBeenCalled();
+  });
+  it('says an access key was not saved when there is no keyring', async () => {
+    const user = userEvent.setup();
+    const saveKey = vi.spyOn(persistence, 'saveKey').mockResolvedValue({ saved: false });
+    render(ConnectionSetup, {
+      props: { desktop: true, onConnect: vi.fn().mockResolvedValue(true) },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
+    await user.click(screen.getByText('Access key (if your service requires one)'));
+    await user.type(screen.getByLabelText('Access key'), 'session-key');
+    await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
+    expect(screen.getByText('Not saved: no system keyring')).toBeVisible();
+    saveKey.mockRestore();
   });
 });

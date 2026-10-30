@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { authStatus, NO_KEYRING_NOTE } from '../auth';
 import type { ExportSettings, SavedHeader, TelemetryView } from '../persistence';
 import TelemetrySettings from './TelemetrySettings.svelte';
 
@@ -196,5 +197,20 @@ describe('telemetry settings', () => {
     await user.type(screen.getByLabelText('Endpoint'), 'x');
     expect(send).toBeDisabled();
     expect(screen.getByText(/Save first to test changes/)).toBeInTheDocument();
+  });
+
+  it('disables saving a header without a keyring', async () => {
+    const api = client({ endpoint: ORIGIN });
+    authStatus.update((status) => ({ ...status, keyring: false }));
+    try {
+      render(TelemetrySettings, { client: api });
+      await waitFor(() => expect(screen.getByLabelText('Endpoint')).toHaveValue(ORIGIN));
+      expect(screen.getByLabelText('Header name')).toBeDisabled();
+      expect(screen.getByLabelText('Header value')).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Add header' })).toBeDisabled();
+      expect(screen.getByText(NO_KEYRING_NOTE)).toBeVisible();
+    } finally {
+      authStatus.update((status) => ({ ...status, keyring: true }));
+    }
   });
 });

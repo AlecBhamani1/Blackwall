@@ -4,6 +4,12 @@ use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
 use thiserror::Error;
 
+/// The local database file in the data folder.
+pub const DATABASE_FILE: &str = "blackwall.sqlite3";
+/// Empty, non-secret file in the data folder: an app lock exists, even when the keyring cannot say so.
+pub const LOCK_MARKER: &str = "app-lock-enabled";
+/// Empty, non-secret file in the data folder: this data has no app lock.
+pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
 
@@ -37,29 +43,36 @@ impl LocalStore {
                 "The local data folder must not be a symbolic link.",
             ));
         }
+        let path = directory.join(DATABASE_FILE);
         #[cfg(unix)]
-        {
+        let created = {
             use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(directory)?;
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-            let path = directory.join("blackwall.sqlite3");
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(path)
+                .open(&path)
             {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
                 Err(error) => return Err(error.into()),
             }
-        }
+        };
         #[cfg(not(unix))]
-        fs::create_dir_all(directory)?;
-        let path = directory.join("blackwall.sqlite3");
+        let created = {
+            fs::create_dir_all(directory)?;
+            !path.try_exists().unwrap_or(true)
+        };
+        // A brand-new database has nothing to protect, so it may open without a keyring.
+        // Best effort: without the marker, a keyring-less launch waits for the keyring.
+        if created && !directory.join(LOCK_MARKER).try_exists().unwrap_or(true) {
+            let _ = fs::write(directory.join(NO_LOCK_MARKER), b"");
+        }
         if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(StorageError::Invalid(
                 "The local database must not be a symbolic link.",
@@ -444,6 +457,27 @@ mod tests {
             .pragma_update(None, "user_version", 5)
             .unwrap();
         assert!(LocalStore::initialize(upgraded.connection).is_err());
+    }
+    #[test]
+    fn a_new_database_is_marked_as_having_no_app_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-lock-marker-{}",
+            crate::pairing::secret("bwd_")
+        ));
+        let fresh = root.join("fresh");
+        drop(LocalStore::open(&fresh).unwrap());
+        assert!(fresh.join(NO_LOCK_MARKER).exists());
+        // An existing database is left as it is.
+        fs::remove_file(fresh.join(NO_LOCK_MARKER)).unwrap();
+        drop(LocalStore::open(&fresh).unwrap());
+        assert!(!fresh.join(NO_LOCK_MARKER).exists());
+        // A folder recorded as locked is never marked as unlocked.
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join(LOCK_MARKER), b"").unwrap();
+        drop(LocalStore::open(&locked).unwrap());
+        assert!(!locked.join(NO_LOCK_MARKER).exists());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn session_lifecycle_retains_attachment_contents() {

@@ -17,6 +17,7 @@ vi.mock('./lib/ipc', async (importOriginal) => ({
 }));
 import App from './App.svelte';
 import { localModelClient } from './lib/ipc';
+import { KEYRING_NEEDED } from './lib/auth';
 
 let saved: Map<string, SessionSummary>;
 beforeEach(() => {
@@ -25,7 +26,7 @@ beforeEach(() => {
   native.invoke.mockReset().mockImplementation(async (command, args) => {
     switch (command) {
       case 'auth_status':
-        return { locked: false, enabled: false };
+        return { locked: false, enabled: false, keyring: true, keyringNeeded: false };
       case 'load_preferences':
         return {};
       case 'list_sessions':
@@ -200,4 +201,23 @@ it('reconnects a saved connection at startup without asking again', async () => 
   render(App);
   expect(await screen.findByRole('textbox', { name: 'Message Blackwall' })).toBeVisible();
   expect(screen.queryByRole('region', { name: 'Found on this computer' })).not.toBeInTheDocument();
+});
+
+it('shows the real error after a keyring retry fails instead of the keyring message', async () => {
+  const user = userEvent.setup();
+  const failure = 'Blackwall could not read its app lock from the system keyring.';
+  const fallback = native.invoke.getMockImplementation();
+  let reads = 0;
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command !== 'auth_status') return fallback?.(command, args);
+    reads += 1;
+    if (reads === 1) return { locked: true, enabled: true, keyring: false, keyringNeeded: true };
+    throw failure;
+  });
+  render(App);
+  expect(await screen.findByText(KEYRING_NEEDED)).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText(failure)).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled();
+  expect(screen.queryByText(KEYRING_NEEDED)).not.toBeInTheDocument();
 });

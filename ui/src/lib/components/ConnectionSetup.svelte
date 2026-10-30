@@ -12,6 +12,7 @@
     type LocalService,
     type DownloadProgress,
   } from '../setup';
+  import { KEY_NOT_SAVED } from '../auth';
   import { persistence, type ConnectionProfile } from '../persistence';
   import LogoMark from './LogoMark.svelte';
   import Icon from './Icon.svelte';
@@ -54,6 +55,7 @@
   let heading: HTMLHeadingElement;
   let errorMessage: HTMLDivElement | undefined;
   let connectedName = '';
+  let keyNotSaved = false;
   let foundServices: LocalService[] = found ?? [];
   let foundScanning = false;
   let foundVersion = 0;
@@ -109,10 +111,11 @@
     if (busy) return;
     busy = true;
     error = '';
+    keyNotSaved = false;
     try {
       if (step === 'advanced' && accessKey.trim()) {
         savingKey = true;
-        await persistence.saveKey(endpoint, accessKey);
+        keyNotSaved = !(await persistence.saveKey(endpoint, accessKey)).saved;
         savingKey = false;
         accessKey = '';
       }
@@ -153,6 +156,7 @@
       if (await onConnect(service.endpoint, 'This computer')) {
         onChooseModel(model);
         connectedName = 'This computer';
+        keyNotSaved = false;
         step = 'success';
         await tick();
         heading?.focus();
@@ -525,6 +529,7 @@
       <p class="intro">
         {connectedName} is ready.<br />Start a conversation, or choose a model from the top bar.
       </p>
+      {#if keyNotSaved}<p class="footnote">{KEY_NOT_SAVED}</p>{/if}
       <button class="primary" onclick={onDone}
         >Start chatting <Icon name="chevron-right" size={16} /></button
       >

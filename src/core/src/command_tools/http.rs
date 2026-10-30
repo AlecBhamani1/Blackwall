@@ -614,6 +614,17 @@ fn store_error(error: SecretError) -> String {
 
 /// Save a header value for the origin of HTTP tool `tool`, which is returned. Blocking.
 pub fn save_secret(directory: &Path, tool: &str, key: &str, value: &str) -> Result<String, String> {
+    save_secret_with(directory, tool, key, value, crate::secrets::set)
+}
+
+/// [`save_secret`] with the secret write supplied by the caller.
+pub fn save_secret_with(
+    directory: &Path,
+    tool: &str,
+    key: &str,
+    value: &str,
+    set: crate::secrets::SetSecret,
+) -> Result<String, String> {
     if !crate::mcp::valid_secret_name(key) {
         return Err("Use a name of uppercase letters, digits, and _, such as GITLAB_TOKEN.".into());
     }
@@ -621,7 +632,12 @@ pub fn save_secret(directory: &Path, tool: &str, key: &str, value: &str) -> Resu
         return Err("Provide a value of up to 16 KiB.".into());
     }
     let origin = tool_origin(directory, tool)?;
-    crate::secrets::set(SECRET_SERVICE, &account(&origin, key), value).map_err(store_error)?;
+    set(SECRET_SERVICE, &account(&origin, key), value).map_err(|error| {
+        error.explain_save(format!(
+            "The credential store could not be updated. {}, then try again.",
+            crate::secrets::RECOVER
+        ))
+    })?;
     Ok(origin)
 }
 

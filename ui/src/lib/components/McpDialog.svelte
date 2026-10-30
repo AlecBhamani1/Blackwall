@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { MCP_SUGGESTIONS, type McpSuggestion } from '../mcpSuggestions';
   import { persistence, type McpServer, type McpToolRule } from '../persistence';
+  import { authStatus, NO_KEYRING_NOTE } from '../auth';
   import { detectPlatform } from '../platform';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
@@ -425,7 +426,7 @@
           pattern="[A-Z_][A-Z0-9_]*"
           maxlength="64"
           required
-          disabled={busy}
+          disabled={busy || !$authStatus.keyring}
           placeholder={server.url ? 'API_TOKEN' : 'JIRA_API_TOKEN'}
         /><label for="mcp-secret-value">Value</label><input
           id="mcp-secret-value"
@@ -434,8 +435,9 @@
           bind:value={secretValue}
           maxlength="16384"
           required
-          disabled={busy}
+          disabled={busy || !$authStatus.keyring}
         />
+        {#if !$authStatus.keyring}<p class="hint">{NO_KEYRING_NOTE}</p>{/if}
         <p class="hint">
           Saved values are kept only in the system credential store and given to this server when it
           {server.url ? 'connects, in the headers that name them' : 'starts'}. They are never shown
@@ -451,7 +453,7 @@
                 () => persistence.removeMcpServer(server.name),
                 'This server could not be removed.',
               )}>Remove server</button
-          ><span></span><button class="primary" disabled={busy}
+          ><span></span><button class="primary" disabled={busy || !$authStatus.keyring}
             >{busy ? 'Saving…' : 'Save secret'}</button
           >
         </div>

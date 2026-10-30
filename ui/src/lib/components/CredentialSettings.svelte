@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
+  import { KEY_NOT_SAVED } from '../auth';
   import { credentialClient, type CredentialKind } from '../credentials';
   import { platform } from '../platform';
 
@@ -12,6 +13,7 @@
   let mutating = false;
   let error = '';
   let feedback = '';
+  let sessionOnly = false;
   let confirming = false;
   let previous = '';
   let version = 0;
@@ -24,6 +26,7 @@
     key = '';
     confirming = false;
     feedback = '';
+    sessionOnly = false;
     void refresh();
   }
   function message(cause: unknown) {
@@ -61,16 +64,21 @@
     mutating = true;
     error = '';
     feedback = '';
+    sessionOnly = false;
     try {
+      let kept = true;
       if (remove) await client.remove(kind, endpoint);
-      else await client.saveModel(endpoint, key.trim());
+      else kept = (await client.saveModel(endpoint, key.trim())).saved;
       if (operation !== version) return;
-      saved = !remove;
+      sessionOnly = !remove && !kept;
+      if (kept) saved = !remove;
       key = '';
       confirming = false;
       feedback = remove
         ? `Saved key removed from ${platform.store}.`
-        : `Access key verified and saved in ${platform.store}.`;
+        : kept
+          ? `Access key verified and saved in ${platform.store}.`
+          : KEY_NOT_SAVED;
     } catch (cause) {
       if (operation === version) error = message(cause);
     } finally {
@@ -162,7 +170,13 @@
   {#if error}<p role="alert" class="error" tabindex="-1" bind:this={resultMessage}>{error}</p>
     {#if saved === null}<button disabled={busy} onclick={refresh}>Retry {platform.store}</button
       >{/if}{/if}
-  {#if feedback}<p role="status" class="feedback" tabindex="-1" bind:this={resultMessage}>
+  {#if feedback}<p
+      role="status"
+      class:feedback={!sessionOnly}
+      class:muted={sessionOnly}
+      tabindex="-1"
+      bind:this={resultMessage}
+    >
       {feedback}
     </p>{/if}
 </section>
@@ -246,5 +260,8 @@
   }
   .feedback {
     color: var(--ok);
+  }
+  .muted {
+    color: var(--text-muted);
   }
 </style>

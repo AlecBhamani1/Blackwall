@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { KEYRING_NEEDED } from '../auth';
 import LockScreen from './LockScreen.svelte';
 describe('app lock', () => {
   it('clears the passphrase immediately after submission', async () => {
@@ -31,6 +32,30 @@ describe('app lock', () => {
     render(LockScreen, {
       props: { error: 'Unlock your login keychain.', onUnlock: vi.fn(), onRetry: retry },
     });
+    expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+  it('never shows the checking text together with an error', () => {
+    render(LockScreen, {
+      props: { error: 'Unlock your login keychain.', onUnlock: vi.fn(), onRetry: vi.fn() },
+    });
+    expect(screen.queryByText('Checking your app lock…')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Unlock your login keychain.');
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeVisible();
+  });
+  it('shows the start-your-keyring message when keyringNeeded', async () => {
+    const retry = vi.fn();
+    const user = userEvent.setup();
+    render(LockScreen, {
+      props: { initialized: true, keyringNeeded: true, onUnlock: vi.fn(), onRetry: retry },
+    });
+    expect(screen.getByText(KEYRING_NEEDED)).toBeVisible();
+    expect(KEYRING_NEEDED).toBe(
+      'Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.',
+    );
+    expect(screen.queryByText('Enter your passphrase to open your conversations.')).toBeNull();
+    expect(screen.queryByText('Checking your app lock…')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     expect(retry).toHaveBeenCalledOnce();

@@ -6,8 +6,12 @@ published installer contains these changes. See the [release checklist](RELEASE_
 Blackwall runs on macOS, Windows 10/11, and Linux (x86-64 and ARM64). Saved access keys, pairing
 credentials, and the app-lock verifier use the platform credential store: Keychain on macOS,
 Credential Manager on Windows, and the Secret Service (GNOME Keyring, KWallet, or a compatible
-provider) on Linux. On Linux, start and unlock a keyring before saving keys; without one, Blackwall
-reports that no system keyring is available and does not fall back to plain-text storage. Local data
+provider) on Linux. On Linux, start and unlock a keyring before saving keys. Without one, a data
+folder with no app lock still opens and a model access key works for that session only (shown as
+"Not saved: no system keyring"). Saving a lock, telemetry header, MCP secret or tool secret is
+refused until you start GNOME Keyring or KWallet and restart Blackwall, and `bw` shows the same
+note when saving a telemetry header, MCP secret or tool secret. Pairing and relay keys are also
+refused until a keyring is running. Blackwall never falls back to plain-text storage. Local data
 lives in `.blackwall` in your home folder (`%USERPROFILE%\.blackwall` on Windows).
 
 ## Connect a model
@@ -1036,12 +1040,22 @@ Langfuse setups.
 Enable **App lock** in **Settings → General → Security** with a passphrase of at least 10 characters.
 Blackwall stores a salted Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
 sharing after flushing pending conversation saves. Failed attempts incur a short delay, increasing
-after repeated failures. Changing or removing the lock requires the current passphrase.
+after repeated failures. Changing or removing the lock requires the current passphrase. Blackwall
+also records the lock state in the data folder with empty marker files (no secret):
+`app-lock-enabled` while a lock is on and `app-lock-disabled` when there is none. The app updates
+them whenever it reads the keyring, including for locks made before these markers existed, and a new
+database without a lock is marked `app-lock-disabled`. On Linux, if the keyring is not available, a
+folder marked `app-lock-disabled`, or one with no database yet, opens. A folder with a lock, or
+older data whose lock state Blackwall can't confirm, stays locked with "Blackwall needs the system
+keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again." A
+keyring prompt you dismiss counts as an error, not as no keyring. Without a keyring you cannot set a
+lock in the desktop app.
 
-This is an access control for the desktop app. It does not encrypt the database, attachments, skills,
-or exports, and does not stop the same user account from reading them or using the CLI. Disk
-encryption (FileVault, BitLocker, or LUKS) protects the disk when the account/device is locked. There is no built-in forgotten-passphrase recovery
-flow; do not enable the lock without retaining the passphrase securely.
+This is an access control for the desktop app, meant for someone at your unlocked screen. It does
+not encrypt the database, attachments, skills, or exports, and does not stop the same user account
+from reading them or using the CLI. Disk encryption (FileVault, BitLocker, or LUKS) protects the
+disk when the account/device is locked. There is no built-in forgotten-passphrase recovery flow; do
+not enable the lock without retaining the passphrase securely.
 
 ## CLI
 

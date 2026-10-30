@@ -296,6 +296,17 @@ pub fn remove_server(directory: &Path, name: &str) -> Result<(), String> {
 
 /// The value is saved first, so the file never names a secret that failed to save. Blocking.
 pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Result<(), String> {
+    save_secret_with(directory, name, key, value, crate::secrets::set)
+}
+
+/// [`save_secret`] with the secret write supplied by the caller.
+pub fn save_secret_with(
+    directory: &Path,
+    name: &str,
+    key: &str,
+    value: &str,
+    set: crate::secrets::SetSecret,
+) -> Result<(), String> {
     let name = &saved_name(name);
     if !valid_secret_name(key) {
         return Err("Use an environment variable name, such as JIRA_API_TOKEN.".into());
@@ -317,7 +328,12 @@ pub fn save_secret(directory: &Path, name: &str, key: &str, value: &str) -> Resu
             None => server.secret_origins.remove(key),
         };
         let account = server.account(key);
-        crate::secrets::set(SECRET_SERVICE, &account, value).map_err(store_error)?;
+        set(SECRET_SERVICE, &account, value).map_err(|error| {
+            error.explain_save(format!(
+                "The credential store could not be updated. {}, then try again.",
+                crate::secrets::RECOVER
+            ))
+        })?;
         if let Some(previous) = previous.filter(|previous| *previous != account) {
             crate::secrets::delete(SECRET_SERVICE, &previous).map_err(store_error)?;
         }

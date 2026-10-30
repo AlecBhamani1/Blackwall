@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { authClient, authError, authStatus } from '../auth';
+  import { authClient, authError, authStatus, NO_KEYRING_NOTE } from '../auth';
   import { isDesktop } from '../setup';
   import { platform } from '../platform';
   export let onLock: () => Promise<void> = async () => {};
@@ -10,6 +10,7 @@
   let busy = false;
   let error = '';
   let saved = '';
+  $: noKeyring = !$authStatus.keyring;
   let currentInput: HTMLInputElement | undefined;
   let passphraseInput: HTMLInputElement | undefined;
   let errorMessage: HTMLParagraphElement | undefined;
@@ -66,6 +67,7 @@
       This locks the desktop app. Saved files remain readable by your {platform.account}; use
       {platform.diskEncryption} to protect your disk.
     </p>
+    {#if noKeyring}<p class="limit">{NO_KEYRING_NOTE}</p>{/if}
     <form
       onsubmit={(event) => {
         event.preventDefault();
@@ -92,7 +94,7 @@
           minlength={10}
           maxlength={1024}
           required
-          disabled={busy}
+          disabled={busy || noKeyring}
         /></label
       >
       <label
@@ -103,11 +105,11 @@
           minlength={10}
           maxlength={1024}
           required
-          disabled={busy}
+          disabled={busy || noKeyring}
         /></label
       >
       <div class="actions">
-        <button disabled={busy}
+        <button disabled={busy || noKeyring}
           >{busy
             ? 'Saving…'
             : $authStatus.enabled
