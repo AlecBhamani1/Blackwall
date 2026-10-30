@@ -703,13 +703,10 @@ fn a_changed_source_after_a_stop_gets_a_new_backup_and_count() {
         failed_backup(open6(&dir));
     }
     assert!(matches!(open6(&dir), Err(StorageError::UpgradeStopped(_))));
-    // A v5 window still running saves a chat: this is a different source now.
+    // A v5 window still running writes a setting: this is a different source now.
     Connection::open(dir.database())
         .unwrap()
-        .execute(
-            "UPDATE sessions SET updated_at=updated_at+1 WHERE id=(SELECT min(id) FROM sessions)",
-            [],
-        )
+        .execute("INSERT INTO settings(key,value) VALUES ('v5','write')", [])
         .unwrap();
     let (second, _) = failed_backup(open6(&dir));
     assert_ne!(second, first);

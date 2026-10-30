@@ -287,14 +287,34 @@ fn create_private_dir(dir: &Path) -> Result<(), StorageError> {
 /// run's writer can be active while Settings asks for the upgrade status). So nothing here opens
 /// the file: the size and mtime come from `stat`, which opens no descriptor, and the rest is SQL.
 ///
-/// `source_hash` is the SHA-256 of `user_version`, `page_count`, `freelist_count`, and every
-/// `sessions` row's id, `updated_at` and body length, ordered by id. Every v5 chat write (save,
-/// delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
-/// milliseconds, so two saves in one millisecond can share one; the body length tells those apart
-/// for free, because `octet_length` reads it from the row header without loading the body.
+/// `source_hash` covers everything a restore would bring back, table by table, so a new table
+/// cannot fall through:
+/// - `user_version`, `page_count` and `freelist_count`;
+/// - `sessions`: each row's id, `updated_at` and body length, ordered by id. Every v5 chat write
+///   (save, delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
+///   milliseconds, so two saves in one millisecond can share one; the body length tells those
+///   apart for free, because `octet_length` reads it from the row header without loading the
+///   body;
+/// - every other ordinary table in `sqlite_master` (settings, memory, proposals, paired devices,
+///   FTS shadow tables): every row in full, in rowid order, or primary-key order for a WITHOUT
+///   ROWID table. Not the `sqlite_%` internals, not virtual tables (their rows live in their
+///   shadow tables, which are hashed), and not [`DERIVED_TABLES`].
 ///
 /// The caller reads it inside one transaction so the parts agree; the upgrade, under its write
 /// lock, so it describes exactly what the backup copies.
+/// Tables rebuilt from `sessions`, skipped by [`source_id`]: v5's recall index
+/// (`session_messages`, which the deferred v5 backfill rewrites on any open, `indexed_sessions`,
+/// and the shadow tables of `message_search`, its external-content FTS). They hold nothing a
+/// restore needs, and the upgrade drops them.
+const DERIVED_TABLES: [&str; 6] = [
+    "session_messages",
+    "indexed_sessions",
+    "message_search_data",
+    "message_search_idx",
+    "message_search_docsize",
+    "message_search_config",
+];
+
 pub(crate) fn source_id(
     connection: &Connection,
     database: &Path,
@@ -308,17 +328,34 @@ pub(crate) fn source_id(
         let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
         hash.update(format!("{pragma}={value};"));
     }
-    let has_sessions: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_sessions {
-        let mut statement = connection
-            .prepare("SELECT id, updated_at, octet_length(body) FROM sessions ORDER BY id")?;
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+             AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for table in tables {
+        if DERIVED_TABLES.contains(&table.as_str()) {
+            continue;
+        }
+        let query = if table == "sessions" {
+            "SELECT id, updated_at, octet_length(body) FROM sessions ORDER BY id".to_owned()
+        } else {
+            format!(
+                "SELECT * FROM {} ORDER BY {}",
+                quoted(&table),
+                row_order(connection, &table)?
+            )
+        };
+        hash.update(format!("table{}:", table.len()));
+        hash.update(&table);
+        let mut statement = connection.prepare(&query)?;
+        let columns = statement.column_count();
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            for column in 0..3 {
+            hash.update(b"row");
+            for column in 0..columns {
                 feed(&mut hash, row.get_ref(column)?);
             }
         }
@@ -328,6 +365,32 @@ pub(crate) fn source_id(
         mtime_ms: meta.modified().map(millis).unwrap_or(0),
         source_hash: hex(&hash.finalize()),
     })
+}
+
+/// `rowid`, or for a WITHOUT ROWID table its primary-key columns in key order.
+fn row_order(connection: &Connection, table: &str) -> Result<String, StorageError> {
+    let without_rowid: bool = connection.query_row(
+        "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !without_rowid {
+        return Ok("rowid".into());
+    }
+    let keys: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk>0 ORDER BY pk")?
+        .query_map([table], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(keys
+        .iter()
+        .map(|key| quoted(key))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// An SQL identifier, quoted.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Adds one value to the hash, tagged by type and length-prefixed, so no two rows run together.
@@ -1150,6 +1213,63 @@ mod tests {
         changes("INSERT INTO sessions VALUES ('c','C',3,'{}')");
         changes("DELETE FROM sessions WHERE id='b'");
         changes("PRAGMA user_version=4");
+    }
+
+    #[test]
+    fn the_source_hash_covers_every_table_a_restore_brings_back() {
+        let data = Data::new();
+        let directory = data.0.join("v5");
+        crate::storage::fixtures::build_v5(&directory, &[], 5);
+        let db = Connection::open(directory.join(super::super::DATABASE_FILE)).unwrap();
+        let database = directory.join(super::super::DATABASE_FILE);
+        let hash = || source_id(&db, &database).unwrap().source_hash;
+        let mut seen = vec![hash()];
+        let mut changes = |what: &str, sql: &str| {
+            db.execute_batch(sql).unwrap();
+            let now = hash();
+            assert!(!seen.contains(&now), "{what} did not change the identity");
+            seen.push(now);
+        };
+        changes(
+            "a settings write",
+            "INSERT INTO settings VALUES ('preferences','{}')",
+        );
+        changes("a settings edit", "UPDATE settings SET value='{\"a\":1}'");
+        changes(
+            "a memory entry",
+            "INSERT INTO memory(id,content,updated_at) VALUES ('m','fact',1);
+             INSERT INTO memory_search(id,content) VALUES ('m','fact');",
+        );
+        changes(
+            "a memory edit",
+            "UPDATE memory SET content='fact two', revision=2",
+        );
+        changes(
+            "a proposal",
+            "INSERT INTO memory_proposals VALUES ('p','{}')",
+        );
+        changes(
+            "a paired device",
+            "INSERT INTO paired_devices VALUES ('d','{}')",
+        );
+        changes(
+            "a new table",
+            "CREATE TABLE later(x); INSERT INTO later VALUES (1)",
+        );
+        // The recall index is rebuilt from `sessions`: its writes are not part of the identity.
+        let before = hash();
+        db.execute_batch(
+            "INSERT INTO sessions VALUES ('s','S',1,'{}');
+             INSERT INTO indexed_sessions VALUES ('s',NULL,'chat');
+             INSERT INTO session_messages(session_id,message_id,message_index,role,content)
+                 VALUES ('s','m',0,'user','needle');",
+        )
+        .unwrap();
+        let with_chat = hash();
+        assert_ne!(with_chat, before, "the chat itself counts");
+        db.execute_batch("DELETE FROM session_messages; DELETE FROM indexed_sessions;")
+            .unwrap();
+        assert_eq!(hash(), with_chat, "the recall index does not");
     }
 
     fn touch(dir: &Path, name: &str) {
