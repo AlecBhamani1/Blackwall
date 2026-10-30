@@ -139,6 +139,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Python and other runtimes now start from the Linux AppImage. Programs it launches no longer get
+  the AppImage's own `PYTHONHOME` and library paths. A Python MCP server that fails to start now
+  shows why in the tool card's details.
+
 - A run now reads `.blackwall/project.json` once, so its rules and its limits always come from the same version of the file, even if the file changes while the run starts.
 - A subagent that runs on a command tool (`runs_on`) now gets an `execute_tool` span in its trace, like any other tool call, with the same redaction rules. Its approval events are recorded on that span.
 - Usage no longer reads an oversized line in a local OTLP metrics file into memory. A line over
@@ -164,6 +168,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
 ### Changed
+
+- **Breaking:** Child programs now start from an allow-listed environment instead of Blackwall's
+  own. This covers shell commands, command tools, MCP servers, and the git, browser-opener and
+  folder-listing helpers, on every system. They keep `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`,
+  `USER`, `LOGNAME`, `SHELL`, `TZ`, `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed commands get
+  less. An MCP server or command tool that relied on an inherited variable (a token, a proxy
+  setting, a custom config path) stops seeing it. To migrate, add its name to the new `env` list
+  in `mcp.json` or `tools.json`, such as `"env":["GITHUB_TOKEN"]`. `env` is owner-only (not allowed
+  in project servers), is refused on URL servers and HTTP tools, and cannot name `PATH`,
+  loader-injection variables or Blackwall's own secrets.
 
 - A first launch with no saved connection lists the servers found on this computer and connects
   only to the one chosen, instead of connecting to the first that answered.
