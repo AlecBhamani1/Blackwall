@@ -7,6 +7,9 @@ use tokio::sync::Mutex;
 const LOCK_ACCOUNT: &str = "passphrase-v1";
 /// Empty, non-secret file in the data folder: an app lock exists, even when the keyring cannot say so.
 pub(crate) const LOCK_MARKER: &str = "app-lock-enabled";
+/// Empty, non-secret file in the data folder: this data has no app lock.
+pub(crate) const NO_LOCK_MARKER: &str = "app-lock-disabled";
+const DATABASE: &str = "blackwall.sqlite3";
 pub(crate) const KEYRING_NEEDED: &str = "Your app lock is stored in the system keyring, which isn't available. Start your keyring (GNOME Keyring or KWallet), then try again.";
 #[derive(Default)]
 struct Inner {
@@ -56,16 +59,6 @@ enum Startup {
     Locked(String),
     KeyringNeeded,
     Retry(String),
-}
-/// Only a fresh data folder (no marker, no conversations) may open without a keyring.
-fn startup(read: LockRead, marker: bool, has_sessions: bool) -> Startup {
-    match read {
-        LockRead::Found(hash) => Startup::Locked(hash),
-        LockRead::Missing => Startup::Open { keyring: true },
-        LockRead::Unavailable if marker || has_sessions => Startup::KeyringNeeded,
-        LockRead::Unavailable => Startup::Open { keyring: false },
-        LockRead::Failed(message) => Startup::Retry(message),
-    }
 }
 
 impl AuthState {
@@ -168,41 +161,90 @@ fn write_hash(hash: Option<&str>) -> Result<(), String> {
         ))
     })
 }
-fn write_marker(directory: &Path) -> std::io::Result<()> {
+const MARKER_ERROR: &str = "The app lock marker could not be updated in your data folder.";
+fn write_marker(directory: &Path, name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)?;
-    std::fs::write(directory.join(LOCK_MARKER), b"")
+    std::fs::write(directory.join(name), b"")
 }
-fn remove_marker(directory: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(directory.join(LOCK_MARKER)) {
+fn remove_marker(directory: &Path, name: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(directory.join(name)) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
     }
 }
-/// Keep the marker in step with the stored lock. The marker changes first, so a failure
-/// to remove it leaves the lock in place rather than an unlocked app that still looks locked.
+/// A file in the data folder whose existence cannot be checked counts as `unknown`.
+fn file_exists(directory: &Path, name: &str, unknown: bool) -> bool {
+    directory.join(name).try_exists().unwrap_or(unknown)
+}
+/// Keep the markers in step with the stored lock. The markers change first, so a failure
+/// to update them leaves the lock in place rather than an unlocked app that still looks locked.
 fn change_lock(
     directory: &Path,
     hash: Option<&str>,
     store: impl FnOnce(Option<&str>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let had_marker = directory.join(LOCK_MARKER).exists();
-    match hash {
-        Some(_) => write_marker(directory),
-        None => remove_marker(directory),
+    let marker_error = |_| MARKER_ERROR.to_string();
+    if hash.is_none() {
+        remove_marker(directory, LOCK_MARKER).map_err(marker_error)?;
+        if let Err(error) = store(None) {
+            // The lock is still saved, so it must stay recorded.
+            let _ = write_marker(directory, LOCK_MARKER);
+            return Err(error);
+        }
+        // Best effort: without it, keyring-less launches wait for the keyring.
+        let _ = write_marker(directory, NO_LOCK_MARKER);
+        return Ok(());
     }
-    .map_err(|_| "The app lock marker could not be updated in your data folder.".to_string())?;
+    let had_lock = file_exists(directory, LOCK_MARKER, true);
+    let had_no_lock = file_exists(directory, NO_LOCK_MARKER, false);
+    write_marker(directory, LOCK_MARKER).map_err(marker_error)?;
+    remove_marker(directory, NO_LOCK_MARKER).map_err(marker_error)?;
     let stored = store(hash);
-    if stored.is_err() && hash.is_some() && !had_marker {
-        // A lock that was never saved must not leave a marker that locks the next launch.
-        let _ = remove_marker(directory);
+    if stored.is_err() {
+        // A lock that was never saved must not change how the next launch opens.
+        if !had_lock {
+            let _ = remove_marker(directory, LOCK_MARKER);
+        }
+        if had_no_lock {
+            let _ = write_marker(directory, NO_LOCK_MARKER);
+        }
     }
     stored
 }
-fn has_sessions(directory: &Path) -> bool {
-    // If the data cannot be inspected, assume conversations exist and stay locked.
-    blackwall_core::storage::LocalStore::open(directory)
-        .and_then(|store| store.has_sessions())
-        .unwrap_or(true)
+/// Decide how the app opens from the keyring read and the lock markers in `directory`.
+/// A data folder opens without a keyring only when it is recorded as having no lock, or has
+/// no database yet. It never opens the database, which would create one.
+fn resolve(read: LockRead, directory: &Path) -> Startup {
+    match read {
+        LockRead::Found(hash) => {
+            // An unrecorded lock could open without the keyring later, so it is not settled.
+            if write_marker(directory, LOCK_MARKER).is_err()
+                || remove_marker(directory, NO_LOCK_MARKER).is_err()
+            {
+                return Startup::Retry(MARKER_ERROR.into());
+            }
+            Startup::Locked(hash)
+        }
+        LockRead::Missing => {
+            // Best effort: if either fails, a later keyring-less launch waits for the keyring.
+            let _ = remove_marker(directory, LOCK_MARKER);
+            let _ = write_marker(directory, NO_LOCK_MARKER);
+            Startup::Open { keyring: true }
+        }
+        LockRead::Unavailable => {
+            if file_exists(directory, LOCK_MARKER, true) {
+                Startup::KeyringNeeded
+            } else if file_exists(directory, NO_LOCK_MARKER, false) {
+                Startup::Open { keyring: false }
+            } else if !file_exists(directory, DATABASE, true) {
+                let _ = write_marker(directory, NO_LOCK_MARKER);
+                Startup::Open { keyring: false }
+            } else {
+                Startup::KeyringNeeded
+            }
+        }
+        LockRead::Failed(message) => Startup::Retry(message),
+    }
 }
 #[tauri::command]
 pub async fn auth_status(
@@ -213,20 +255,9 @@ pub async fn auth_status(
     if !inner.initialized {
         let directory = crate::identity::data_directory(&app)?;
         let read = crate::keychain::read(|| Ok(read_hash())).await?;
-        let dir = directory.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let marker = dir.join(LOCK_MARKER).exists();
-            // Best effort: a stale marker only matters once the keyring is gone.
-            match &read {
-                LockRead::Found(_) => drop(write_marker(&dir)),
-                LockRead::Missing => drop(remove_marker(&dir)),
-                _ => {}
-            }
-            let sessions = matches!(read, LockRead::Unavailable) && !marker && has_sessions(&dir);
-            startup(read, marker, sessions)
-        })
-        .await
-        .map_err(|_| "Blackwall could not read its app lock.")?;
+        let outcome = tokio::task::spawn_blocking(move || resolve(read, &directory))
+            .await
+            .map_err(|_| "Blackwall could not read its app lock.")?;
         // Only Locked and Open are settled; the other outcomes read the keyring again next time.
         match outcome {
             Startup::Retry(message) => return Err(message),
@@ -382,38 +413,108 @@ mod tests {
         assert!(state.ensure_unlocked().await.is_err());
         assert!(!state.0.lock().await.locking);
     }
+    fn present(directory: &Path, name: &str) -> bool {
+        directory.join(name).exists()
+    }
     #[test]
-    fn startup_opens_only_fresh_data_without_keyring() {
+    fn keyring_less_profile_reopens_after_saving_a_conversation() {
+        let root = data_folder("reopen");
+        let directory = root.join("data");
         assert_eq!(
-            startup(LockRead::Unavailable, false, false),
+            resolve(LockRead::Unavailable, &directory),
             Startup::Open { keyring: false }
         );
+        assert!(present(&directory, NO_LOCK_MARKER));
+        // The first saved conversation creates the database.
+        std::fs::write(directory.join(DATABASE), b"").unwrap();
         assert_eq!(
-            startup(LockRead::Unavailable, true, false),
+            resolve(LockRead::Unavailable, &directory),
+            Startup::Open { keyring: false }
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn both_markers_need_the_keyring() {
+        let directory = data_folder("both");
+        std::fs::write(directory.join(LOCK_MARKER), b"").unwrap();
+        std::fs::write(directory.join(NO_LOCK_MARKER), b"").unwrap();
+        assert_eq!(
+            resolve(LockRead::Unavailable, &directory),
             Startup::KeyringNeeded
         );
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn startup_dismissed_prompt_retries_and_existing_data_without_marker_stays_locked() {
+        let directory = data_folder("existing");
         assert!(matches!(
-            startup(LockRead::Failed("dismissed".into()), false, false),
+            resolve(LockRead::Failed("dismissed".into()), &directory),
             Startup::Retry(_)
         ));
+        std::fs::write(directory.join(DATABASE), b"").unwrap();
         assert_eq!(
-            startup(LockRead::Unavailable, false, true),
+            resolve(LockRead::Unavailable, &directory),
             Startup::KeyringNeeded
         );
+        assert!(!present(&directory, NO_LOCK_MARKER));
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
-    fn found_lock_is_locked_and_missing_lock_opens() {
+    fn existing_memories_without_conversations_or_marker_need_the_keyring() {
+        let directory = data_folder("memories");
+        let mut store = blackwall_core::storage::LocalStore::open(&directory).unwrap();
+        store
+            .save_memory(&blackwall_core::storage::MemoryEntry {
+                id: "memory_one".into(),
+                content: "I prefer concise answers".into(),
+                updated_at: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        drop(store);
+        // Data from a version that recorded no lock state.
+        let _ = std::fs::remove_file(directory.join(NO_LOCK_MARKER));
         assert_eq!(
-            startup(LockRead::Found("h".into()), false, true),
+            resolve(LockRead::Unavailable, &directory),
+            Startup::KeyringNeeded
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn found_lock_records_lock_on_and_missing_lock_records_lock_off() {
+        let directory = data_folder("found");
+        std::fs::write(directory.join(NO_LOCK_MARKER), b"").unwrap();
+        assert_eq!(
+            resolve(LockRead::Found("h".into()), &directory),
             Startup::Locked("h".into())
         );
+        assert!(present(&directory, LOCK_MARKER));
+        assert!(!present(&directory, NO_LOCK_MARKER));
         assert_eq!(
-            startup(LockRead::Missing, true, true),
+            resolve(LockRead::Missing, &directory),
             Startup::Open { keyring: true }
         );
+        assert!(!present(&directory, LOCK_MARKER));
+        assert!(present(&directory, NO_LOCK_MARKER));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn found_lock_retries_when_its_markers_cannot_be_updated() {
+        // A directory in a marker's place cannot be removed or written as a file.
+        let directory = data_folder("found-stuck");
+        std::fs::create_dir(directory.join(NO_LOCK_MARKER)).unwrap();
+        assert!(matches!(
+            resolve(LockRead::Found("h".into()), &directory),
+            Startup::Retry(_)
+        ));
+        std::fs::remove_dir(directory.join(NO_LOCK_MARKER)).unwrap();
+        std::fs::remove_file(directory.join(LOCK_MARKER)).unwrap();
+        std::fs::create_dir(directory.join(LOCK_MARKER)).unwrap();
+        assert!(matches!(
+            resolve(LockRead::Found("h".into()), &directory),
+            Startup::Retry(_)
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
     }
     fn data_folder(name: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -437,9 +538,39 @@ mod tests {
             !marker.exists(),
             "a lock that was never saved must not leave a marker"
         );
-        write_marker(&directory).unwrap();
+        std::fs::write(directory.join(NO_LOCK_MARKER), b"").unwrap();
+        assert!(change_lock(&directory, Some("hash"), failing).is_err());
+        assert!(!marker.exists());
+        assert!(
+            present(&directory, NO_LOCK_MARKER),
+            "a lock that was never saved keeps the no-lock marker"
+        );
+        std::fs::write(&marker, b"").unwrap();
         assert!(change_lock(&directory, Some("hash"), failing).is_err());
         assert!(marker.exists(), "an existing lock keeps its marker");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn failed_lock_removal_keeps_the_lock_marker() {
+        let directory = data_folder("failed-removal");
+        std::fs::write(directory.join(LOCK_MARKER), b"").unwrap();
+        let failing = |_: Option<&str>| Err("keyring delete failed".to_string());
+        assert!(change_lock(&directory, None, failing).is_err());
+        assert!(present(&directory, LOCK_MARKER));
+        assert!(!present(&directory, NO_LOCK_MARKER));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn lock_is_not_saved_when_the_no_lock_marker_cannot_be_removed() {
+        let directory = data_folder("set-stuck");
+        std::fs::create_dir(directory.join(NO_LOCK_MARKER)).unwrap();
+        let stored = std::cell::Cell::new(false);
+        let store = |_: Option<&str>| {
+            stored.set(true);
+            Ok(())
+        };
+        assert!(change_lock(&directory, Some("hash"), store).is_err());
+        assert!(!stored.get(), "the hash must stay untouched");
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -452,8 +583,10 @@ mod tests {
             stored.set(stored.get() + 1);
             Ok(())
         };
+        std::fs::write(directory.join(NO_LOCK_MARKER), b"").unwrap();
         change_lock(&directory, Some("hash"), store).unwrap();
         assert!(marker.exists());
+        assert!(!present(&directory, NO_LOCK_MARKER));
         assert_eq!(stored.get(), 1);
         #[cfg(unix)]
         {
@@ -469,6 +602,7 @@ mod tests {
         }
         change_lock(&directory, None, store).unwrap();
         assert!(!marker.exists());
+        assert!(present(&directory, NO_LOCK_MARKER));
         assert_eq!(stored.get(), 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
