@@ -1,12 +1,24 @@
 //! Find the protected names under a project before a sandboxed Linux command runs, so they can be
 //! masked, and record the start state of every file for the copy-back. Std only, and it never
 //! follows a symlink. Callers run it in `spawn_blocking`.
-// The mask builder and the staging code that use this arrive in later tasks.
+//!
+//! Known limits, accepted on purpose:
+//! - A protected name more than one level below a skipped directory (`node_modules/x/.git`) is not
+//!   found, because scanning huge dependency and build trees before every command is too slow.
+//!   Only a skipped directory's direct children are checked. Network is off by default, so the
+//!   exposure is read-only.
+//! - The walk and the mount that uses it are separate steps, so a directory swapped for a symlink
+//!   in between (a `read_dir` race) is not caught here. A later task closes it with `openat`.
+//! - Names compare as raw bytes with ASCII case folding. A case-folding filesystem that also folds
+//!   non-ASCII (or non-UTF-8) names can reach a protected name this does not recognise.
+//!
+//! `allow(dead_code)` stays until the mask builder and staging code (D4, D5, E1) use this module;
+//! remove it in the task that wires the last of them.
 #![allow(dead_code)]
 
 use crate::tools::ToolError;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -34,8 +46,8 @@ pub(crate) const SKIP_BELOW_ROOT: [&str; 7] = [
     "build",
 ];
 pub(crate) const MAX_ENTRIES: usize = 500_000;
-
-/// ASCII case-insensitive, the way the copy-back refuses names.
+/// ASCII case-insensitive on the raw bytes, the way the copy-back refuses names. A name with a
+/// non-UTF-8 byte is just a different name: `.G\xffIT` is not `.git` and is not protected.
 pub(crate) fn is_protected(name: &OsStr) -> bool {
     PROTECTED.iter().any(|p| name.eq_ignore_ascii_case(p))
 }
@@ -82,20 +94,44 @@ pub(crate) struct Walk {
 /// Paths are relative to the walked root.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WalkError {
-    TooLarge { subtree: PathBuf },
-    Unreadable { path: PathBuf },
+    /// Too many entries in total; `subtree` is the top-level entry holding the most.
+    TooLarge {
+        subtree: PathBuf,
+    },
+    /// The root's own direct entries are already over the limit.
+    RootTooLarge,
+    Unreadable {
+        path: PathBuf,
+    },
+}
+
+impl From<WalkError> for ToolError {
+    fn from(error: WalkError) -> Self {
+        ToolError::Execution(match error {
+            WalkError::TooLarge { subtree } => format!(
+                "This project is too large to sandbox safely: {} has too many files. The command was not run.",
+                subtree.display()
+            ),
+            WalkError::RootTooLarge => "This project folder itself has too many files to sandbox safely. The command was not run.".to_string(),
+            WalkError::Unreadable { .. } => "A folder in this project could not be read, so Blackwall could not check it before sandboxing. The command was not run.".to_string(),
+        })
+    }
 }
 
 /// Walk `root`, counting at most `limit` entries. Symlinks are never followed, masked or recorded.
 /// A masked directory is not entered. A directory in `SKIP_BELOW_ROOT` is not entered either, but
-/// its direct children are still checked for protected names and are not counted.
+/// its direct children are still checked for protected names and are not counted. Past the limit
+/// the error names the top-level entry that has the most entries counted so far (ties go to the
+/// lower name), or the root itself when its direct entries alone are over the limit.
 pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
     let mut masks = Vec::new();
     let mut files = HashMap::new();
     let mut count = 0usize;
+    let mut per_top: HashMap<OsString, usize> = HashMap::new();
     // (relative directory, whether only its direct children are checked)
     let mut pending = vec![(PathBuf::new(), false)];
     while let Some((relative, shallow)) = pending.pop() {
+        let at_root = relative.as_os_str().is_empty();
         let unreadable = || WalkError::Unreadable {
             path: relative.clone(),
         };
@@ -106,12 +142,22 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
             let path = relative.join(&name);
             if !shallow {
                 count += 1;
+                let top = relative
+                    .components()
+                    .next()
+                    .map_or_else(|| name.clone(), |first| first.as_os_str().to_os_string());
+                *per_top.entry(top).or_insert(0) += 1;
+                if at_root && count > limit {
+                    return Err(WalkError::RootTooLarge);
+                }
                 if count > limit {
-                    let subtree = path
-                        .components()
-                        .next()
-                        .map_or_else(|| path.clone(), |first| PathBuf::from(first.as_os_str()));
-                    return Err(WalkError::TooLarge { subtree });
+                    let largest = per_top
+                        .into_iter()
+                        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                        .map(|(name, _)| PathBuf::from(name));
+                    return Err(WalkError::TooLarge {
+                        subtree: largest.unwrap_or(path),
+                    });
                 }
             }
             let meta = match std::fs::symlink_metadata(root.join(&path)) {
@@ -146,18 +192,65 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
 }
 
 const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
+const DATA_INSIDE_PROJECT: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
+const NO_HOME: &str = "Blackwall couldn't find your home folder, so it won't sandbox this command.";
+const UNRESOLVED: &str =
+    "Blackwall couldn't resolve a folder it needs to check, so it won't sandbox this command.";
+
+/// Canonicalize a path whose last components may not exist yet: resolve the nearest existing
+/// ancestor and put the missing names back.
+fn canonical_allowing_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut resolved) => {
+                resolved.extend(missing.iter().rev());
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name().map(OsStr::to_os_string) else {
+                    return Err(error);
+                };
+                missing.push(name);
+                current.pop();
+                if current.as_os_str().is_empty() {
+                    current = PathBuf::from(".");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// A project must sit strictly inside the home folder, and the app's data folder must not sit
-/// inside the project. With no home folder known, only the data folder rule applies.
+/// inside the project. Paths are resolved first (`..`, relative paths and symlinks), and anything
+/// that cannot be resolved, including a missing home folder, is refused.
 pub(crate) fn check_location(
     project: &Path,
     home: Option<&Path>,
     data: Option<&Path>,
 ) -> Result<(), ToolError> {
-    let home_is_project_or_inside_it = home.is_some_and(|home| home.starts_with(project));
-    let data_inside_project = data.is_some_and(|data| data.starts_with(project));
-    if home_is_project_or_inside_it || data_inside_project {
-        return Err(ToolError::Execution(OUTSIDE_HOME.to_string()));
+    let refuse = |message: &str| Err(ToolError::Execution(message.to_string()));
+    let Some(home) = home else {
+        return refuse(NO_HOME);
+    };
+    let Ok(home) = std::fs::canonicalize(home) else {
+        return refuse(NO_HOME);
+    };
+    let Ok(project) = std::fs::canonicalize(project) else {
+        return refuse(UNRESOLVED);
+    };
+    if home.starts_with(&project) {
+        return refuse(OUTSIDE_HOME);
+    }
+    if let Some(data) = data {
+        let Ok(data) = canonical_allowing_missing(data) else {
+            return refuse(UNRESOLVED);
+        };
+        if data.starts_with(&project) {
+            return refuse(DATA_INSIDE_PROJECT);
+        }
     }
     Ok(())
 }
@@ -290,29 +383,211 @@ mod tests {
     }
 
     #[test]
-    fn location_refuses_home_its_ancestors_and_data_inside_project() {
-        let message = "Choose a project folder inside your home folder";
-        let refused = |project, home, data| {
-            check_location(Path::new(project), home, data)
-                .unwrap_err()
-                .to_string()
-        };
-        let home = Some(Path::new("/home/u"));
-        assert_eq!(refused("/home/u", home, None), message);
-        assert_eq!(refused("/home", home, None), message);
-        assert_eq!(refused("/", home, None), message);
+    fn is_protected_does_not_fold_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!is_protected(OsStr::from_bytes(b".G\xffIT")));
+        assert!(is_protected(OsStr::from_bytes(b".GIT")));
+    }
+
+    #[test]
+    fn walk_limit_names_the_largest_top_level_entry_not_the_one_that_tips_it() {
+        // Whichever order the directories are read in, the big one is named.
+        for small in ["a_small", "z_small"] {
+            let root = Root::new();
+            for n in 0..30 {
+                root.file(&format!("m_big/f{n}"));
+            }
+            for n in 0..2 {
+                root.file(&format!("{small}/f{n}"));
+            }
+            assert_eq!(
+                walk(&root.0, 20).err(),
+                Some(WalkError::TooLarge {
+                    subtree: "m_big".into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn walk_limit_on_a_flat_root_names_the_root() {
+        let root = Root::new();
+        for n in 0..20 {
+            root.file(&format!("f{n}"));
+        }
+        assert_eq!(walk(&root.0, 10).err(), Some(WalkError::RootTooLarge));
+        let message = ToolError::from(WalkError::RootTooLarge).to_string();
         assert_eq!(
-            refused("/home/u/p", home, Some(Path::new("/home/u/p/.data"))),
-            message
+            message,
+            "This project folder itself has too many files to sandbox safely. The command was not run."
         );
-        assert!(check_location(
-            Path::new("/home/u/p"),
-            home,
-            Some(Path::new("/home/u/.blackwall"))
-        )
-        .is_ok());
-        assert!(check_location(Path::new("/home/u/p"), None, None).is_ok());
-        // A sibling that merely shares a name prefix is not an ancestor.
-        assert!(check_location(Path::new("/home/u2"), home, None).is_ok());
+        let named = ToolError::from(WalkError::TooLarge {
+            subtree: "big".into(),
+        })
+        .to_string();
+        assert_eq!(
+            named,
+            "This project is too large to sandbox safely: big has too many files. The command was not run."
+        );
+    }
+
+    #[test]
+    fn walk_masks_a_fifo_with_a_protected_name_as_a_file() {
+        let root = Root::new();
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.0.join(".git"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let w = walk(&root.0, MAX_ENTRIES).unwrap();
+        assert_eq!(kinds(&w), [(".git", &MaskKind::File)]);
+        assert!(w.files.is_empty());
+    }
+
+    #[test]
+    fn walk_masks_a_protected_file_directly_inside_a_skipped_dir() {
+        let root = Root::new();
+        root.file("node_modules/.codex");
+        root.file("node_modules/pkg/.codex");
+        let w = walk(&root.0, MAX_ENTRIES).unwrap();
+        assert_eq!(kinds(&w), [("node_modules/.codex", &MaskKind::File)]);
+    }
+
+    #[test]
+    fn walk_reports_an_unreadable_directory_in_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root reads everything, so there is nothing to refuse
+        }
+        let root = Root::new();
+        root.dir("a/locked");
+        let locked = root.0.join("a/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = walk(&root.0, 100);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            result.err(),
+            Some(WalkError::Unreadable {
+                path: "a/locked".into()
+            })
+        );
+    }
+
+    /// A real home with a project inside it and a data folder beside the project.
+    struct Home {
+        root: Root,
+        home: PathBuf,
+        project: PathBuf,
+    }
+    impl Home {
+        fn new() -> Self {
+            let root = Root::new();
+            let home = root.0.join("home");
+            let project = home.join("p");
+            std::fs::create_dir_all(&project).unwrap();
+            Self {
+                root,
+                home,
+                project,
+            }
+        }
+        fn check(&self, project: &Path, data: Option<&Path>) -> Result<(), String> {
+            check_location(project, Some(&self.home), data).map_err(|e| e.to_string())
+        }
+    }
+    const OUTSIDE: &str = "Choose a project folder inside your home folder";
+    const DATA_INSIDE: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
+
+    #[test]
+    fn location_refuses_home_its_ancestors_and_data_inside_project() {
+        let h = Home::new();
+        assert_eq!(h.check(&h.home, None), Err(OUTSIDE.into()));
+        assert_eq!(h.check(&h.root.0, None), Err(OUTSIDE.into()));
+        assert_eq!(h.check(Path::new("/"), None), Err(OUTSIDE.into()));
+        // The data folder does not exist yet.
+        assert_eq!(
+            h.check(&h.project, Some(&h.project.join(".data/deeper"))),
+            Err(DATA_INSIDE.into())
+        );
+        assert_eq!(
+            h.check(&h.project, Some(&h.project)),
+            Err(DATA_INSIDE.into())
+        );
+        assert_eq!(
+            h.check(&h.project, Some(&h.home.join(".blackwall"))),
+            Ok(())
+        );
+        assert_eq!(h.check(&h.project, None), Ok(()));
+        // A sibling that merely shares a name prefix is not the home folder.
+        let sibling = h.root.0.join("home2");
+        std::fs::create_dir(&sibling).unwrap();
+        assert_eq!(h.check(&sibling, None), Ok(()));
+    }
+
+    #[test]
+    fn location_resolves_dotdot_and_relative_paths() {
+        let h = Home::new();
+        assert_eq!(
+            h.check(&h.project.join(".."), None),
+            Err(OUTSIDE.into()),
+            "p/.. is the home folder"
+        );
+        // data written with .. that lands inside the project
+        std::fs::create_dir(h.home.join("x")).unwrap();
+        assert_eq!(
+            h.check(&h.project, Some(&h.home.join("x/../p/.data"))),
+            Err(DATA_INSIDE.into())
+        );
+        // A relative path to the home folder, built from the current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = PathBuf::from(format!(
+            "{up}{}",
+            h.home.strip_prefix("/").unwrap().display()
+        ));
+        assert!(relative.is_relative());
+        assert_eq!(h.check(&relative, None), Err(OUTSIDE.into()));
+    }
+
+    #[test]
+    fn location_resolves_symlinked_home_and_project() {
+        let h = Home::new();
+        let home_link = h.root.0.join("home-link");
+        symlink(&h.home, &home_link).unwrap();
+        let project_link = h.root.0.join("project-link");
+        symlink(&h.project, &project_link).unwrap();
+        // The home folder through a link is still the home folder.
+        assert_eq!(h.check(&home_link, None), Err(OUTSIDE.into()));
+        assert_eq!(
+            check_location(&h.home, Some(&home_link), None).map_err(|e| e.to_string()),
+            Err(OUTSIDE.into())
+        );
+        // A project reached through a link, and its data reached through another.
+        assert_eq!(
+            check_location(&project_link, Some(&home_link), None).map_err(|e| e.to_string()),
+            Ok(())
+        );
+        assert_eq!(
+            h.check(&h.home.join("p"), Some(&project_link.join(".data"))),
+            Err(DATA_INSIDE.into())
+        );
+        // A link inside home that points outside it: the real place is what counts.
+        let elsewhere = Home::new();
+        let escape = h.home.join("escape");
+        symlink(&elsewhere.root.0, &escape).unwrap();
+        assert_eq!(h.check(&escape, None), Ok(()));
+    }
+
+    #[test]
+    fn location_fails_closed_without_a_resolvable_home_or_project() {
+        let h = Home::new();
+        let no_home = "Blackwall couldn't find your home folder, so it won't sandbox this command.";
+        let unresolved =
+            "Blackwall couldn't resolve a folder it needs to check, so it won't sandbox this command.";
+        let err =
+            |p: &Path, home: Option<&Path>| check_location(p, home, None).unwrap_err().to_string();
+        assert_eq!(err(&h.project, None), no_home);
+        assert_eq!(err(&h.project, Some(&h.root.0.join("nope"))), no_home);
+        assert_eq!(err(&h.root.0.join("nope"), Some(&h.home)), unresolved);
     }
 }
