@@ -645,11 +645,12 @@ fn is_option(value: &str) -> bool {
     value.starts_with('-') || (cfg!(windows) && value.starts_with('/'))
 }
 
-/// An absolute program, or a bare name found in the child's validated `PATH`: absolute entries
-/// outside the AppImage mount and `project`, whose directory also does not resolve (through
-/// symlinks) into `project`. A repository can therefore never plant the program that an owner
-/// command tool or MCP server starts. On Windows the `.exe` is resolved here, so the approved path
-/// is exactly the one that runs.
+/// An absolute program outside `project`, or a bare name found in the child's validated `PATH`:
+/// absolute entries outside the AppImage mount and `project`, whose directory also does not
+/// resolve (through symlinks) into `project`. An absolute program that is, or resolves through
+/// symlinks into, `project` is refused. A repository can therefore never plant the program that
+/// an owner command tool or MCP server starts. On Windows the `.exe` is resolved here, so the
+/// approved path is exactly the one that runs.
 pub(crate) fn resolve_program(program: &str, project: &Path) -> Result<PathBuf, ToolError> {
     let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
     let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
@@ -659,14 +660,19 @@ pub(crate) fn resolve_program(program: &str, project: &Path) -> Result<PathBuf, 
         crate::child_env::valid_appdir(appdir.as_deref()),
         &project,
     )
-    .map_err(|why| {
-        ToolError::Execution(match why {
-            NotResolved::Missing => format!("{program} was not found on this computer."),
-            NotResolved::OnlyInProject => format!(
-                "{program} was only found inside the project folder, which Blackwall never runs programs from. Use an absolute path in the config."
-            ),
-        })
-    })
+    .map_err(|why| ToolError::Execution(not_resolved_message(program, why)))
+}
+
+fn not_resolved_message(program: &str, why: NotResolved) -> String {
+    match why {
+        NotResolved::Missing => format!("{program} was not found on this computer."),
+        NotResolved::OnlyInProject => format!(
+            "{program} was only found inside the project folder, which Blackwall never runs programs from. Install it outside the project."
+        ),
+        NotResolved::InsideProject => format!(
+            "{program} is inside the project folder, which Blackwall never runs programs from."
+        ),
+    }
 }
 
 /// Why a program name did not resolve.
@@ -675,6 +681,8 @@ enum NotResolved {
     Missing,
     /// Every match was in a `PATH` directory inside the project.
     OnlyInProject,
+    /// An absolute program that is, or resolves through symlinks into, the project.
+    InsideProject,
 }
 
 fn resolve_in(
@@ -690,10 +698,12 @@ fn resolve_in(
     };
     let path = Path::new(&name);
     if path.is_absolute() {
-        return if executable(path) {
-            Ok(path.to_path_buf())
-        } else {
+        return if !executable(path) {
             Err(NotResolved::Missing)
+        } else if crate::child_env::inside_project(path, project) {
+            Err(NotResolved::InsideProject)
+        } else {
+            Ok(path.to_path_buf())
         };
     }
     let search_path = search_path.ok_or(NotResolved::Missing)?;
@@ -908,9 +918,49 @@ mod tests {
             Err(NotResolved::OnlyInProject)
         );
         assert_eq!(find("absent", &[&system]), Err(NotResolved::Missing));
-        // An absolute path in the configuration is the owner's explicit choice.
-        let absolute = planted.join("tool");
-        assert_eq!(find(absolute.to_str().unwrap(), &[&system]), Ok(absolute));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_programs_inside_the_project_are_refused_even_through_symlinks() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("blackwall-resolve-{}", rand::random::<u64>()));
+        let project = root.join("project");
+        let planted = plant(&project, "node_modules/.bin");
+        let system = plant(&root, "system/bin");
+        // A folder outside the project that links into it, and a file link to a planted program.
+        std::os::unix::fs::symlink(&planted, root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(planted.join("tool"), system.join("linked")).unwrap();
+        let find = |program: &Path| resolve_in(program.to_str().unwrap(), None, None, &project);
+        assert_eq!(find(&planted.join("tool")), Err(NotResolved::InsideProject));
+        assert_eq!(
+            find(&root.join("alias").join("tool")),
+            Err(NotResolved::InsideProject)
+        );
+        assert_eq!(
+            find(&system.join("linked")),
+            Err(NotResolved::InsideProject)
+        );
+        assert_eq!(find(&system.join("tool")), Ok(system.join("tool")));
+        let program = planted.join("tool");
+        let error = resolve_program(program.to_str().unwrap(), &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "is inside the project folder, which Blackwall never runs programs from."
+            ),
+            "{error}"
+        );
+        // A bare name found only in the project points the owner outside it, never into it.
+        let error = format!(
+            "{}",
+            ToolError::Execution(not_resolved_message("tool", NotResolved::OnlyInProject))
+        );
+        assert!(!error.contains("absolute path"), "{error}");
+        assert!(error.contains("Install it outside the project"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

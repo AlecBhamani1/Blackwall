@@ -707,8 +707,8 @@ mod settings_tests {
         /// An executable script that echoes its standard input and then ` ANSWER`.
         #[cfg_attr(not(unix), allow(dead_code))]
         fn script(&self) -> String {
-            // Inside the project, which the default sandbox lets programs read.
-            let path = self.project().join("review.sh");
+            // Beside the project: Blackwall never runs a program from inside it.
+            let path = self.0.join("review.sh");
             std::fs::write(&path, "#!/bin/sh\ncat\nprintf ' ANSWER'\n").unwrap();
             #[cfg(unix)]
             {
