@@ -1,5 +1,5 @@
 //! Versioned local SQLite persistence. All values are bounded and writes are transactional.
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
 use thiserror::Error;
@@ -12,6 +12,9 @@ pub const LOCK_MARKER: &str = "app-lock-enabled";
 pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -84,16 +87,45 @@ impl LocalStore {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         }
         let connection = Connection::open(path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         Self::initialize(connection)
     }
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
+        )?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 4 {
+        if version > SCHEMA_VERSION {
             return Err(StorageError::Invalid(
                 "This data was created by a newer Blackwall version. Update the app to open it.",
             ));
+        }
+        if version == SCHEMA_VERSION {
+            let store = Self { connection };
+            if store.message_index_is_current()? {
+                return Ok(store);
+            }
+            store.connection.busy_timeout(BACKFILL_BUSY_TIMEOUT)?;
+            let result = store.migrate_message_index();
+            store.connection.busy_timeout(BUSY_TIMEOUT)?;
+            return match result {
+                Err(error) if is_busy(&error) => Ok(store),
+                result => result.map(|()| store),
+            };
+        }
+
+        // Only schema creation and upgrades wait for the writer lock. Re-read the version after
+        // acquiring it because another opener may have completed the upgrade while this one waited.
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(StorageError::Invalid(
+                "This data was created by a newer Blackwall version. Update the app to open it.",
+            ));
+        }
+        if version == SCHEMA_VERSION {
+            connection.execute_batch("ROLLBACK;")?;
+            return Ok(Self { connection });
         }
         connection.execute_batch("
             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
@@ -101,6 +133,7 @@ impl LocalStore {
             CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at INTEGER NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, content);
             CREATE TABLE IF NOT EXISTS paired_devices (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions(updated_at DESC);
             ")?;
         if version < 3 {
             connection.execute_batch(
@@ -117,10 +150,11 @@ impl LocalStore {
             )?;
         }
         recall::schema(&connection)?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         connection.execute_batch("COMMIT;")?;
-        let store = Self { connection };
-        store.migrate_message_index()?;
-        Ok(store)
+        // Defer legacy message indexing until a later open so the migration winner releases the
+        // writer lock directly to any other openers waiting to observe the new schema.
+        Ok(Self { connection })
     }
     pub fn paired_devices(&self) -> Result<Vec<crate::pairing::PairedDevice>, StorageError> {
         let mut query = self
@@ -190,9 +224,14 @@ impl LocalStore {
     }
     pub fn list_sessions(&self) -> Result<Vec<Value>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, title, updated_at, json_extract(body, '$.mode'),
-                    json_extract(body, '$.workspace')
-             FROM sessions ORDER BY updated_at DESC LIMIT 500",
+            "SELECT id, title, updated_at,
+                    json_extract(body, '$.mode'), json_extract(body, '$.workspace')
+             FROM (
+                 SELECT id, title, updated_at, body
+                 FROM sessions
+                 ORDER BY updated_at DESC LIMIT 500
+             )
+             ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(json!({
@@ -387,16 +426,306 @@ fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), Storag
     Ok((id, title, updated as i64, body))
 }
 
+fn is_busy(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Database(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Barrier},
+        thread,
+        time::{Duration, Instant},
+    };
+
     fn store() -> LocalStore {
         LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap()
     }
     fn session(id: &str) -> Value {
         json!({"id":id,"title":"A conversation","updatedAt":123,"messages":[{"role":"user","content":"Read this","attachments":[{"textContent":"retained bytes"}]}]})
     }
+
+    struct SyntheticStore {
+        directory: PathBuf,
+    }
+
+    impl Drop for SyntheticStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn perf_scale(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn synthetic_text(session_index: usize, message_index: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
+        let mut state = ((session_index as u64 + 1) << 32) | (message_index as u64 + 1);
+        let mut text = String::with_capacity(1536);
+        for _ in 0..1536 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            text.push(ALPHABET[state as usize % ALPHABET.len()] as char);
+        }
+        text
+    }
+
+    fn synthetic_session(session_index: usize, message_count: usize) -> Value {
+        let messages: Vec<_> = (0..message_count)
+            .map(|message_index| {
+                json!({
+                    "id": format!("message_{message_index}"),
+                    "role": if message_index % 2 == 0 { "user" } else { "assistant" },
+                    "content": synthetic_text(session_index, message_index),
+                    "attachments": []
+                })
+            })
+            .collect();
+        let transcript: Vec<_> = messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message["role"],
+                    "content": message["content"]
+                })
+            })
+            .collect();
+        let context = crate::context::ContextState::restore(&transcript, None).unwrap();
+        json!({
+            "id": format!("perf_session_{session_index:04}"),
+            "title": format!("Synthetic conversation {session_index}"),
+            "updatedAt": 1_700_000_000_000_u64 + session_index as u64,
+            "mode": if session_index.is_multiple_of(2) { "chat" } else { "agent" },
+            "workspace": format!("/synthetic/project_{}", session_index % 8),
+            "messages": messages,
+            "contextState": context
+        })
+    }
+
+    /// Builds a valid current-format store, then makes its search index look like an imported
+    /// pre-index database so that the next `LocalStore::open` runs the real backfill path.
+    fn build_synthetic_store(session_count: usize, message_count: usize) -> SyntheticStore {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-large-history-{:016x}",
+            rand::random::<u64>()
+        ));
+        let store = LocalStore::open(&directory).unwrap();
+        store
+            .save_setting("preferences", r#"{"model":"synthetic"}"#)
+            .unwrap();
+
+        let public_session_count = session_count.min(MAX_SESSIONS as usize);
+        for session_index in 0..public_session_count {
+            let value = synthetic_session(session_index, message_count);
+            store.save_session(&value).unwrap_or_else(|error| {
+                panic!("failed to seed synthetic session {session_index}: {error:?}")
+            });
+        }
+        // Public saves intentionally cap newly-created history at 500. Large imported databases
+        // can exceed that, so only overflow fixture rows use direct SQL, grouped in one
+        // transaction.
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for session_index in public_session_count..session_count {
+            let value = synthetic_session(session_index, message_count);
+            let (id, title, updated_at, body) = validate_session(&value).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4)",
+                    params![id, title, updated_at, body],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute("DELETE FROM indexed_sessions", [])
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(store);
+        SyntheticStore { directory }
+    }
+
+    fn load_preferences(directory: &Path) -> Result<Value, StorageError> {
+        LocalStore::open(directory)?
+            .setting("preferences")?
+            .map(|text| serde_json::from_str(&text).map_err(StorageError::from))
+            .transpose()
+            .map(|value| value.unwrap_or_else(|| json!({})))
+    }
+
+    #[test]
+    fn synthetic_large_history_helper_builds_a_tiny_store() {
+        let fixture = build_synthetic_store(3, 4);
+        let store = LocalStore::open(&fixture.directory).unwrap();
+        let summaries = store.list_sessions().unwrap();
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(
+            store.load_session("perf_session_0002").unwrap().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            load_preferences(&fixture.directory).unwrap()["model"],
+            "synthetic"
+        );
+    }
+
+    #[test]
+    fn current_database_opens_and_lists_while_another_connection_holds_a_write_lock() {
+        let fixture = build_synthetic_store(3, 2);
+        let database = fixture.directory.join(DATABASE_FILE);
+        let writer = Connection::open(database).unwrap();
+        let indexed_before: i64 = writer
+            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = Instant::now();
+        let store = LocalStore::open(&fixture.directory).unwrap();
+        assert_eq!(store.list_sessions().unwrap().len(), 3);
+        assert_eq!(
+            store.setting("preferences").unwrap().as_deref(),
+            Some(r#"{"model":"synthetic"}"#)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "opening a current database waited for an unrelated writer"
+        );
+        let indexed_while_locked: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed_while_locked, indexed_before);
+
+        writer.execute_batch("COMMIT;").unwrap();
+        drop(store);
+        let reopened = LocalStore::open(&fixture.directory).unwrap();
+        let indexed_after: i64 = reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(indexed_after > indexed_before);
+    }
+
+    #[test]
+    fn version_four_database_without_session_index_upgrades_and_lists_in_order() {
+        let fixture = build_synthetic_store(3, 1);
+        let database = fixture.directory.join(DATABASE_FILE);
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch("DROP INDEX sessions_updated_at; PRAGMA user_version=4;")
+            .unwrap();
+        drop(connection);
+
+        let upgraded = LocalStore::open(&fixture.directory).unwrap();
+        let version: i64 = upgraded
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let has_index: bool = upgraded
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='index' AND name='sessions_updated_at'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ids: Vec<_> = upgraded
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session["id"].as_str().unwrap().to_owned())
+            .collect();
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(has_index);
+        assert_eq!(
+            ids,
+            [
+                "perf_session_0002",
+                "perf_session_0001",
+                "perf_session_0000"
+            ]
+        );
+    }
+
+    /// Reported 800 x 300 baseline. Reproduce at full scale with
+    /// BLACKWALL_PERF_SESSIONS=800 and BLACKWALL_PERF_MESSAGES=300.
+    #[test]
+    fn large_history_concurrent_startup_is_lock_free_and_list_is_bounded() {
+        let session_count = perf_scale("BLACKWALL_PERF_SESSIONS", 12);
+        let message_count = perf_scale("BLACKWALL_PERF_MESSAGES", 8);
+        let list_budget =
+            Duration::from_millis(perf_scale("BLACKWALL_PERF_LIST_BUDGET_MS", 2_000) as u64);
+        let fixture = build_synthetic_store(session_count, message_count);
+        let directory = Arc::new(fixture.directory.clone());
+        let thread_count = 8;
+        let barrier = Arc::new(Barrier::new(thread_count));
+        let workers: Vec<_> = (0..thread_count)
+            .map(|worker| {
+                let directory = Arc::clone(&directory);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let result = if worker % 2 == 0 {
+                        LocalStore::open(&directory)
+                            .and_then(|store| store.list_sessions())
+                            .map(|_| ())
+                    } else {
+                        load_preferences(&directory).map(|_| ())
+                    };
+                    result.map_err(|error| format!("{error:?}"))
+                })
+            })
+            .collect();
+
+        let failures: Vec<_> = workers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(worker, handle)| match handle.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("worker {worker}: {error}")),
+                Err(_) => Some(format!("worker {worker}: panicked")),
+            })
+            .collect();
+        let store = LocalStore::open(&directory).unwrap();
+        let started = Instant::now();
+        let summaries = store.list_sessions().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            failures.is_empty(),
+            "concurrent startup storage calls failed (busy/locked errors reproduce the startup bug): {failures:#?}"
+        );
+        assert_eq!(summaries.len(), session_count.min(MAX_SESSIONS as usize));
+        assert!(
+            elapsed < list_budget,
+            "list_sessions took {elapsed:?} for {session_count} sessions x {message_count} messages; budget is {list_budget:?}"
+        );
+    }
+
     #[test]
     fn stale_pairing_writes_cannot_reverse_committed_removal_or_activation() {
         use crate::pairing::*;
@@ -451,10 +780,10 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
         upgraded
             .connection
-            .pragma_update(None, "user_version", 5)
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(LocalStore::initialize(upgraded.connection).is_err());
     }
