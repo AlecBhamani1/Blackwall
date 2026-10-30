@@ -5,7 +5,10 @@
 # This profile lets only the bundled bwrap do that, following Ubuntu's bwrap-userns-restrict model:
 # bwrap is confined, and every program it starts is stacked with blackwall-bwrap-child, which has
 # no capabilities and cannot create user namespaces or mounts. bwrap sets no_new_privs before it
-# runs the command, so the children stay inside the stack.
+# runs the command, so the children stay inside the stack. Both exec rules are px to the named stack
+# blackwall-bwrap//&blackwall-bwrap-child: if the child profile is missing, the exec fails instead
+# of running with bwrap's profile. (A leading "&" stacks onto the current label, but AppArmor 4.0
+# resolves that only through an ix fallback, which pix would need and px cannot use.)
 #
 # The rules are the smallest set that bubblewrap 0.13.1 needed on Ubuntu 24.04 for the sandbox
 # Blackwall builds (read-only binds, masks, overlays, seccomp, with or without network):
@@ -15,9 +18,11 @@
 #     without a log entry; bwrap works without both.
 #   - files: everything, because sandboxed commands run arbitrary programs. What a command can see
 #     is decided by the mounts bwrap builds, not here.
-#   - unix sockets, sent signals and ptrace reads: only between bwrap and its own children. Any
+#   - unix sockets, sent signals and ptrace reads: only between processes with these labels. Any
 #     process may signal the sandbox (Blackwall's Stop and timeouts). Pathname sockets follow the
-#     file rules.
+#     file rules. The labels are shared by every Blackwall sandbox on the machine, so two sandboxes
+#     running at once with --share-net can reach each other's abstract unix sockets, and without
+#     --unshare-pid they can signal or read each other's processes. Signals still need the same uid.
 #   - no D-Bus, POSIX message queue or io_uring access, and no network family other than IP and
 #     netlink.
 #
@@ -46,7 +51,7 @@ profile blackwall-bwrap /usr/lib/blackwall/bwrap flags=(attach_disconnected) {
   signal (send) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
   ptrace (read, readby) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
 
-  pix /** -> &blackwall-bwrap//&blackwall-bwrap-child,
+  px /** -> blackwall-bwrap//&blackwall-bwrap-child,
 }
 
 profile blackwall-bwrap-child flags=(attach_disconnected) {
@@ -62,5 +67,5 @@ profile blackwall-bwrap-child flags=(attach_disconnected) {
   signal (send) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
   ptrace (read, readby) peer=blackwall-bwrap{,//&blackwall-bwrap-child},
 
-  pix /** -> &blackwall-bwrap-child,
+  px /** -> blackwall-bwrap//&blackwall-bwrap-child,
 }

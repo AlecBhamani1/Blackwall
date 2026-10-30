@@ -15,6 +15,7 @@ test('the Linux packages install bundled bubblewrap at /usr/lib/blackwall/bwrap'
   const { deb, appimage } = linuxConfig().bundle.linux;
   assert.deepEqual(appimage.files, bundled);
   assert.deepEqual(deb.files, { ...bundled, '/usr/share/blackwall/apparmor/blackwall-bwrap': profileSource });
+  assert.deepEqual(deb.depends, ['libcap2']);
 });
 
 test('the bubblewrap build pins the 0.13.1 release, its SHA-256 and a non-SELinux, non-setuid build', () => {
@@ -24,6 +25,18 @@ test('the bubblewrap build pins the 0.13.1 release, its SHA-256 and a non-SELinu
   assert.match(script, /sha256sum --check/);
   assert.match(script, /-Dselinux=disabled/);
   assert.match(script, /test -u/);
+  assert.match(script, /-Db_pie=true/);
+  assert.match(script, /-D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection/);
+  assert.match(script, /-Wl,-z,relro,-z,now/);
+});
+
+test('each release publishes the verified bubblewrap source next to its binaries', () => {
+  for (const workflow of ['release-beta.yml', 'release-main.yml']) {
+    assert.match(read(`.github/workflows/${workflow}`),
+      /\.\/scripts\/build-bwrap\.sh src\/app\/resources\/linux\n\s+.*\n?\s*gh release upload "v\$RELEASE_VERSION" src\/app\/resources\/linux\/bubblewrap-0\.13\.1\.tar\.xz --clobber/);
+  }
+  assert.match(read('scripts/build-bwrap.sh'), /install -m 0644 "\$work\/bubblewrap\.tar\.xz" "\$out_dir\/bubblewrap-0\.13\.1\.tar\.xz"/);
+  assert.match(read('NOTICE'), /source tarball \(bubblewrap-0\.13\.1\.tar\.xz, SHA-256 checked\) is published with each Blackwall release/);
 });
 
 test('NOTICE credits bubblewrap and links its source', () => {
@@ -41,9 +54,19 @@ test('the AppArmor profile grants user namespaces only to the bundled bwrap and 
   assert.match(rules, /^\s*userns,$/m);
   assert.doesNotMatch(profile, /unconfined/);
   // Sandboxed programs run without capabilities and cannot create further user namespaces.
-  const child = rules.slice(rules.indexOf('profile blackwall-bwrap-child'));
+  const start = rules.indexOf('profile blackwall-bwrap-child');
+  const bwrap = rules.slice(0, start);
+  const child = rules.slice(start);
   assert.match(child, /^\s*deny capability,$/m);
   assert.doesNotMatch(child, /userns|mount|pivot_root/);
+  // Programs bwrap runs must enter the capability-free stack; a missing child profile fails the exec.
+  const execRules = text => [...text.matchAll(/^\s*(\S+)\s+\S+\s+->\s+(\S+),$/gm)].map(m => [m[1], m[2]]);
+  // px to the named stack: AppArmor 4.0 resolves a leading-'&' target only through an ix fallback.
+  assert.deepEqual(execRules(bwrap), [['px', 'blackwall-bwrap//&blackwall-bwrap-child']]);
+  assert.deepEqual(execRules(child), [['px', 'blackwall-bwrap//&blackwall-bwrap-child']]);
+  for (const profile of [bwrap, child]) {
+    assert.doesNotMatch(profile, /\b[pc]?[iuU]x\b(?! ->)|\bux\b|\bUx\b|change_profile/);
+  }
 });
 
 test('the .deb installs and removes the AppArmor profile with its maintainer scripts', () => {

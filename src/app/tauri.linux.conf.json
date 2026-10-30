@@ -2,6 +2,7 @@
   "bundle": {
     "linux": {
       "deb": {
+        "depends": ["libcap2"],
         "files": {
           "/usr/lib/blackwall/bwrap": "resources/linux/bwrap",
           "/usr/share/doc/blackwall/bubblewrap/COPYING": "resources/linux/COPYING",

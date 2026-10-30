@@ -2,4 +2,5 @@ Blackwall
 Copyright the Blackwall contributors. Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 This product bundles bubblewrap 0.13.1 (LGPL-2.0-or-later), run as a separate program. Source: https://github.com/containers/bubblewrap/tree/v0.13.1
-The Linux packages include its license text at /usr/share/doc/blackwall/bubblewrap/COPYING.
+The Linux packages include its license text at /usr/share/doc/blackwall/bubblewrap/COPYING, and its
+source tarball (bubblewrap-0.13.1.tar.xz, SHA-256 checked) is published with each Blackwall release.
