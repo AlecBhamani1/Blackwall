@@ -167,6 +167,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Show all slash commands and enabled skills in a scrollable menu above the chat input. Filter
   suggestions as you type, keep keyboard selections visible, and clear the menu when switching chats.
 
+- Open Blackwall on Linux without a system keyring (#52). A new data folder opens, and an access
+  key works for the session only, marked "Not saved: no system keyring". Saving a lock, telemetry
+  header, MCP secret or HTTP tool secret says to start GNOME Keyring or KWallet instead; `bw` shows
+  the same note.
+
+- Keep an app lock enforced when the Linux keyring is unavailable. Turning the lock on leaves an
+  `app-lock-enabled` marker in the data folder; with that marker or saved conversations and no
+  keyring, the app stays locked and asks you to start the keyring and try again. A dismissed or
+  locked keyring prompt is an error with "Try again", not "no keyring".
+
 ### Changed
 
 - Start child programs from a cleaned environment instead of Blackwall's own, which changes
