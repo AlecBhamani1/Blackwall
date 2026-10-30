@@ -8,7 +8,8 @@
 //!   exposure is read-only.
 //! - The project is pinned by a descriptor before the walk, the walk must start at that folder,
 //!   and that descriptor is what gets mounted, so swapping the whole folder (before, during or
-//!   after the walk) is caught. Inside it, the walk goes by path: a process outside the sandbox
+//!   after the walk) is caught. Workspace-write mounts it by path instead, after checking the
+//!   pin once more (see the `bwrap` module). Inside it, the walk goes by path: a process outside the sandbox
 //!   that renames folders within the project while the walk runs (moving a protected name into a
 //!   folder already walked, say) can still leave that name unmasked.
 //! - The walk stops after [`TIME_LIMIT`] and never enters another mounted file system, but a read

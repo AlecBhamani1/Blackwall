@@ -22,18 +22,21 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const MACOS_UNAVAILABLE: &str = "The macOS sandbox backend is unavailable. The command was not run. Choose unsandboxed explicitly only if full account access is intended.";
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const UNSUPPORTED: &str = "Sandboxed commands are not supported on this platform. Choose unsandboxed explicitly to run with full account access.";
-/// Until the next update, Linux runs only the Read-only profile in a sandbox.
-pub const LINUX_WORKSPACE_WRITE_LATER: &str =
-    "Workspace-write on Linux arrives in the next update. Choose Read-only or Unsandboxed.";
+/// Said when Workspace-write is chosen where it can't run and there is no more specific note.
+pub const WORKSPACE_WRITE_UNAVAILABLE: &str =
+    "Workspace-write can't run on this computer. Choose Read-only or Unsandboxed.";
 
 /// Whether the owner's sandboxed profiles can run on this machine, for the profile selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxStatus {
+    /// Whether Read-only commands can run in the sandbox.
     pub available: bool,
-    /// Why sandboxed commands can't run here, when they can't.
+    /// Why a sandboxed profile can't run here: why none can, or else why Workspace-write can't.
+    /// `None` when both can.
     pub note: Option<&'static str>,
-    /// Whether Workspace-write can run here too. Not yet on Linux.
+    /// Whether Workspace-write can run here too. On Linux that takes a working overlay, which
+    /// the probe checks separately.
     pub workspace_write: bool,
 }
 
@@ -56,8 +59,14 @@ pub fn selector_status(data_directory: &Path) -> Option<SandboxStatus> {
 fn linux_status(availability: &linux::Availability) -> SandboxStatus {
     SandboxStatus {
         available: matches!(availability, linux::Availability::Available { .. }),
-        note: availability.note(),
-        workspace_write: false,
+        note: availability.workspace_write_note(),
+        workspace_write: matches!(
+            availability,
+            linux::Availability::Available {
+                workspace_write: true,
+                ..
+            }
+        ),
     }
 }
 
@@ -116,11 +125,14 @@ impl ExecutionPolicy {
 /// (`<data>/staging/<run-id>`, holding the seccomp filter and the bubblewrap arguments) on Linux,
 /// nothing elsewhere. [`RunGuard::finish`] removes it, and so does dropping the guard, so a
 /// cancelled command cleans up too. On Linux it also holds the checked project's descriptor
-/// until [`RunGuard::spawn`] hands it to bubblewrap.
+/// until [`RunGuard::spawn`] hands it to bubblewrap (Read-only), or a Workspace-write run's
+/// staging (see [`Staged`]).
 pub(crate) struct RunGuard {
     run: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     project: Option<std::os::fd::OwnedFd>,
+    #[cfg(target_os = "linux")]
+    staged: Option<Staged>,
 }
 impl RunGuard {
     fn empty() -> Self {
@@ -128,27 +140,43 @@ impl RunGuard {
             run: None,
             #[cfg(target_os = "linux")]
             project: None,
+            #[cfg(target_os = "linux")]
+            staged: None,
         }
     }
     /// Start the command [`prepare`] returned. Unix only: Windows starts commands its own way. A Linux sandbox gets the project descriptor its
-    /// arguments name, which is closed here once bubblewrap has started.
+    /// arguments name, which is closed here once bubblewrap has started. A Linux Workspace-write
+    /// sandbox gets no descriptor; its project must still be the pinned folder, checked here by
+    /// path just before bubblewrap opens it (see the `bwrap` module for what that leaves).
     #[cfg(unix)]
     pub(crate) fn spawn(
         &mut self,
         process: &mut tokio::process::Command,
     ) -> std::io::Result<tokio::process::Child> {
         #[cfg(target_os = "linux")]
+        if let Some(staged) = &self.staged {
+            if !linux::still_pinned(&staged.project, staged.pinned) {
+                return Err(std::io::Error::other(PROJECT_CHANGED));
+            }
+            return process.spawn();
+        }
+        #[cfg(target_os = "linux")]
         if let Some(project) = self.project.take() {
             return linux::spawn_with(project, || process.spawn());
         }
         process.spawn()
     }
-    /// Remove the run folder and hand back the command's outcome.
+    /// Remove the run folder and hand back the command's outcome. For a Linux Workspace-write
+    /// command, first apply its staged changes or keep them (see [`Staged::finish`]).
     pub(crate) async fn finish(
         mut self,
         outcome: Result<String, ToolError>,
     ) -> Result<String, ToolError> {
         self.remove();
+        #[cfg(target_os = "linux")]
+        if let Some(staged) = self.staged.take() {
+            return staged.finish(outcome).await;
+        }
         outcome
     }
     fn remove(&mut self) {
@@ -158,20 +186,116 @@ impl RunGuard {
     }
 }
 impl Drop for RunGuard {
+    /// A cancelled command: its run folder goes, and a Workspace-write run's staging is kept
+    /// unapplied (dropping it lets go of its locks).
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+/// A Linux Workspace-write run: its staging folder, what the apply step needs, and the locks
+/// held until that step and its cleanup are over.
+#[cfg(target_os = "linux")]
+struct Staged {
+    staging: staging::Staging,
+    project: PathBuf,
+    /// The project's device and inode, pinned before the start walk, which started there.
+    pinned: (u64, u64),
+    /// Keeps the pinned folder open, so its inode can't be freed and reused while the run lasts.
+    /// It is close-on-exec and never handed to bubblewrap.
+    _pin: std::os::fd::OwnedFd,
+    /// The project's Workspace-write lock (`staging::lock_project`).
+    _lock: std::fs::File,
+    /// Read before the start walk: what changed after it is the owner's, not the command's.
+    run_started: std::time::SystemTime,
+    instruction_files: Vec<String>,
+}
+/// Whether a finished Workspace-write run's staging folder is still there.
+#[cfg(target_os = "linux")]
+enum Kept {
+    No,
+    /// Something was refused, conflicted or held back: the owner may want the command's version.
+    Yes,
+    /// Nothing needed keeping, but removing it failed part way.
+    CleanupFailed,
+}
+#[cfg(target_os = "linux")]
+impl Staged {
+    /// Apply the staged changes, only for a command that ran to its end (`tools::completed`): the
+    /// sandbox was reaped by then, and it was its PID namespace's init, so nothing in it is left
+    /// to write. Then append the report to the output, success or failure alike. The staging
+    /// folder is removed only when the report has nothing refused, conflicted or held back and
+    /// the removal works; otherwise (a panic in the apply step included) it is kept for
+    /// `staging::KEEP_FOR` and the output says where. A command that didn't finish (time limit,
+    /// output limit, signal, failure to start) gets nothing applied and its staging kept.
+    async fn finish(self, outcome: Result<String, ToolError>) -> Result<String, ToolError> {
+        let folder = self.staging.root.display().to_string();
+        let kept = format!("Your command's versions are kept for 24 hours in {folder}.");
+        if !crate::tools::completed(&outcome) {
+            // Dropping `self` lets go of the locks and leaves the folder to the sweep.
+            return with_note(
+                outcome,
+                &format!(
+                    "The command didn't finish, so Blackwall applied none of its changes. {kept}"
+                ),
+            );
+        }
+        let note = match tokio::task::spawn_blocking(move || self.settle()).await {
+            Ok((report, Kept::No)) => report.to_string(),
+            Ok((report, Kept::Yes)) => format!("{report}\n{kept}"),
+            Ok((report, Kept::CleanupFailed)) => format!(
+                "{report}\nBlackwall couldn't remove its staging folder {folder}; it is removed after 24 hours."
+            ),
+            Err(_) => format!(
+                "Blackwall stopped while applying the command's changes, so some may not have been applied. {kept}"
+            ),
+        };
+        with_note(outcome, &note)
+    }
+    /// Blocking. The locks are let go when this returns, after the cleanup.
+    fn settle(self) -> (apply::Report, Kept) {
+        let report = apply::apply(
+            &self.staging.upper,
+            &self.project,
+            self.pinned,
+            &self.staging.start,
+            self.run_started,
+            &self.instruction_files,
+        );
+        let clean = report.refused.is_empty()
+            && report.conflicted.is_empty()
+            && report.held_back.is_empty();
+        if !clean {
+            return (report, Kept::Yes);
+        }
+        match staging::remove_tree(&self.staging.root, self.staging.id) {
+            Ok(()) => (report, Kept::No),
+            Err(_) => (report, Kept::CleanupFailed),
+        }
+    }
+}
+/// `outcome` with `note` after a blank line. Only text outcomes can carry it.
+#[cfg(target_os = "linux")]
+fn with_note(outcome: Result<String, ToolError>, note: &str) -> Result<String, ToolError> {
+    match outcome {
+        Ok(text) => Ok(format!("{text}\n\n{note}")),
+        Err(ToolError::Execution(text)) => Err(ToolError::Execution(format!("{text}\n\n{note}"))),
+        other => other,
     }
 }
 
 /// Prepare `process` for the owner's execution profile and give it its environment: the minimal
 /// sandbox one, or, when unsandboxed, the one for `unsandboxed` (the shell's own, or the owner
 /// one plus the `pass_through` variables). Spawn the result from the async runtime with the guard's
-/// [`RunGuard::spawn`], and pass its outcome through the guard's `finish`.
+/// [`RunGuard::spawn`], and pass its outcome through the guard's `finish`. `timeout` is the
+/// command's time limit, which also bounds the wait for another Workspace-write command in the
+/// same project (Linux).
 pub(crate) async fn prepare(
     workspace: &Workspace,
     process: tokio::process::Command,
     unsandboxed: crate::child_env::Scope,
     pass_through: &[String],
+    timeout: std::time::Duration,
 ) -> Result<(tokio::process::Command, RunGuard), ToolError> {
     #[cfg(target_os = "linux")]
     {
@@ -181,10 +305,19 @@ pub(crate) async fn prepare(
         } else {
             find_availability(workspace).await?
         };
-        prepare_with(workspace, process, unsandboxed, pass_through, availability).await
+        prepare_with(
+            workspace,
+            process,
+            unsandboxed,
+            pass_through,
+            availability,
+            timeout,
+        )
+        .await
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = timeout;
         #[cfg(target_os = "macos")]
         let backend = Path::new(SANDBOX_EXEC);
         #[cfg(not(target_os = "macos"))]
@@ -212,7 +345,9 @@ pub(crate) async fn ready(workspace: &Workspace) -> Result<(), ToolError> {
     }
 }
 /// [`ready_with`], then the project's location (not its contents, so it is quick): a project that
-/// is the home folder, or holds Blackwall's data, fails before the prompt rather than after it.
+/// is the home folder, or holds Blackwall's data, fails before the prompt rather than after it,
+/// and so does a Workspace-write project in a place it can't be staged from
+/// (`linux::check_workspace_write_location`).
 #[cfg(target_os = "linux")]
 async fn ready_for(
     workspace: &Workspace,
@@ -222,13 +357,27 @@ async fn ready_for(
     let project = workspace.path.clone();
     let data = workspace.execution.data_directory.clone();
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    let staged = match availability {
+        linux::Availability::Available { bwrap, .. }
+            if workspace.execution.profile == ExecutionProfile::WorkspaceWrite =>
+        {
+            Some(bwrap.clone())
+        }
+        _ => None,
+    };
     tokio::task::spawn_blocking(move || {
-        walk::check_location(&project, home.as_deref(), data.as_deref())
+        walk::check_location(&project, home.as_deref(), data.as_deref())?;
+        if let Some(bwrap) = staged {
+            let data = data.ok_or_else(|| ToolError::Execution(NO_DATA_FOLDER.into()))?;
+            let appdir = linux::current_appdir();
+            linux::check_workspace_write_location(&project, &data, &bwrap, appdir.as_deref())?;
+        }
+        Ok(())
     })
     .await
     .map_err(|_| ToolError::Execution(PREPARE_FAILED.into()))?
 }
-/// Bubblewrap is there and the profile is one Linux can sandbox.
+/// Bubblewrap is there, and for Workspace-write its overlay works too.
 #[cfg(target_os = "linux")]
 fn ready_with(workspace: &Workspace, availability: &linux::Availability) -> Result<(), ToolError> {
     if !matches!(availability, linux::Availability::Available { .. }) {
@@ -236,7 +385,9 @@ fn ready_with(workspace: &Workspace, availability: &linux::Availability) -> Resu
         return Err(ToolError::Execution(note.into()));
     }
     if workspace.execution.profile == ExecutionProfile::WorkspaceWrite {
-        return Err(ToolError::Execution(LINUX_WORKSPACE_WRITE_LATER.into()));
+        if let Some(note) = availability.workspace_write_note() {
+            return Err(ToolError::Execution(note.into()));
+        }
     }
     Ok(())
 }
@@ -267,8 +418,15 @@ const WHOLE_COMPUTER: &str = "Blackwall won't sandbox the whole computer. Choose
 const PROJECT_CHANGED: &str =
     "The project folder changed while Blackwall was checking it. The command was not run.";
 
-/// [`prepare`] with `availability` given, rather than found. Linux only: Read-only runs under
-/// bubblewrap, and anything that can't be checked or set up fails closed without running.
+/// [`prepare`] with `availability` given, rather than found. Linux only: Read-only and
+/// Workspace-write run under bubblewrap, and anything that can't be checked or set up fails closed
+/// without running.
+///
+/// Workspace-write also, in this order: checks where the project is
+/// (`linux::check_workspace_write_location`), pins it, takes its lock (waiting up to `timeout`),
+/// reads `run_started`, walks it recording every file's fingerprint, and makes its staging folder
+/// (holding its lease). The project is mounted as an overlay whose writes land in that folder;
+/// [`RunGuard::finish`] applies them.
 #[cfg(target_os = "linux")]
 pub(crate) async fn prepare_with(
     workspace: &Workspace,
@@ -276,6 +434,7 @@ pub(crate) async fn prepare_with(
     unsandboxed: crate::child_env::Scope,
     pass_through: &[String],
     availability: &linux::Availability,
+    timeout: std::time::Duration,
 ) -> Result<(tokio::process::Command, RunGuard), ToolError> {
     use crate::child_env::{from_process, Scope};
     let execution = &workspace.execution;
@@ -300,42 +459,72 @@ pub(crate) async fn prepare_with(
     let seccomp =
         seccomp::program().ok_or_else(|| ToolError::Execution(linux::LINUX_UNAVAILABLE.into()))?;
     let (project, network) = (workspace.path.clone(), execution.network);
+    let staged = execution.profile == ExecutionProfile::WorkspaceWrite;
+    let instruction_files = workspace.instruction_files.clone();
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    let checked_bwrap = bwrap.clone();
     // Everything that reads or writes files runs off the async workers. The command itself is
     // spawned later by the caller, from the runtime: bubblewrap's --die-with-parent follows the
     // thread that starts it, and a blocking-pool thread can exit while the command still runs.
     let (guard, run) = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
         walk::check_location(&project, home.as_deref(), Some(&data))?;
-        // Pin the folder first, then walk it: the walk must start at the pinned folder, which is
-        // what gets mounted (by descriptor), so the path can't be swapped during or after it.
+        let failed = |_| ToolError::Execution(PREPARE_FAILED.into());
         let changed = || ToolError::Execution(PROJECT_CHANGED.into());
-        let (project_fd, pinned) = linux::pin_project(&project).ok_or_else(changed)?;
-        let found = walk::walk(&project, walk::MAX_ENTRIES)?;
+        if !staged {
+            // Pin the folder first, then walk it: the walk must start at the pinned folder, which
+            // is what gets mounted (by descriptor), so the path can't be swapped during or after it.
+            let (project_fd, pinned) = linux::pin_project(&project).ok_or_else(changed)?;
+            let found = walk::walk(&project, walk::MAX_ENTRIES)?;
+            if found.root != pinned {
+                return Err(changed());
+            }
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&project_fd);
+            let args = mount_args(&project, fd, None, network, &found.masks)?;
+            let run = linux::run_directory(&data).map_err(failed)?;
+            // From here on, dropping the guard removes the folder, even on an early return.
+            let guard = RunGuard {
+                run: Some(run.clone()),
+                project: Some(project_fd),
+                staged: None,
+            };
+            write_run_files(&run, &seccomp, &args)?;
+            return Ok((guard, run));
+        }
+        // The staging folder's path is shown to the owner, so it is built from the canonical one.
+        let data = std::fs::canonicalize(&data).map_err(failed)?;
+        let appdir = linux::current_appdir();
+        linux::check_workspace_write_location(&project, &data, &checked_bwrap, appdir.as_deref())?;
+        let (pin, pinned) = linux::pin_project(&project).ok_or_else(changed)?;
+        if linux::on_overlayfs(&pin) {
+            return Err(ToolError::Execution(linux::PROJECT_ON_OVERLAY.into()));
+        }
+        let lock = staging::lock_project(&data, pinned, timeout)?;
+        let run_started = std::time::SystemTime::now();
+        let found = walk::walk_with_files(&project, walk::MAX_ENTRIES)?;
         if found.root != pinned {
             return Err(changed());
         }
-        let roots = bwrap::host_roots();
-        let plan = bwrap::MountPlan {
-            project: &project,
-            project_fd: std::os::fd::AsRawFd::as_raw_fd(&project_fd),
-            network,
-            system_masks: bwrap::host_system_masks(&roots),
-            roots,
-            etc: bwrap::host_etc(),
-            masks: &found.masks,
+        let staging = staging::create(&data, found.files)?;
+        let overlay = bwrap::Overlay {
+            upper: &staging.upper,
+            work: &staging.work,
         };
-        let failed = |_| ToolError::Execution(PREPARE_FAILED.into());
-        let args = bwrap::args_file(&bwrap::args(&plan))
-            .ok_or_else(|| ToolError::Execution(PREPARE_FAILED.into()))?;
+        let args = mount_args(&project, -1, Some(overlay), network, &found.masks)?;
         let run = linux::run_directory(&data).map_err(failed)?;
-        // From here on, dropping the guard removes the folder, even on an early return.
         let guard = RunGuard {
             run: Some(run.clone()),
-            project: Some(project_fd),
+            project: None,
+            staged: Some(Staged {
+                staging,
+                project: project.clone(),
+                pinned,
+                _pin: pin,
+                _lock: lock,
+                run_started,
+                instruction_files,
+            }),
         };
-        linux::write_private(&run.join("seccomp.bpf"), &seccomp::to_bytes(&seccomp))
-            .map_err(failed)?;
-        linux::write_private(&run.join("args"), &args).map_err(failed)?;
+        write_run_files(&run, &seccomp, &args)?;
         Ok((guard, run))
     })
     .await
@@ -343,11 +532,12 @@ pub(crate) async fn prepare_with(
     let original = process.as_std();
     let program_args: Vec<std::ffi::OsString> =
         original.get_args().map(ToOwned::to_owned).collect();
-    let project_fd = guard
-        .project
-        .as_ref()
-        .map(std::os::fd::AsRawFd::as_raw_fd)
-        .ok_or_else(|| ToolError::Execution(PREPARE_FAILED.into()))?;
+    // Read-only hands bubblewrap the project's descriptor; Workspace-write hands it none.
+    let project_fd = match (&guard.staged, &guard.project) {
+        (Some(_), _) => None,
+        (None, Some(fd)) => Some(std::os::fd::AsRawFd::as_raw_fd(fd)),
+        (None, None) => return Err(ToolError::Execution(PREPARE_FAILED.into())),
+    };
     let mut launcher = bwrap::launcher(
         &bwrap,
         &run.join("seccomp.bpf"),
@@ -361,6 +551,46 @@ pub(crate) async fn prepare_with(
     // Owner pass-through names are not honoured inside the sandbox.
     from_process(Scope::Sandboxed, &workspace.path, &[]).apply(&mut launcher);
     Ok((launcher, guard))
+}
+
+/// The `--args` file for a command in `project`: Read-only from `project_fd`, or
+/// Workspace-write through `overlay`.
+#[cfg(target_os = "linux")]
+fn mount_args(
+    project: &Path,
+    project_fd: std::os::fd::RawFd,
+    overlay: Option<bwrap::Overlay>,
+    network: bool,
+    masks: &[walk::Mask],
+) -> Result<Vec<u8>, ToolError> {
+    let roots = bwrap::host_roots();
+    let plan = bwrap::MountPlan {
+        project,
+        project_fd,
+        profile: if overlay.is_some() {
+            ExecutionProfile::WorkspaceWrite
+        } else {
+            ExecutionProfile::ReadOnly
+        },
+        overlay,
+        network,
+        system_masks: bwrap::host_system_masks(&roots),
+        roots,
+        etc: bwrap::host_etc(),
+        masks,
+    };
+    bwrap::args_file(&bwrap::args(&plan)).ok_or_else(|| ToolError::Execution(PREPARE_FAILED.into()))
+}
+/// The seccomp filter and the bubblewrap arguments, private, in the run folder.
+#[cfg(target_os = "linux")]
+fn write_run_files(
+    run: &Path,
+    seccomp: &[libc::sock_filter],
+    args: &[u8],
+) -> Result<(), ToolError> {
+    let failed = |_| ToolError::Execution(PREPARE_FAILED.into());
+    linux::write_private(&run.join("seccomp.bpf"), &seccomp::to_bytes(seccomp)).map_err(failed)?;
+    linux::write_private(&run.join("args"), args).map_err(failed)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -546,7 +776,8 @@ mod tests {
             &workspace,
             tokio::process::Command::new("unused"),
             owner,
-            &[]
+            &[],
+            std::time::Duration::from_secs(10),
         )
         .await
         .is_err());
@@ -555,7 +786,8 @@ mod tests {
             &workspace,
             tokio::process::Command::new("unused"),
             owner,
-            &[]
+            &[],
+            std::time::Duration::from_secs(10),
         )
         .await
         .is_ok());
@@ -601,6 +833,23 @@ mod tests {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, text).unwrap();
             }
+            /// The Workspace-write staging folders left under `<data>/staging`.
+            fn staged_left(&self) -> Vec<PathBuf> {
+                std::fs::read_dir(self.data().join("staging"))
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                            .filter(|e| {
+                                let name = e.file_name();
+                                let name = name.to_string_lossy();
+                                name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                            .map(|e| e.path())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             /// The run folders left under `<data>/staging`.
             fn runs_left(&self) -> Vec<String> {
                 std::fs::read_dir(self.data().join("staging"))
@@ -627,6 +876,7 @@ mod tests {
                     crate::child_env::Scope::Shell,
                     &[],
                     availability,
+                    timeout,
                 )
                 .await?;
                 let outcome = crate::tools::run_with_input(
@@ -671,14 +921,15 @@ mod tests {
                 assert_eq!(error.to_string(), note);
                 assert!(!ran.exists());
             }
-            // Even with bubblewrap, Workspace-write isn't on Linux yet, and nothing starts.
+            // With bubblewrap but no overlay, Workspace-write doesn't start, with its own note.
             let fake = Availability::Available {
                 bwrap: "/no/such/bwrap".into(),
                 version: (0, 13, 1),
+                workspace_write: false,
             };
             project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
             let error = project.run("printf x > ran", &fake).await.unwrap_err();
-            assert_eq!(error.to_string(), LINUX_WORKSPACE_WRITE_LATER);
+            assert_eq!(error.to_string(), crate::sandbox::linux::LINUX_NO_OVERLAY);
             // Data inside the project, and the whole file system as the project, are refused.
             project.workspace.execution.profile = ExecutionProfile::ReadOnly;
             project.workspace.execution.data_directory = Some(project.workspace.path.join(".d"));
@@ -714,6 +965,7 @@ mod tests {
             let fake = Availability::Available {
                 bwrap: "/bin/true".into(),
                 version: (0, 13, 1),
+                workspace_write: true,
             };
             let mut process = tokio::process::Command::new("/bin/sh");
             process.args(["-c", "printf x > ran"]).env("LEAK", "1");
@@ -723,6 +975,7 @@ mod tests {
                 crate::child_env::Scope::Shell,
                 &[],
                 &fake,
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -798,6 +1051,7 @@ mod tests {
                 crate::child_env::Scope::Shell,
                 &[],
                 &fake,
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -839,14 +1093,33 @@ mod tests {
             };
             let tool: crate::command_tools::CommandTool = serde_json::from_value(serde_json::json!({"name":"touch_probe", "description":"Linux fixture", "command":["/usr/bin/touch", "ran"]})).unwrap();
             project.workspace.execution.command_tools = Isolation::Sandboxed;
-            // Whatever this host has: no data folder to stage in, and Workspace-write (not on
-            // Linux yet, or no bubblewrap at all) both stop the command before the prompt.
+            // Whatever this host has: no data folder to stage in stops the command before the
+            // prompt, and so does Workspace-write where its overlay (or bubblewrap) doesn't work.
             let no_data = project.workspace.execution.clone();
             project.workspace.execution.data_directory = None;
             let mut cases = vec![project.workspace.execution.clone()];
             project.workspace.execution = no_data;
+            let data = project.data();
+            let here = tokio::task::spawn_blocking(move || super::linux::availability(&data))
+                .await
+                .unwrap();
             project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
-            cases.push(project.workspace.execution.clone());
+            if here.workspace_write_note().is_some() {
+                cases.push(project.workspace.execution.clone());
+            }
+            let no_overlay = Availability::Available {
+                bwrap: "/no/such/bwrap".into(),
+                version: (0, 13, 1),
+                workspace_write: false,
+            };
+            assert_eq!(
+                ready_with(&project.workspace, &no_overlay)
+                    .unwrap_err()
+                    .to_string(),
+                super::linux::LINUX_NO_OVERLAY
+            );
+            project.workspace.execution.profile = ExecutionProfile::ReadOnly;
+            assert!(ready_with(&project.workspace, &no_overlay).is_ok());
             for execution in cases {
                 project.workspace.execution = execution;
                 let timeout = Duration::from_secs(5);
@@ -892,6 +1165,7 @@ mod tests {
             let works = Availability::Available {
                 bwrap: "/no/such/bwrap".into(),
                 version: (0, 13, 1),
+                workspace_write: true,
             };
             assert_eq!(
                 ready_for(&at_home, &works).await.unwrap_err().to_string(),
@@ -918,16 +1192,26 @@ mod tests {
         }
 
         #[test]
-        fn status_reports_the_note_and_no_workspace_write_on_linux() {
-            let available = Availability::Available {
+        fn status_reports_read_only_and_workspace_write_separately() {
+            let available = |workspace_write| Availability::Available {
                 bwrap: "/usr/lib/blackwall/bwrap".into(),
                 version: (0, 13, 1),
+                workspace_write,
             };
             assert_eq!(
-                linux_status(&available),
+                linux_status(&available(true)),
                 SandboxStatus {
                     available: true,
                     note: None,
+                    workspace_write: true
+                }
+            );
+            // No overlay: Read-only still available, Workspace-write not, with its note.
+            assert_eq!(
+                linux_status(&available(false)),
+                SandboxStatus {
+                    available: true,
+                    note: Some(super::linux::LINUX_NO_OVERLAY),
                     workspace_write: false
                 }
             );
@@ -951,6 +1235,257 @@ mod tests {
             );
         }
 
+        /// Workspace-write with `/bin/true` as bubblewrap: nothing runs, so a test plays the sandbox
+        /// by writing into the staging folder's `upper` itself.
+        fn fake_staging() -> Availability {
+            Availability::Available {
+                bwrap: "/bin/true".into(),
+                version: (0, 13, 1),
+                workspace_write: true,
+            }
+        }
+        async fn prepare_staged(
+            project: &Project,
+            timeout: Duration,
+        ) -> Result<(tokio::process::Command, RunGuard), ToolError> {
+            let mut process = tokio::process::Command::new("/bin/sh");
+            process.args(["-c", "true"]);
+            prepare_with(
+                &project.workspace,
+                process,
+                crate::child_env::Scope::Shell,
+                &[],
+                &fake_staging(),
+                timeout,
+            )
+            .await
+        }
+        /// A Workspace-write project for the fake tests, or `None` where this host can't stage one
+        /// (temp on an overlay, as in a container): then the refusal is checked instead.
+        async fn staged_project() -> Option<Project> {
+            let mut project = Project::new();
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let folder = super::linux::open_directory(&project.workspace.path).unwrap();
+            if super::linux::on_overlayfs(&folder) {
+                let error = prepare_staged(&project, Duration::from_secs(1)).await;
+                assert_eq!(
+                    error.err().map(|e| e.to_string()).as_deref(),
+                    Some(super::linux::PROJECT_ON_OVERLAY)
+                );
+                return None;
+            }
+            Some(project)
+        }
+
+        #[tokio::test]
+        async fn workspace_write_stages_an_overlay_and_finish_applies_its_changes() {
+            let Some(project) = staged_project().await else {
+                return;
+            };
+            project.file("kept.txt", "old");
+            project.file(".git/HEAD", "ref");
+            let (launcher, guard) = prepare_staged(&project, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let argv: Vec<String> = launcher
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // No descriptor for the real project reaches bubblewrap, so none reaches the command.
+            assert_eq!(argv[5], "none");
+            assert!(guard.project.is_none());
+            let staged = guard.staged.as_ref().unwrap();
+            let staging = &staged.staging;
+            let data = std::fs::canonicalize(project.data()).unwrap();
+            assert_eq!(staging.root.parent(), Some(data.join("staging").as_path()));
+            for dir in [&staging.root, &staging.upper, &staging.work] {
+                assert_eq!(
+                    std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            assert!(staging.start.contains_key(Path::new("kept.txt")));
+            assert!(!staging.start.contains_key(Path::new(".git/HEAD")));
+            let args = std::fs::read(&argv[4]).unwrap();
+            let path = project.workspace.path.display();
+            let has = |needle: String| args.windows(needle.len()).any(|w| w == needle.as_bytes());
+            assert!(has(format!(
+                "--overlay-src\0{path}\0--overlay\0{}\0{}\0{path}\0",
+                staging.upper.display(),
+                staging.work.display()
+            )));
+            assert!(has("--as-pid-1\0".into()));
+            assert!(has(format!("--tmpfs\0{path}/.git\0--remount-ro\0/\0")));
+            assert!(!has("--ro-bind-fd".into()));
+            // While it runs, another Workspace-write command in the project waits, then gives up.
+            assert_eq!(
+                prepare_staged(&project, Duration::from_millis(100))
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+                    .as_deref(),
+                Some(super::staging::PROJECT_BUSY)
+            );
+            // The command's writes, as the overlay stages them.
+            std::fs::write(staging.upper.join("new.txt"), "new").unwrap();
+            std::fs::write(staging.upper.join("kept.txt"), "changed").unwrap();
+            let root = staging.root.clone();
+            let out = guard.finish(Ok("Exit: 0\n".into())).await.unwrap();
+            assert_eq!(
+                out,
+                "Exit: 0\n\n\nWorkspace changes: 2 applied, 0 deleted, 0 refused, 0 conflicted\nApplied:\n  kept.txt\n  new.txt"
+            );
+            let read = |name: &str| std::fs::read_to_string(project.workspace.path.join(name));
+            assert_eq!(read("kept.txt").unwrap(), "changed");
+            assert_eq!(read("new.txt").unwrap(), "new");
+            // Nothing needed keeping: the staging folder is gone, and the project is free again.
+            assert!(!root.exists());
+            assert!(project.staged_left().is_empty());
+            assert!(project.runs_left().is_empty());
+            let (_, again) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            // A failed command's changes are applied too: it ran to its end.
+            let staging = &again.staged.as_ref().unwrap().staging;
+            std::fs::write(staging.upper.join("after-failure.txt"), "x").unwrap();
+            let error = again
+                .finish(Err(ToolError::Execution("Exit: 2\nboom".into())))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("Exit: 2\nboom\n\nWorkspace changes: 1 applied"),
+                "{error}"
+            );
+            assert!(read("after-failure.txt").is_ok());
+        }
+
+        #[tokio::test]
+        async fn workspace_write_keeps_what_it_did_not_apply_and_applies_nothing_unfinished() {
+            let Some(mut project) = staged_project().await else {
+                return;
+            };
+            project.workspace.instruction_files = vec!["docs/GUIDE.md".into()];
+            let kept_note = |root: &Path| {
+                format!(
+                    "Your command's versions are kept for 24 hours in {}.",
+                    root.display()
+                )
+            };
+            // A protected name and the owner's extra instruction file are refused, so the
+            // command's versions stay, and the output says where.
+            let (_, guard) = prepare_staged(&project, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let staging = &guard.staged.as_ref().unwrap().staging;
+            std::fs::create_dir_all(staging.upper.join(".ssh")).unwrap();
+            std::fs::create_dir_all(staging.upper.join("docs")).unwrap();
+            std::fs::write(staging.upper.join("docs/GUIDE.md"), "obey").unwrap();
+            std::fs::write(staging.upper.join("fine.txt"), "fine").unwrap();
+            let root = staging.root.clone();
+            let out = guard.finish(Ok("Exit: 0\n".into())).await.unwrap();
+            assert!(out.contains(", 2 refused, 0 conflicted"), "{out}");
+            assert!(
+                out.contains("docs/GUIDE.md (an agent instruction file)"),
+                "{out}"
+            );
+            assert!(out.ends_with(&kept_note(&root)), "{out}");
+            assert!(root.join("upper/docs/GUIDE.md").exists());
+            assert!(!project.workspace.path.join("docs/GUIDE.md").exists());
+            assert!(!project.workspace.path.join(".ssh").exists());
+            assert!(project.workspace.path.join("fine.txt").exists());
+            // Not finished: the time limit, the output limit, a signal, a failure to start.
+            for unfinished in [
+                crate::tools::TIME_LIMIT_MESSAGE,
+                "Exit: stopped\nThe command was stopped after 64 MiB of output.",
+                "Exit: signal\n",
+                "The command could not start.",
+            ] {
+                let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+                let staging = &guard.staged.as_ref().unwrap().staging;
+                std::fs::write(staging.upper.join("unfinished.txt"), "x").unwrap();
+                let root = staging.root.clone();
+                let error = guard
+                    .finish(Err(ToolError::Execution(unfinished.into())))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    error,
+                    format!(
+                        "{unfinished}\n\nThe command didn't finish, so Blackwall applied none of its changes. {}",
+                        kept_note(&root)
+                    )
+                );
+                assert!(root.join("upper/unfinished.txt").exists());
+                assert!(!project.workspace.path.join("unfinished.txt").exists());
+            }
+            // Another kind of error passes through as it is, and nothing is applied either.
+            let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let root = guard.staged.as_ref().unwrap().staging.root.clone();
+            std::fs::write(root.join("upper/other.txt"), "x").unwrap();
+            assert!(matches!(
+                guard.finish(Err(ToolError::File)).await,
+                Err(ToolError::File)
+            ));
+            assert!(root.exists() && !project.workspace.path.join("other.txt").exists());
+            // Cancelled (the guard dropped without finishing): kept, and the lock is let go.
+            let (_, guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            let root = guard.staged.as_ref().unwrap().staging.root.clone();
+            drop(guard);
+            assert!(root.exists());
+            let (mut launcher, mut guard) = prepare_staged(&project, Duration::ZERO).await.unwrap();
+            // The project swapped for another folder before bubblewrap starts: it doesn't start.
+            let path = project.workspace.path.clone();
+            std::fs::rename(&path, project.root.join("moved")).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let spawned = guard.spawn(&mut launcher);
+            assert_eq!(
+                spawned.err().map(|e| e.to_string()).as_deref(),
+                Some(PROJECT_CHANGED)
+            );
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(project.root.join("moved"), &path).unwrap();
+            let started = guard.spawn(&mut launcher).unwrap().wait().await.unwrap();
+            assert!(started.success());
+            drop(guard);
+            assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        async fn workspace_write_refuses_a_project_it_cannot_stage_before_the_prompt() {
+            let project = Project::new();
+            // A project inside the data folder: refused for Workspace-write, before and at the
+            // start; Read-only is not affected.
+            let inside = project.data().join("work");
+            std::fs::create_dir_all(&inside).unwrap();
+            let mut workspace = Workspace::open(&inside).unwrap();
+            workspace.execution = project.workspace.execution.clone();
+            workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let message = "This project folder is inside Blackwall's data folder. Choose a project folder outside it for Workspace-write.";
+            assert_eq!(
+                ready_for(&workspace, &fake_staging())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+            let error = prepare_with(
+                &workspace,
+                tokio::process::Command::new("/bin/true"),
+                crate::child_env::Scope::Shell,
+                &[],
+                &fake_staging(),
+                Duration::from_secs(1),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(error.as_deref(), Some(message));
+            workspace.execution.profile = ExecutionProfile::ReadOnly;
+            assert!(ready_for(&workspace, &fake_staging()).await.is_ok());
+            assert!(project.staged_left().is_empty());
+        }
+
         // ---- with the real bubblewrap -------------------------------------------------------
 
         fn test_bwrap() -> Availability {
@@ -959,6 +1494,7 @@ mod tests {
             Availability::Available {
                 bwrap: std::fs::canonicalize(bwrap).unwrap(),
                 version: (0, 13, 1),
+                workspace_write: true,
             }
         }
 
@@ -996,6 +1532,7 @@ mod tests {
                 crate::child_env::Scope::Shell,
                 &[],
                 &bw,
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -1329,6 +1866,134 @@ else:
                 .is_err());
             assert!(!project.workspace.path.join("tool-write").exists());
             assert!(project.runs_left().is_empty());
+        }
+
+        /// Every name under `dir`, recursively, relative to it.
+        fn tree(dir: &Path) -> Vec<String> {
+            let mut names = Vec::new();
+            let mut pending = vec![dir.to_path_buf()];
+            while let Some(next) = pending.pop() {
+                for entry in std::fs::read_dir(&next).unwrap().flatten() {
+                    let path = entry.path();
+                    names.push(path.strip_prefix(dir).unwrap().display().to_string());
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(path);
+                    }
+                }
+            }
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_sandbox_is_dead_before_apply() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            // Background writers outlive the command's own exit. The refused .ssh keeps the
+            // staging folder, so `upper` can be looked at afterwards.
+            let out = project
+                .run(
+                    "(sleep 2; echo late > late.txt) & \
+                     (while :; do echo x >> busy; done) >/dev/null 2>&1 & \
+                     sleep 0.3; mkdir .ssh; printf now > now.txt; ls /proc/$$/fd | tr '\\n' ' '",
+                    &bw,
+                )
+                .await
+                .unwrap();
+            // Only the standard streams reach the command: no descriptor for the real project.
+            assert!(
+                out.starts_with("Exit: 0\n0 1 2 \n\nWorkspace changes:"),
+                "{out}"
+            );
+            assert!(out.contains(".ssh (a protected name"), "{out}");
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1, "{out}");
+            let upper = staged[0].join("upper");
+            assert!(out.ends_with(&format!("kept for 24 hours in {}.", staged[0].display())));
+            let busy = || std::fs::metadata(upper.join("busy")).unwrap().len();
+            let size = busy();
+            assert!(size > 0);
+            let path = &project.workspace.path;
+            assert_eq!(
+                std::fs::read_to_string(path.join("now.txt")).unwrap(),
+                "now"
+            );
+            assert_eq!(std::fs::metadata(path.join("busy")).unwrap().len(), size);
+            for _ in 0..2 {
+                assert!(!upper.join("late.txt").exists());
+                assert!(!path.join("late.txt").exists());
+                assert_eq!(busy(), size, "a writer outlived the sandbox");
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_discards_writes_into_masks() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file(".git/HEAD", "ref");
+            project.file("a/.claude/settings.json", "{}");
+            project.file("x/.ssh", "key");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let out = project
+                .run(
+                    "printf x > .git/x && mkdir .git/d && printf y > a/.claude/y \
+                     && printf z > z && mv z .git/z && cat .git/x .git/z && ls -A .git | tr '\\n' ' '; \
+                     printf k >> x/.ssh; mkdir .ssh; true",
+                    &bw,
+                )
+                .await
+                .unwrap();
+            // Inside, the masked folders take the writes, and the rename into one works.
+            assert!(out.starts_with("Exit: 0\nxzd x z "), "{out}");
+            // Afterwards, none of it is anywhere: not in the project, not staged.
+            let path = &project.workspace.path;
+            assert_eq!(tree(&path.join(".git")), ["HEAD"]);
+            assert_eq!(tree(&path.join("a/.claude")), ["settings.json"]);
+            assert!(!path.join("z").exists());
+            assert_eq!(std::fs::read_to_string(path.join("x/.ssh")).unwrap(), "key");
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1, "{out}");
+            assert_eq!(tree(&staged[0].join("upper")), [".ssh"], "{out}");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_time_limit_stops_it_and_applies_nothing() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let error = project
+                .run_for(
+                    "printf a > early.txt; sleep 1; printf b > late.txt",
+                    &bw,
+                    Duration::from_millis(400),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with(&format!(
+                    "{}\n\nThe command didn't finish, so Blackwall applied none of its changes.",
+                    crate::tools::TIME_LIMIT_MESSAGE
+                )),
+                "{error}"
+            );
+            let path = &project.workspace.path;
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1);
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Stopped: its first write is staged, the one it would have made later never is.
+            assert_eq!(tree(&staged[0].join("upper")), ["early.txt"]);
+            assert!(!path.join("early.txt").exists() && !path.join("late.txt").exists());
+            // The project's lock was let go: the next command runs and applies.
+            let out = project.run("printf c > next.txt", &bw).await.unwrap();
+            assert!(out.contains("1 applied"), "{out}");
+            assert_eq!(std::fs::read_to_string(path.join("next.txt")).unwrap(), "c");
         }
     }
 
@@ -1857,6 +2522,7 @@ else:
                 process,
                 crate::child_env::Scope::Owner,
                 &[],
+                Duration::from_secs(10),
             )
             .await
             .unwrap();

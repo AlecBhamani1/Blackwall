@@ -208,6 +208,10 @@ pub struct Workspace {
     pub(crate) directory: Arc<Dir>,
     pub path: PathBuf,
     pub execution: crate::sandbox::ExecutionPolicy,
+    /// The owner's extra instruction files (relative names such as
+    /// `.github/copilot-instructions.md`), which a Linux Workspace-write command can't create or
+    /// change, on top of the built-in ones. The agent sets them for each run.
+    pub(crate) instruction_files: Vec<String>,
 }
 impl Workspace {
     pub fn open(path: &Path) -> Result<Self, ToolError> {
@@ -218,6 +222,7 @@ impl Workspace {
             directory: Arc::new(directory),
             path,
             execution: Default::default(),
+            instruction_files: Vec::new(),
         })
     }
     pub(crate) fn checked(&self, path: &str) -> Result<PathBuf, ToolError> {
@@ -566,9 +571,14 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            let (process, mut guard) =
-                crate::sandbox::prepare(workspace, shell_command(command), Scope::Shell, &[])
-                    .await?;
+            let (process, mut guard) = crate::sandbox::prepare(
+                workspace,
+                shell_command(command),
+                Scope::Shell,
+                &[],
+                command_timeout,
+            )
+            .await?;
             let outcome = run_with_input(
                 &workspace.path,
                 process,
@@ -689,7 +699,8 @@ pub(crate) async fn program_with_timeout(
             return run_with_input(&workspace.path, process, input, timeout, output, None).await;
         }
         let (process, mut guard) =
-            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through).await?;
+            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through, timeout)
+                .await?;
         let outcome = run_with_input(
             &workspace.path,
             process,
@@ -734,10 +745,29 @@ fn with_sandbox_hint(text: String, profile: ExecutionProfile) -> String {
         ExecutionProfile::Unsandboxed => return text,
     };
     let lower = text.to_lowercase();
-    if text == TIME_LIMIT_MESSAGE || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m)) {
+    // A Workspace-write command's time limit comes back with a note about its staged changes.
+    if text.starts_with(TIME_LIMIT_MESSAGE)
+        || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m))
+    {
         return text;
     }
     format!("{text}\n{}", SANDBOXED_TOOL_HINT.replace("{profile}", name))
+}
+/// Whether a sandboxed command ran to its end, so that a Linux Workspace-write command's staged
+/// changes may be applied: it succeeded (`Ok`), or failed with an exit code (`Exit: ` and an ASCII
+/// digit, as [`run_with_input`] writes it). Both come only after the process was waited for and
+/// reaped. The time limit, a cancel (no outcome at all), the 64 MiB stop (`Exit: stopped`), a
+/// signal (`Exit: signal`), a failure to start, and every other error are not.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux stages Workspace-write
+pub(crate) fn completed(outcome: &Result<String, ToolError>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(ToolError::Execution(text)) => text
+            .strip_prefix("Exit: ")
+            .and_then(|rest| rest.bytes().next())
+            .is_some_and(|first| first.is_ascii_digit()),
+        Err(_) => false,
+    }
 }
 static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
 /// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
@@ -1161,6 +1191,43 @@ mod tests {
         );
     }
     #[test]
+    fn completed_only_for_real_exits() {
+        let execution = |text: &str| Err(ToolError::Execution(text.into()));
+        for done in [
+            Ok("Exit: 0\nout".to_owned()),
+            Ok(String::new()),
+            execution("Exit: 1\n"),
+            execution("Exit: 0"),
+            execution("Exit: 127"),
+            execution("Exit: 1\nbwrap: execvp /x: No such file or directory\n"),
+        ] {
+            assert!(completed(&done), "{done:?}");
+        }
+        for not_done in [
+            execution("Exit: stopped"),
+            execution("Exit: stopped\noverflow\nThe command was stopped after 64 MiB of output."),
+            execution("Exit: signal\n"),
+            execution("Exit: "),
+            execution("Exit: x"),
+            execution("Exit: \u{0661}"),
+            execution("Exit:1"),
+            execution(" Exit: 1"),
+            execution("exit: 1"),
+            execution(""),
+            execution(TIME_LIMIT_MESSAGE),
+            execution("The command could not start."),
+            execution("The command did not start."),
+            Err(ToolError::Path),
+            Err(ToolError::File),
+            Err(ToolError::Limit),
+            Err(ToolError::Arguments),
+            Err(ToolError::Denied),
+            Err(ToolError::Changed),
+        ] {
+            assert!(!completed(&not_done), "{not_done:?}");
+        }
+    }
+    #[test]
     fn sandbox_hint_only_follows_a_failure_that_looks_like_a_denial() {
         let hinted = |text: &str, profile| with_sandbox_hint(text.to_owned(), profile);
         let denied = "Exit: 1\ntouch: x: Operation not permitted\n";
@@ -1180,10 +1247,12 @@ mod tests {
         )
         .contains("the Read-only sandbox."));
         // A plain failure, the time limit, and an unsandboxed profile get no hint.
+        let staged = format!("{TIME_LIMIT_MESSAGE}\n\nNot applied; kept in /sandbox/staging/x.");
         for text in [
             "Exit: 3\n",
             "Exit: 1\nFAILED tests::a\n",
             TIME_LIMIT_MESSAGE,
+            staged.as_str(),
         ] {
             assert_eq!(hinted(text, ExecutionProfile::ReadOnly), text);
         }
@@ -1254,10 +1323,16 @@ mod tests {
         let mut workspace = Workspace::open(&directory).unwrap();
         workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         // Cargo sets this for the test process: the shell keeps it, programs do not get it.
-        let process = crate::sandbox::prepare(&workspace, shell_command("env"), Scope::Shell, &[])
-            .await
-            .unwrap()
-            .0;
+        let process = crate::sandbox::prepare(
+            &workspace,
+            shell_command("env"),
+            Scope::Shell,
+            &[],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .0;
         let out = run_with_timeout(
             &workspace.path,
             process,

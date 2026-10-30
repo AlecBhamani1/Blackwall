@@ -1,4 +1,5 @@
-//! Linux sandbox backend: find a trusted bubblewrap and prove it works on this kernel.
+//! Linux sandbox backend: find a trusted bubblewrap and prove it works on this kernel, for
+//! Read-only and, separately, for Workspace-write's overlay.
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Write};
@@ -14,9 +15,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Availability {
+    /// Read-only commands can run. Workspace-write ones can too only when `workspace_write`: a
+    /// real overlay worked in a sandbox (see [`probe_overlay`]). An overlay that doesn't never
+    /// takes Read-only away.
     Available {
         bwrap: PathBuf,
         version: (u32, u32, u32),
+        workspace_write: bool,
     },
     /// No trusted, new-enough bubblewrap that works here. Asking again won't change it.
     Unavailable,
@@ -36,10 +41,24 @@ impl Availability {
             Self::Blocked => Some(LINUX_BLOCKED),
         }
     }
+    /// What to tell the owner when Workspace-write commands can't run, or `None` when they can.
+    pub fn workspace_write_note(&self) -> Option<&'static str> {
+        match self {
+            Self::Available {
+                workspace_write: true,
+                ..
+            } => None,
+            Self::Available { .. } => Some(LINUX_NO_OVERLAY),
+            other => other.note(),
+        }
+    }
 }
 pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.";
 pub const LINUX_RETRYING: &str = "Bubblewrap didn't start just now. Try again in a moment.";
 pub const LINUX_BLOCKED: &str = "Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.";
+pub const LINUX_NO_OVERLAY: &str = "Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.";
+/// Also enough for Workspace-write: bubblewrap has had `--overlay` since 0.11.0. The overlay
+/// probe, not this number, decides whether it works.
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
 /// After a Retrying or Blocked answer, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -292,7 +311,15 @@ pub(crate) fn resolve(
             continue;
         };
         match probe(&bwrap, scratch, timeout) {
-            Ok(()) => return Availability::Available { bwrap, version },
+            Ok(()) => {
+                // Read-only works. Whatever the overlay does, it stays available.
+                let workspace_write = probe_overlay(&bwrap, scratch, timeout).is_ok();
+                return Availability::Available {
+                    bwrap,
+                    version,
+                    workspace_write,
+                };
+            }
             // It ran and refused: policy (AppArmor, disabled user namespaces) most likely.
             Err(ProbeError::Failed(_) | ProbeError::UnexpectedOutput) => blocked = true,
             Err(
@@ -323,7 +350,7 @@ pub(crate) fn probe(bwrap: &Path, scratch: &Path, timeout: Duration) -> Result<(
         .create(&project)
         .map_err(ProbeError::Files)?;
     let result = probe_in(bwrap, &project, timeout);
-    let _ = std::fs::remove_dir_all(&project);
+    let _ = super::staging::remove_dir(&project);
     result
 }
 fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), ProbeError> {
@@ -332,6 +359,8 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
     let plan = super::bwrap::MountPlan {
         project,
         project_fd: project_fd.as_raw_fd(),
+        profile: crate::sandbox::ExecutionProfile::ReadOnly,
+        overlay: None,
         network: false,
         system_masks: super::bwrap::host_system_masks(&roots),
         roots,
@@ -348,7 +377,7 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
         bwrap,
         &seccomp_file,
         &args_file,
-        project_fd.as_raw_fd(),
+        Some(project_fd.as_raw_fd()),
         OsStr::new("/bin/sh"),
         &["-c".into(), "printf ok".into()],
     )
@@ -361,6 +390,97 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
         return Err(ProbeError::UnexpectedOutput);
     }
     Ok(())
+}
+
+/// Whether Workspace-write works here: start a sandbox exactly as a Workspace-write command gets
+/// one, with a real overlay over a new probe project in `scratch` (under `<data>/staging`), and
+/// through the merged folder create a file, change one and delete one. Then look in `upper`
+/// itself, not at what the command printed: the new file, the changed file and a whiteout (a 0/0
+/// character device) for the deleted one must be there, and the project must be unchanged. Any
+/// failure, of any kind, means no Workspace-write; it never affects Read-only.
+pub(crate) fn probe_overlay(
+    bwrap: &Path,
+    scratch: &Path,
+    timeout: Duration,
+) -> Result<(), ProbeError> {
+    let dir = scratch.join(format!("overlay-{:016x}", rand::random::<u64>()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(ProbeError::Files)?;
+    let result = probe_overlay_in(bwrap, &dir, timeout);
+    // The overlay leaves a mode-000 folder in `work`; the remover copes with it.
+    let _ = super::staging::remove_dir(&dir);
+    result
+}
+fn probe_overlay_in(bwrap: &Path, dir: &Path, timeout: Duration) -> Result<(), ProbeError> {
+    let (project, upper, work) = (dir.join("project"), dir.join("upper"), dir.join("work"));
+    for folder in [&project, &upper, &work] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(folder)
+            .map_err(ProbeError::Files)?;
+    }
+    for name in ["changed", "deleted"] {
+        write_private(&project.join(name), b"old").map_err(ProbeError::Files)?;
+    }
+    let roots = super::bwrap::host_roots();
+    let plan = super::bwrap::MountPlan {
+        project: &project,
+        project_fd: -1,
+        profile: crate::sandbox::ExecutionProfile::WorkspaceWrite,
+        overlay: Some(super::bwrap::Overlay {
+            upper: &upper,
+            work: &work,
+        }),
+        network: false,
+        system_masks: super::bwrap::host_system_masks(&roots),
+        roots,
+        etc: super::bwrap::host_etc(),
+        masks: &[],
+    };
+    let seccomp = super::seccomp::program().ok_or(ProbeError::UnexpectedOutput)?;
+    let args =
+        super::bwrap::args_file(&super::bwrap::args(&plan)).ok_or(ProbeError::UnexpectedOutput)?;
+    let (seccomp_file, args_file) = (dir.join("seccomp.bpf"), dir.join("args"));
+    write_private(&seccomp_file, &super::seccomp::to_bytes(&seccomp)).map_err(ProbeError::Files)?;
+    write_private(&args_file, &args).map_err(ProbeError::Files)?;
+    let script = "printf new > new && printf changed > changed && rm deleted && printf ok";
+    let launcher = super::bwrap::launcher(
+        bwrap,
+        &seccomp_file,
+        &args_file,
+        None,
+        OsStr::new("/bin/sh"),
+        &["-c".into(), script.into()],
+    )
+    .ok_or(ProbeError::UnexpectedOutput)?;
+    let (status, stdout) = run_command(launcher.into_std(), timeout, None)?;
+    if !status.success() {
+        return Err(ProbeError::Failed(status));
+    }
+    if stdout != b"ok" {
+        return Err(ProbeError::UnexpectedOutput);
+    }
+    let file_holds = |path: &Path, text: &[u8]| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+            && std::fs::read(path).is_ok_and(|read| read == text)
+    };
+    let whiteout = std::fs::symlink_metadata(upper.join("deleted")).is_ok_and(|meta| {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_char_device() && meta.rdev() == 0
+    });
+    let staged = file_holds(&upper.join("new"), b"new")
+        && file_holds(&upper.join("changed"), b"changed")
+        && whiteout;
+    let untouched = file_holds(&project.join("changed"), b"old")
+        && file_holds(&project.join("deleted"), b"old")
+        && !project.join("new").exists();
+    if staged && untouched {
+        Ok(())
+    } else {
+        Err(ProbeError::UnexpectedOutput)
+    }
 }
 
 /// `directory` as a path-only descriptor (`O_PATH | O_DIRECTORY | O_NOFOLLOW`) for bubblewrap's
@@ -383,6 +503,81 @@ pub(crate) fn pin_project(project: &Path) -> Option<(OwnedFd, (u64, u64))> {
     let meta = file.metadata().ok()?;
     (std::fs::canonicalize(project).ok().as_deref() == Some(project))
         .then(|| (file.into(), (meta.dev(), meta.ino())))
+}
+
+/// Whether `project` is still its canonical path and still the folder [`pin_project`] pinned: the
+/// last check before a Workspace-write sandbox opens it by path (see the `bwrap` module).
+pub(crate) fn still_pinned(project: &Path, pinned: (u64, u64)) -> bool {
+    std::fs::canonicalize(project).ok().as_deref() == Some(project)
+        && std::fs::symlink_metadata(project)
+            .is_ok_and(|meta| meta.is_dir() && (meta.dev(), meta.ino()) == pinned)
+}
+
+/// The overlay file system's magic number, from `statfs`.
+const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+/// Whether `folder` is on an overlay file system (as in a container). The kernel can't stack
+/// Workspace-write's overlay on one safely as its lower layer.
+#[allow(clippy::unnecessary_cast)] // `f_type`'s type differs between architectures.
+pub(crate) fn on_overlayfs(folder: impl std::os::fd::AsFd) -> bool {
+    // Unknown counts as overlay: refused.
+    rustix::fs::fstatfs(folder).map_or(true, |fs| fs.f_type as u64 == OVERLAYFS_SUPER_MAGIC)
+}
+
+const PROJECT_INSIDE_DATA: &str = "This project folder is inside Blackwall's data folder. Choose a project folder outside it for Workspace-write.";
+const PROJECT_HOLDS_DATA: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
+const PROJECT_HOLDS_BWRAP: &str = "This project folder contains the Bubblewrap program Blackwall sandboxes commands with, so Workspace-write can't run in it. Choose a smaller project folder.";
+const PROJECT_HOLDS_APP: &str = "This project folder contains Blackwall's own app files, so Workspace-write can't run in it. Choose a project folder outside them.";
+pub(crate) const PROJECT_ON_OVERLAY: &str = "This project folder is on an overlay file system (as inside a container), which Workspace-write can't stage. Choose Read-only, or a project folder on another file system.";
+const LOCATION_UNRESOLVED: &str =
+    "Blackwall couldn't resolve a folder it needs to check, so it won't run this Workspace-write command.";
+
+/// Where a Workspace-write project may not be, on top of `walk::check_location`: inside the data
+/// folder (where its staging lives) or holding it, holding the resolved bubblewrap or the
+/// AppImage folder (`appdir`, canonical), whose files the apply step could then replace, or on an
+/// overlay file system. Read-only is not affected. Blocking (it resolves paths).
+pub(crate) fn check_workspace_write_location(
+    project: &Path,
+    data: &Path,
+    bwrap: &Path,
+    appdir: Option<&Path>,
+) -> Result<(), crate::tools::ToolError> {
+    let refuse = |message: &str| Err(crate::tools::ToolError::Execution(message.into()));
+    let (Ok(project), Ok(data), Ok(bwrap)) = (
+        std::fs::canonicalize(project),
+        std::fs::canonicalize(data),
+        std::fs::canonicalize(bwrap),
+    ) else {
+        return refuse(LOCATION_UNRESOLVED);
+    };
+    if project.starts_with(&data) {
+        return refuse(PROJECT_INSIDE_DATA);
+    }
+    if data.starts_with(&project) {
+        return refuse(PROJECT_HOLDS_DATA);
+    }
+    if bwrap.starts_with(&project) {
+        return refuse(PROJECT_HOLDS_BWRAP);
+    }
+    if appdir.is_some_and(|appdir| appdir.starts_with(&project)) {
+        return refuse(PROJECT_HOLDS_APP);
+    }
+    let Ok(folder) = open_directory(&project) else {
+        return refuse(LOCATION_UNRESOLVED);
+    };
+    if on_overlayfs(&folder) {
+        return refuse(PROJECT_ON_OVERLAY);
+    }
+    Ok(())
+}
+
+/// The AppImage folder Blackwall runs from, if any (see [`appimage_dir`]).
+pub(crate) fn current_appdir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    appimage_dir(
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+        &exe,
+    )
 }
 
 /// Run `spawn` with `fd` open in the new process at the same number, then close it here. The
@@ -436,13 +631,19 @@ fn prepare_scratch(data_directory: &Path) -> std::io::Result<PathBuf> {
 pub(crate) fn run_directory(data_directory: &Path) -> std::io::Result<PathBuf> {
     private_scratch(data_directory, "run-")
 }
+/// `<data>/staging`, made private (0700) if it is missing. A symlinked data directory or staging
+/// directory is refused.
+pub(crate) fn staging_directory(data_directory: &Path) -> std::io::Result<PathBuf> {
+    real_directory(data_directory)?;
+    let staging = data_directory.join("staging");
+    private_directory(&staging)?;
+    Ok(staging)
+}
 /// A fresh private (0700) `<data>/staging/<prefix><16 hex digits from the system's random
 /// source>` directory, after the same checks and the one sweep of old folders as the probe's.
 pub(crate) fn private_scratch(data_directory: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     use rand::rand_core::TryRng;
-    real_directory(data_directory)?;
-    let staging = data_directory.join("staging");
-    private_directory(&staging)?;
+    let staging = staging_directory(data_directory)?;
     super::staging::sweep(data_directory, SystemTime::now());
     let random = rand::rngs::SysRng
         .try_next_u64()
@@ -544,7 +745,7 @@ pub fn availability(data_directory: &Path) -> &'static Availability {
             Duration::from_secs(2),
             appimage.as_deref(),
         );
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = super::staging::remove_dir(&scratch);
         Some(found)
     })
 }
@@ -641,8 +842,28 @@ mod tests {
         let available = Availability::Available {
             bwrap: "/usr/lib/blackwall/bwrap".into(),
             version: (0, 13, 1),
+            workspace_write: true,
         };
         assert_eq!(available.note(), None);
+        assert_eq!(available.workspace_write_note(), None);
+        // Without the overlay, Read-only still has no note; Workspace-write says why it can't.
+        let read_only = Availability::Available {
+            bwrap: "/usr/lib/blackwall/bwrap".into(),
+            version: (0, 13, 1),
+            workspace_write: false,
+        };
+        assert_eq!(read_only.note(), None);
+        assert_eq!(
+            read_only.workspace_write_note(),
+            Some("Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.")
+        );
+        for other in [
+            Availability::Unavailable,
+            Availability::Retrying,
+            Availability::Blocked,
+        ] {
+            assert_eq!(other.workspace_write_note(), other.note());
+        }
     }
     #[test]
     fn parse_version_accepts_only_bubblewrap_semver() {
@@ -684,7 +905,7 @@ mod tests {
             assert!(
                 matches!(
                     root.resolve(&[candidate, control.clone()]),
-                    Availability::Available { bwrap, version: (0, 13, 1) } if bwrap == control
+                    Availability::Available { bwrap, version: (0, 13, 1), .. } if bwrap == control
                 ),
                 "{why} then control"
             );
@@ -703,6 +924,135 @@ mod tests {
         // A usable-looking bubblewrap that runs but cannot start a sandbox is blocked (AppArmor on
         // Ubuntu 24.04, say), which is asked again later too.
         assert_eq!(root.resolve(&[blocked]), Availability::Blocked);
+    }
+    #[test]
+    fn a_failing_overlay_probe_leaves_read_only_available() {
+        let root = Root::new();
+        let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
+        // Only a Workspace-write sandbox's arguments (fd 4) have --overlay.
+        let overlay = "tr '\\0' '\\n' <&4 | grep -qx -- --overlay";
+        let fakes = [
+            // The kernel or a policy refuses the overlay (EPERM, EINVAL, ENODEV...).
+            format!("{new}if {overlay}; then echo 'bwrap: Can'\\''t make overlay mount' >&2; exit 1; fi; printf ok;; esac"),
+            // It says it worked, but nothing reached upper.
+            format!("{new}printf ok;; esac"),
+            // It hangs.
+            format!("{new}if {overlay}; then exec sleep 30; fi; printf ok;; esac"),
+        ];
+        for body in fakes {
+            let fake = root.fake(&body);
+            let found = resolve(
+                std::slice::from_ref(&fake),
+                &root.scratch,
+                Duration::from_millis(500),
+                Some(&root.path),
+            );
+            assert_eq!(
+                found,
+                Availability::Available {
+                    bwrap: fake.clone(),
+                    version: (0, 13, 1),
+                    workspace_write: false,
+                },
+                "{body}"
+            );
+            assert_eq!(found.note(), None);
+            assert_eq!(found.workspace_write_note(), Some(LINUX_NO_OVERLAY));
+            assert!(matches!(
+                probe_overlay(&fake, &root.scratch, Duration::from_millis(500)),
+                Err(ProbeError::Failed(_) | ProbeError::UnexpectedOutput | ProbeError::TimedOut)
+            ));
+        }
+        // The probes clean up after themselves, the overlay's work folder included.
+        assert_eq!(std::fs::read_dir(&root.scratch).unwrap().count(), 0);
+    }
+    #[test]
+    fn workspace_write_location_refusals_each_have_their_own_message() {
+        let root = Root::new();
+        let data = root.path.join("data");
+        let project = root.path.join("project");
+        let bwrap = root.path.join("bin/bwrap");
+        for dir in [&data, &project, &bwrap.parent().unwrap().to_path_buf()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&bwrap, "").unwrap();
+        let check = |project: &Path, data: &Path, bwrap: &Path, appdir: Option<&Path>| {
+            check_workspace_write_location(project, data, bwrap, appdir)
+                .map_err(|error| error.to_string())
+        };
+        // tmpfs or ext4 in tests; an overlay project (a container's root) is refused below.
+        if !on_overlayfs(open_directory(&project).unwrap()) {
+            assert_eq!(check(&project, &data, &bwrap, None), Ok(()));
+            assert_eq!(
+                check(&project, &data, &bwrap, Some(&root.path.join("app"))),
+                Ok(())
+            );
+        }
+        let inside = data.join("staging/p");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(
+            check(&inside, &data, &bwrap, None),
+            Err(PROJECT_INSIDE_DATA.into())
+        );
+        assert_eq!(
+            check(&data, &data, &bwrap, None),
+            Err(PROJECT_INSIDE_DATA.into())
+        );
+        assert_eq!(
+            check(&root.path, &data, &bwrap, None),
+            Err(PROJECT_HOLDS_DATA.into())
+        );
+        let elsewhere = root.path.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let tool = project.join("tools/bwrap");
+        std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
+        std::fs::write(&tool, "").unwrap();
+        assert_eq!(
+            check(&project, &elsewhere, &tool, None),
+            Err(PROJECT_HOLDS_BWRAP.into())
+        );
+        // Through a link, the resolved path is what counts.
+        let link = root.path.join("link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        assert_eq!(
+            check(&project, &elsewhere, &link, None),
+            Err(PROJECT_HOLDS_BWRAP.into())
+        );
+        assert_eq!(
+            check(&project, &elsewhere, &bwrap, Some(&project.join("tools"))),
+            Err(PROJECT_HOLDS_APP.into())
+        );
+        assert_eq!(
+            check(&project, &elsewhere, &bwrap, Some(&project)),
+            Err(PROJECT_HOLDS_APP.into())
+        );
+        assert_eq!(
+            check(&root.path.join("missing"), &data, &bwrap, None),
+            Err(LOCATION_UNRESOLVED.into())
+        );
+        // The root of a container is an overlay.
+        if on_overlayfs(open_directory(Path::new("/")).unwrap()) {
+            assert_eq!(
+                check(Path::new("/usr"), &data, &bwrap, None),
+                Err(PROJECT_ON_OVERLAY.into())
+            );
+        }
+    }
+    #[test]
+    fn the_pin_is_checked_again_by_path_before_bubblewrap_starts() {
+        let root = Root::new();
+        let project = root.path.join("p");
+        std::fs::create_dir(&project).unwrap();
+        let (_fd, pinned) = pin_project(&project).unwrap();
+        assert!(still_pinned(&project, pinned));
+        // Swapped for another folder, or for a link to the pinned one: not the project any more.
+        std::fs::rename(&project, root.path.join("moved")).unwrap();
+        assert!(!still_pinned(&project, pinned));
+        std::fs::create_dir(&project).unwrap();
+        assert!(!still_pinned(&project, pinned));
+        std::fs::remove_dir(&project).unwrap();
+        std::os::unix::fs::symlink(root.path.join("moved"), &project).unwrap();
+        assert!(!still_pinned(&project, pinned));
     }
     #[test]
     fn resolver_reports_a_timeout_as_transient() {
@@ -920,6 +1270,7 @@ mod tests {
         let found = Availability::Available {
             bwrap: "/usr/lib/blackwall/bwrap".into(),
             version: (0, 13, 1),
+            workspace_write: true,
         };
         assert_eq!(memory.answer(|| Some(found.clone())), &found);
         assert_eq!(memory.answer(never), &found);
@@ -1111,12 +1462,43 @@ mod tests {
     fn linux_sandbox_probe_passes_with_the_installed_bwrap() {
         let root = Root::new();
         let found = candidates(Path::new("/usr/bin/blackwall"));
-        let Availability::Available { bwrap, version } =
-            resolve(&found, &root.scratch, secs(5), None)
+        let Availability::Available {
+            bwrap,
+            version,
+            workspace_write,
+        } = resolve(&found, &root.scratch, secs(5), None)
         else {
             panic!("no usable bwrap among {found:?}");
         };
         assert!(version >= MIN_VERSION, "{bwrap:?} {version:?}");
         probe(&bwrap, &root.scratch, secs(5)).unwrap();
+        // The overlay works under this bubblewrap and kernel, so Workspace-write is offered.
+        assert!(workspace_write, "the overlay probe failed with {bwrap:?}");
+        probe_overlay(&bwrap, &root.scratch, secs(5)).unwrap();
+        assert_eq!(std::fs::read_dir(&root.scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+    fn linux_sandbox_overlay_probe_reads_its_results_from_upper() {
+        let root = Root::new();
+        let bwrap = PathBuf::from(
+            std::env::var_os("BLACKWALL_TEST_BWRAP")
+                .expect("set BLACKWALL_TEST_BWRAP to a bubblewrap binary"),
+        );
+        let dir = root.scratch.join("overlay");
+        std::fs::create_dir(&dir).unwrap();
+        probe_overlay_in(&bwrap, &dir, secs(5)).unwrap();
+        use std::os::unix::fs::FileTypeExt;
+        let upper = dir.join("upper");
+        assert_eq!(std::fs::read(upper.join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(upper.join("changed")).unwrap(), b"changed");
+        let whiteout = std::fs::symlink_metadata(upper.join("deleted")).unwrap();
+        assert!(whiteout.file_type().is_char_device() && whiteout.rdev() == 0);
+        assert_eq!(std::fs::read(dir.join("project/changed")).unwrap(), b"old");
+        assert!(dir.join("project/deleted").exists());
+        // The probe's own run removes this, mode-000 work folder and all.
+        super::super::staging::remove_dir(&dir).unwrap();
+        assert!(!dir.exists());
     }
 }

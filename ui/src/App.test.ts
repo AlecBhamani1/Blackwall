@@ -286,12 +286,13 @@ it('says what command network reaches when it is on', async () => {
   expect(screen.queryByText(hint)).not.toBeInTheDocument();
 });
 
-it('offers Read-only but not yet Workspace-write where only Read-only is sandboxed', async () => {
+it('offers Workspace-write only where its overlay works, and says why when it does not', async () => {
+  const note =
+    "Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.";
+  let status = { available: true, note: note as string | null, workspaceWrite: false };
   const fallback = native.invoke.getMockImplementation();
   native.invoke.mockImplementation(async (command, args) =>
-    command === 'sandbox_status'
-      ? { available: true, note: null, workspaceWrite: false }
-      : fallback?.(command, args),
+    command === 'sandbox_status' ? status : fallback?.(command, args),
   );
   render(App);
   await screen.findByRole('combobox', { name: 'Model' });
@@ -303,6 +304,14 @@ it('offers Read-only but not yet Workspace-write where only Read-only is sandbox
     expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
   );
   expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  expect(await screen.findByText(note)).toBeInTheDocument();
+  // Where the overlay works too, Workspace-write is on offer and there is nothing to explain.
+  status = { available: true, note: null, workspaceWrite: true };
+  await fireEvent.focus(window);
+  await waitFor(() =>
+    expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeEnabled(),
+  );
+  expect(screen.queryByText(note)).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Learn more' })).not.toBeInTheDocument();
 });
 

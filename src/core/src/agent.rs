@@ -299,6 +299,10 @@ impl Agent<'_> {
         // caps or drop extra files, never raise or add them.
         let limits = project_settings.limits;
         let project_instructions = project_settings.instructions;
+        // Every extra instruction file the owner set up, before a project drops any: a Linux
+        // Workspace-write command can create or change none of them.
+        let mut tool_workspace = self.workspace.clone();
+        tool_workspace.instruction_files = instruction_settings.extra_files.clone();
         let instruction_settings = instruction_settings.within(project_instructions.as_ref());
         if let Some(limits) = &limits {
             budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
@@ -637,6 +641,7 @@ impl Agent<'_> {
                     let proposals = &proposals;
                     let invoked = &invoked;
                     let subagents = &subagents;
+                    let tool_workspace = &tool_workspace;
                     async move {
                         let output_cap = tools::OutputCap::new(budget.max_output_bytes);
                         let permitted = definitions.iter().any(|definition| {
@@ -770,7 +775,7 @@ impl Agent<'_> {
                             crate::subagents::run_with_instructions(
                                 &crate::subagents::Parent {
                                     backend: self.backend,
-                                    workspace: &self.workspace,
+                                    workspace: tool_workspace,
                                     request_id,
                                     approvals: &self.approvals,
                                     emit: self.emit.clone(),
@@ -798,7 +803,7 @@ impl Agent<'_> {
                             .await
                         } else if let Some(tool) = command_tools.get(&call.function.name) {
                             tool.run(
-                                &self.workspace,
+                                tool_workspace,
                                 &call.function.arguments,
                                 request_id,
                                 &self.approvals,
@@ -809,7 +814,7 @@ impl Agent<'_> {
                             .await
                         } else {
                             tools::execute(
-                                &self.workspace,
+                                tool_workspace,
                                 &call,
                                 request_id,
                                 &self.approvals,
