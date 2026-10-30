@@ -522,6 +522,9 @@ impl Policy {
             if let Some(digest) = &call.stdin_sha256 {
                 entry["stdinSha256"] = json!(digest);
             }
+            if call.overridden {
+                entry["overridden"] = json!(true);
+            }
         }
         if let Some(rule) = saved {
             entry["saved"] = json!(rule);
@@ -832,7 +835,7 @@ pub(crate) fn normalize(path: &str) -> Option<PathBuf> {
 /// An owner command tool's call, for its audit record: the absolute program, the tool, where it
 /// runs, its arguments after the program, the pass-through names it gets, and the SHA-256 of
 /// its standard input. Never a variable's value; arguments are redacted as a subject is.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProgramCall<'a> {
     pub program: &'a Path,
     pub tool: &'a str,
@@ -840,6 +843,8 @@ pub(crate) struct ProgramCall<'a> {
     pub args: &'a [String],
     pub env: &'a [String],
     pub stdin_sha256: Option<String>,
+    /// An allow rule matched, but the tool always asks, so the rule did not decide.
+    pub overridden: bool,
 }
 
 /// Each argument [`redact`]ed, and the one after a credential option or `Bearer` hidden whole.

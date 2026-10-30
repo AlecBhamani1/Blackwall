@@ -234,11 +234,16 @@ impl Approvals {
             .await?
             != ApprovalDecision::Deny;
         if let (Some(policy), Some(verdict)) = (&policy, verdict) {
+            // A matching allow rule did not skip the prompt; the audit says so.
+            let call = crate::policy::ProgramCall {
+                overridden: verdict.decision == Decision::Allow,
+                ..call.clone()
+            };
             policy
                 .record_program(
                     ApprovalKind::Exec,
                     subject,
-                    Some(call),
+                    Some(&call),
                     Decision::Ask,
                     allowed,
                     None,

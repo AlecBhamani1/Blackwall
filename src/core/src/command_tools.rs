@@ -604,6 +604,7 @@ impl CommandTool {
             args,
             env,
             stdin_sha256: input.map(sha256_hex),
+            overridden: false,
         }
     }
 
@@ -1553,6 +1554,30 @@ mod tests {
                     && !detail.contains("Approval cannot expand this boundary")
         )));
         assert!(results.iter().all(Result::is_ok), "{results:?}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_marks_an_allow_rule_an_outside_tool_overrode() {
+        let last = |directory: &Path| -> Value {
+            let audit = std::fs::read_to_string(directory.join("policy-audit.jsonl")).unwrap();
+            serde_json::from_str(audit.lines().last().unwrap()).unwrap()
+        };
+        let (_, _, directory) = echo_twice(
+            Isolation::Outside,
+            r#"{"rules":[{"decision":"allow","kind":"exec","command":"echo hi"}]}"#,
+        )
+        .await;
+        let line = last(&directory);
+        assert_eq!(line["decision"], "ask", "{line}");
+        assert_eq!(line["rule"]["index"], 0, "{line}");
+        assert_eq!(line["overridden"], true, "{line}");
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+        // Without a matching allow rule there is nothing to override.
+        let (_, _, directory) = echo_twice(Isolation::Outside, r#"{"rules":[]}"#).await;
+        let line = last(&directory);
+        assert!(line.get("overridden").is_none(), "{line}");
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
