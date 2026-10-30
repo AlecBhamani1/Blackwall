@@ -101,14 +101,16 @@ jobs:
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
         run: ./scripts/install-linux-deps.sh
-      - name: Build bubblewrap and attach its source to the draft
+      - name: Build bubblewrap
+        # Downloaded source is built here, so this step gets no token.
+        if: runner.os == 'Linux'
+        run: ./scripts/build-bwrap.sh src/app/resources/linux
+      - name: Attach bubblewrap source
+        # LGPL source for the bundled bwrap; both Linux jobs upload the same verified bytes.
         if: runner.os == 'Linux'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          ./scripts/build-bwrap.sh src/app/resources/linux
-          # LGPL source for the bundled bwrap; both Linux jobs upload the same verified bytes.
-          gh release upload "v$RELEASE_VERSION" src/app/resources/linux/bubblewrap-0.13.1.tar.xz --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "v$RELEASE_VERSION" src/app/resources/linux/bubblewrap-0.13.1.tar.xz --clobber --repo "$GITHUB_REPOSITORY"
       - name: Install UI dependencies
         run: npm ci --prefix ui
       - name: Set the approved application version
