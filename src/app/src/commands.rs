@@ -661,6 +661,14 @@ pub(crate) async fn stream_chat(
             profile: options.execution_profile,
             network: options.command_network,
             data_directory: Some(instruction_directory.clone()),
+            command_tools: crate::data::command_tools_isolation(instruction_directory.clone())
+                .await
+                .map_err(|message| CommandError {
+                    code: "settings_error",
+                    message,
+                    detail: None,
+                    retryable: false,
+                })?,
         };
         let subagents = crate::data::subagent_settings(instruction_directory.clone())
             .await

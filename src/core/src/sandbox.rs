@@ -37,6 +37,8 @@ pub struct ExecutionPolicy {
     pub network: bool,
     /// The actual data directory, including installations using a custom data location.
     pub data_directory: Option<PathBuf>,
+    /// Where owner command tools run. Only the owner's saved setting sets it.
+    pub command_tools: crate::command_tools::Isolation,
 }
 impl ExecutionPolicy {
     pub fn description(&self) -> String {
@@ -263,6 +265,7 @@ mod tests {
                     profile,
                     network: false,
                     data_directory: Some(root.join("data")),
+                    ..Default::default()
                 };
                 Self {
                     root: std::fs::canonicalize(root).unwrap(),

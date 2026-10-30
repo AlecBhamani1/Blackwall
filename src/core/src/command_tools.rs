@@ -44,6 +44,52 @@ const BUILT_IN: [&str; 13] = [
     "skill_propose",
 ];
 
+/// Where the owner's command tools run: outside the sandbox, always asking (the default), or
+/// inside the Commands profile. Only the owner chooses; a project file cannot.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    #[default]
+    Outside,
+    Sandboxed,
+}
+
+impl Isolation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Outside => "outside",
+            Self::Sandboxed => "sandboxed",
+        }
+    }
+}
+
+impl std::str::FromStr for Isolation {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "outside" => Ok(Self::Outside),
+            "sandboxed" => Ok(Self::Sandboxed),
+            _ => Err("Choose outside or sandboxed."),
+        }
+    }
+}
+
+/// The desktop's saved `commandToolsIsolation`; a missing one is the default.
+pub fn isolation_from_preferences(
+    preferences: &Map<String, Value>,
+) -> Result<Isolation, &'static str> {
+    preferences
+        .get("commandToolsIsolation")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or("Choose outside or sandboxed.")
+                .and_then(str::parse)
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 /// What a tool does when called: run a program (the default) or send an HTTP request.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -770,6 +816,28 @@ fn validate_schema(schema: &Schema) -> Result<(), &'static str> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_defaults_outside_and_parses_strictly() {
+        assert_eq!(Isolation::default(), Isolation::Outside);
+        assert_eq!("sandboxed".parse::<Isolation>(), Ok(Isolation::Sandboxed));
+        assert_eq!("outside".parse::<Isolation>(), Ok(Isolation::Outside));
+        assert!("inside".parse::<Isolation>().is_err());
+        assert_eq!(Isolation::Sandboxed.name(), "sandboxed");
+        assert_eq!(
+            isolation_from_preferences(&json!({}).as_object().unwrap().clone()),
+            Ok(Isolation::Outside)
+        );
+        let saved = json!({"commandToolsIsolation":"sandboxed"});
+        assert_eq!(
+            isolation_from_preferences(saved.as_object().unwrap()),
+            Ok(Isolation::Sandboxed)
+        );
+        for bad in [json!("inside"), json!(true), json!(null)] {
+            let saved = json!({ "commandToolsIsolation": bad });
+            assert!(isolation_from_preferences(saved.as_object().unwrap()).is_err());
+        }
+    }
 
     /// A fixture directory under the temp folder with a `bin` that holds an executable `tool`.
     #[cfg(unix)]

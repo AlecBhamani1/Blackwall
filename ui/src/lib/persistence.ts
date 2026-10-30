@@ -19,6 +19,7 @@ export const SUBAGENT_TOOLS = [
 ] as const;
 export type SubagentTool = (typeof SUBAGENT_TOOLS)[number];
 export type SubagentRunsOn = 'local' | { tool: string };
+export type CommandToolsIsolation = 'outside' | 'sandboxed';
 /** Up to 8 extra guidance files are read after AGENTS.md in each directory. */
 export const MAX_INSTRUCTION_FILES = 8;
 /** A relative path of plain names with `/`: no `..`, `.`, `.git`, root, drive or backslash. */
@@ -52,6 +53,8 @@ export interface Preferences {
   subagentTools?: SubagentTool[];
   /** Where subagents run: the current model, or an owner command tool. */
   subagentRunsOn?: SubagentRunsOn;
+  /** Where owner command tools run; outside the sandbox (always ask) unless "sandboxed". */
+  commandToolsIsolation?: CommandToolsIsolation;
   /** Per-file guidance cap in KiB, 1 to 64; longer files are truncated. */
   instructionMaxFileKib?: number;
   /** Cap on all guidance in a turn in KiB, 8 to 256. */

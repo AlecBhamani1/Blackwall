@@ -889,6 +889,7 @@ fn execution_workspace(
         profile: settings.execution_profile,
         network: settings.command_network,
         data_directory: Some(directory.into()),
+        command_tools: settings.command_tools_isolation,
     };
     Ok(workspace)
 }
