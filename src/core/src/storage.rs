@@ -206,13 +206,6 @@ impl LocalStore {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
-    pub fn has_sessions(&self) -> Result<bool, StorageError> {
-        Ok(self
-            .connection
-            .query_row("SELECT EXISTS(SELECT 1 FROM sessions)", [], |row| {
-                row.get(0)
-            })?)
-    }
     pub fn load_session(&self, id: &str) -> Result<Option<Value>, StorageError> {
         validate_id(id)?;
         let body: Option<String> = self
@@ -485,15 +478,6 @@ mod tests {
         drop(LocalStore::open(&locked).unwrap());
         assert!(!locked.join(NO_LOCK_MARKER).exists());
         fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn has_sessions_is_false_for_a_fresh_store_and_true_after_save() {
-        let db = store();
-        assert!(!db.has_sessions().unwrap());
-        db.save_session(&session("session_one")).unwrap();
-        assert!(db.has_sessions().unwrap());
-        db.delete_session("session_one").unwrap();
-        assert!(!db.has_sessions().unwrap());
     }
     #[test]
     fn session_lifecycle_retains_attachment_contents() {
