@@ -304,15 +304,29 @@ it('offers Workspace-write only where its overlay works, and says why when it do
     expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
   );
   expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  // Read-only works, so its owner isn't told about Workspace-write ...
+  expect(profile).toHaveValue('read-only');
+  expect(screen.queryByText(note)).not.toBeInTheDocument();
+  // ... until they open the profile picker.
+  await fireEvent.focus(profile);
   expect(await screen.findByText(note)).toBeInTheDocument();
+  await fireEvent.blur(profile);
+  await waitFor(() => expect(screen.queryByText(note)).not.toBeInTheDocument());
   // Where the overlay works too, Workspace-write is on offer and there is nothing to explain.
   status = { available: true, note: null, workspaceWrite: true };
   await fireEvent.focus(window);
   await waitFor(() =>
     expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeEnabled(),
   );
-  expect(screen.queryByText(note)).not.toBeInTheDocument();
+  await fireEvent.focus(profile);
   expect(screen.queryByRole('button', { name: 'Learn more' })).not.toBeInTheDocument();
+  await fireEvent.change(profile, { target: { value: 'workspace-write' } });
+  await fireEvent.blur(profile);
+  expect(profile).toHaveValue('workspace-write');
+  // With Workspace-write selected, a later check that finds no overlay says why.
+  status = { available: true, note, workspaceWrite: false };
+  await fireEvent.focus(window);
+  expect(await screen.findByText(note)).toBeInTheDocument();
 });
 
 it('asks which server to use on a first launch instead of connecting on its own', async () => {

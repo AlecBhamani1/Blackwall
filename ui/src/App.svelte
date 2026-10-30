@@ -128,8 +128,11 @@
   // Only Linux reports a status. Unknown (other systems, the browser preview, or no answer)
   // leaves every profile on offer; a command that can't be sandboxed still fails closed and says
   // why. Read-only, the safe default, stays selectable even when the sandbox is unavailable.
-  // Workspace-write is offered only where its overlay works; the note says why when it isn't.
+  // Workspace-write is offered only where its overlay works; the note says why when it isn't,
+  // to an owner who has Workspace-write selected or is choosing a profile, never to one who just
+  // uses Read-only.
   let sandbox: SandboxStatus | null = null;
+  let choosingProfile = false;
   $: workspaceWrite = sandbox?.workspaceWrite ?? true;
   const SANDBOX_RECHECK_MS = 30_000;
   let sandboxRecheck: ReturnType<typeof setTimeout> | undefined;
@@ -291,6 +294,8 @@
                 aria-label="Command execution profile"
                 bind:value={$executionProfile}
                 disabled={$runState !== 'idle'}
+                onfocus={() => (choosingProfile = true)}
+                onblur={() => (choosingProfile = false)}
               >
                 <option value="read-only">Read-only</option>
                 <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
@@ -321,7 +326,7 @@
       {#if !setupOpen && isDesktop() && $agentMode && $workspace}
         <ProjectTrust workspace={$workspace} refresh={$runState} />
       {/if}
-      {#if !setupOpen && isDesktop() && $agentMode && sandbox?.note && (!sandbox.available || !workspaceWrite)}
+      {#if !setupOpen && isDesktop() && $agentMode && sandbox?.note && (!sandbox.available || (!workspaceWrite && (choosingProfile || $executionProfile === 'workspace-write')))}
         <p class="sandbox-note" role="status">
           {sandbox.note}<button
             class="sandbox-help"

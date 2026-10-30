@@ -675,7 +675,8 @@ One Workspace-write command runs in a project at a time. A second waits for the 
 own time limit, and fails with a note that another is still running only if the first still is.
 
 It needs Linux 5.11 or newer with overlay mounts allowed. Without them, the selector turns
-Workspace-write off with a note, `bw` refuses it, and Read-only keeps working. A project on an
+Workspace-write off with a note, shown while you choose a profile or when Workspace-write is still
+selected (Read-only users aren't shown it), `bw` refuses it, and Read-only keeps working. A project on an
 overlay file system (as inside a container), inside Blackwall's data folder, or holding the
 `bwrap` Blackwall uses or the app's own files (the AppImage folder) is refused up front with a
 plain note, and so is a project or data folder whose path has a comma, colon or backslash, since
