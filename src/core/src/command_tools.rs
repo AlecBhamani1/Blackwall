@@ -1240,7 +1240,7 @@ mod tests {
     const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#;
     // PowerShell, not cmd.exe, which rejects the verbatim `\\?\` working directory.
     #[cfg(windows)]
-    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["powershell","-NoProfile","-Command","Set-Content -Path tool-write -Value x"]}]}"#;
+    const TOUCH_TOOL: &str = r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["powershell","-NoProfile","-NonInteractive","-Command","Set-Content -Path tool-write -Value x"]}]}"#;
 
     /// Run a tool that creates `tool-write` in the project, approving its prompt.
     #[cfg(any(unix, windows))]
@@ -1280,7 +1280,8 @@ mod tests {
                 "run",
                 &approvals,
                 &allow,
-                Duration::from_secs(5),
+                // PowerShell can take far longer than 5 seconds to cold-start on a CI runner.
+                Duration::from_secs(if cfg!(windows) { 60 } else { 5 }),
                 &Default::default(),
             )
             .await;
