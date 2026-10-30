@@ -64,7 +64,7 @@
       if (isDesktop()) {
         const status = await authClient.status();
         authStatus.set(status);
-        authInitialized = true;
+        authInitialized = !status.keyringNeeded;
         if (status.locked) return;
       }
       booted = true;
@@ -86,6 +86,11 @@
       if (!connected && !showHarnessDemo) setupOpen = true;
     } catch (cause) {
       lockError = authError(cause);
+      if (!booted) {
+        // A failed read settles nothing, so show its error rather than an earlier state.
+        authStatus.update((status) => ({ ...status, keyringNeeded: false }));
+        authInitialized = false;
+      }
     } finally {
       authBusy = false;
     }
