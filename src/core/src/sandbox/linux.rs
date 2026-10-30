@@ -20,6 +20,9 @@ pub enum Availability {
     Unavailable,
     /// A trusted bubblewrap failed to start just now. It's asked again after about 30 seconds.
     Retrying,
+    /// Every trusted, new-enough bubblewrap ran but could not start a sandbox, as when AppArmor
+    /// on Ubuntu 24.04 stops one without a profile. It's asked again after about 30 seconds too.
+    Blocked,
 }
 impl Availability {
     /// What to tell the owner when sandboxed commands can't run, or `None` when they can.
@@ -28,13 +31,15 @@ impl Availability {
             Self::Available { .. } => None,
             Self::Unavailable => Some(LINUX_UNAVAILABLE),
             Self::Retrying => Some(LINUX_RETRYING),
+            Self::Blocked => Some(LINUX_BLOCKED),
         }
     }
 }
 pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
 pub const LINUX_RETRYING: &str = "Bubblewrap didn't start just now. Try again in a moment.";
+pub const LINUX_BLOCKED: &str = "Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.";
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
-/// After a timeout or a setup failure, ask again no sooner than this.
+/// After a Retrying or Blocked answer, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const STALE_PROBE_DIRECTORY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -52,14 +57,6 @@ pub(crate) enum ProbeError {
     UnexpectedOutput,
     #[error("could not write the sandbox files: {0}")]
     Files(std::io::Error),
-}
-
-/// What `resolve` found. `transient` means a trusted bubblewrap failed to run, or a new-enough one
-/// failed to start a sandbox, so the answer may change if asked again. Without one it is final.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Resolution {
-    pub availability: Availability,
-    pub transient: bool,
 }
 
 /// "bubblewrap X.Y[.Z]" on the first line, nothing else.
@@ -252,14 +249,18 @@ fn run_command(
 }
 
 /// The first candidate that is trusted, new enough and able to start a sandbox on this kernel.
-/// `scratch` is an existing private directory. Blocking: async callers use `spawn_blocking`.
+/// Without one, the answer is `Unavailable` (final) when no trusted, new-enough candidate failed,
+/// `Blocked` when each that failed ran and could not start a sandbox, and `Retrying` when any
+/// failed in a way that may pass (it could not be started or waited for, timed out, or its files
+/// could not be written). `scratch` is an existing private directory. Blocking: async callers use
+/// `spawn_blocking`.
 pub(crate) fn resolve(
     candidates: &[PathBuf],
     scratch: &Path,
     timeout: Duration,
     appimage: Option<&Path>,
-) -> Resolution {
-    let mut transient = false;
+) -> Availability {
+    let (mut blocked, mut transient) = (false, false);
     let mut seen = HashSet::new();
     for candidate in candidates {
         let Some(bwrap) = trusted_file(candidate, appimage) else {
@@ -282,20 +283,23 @@ pub(crate) fn resolve(
             continue;
         };
         match probe(&bwrap, scratch, timeout) {
-            Ok(()) => {
-                return Resolution {
-                    availability: Availability::Available { bwrap, version },
-                    transient: false,
-                }
-            }
-            // A trusted, new-enough bubblewrap that cannot start a sandbox may be blocked by
-            // policy for good, or short of a resource for a moment. Ask again later to find out.
-            Err(_) => transient = true,
+            Ok(()) => return Availability::Available { bwrap, version },
+            // It ran and refused: policy (AppArmor, disabled user namespaces) most likely.
+            Err(ProbeError::Failed(_) | ProbeError::UnexpectedOutput) => blocked = true,
+            Err(
+                ProbeError::Spawn(_)
+                | ProbeError::Wait(_)
+                | ProbeError::TimedOut
+                | ProbeError::Files(_),
+            ) => transient = true,
         }
     }
-    Resolution {
-        availability: Availability::Unavailable,
-        transient,
+    if transient {
+        Availability::Retrying
+    } else if blocked {
+        Availability::Blocked
+    } else {
+        Availability::Unavailable
     }
 }
 
@@ -403,76 +407,99 @@ fn private_scratch(data_directory: &Path, prefix: &str) -> std::io::Result<PathB
 
 static UNAVAILABLE: Availability = Availability::Unavailable;
 static RETRYING: Availability = Availability::Retrying;
-static AVAILABLE: OnceLock<Availability> = OnceLock::new();
-static NEVER_AVAILABLE: AtomicBool = AtomicBool::new(false);
-static RETRY_NOT_BEFORE: Mutex<Option<Instant>> = Mutex::new(None);
+static BLOCKED: Availability = Availability::Blocked;
+
+/// What [`availability`] has found so far.
+struct Memory {
+    /// A working bubblewrap, kept for the life of the process.
+    found: OnceLock<Availability>,
+    /// No trusted, new-enough bubblewrap: kept for the life of the process too.
+    never: AtomicBool,
+    /// The last Retrying or Blocked answer and when to ask again. Held while looking, so
+    /// concurrent first callers wait for one answer instead of probing twice.
+    retry: Mutex<Option<(Instant, &'static Availability)>>,
+    retry_after: Duration,
+}
+impl Memory {
+    const fn new(retry_after: Duration) -> Self {
+        Self {
+            found: OnceLock::new(),
+            never: AtomicBool::new(false),
+            retry: Mutex::new(None),
+            retry_after,
+        }
+    }
+    /// The remembered answer, or what `look` finds now. `look` gives `None` when it could not
+    /// even get ready to look (no probe folder yet): that is `Retrying` but not remembered, so a
+    /// first launch, before the data folder exists, is not stuck with it for 30 seconds.
+    fn answer(&'static self, look: impl FnOnce() -> Option<Availability>) -> &'static Availability {
+        if let Some(found) = self.found.get() {
+            return found;
+        }
+        if self.never.load(Ordering::Acquire) {
+            return &UNAVAILABLE;
+        }
+        let mut retry = self
+            .retry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(found) = self.found.get() {
+            return found;
+        }
+        if self.never.load(Ordering::Acquire) {
+            return &UNAVAILABLE;
+        }
+        if let Some((until, answer)) = *retry {
+            if Instant::now() < until {
+                return answer;
+            }
+        }
+        let Some(looked) = look() else {
+            return &RETRYING;
+        };
+        let answer = match looked {
+            found @ Availability::Available { .. } => return self.found.get_or_init(|| found),
+            Availability::Unavailable => {
+                self.never.store(true, Ordering::Release);
+                return &UNAVAILABLE;
+            }
+            Availability::Blocked => &BLOCKED,
+            Availability::Retrying => &RETRYING,
+        };
+        *retry = Some((Instant::now() + self.retry_after, answer));
+        answer
+    }
+}
+static MEMORY: Memory = Memory::new(RETRY_AFTER);
 
 /// Whether sandboxed commands can run on this machine. Finding a working bubblewrap and finding
-/// none are both remembered for the life of the process (the first data directory wins). A
-/// timeout or a scratch-directory failure is not: the answer is `Retrying`, and it is asked again
-/// after about 30 seconds. A processor the seccomp filter doesn't support is never available.
-/// Blocking: async callers use `spawn_blocking`.
+/// none are both remembered for the life of the process (the first data directory wins). Any other
+/// failure of a trusted candidate (it would not run, or a new-enough one would not start a
+/// sandbox) is not: the answer is `Blocked` or `Retrying`, and it is asked again after about 30
+/// seconds. A probe folder that can't be made is
+/// `Retrying` and asked again on the next call. A processor the seccomp filter doesn't support is
+/// never available. Blocking: async callers use `spawn_blocking`.
 pub fn availability(data_directory: &Path) -> &'static Availability {
     if super::seccomp::NATIVE_ARCH.is_none() {
         return &UNAVAILABLE;
     }
-    if let Some(found) = AVAILABLE.get() {
-        return found;
-    }
-    if NEVER_AVAILABLE.load(Ordering::Acquire) {
-        return &UNAVAILABLE;
-    }
-    // Held while probing, so concurrent first callers wait for one answer instead of probing twice.
-    let mut retry_not_before = RETRY_NOT_BEFORE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(found) = AVAILABLE.get() {
-        return found;
-    }
-    if NEVER_AVAILABLE.load(Ordering::Acquire) {
-        return &UNAVAILABLE;
-    }
-    if retry_not_before.is_some_and(|instant| Instant::now() < instant) {
-        return &RETRYING;
-    }
-    let resolution = match prepare_scratch(data_directory) {
-        Ok(scratch) => {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let appimage = appimage_dir(
-                std::env::var_os("APPIMAGE"),
-                std::env::var_os("APPDIR"),
-                &exe,
-            );
-            let resolution = resolve(
-                &candidates(&exe),
-                &scratch,
-                Duration::from_secs(2),
-                appimage.as_deref(),
-            );
-            let _ = std::fs::remove_dir_all(&scratch);
-            resolution
-        }
-        Err(_) => Resolution {
-            availability: Availability::Unavailable,
-            transient: true,
-        },
-    };
-    match resolution {
-        Resolution {
-            availability: found @ Availability::Available { .. },
-            ..
-        } => AVAILABLE.get_or_init(|| found),
-        Resolution {
-            transient: true, ..
-        } => {
-            *retry_not_before = Some(Instant::now() + RETRY_AFTER);
-            &RETRYING
-        }
-        _ => {
-            NEVER_AVAILABLE.store(true, Ordering::Release);
-            &UNAVAILABLE
-        }
-    }
+    MEMORY.answer(|| {
+        let scratch = prepare_scratch(data_directory).ok()?;
+        let exe = std::env::current_exe().unwrap_or_default();
+        let appimage = appimage_dir(
+            std::env::var_os("APPIMAGE"),
+            std::env::var_os("APPDIR"),
+            &exe,
+        );
+        let found = resolve(
+            &candidates(&exe),
+            &scratch,
+            Duration::from_secs(2),
+            appimage.as_deref(),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        Some(found)
+    })
 }
 
 #[cfg(test)]
@@ -526,7 +553,7 @@ mod tests {
                 mode,
             )
         }
-        fn resolve(&self, candidates: &[PathBuf]) -> Resolution {
+        fn resolve(&self, candidates: &[PathBuf]) -> Availability {
             resolve(candidates, &self.scratch, secs(2), Some(&self.path))
         }
     }
@@ -553,6 +580,20 @@ mod tests {
         std::fs::remove_file(&source).unwrap();
     }
 
+    #[test]
+    fn each_answer_but_available_has_its_note() {
+        assert_eq!(
+            Availability::Blocked.note(),
+            Some("Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.")
+        );
+        assert_eq!(Availability::Retrying.note(), Some(LINUX_RETRYING));
+        assert_eq!(Availability::Unavailable.note(), Some(LINUX_UNAVAILABLE));
+        let available = Availability::Available {
+            bwrap: "/usr/lib/blackwall/bwrap".into(),
+            version: (0, 13, 1),
+        };
+        assert_eq!(available.note(), None);
+    }
     #[test]
     fn parse_version_accepts_only_bubblewrap_semver() {
         assert_eq!(parse_version("bubblewrap 0.13.1\n"), Some((0, 13, 1)));
@@ -585,14 +626,14 @@ mod tests {
         for (why, candidate) in bad {
             assert!(
                 matches!(
-                    &root.resolve(std::slice::from_ref(&candidate)).availability,
+                    &root.resolve(std::slice::from_ref(&candidate)),
                     Availability::Unavailable
                 ),
                 "{why} alone"
             );
             assert!(
                 matches!(
-                    root.resolve(&[candidate, control.clone()]).availability,
+                    root.resolve(&[candidate, control.clone()]),
                     Availability::Available { bwrap, version: (0, 13, 1) } if bwrap == control
                 ),
                 "{why} then control"
@@ -605,20 +646,13 @@ mod tests {
         let blocked =
             root.fake("case $1 in --version) echo 'bubblewrap 0.13.1';; *) exit 1;; esac");
         let ok = root.passing("bubblewrap 0.13.1", 0o755);
-        let resolution = root.resolve(&[blocked.clone(), ok.clone()]);
-        assert!(!resolution.transient);
         assert!(matches!(
-            resolution.availability,
+            root.resolve(&[blocked.clone(), ok.clone()]),
             Availability::Available { bwrap, .. } if bwrap == ok
         ));
-        // A usable-looking bubblewrap that cannot start a sandbox may recover (resources, policy).
-        assert_eq!(
-            root.resolve(&[blocked]),
-            Resolution {
-                availability: Availability::Unavailable,
-                transient: true
-            }
-        );
+        // A usable-looking bubblewrap that runs but cannot start a sandbox is blocked (AppArmor on
+        // Ubuntu 24.04, say), which is asked again later too.
+        assert_eq!(root.resolve(&[blocked]), Availability::Blocked);
     }
     #[test]
     fn resolver_reports_a_timeout_as_transient() {
@@ -630,13 +664,32 @@ mod tests {
             Duration::from_millis(300),
             Some(&root.path),
         );
+        assert_eq!(resolution, Availability::Retrying);
+    }
+    #[test]
+    fn resolver_tells_a_blocked_sandbox_from_a_transient_failure() {
+        let root = Root::new();
+        let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
+        let exits = root.fake(&format!("{new}exit 1;; esac"));
+        let wrong = root.fake(&format!("{new}printf no;; esac"));
+        let slow = root.fake(&format!("{new}exec sleep 30;; esac"));
+        let short = Duration::from_millis(300);
+        let resolve_in =
+            |found: &[PathBuf], timeout| resolve(found, &root.scratch, timeout, Some(&root.path));
         assert_eq!(
-            resolution,
-            Resolution {
-                availability: Availability::Unavailable,
-                transient: true
-            }
+            resolve_in(std::slice::from_ref(&exits), secs(2)),
+            Availability::Blocked
         );
+        assert_eq!(
+            resolve_in(&[exits.clone(), wrong], secs(2)),
+            Availability::Blocked
+        );
+        assert_eq!(
+            resolve_in(std::slice::from_ref(&slow), short),
+            Availability::Retrying
+        );
+        // One failure that may pass among blocked ones: asking again may find a working one.
+        assert_eq!(resolve_in(&[exits, slow], short), Availability::Retrying);
     }
     #[test]
     fn resolver_uses_the_canonical_path_and_tries_each_file_once() {
@@ -644,19 +697,15 @@ mod tests {
         let real = root.passing("bubblewrap 0.13.1", 0o755);
         let link = root.path.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let resolution = root.resolve(&[link.clone(), real.clone()]);
         assert!(matches!(
-            resolution.availability,
+            root.resolve(&[link.clone(), real.clone()]),
             Availability::Available { bwrap, .. } if bwrap == real
         ));
         // A symlink to something untrusted is judged by its target.
         let writable = root.passing("bubblewrap 0.13.1", 0o777);
         let bad_link = root.path.join("bad-link");
         std::os::unix::fs::symlink(writable, &bad_link).unwrap();
-        assert_eq!(
-            root.resolve(&[bad_link]).availability,
-            Availability::Unavailable
-        );
+        assert_eq!(root.resolve(&[bad_link]), Availability::Unavailable);
     }
     #[test]
     fn candidates_are_absolute_and_bundled_first() {
@@ -686,9 +735,10 @@ mod tests {
         let root = Root::new();
         let started = Instant::now();
         // Gives up waiting while a background process is still running.
+        // A second is ample for it to record the pid first, even on a slow CI runner.
         let hung = root.fake("sleep 30 &\necho $! > \"$0.pid\"\nsleep 30");
         assert!(matches!(
-            probe(&hung, &root.scratch, Duration::from_millis(300)),
+            probe(&hung, &root.scratch, secs(1)),
             Err(ProbeError::TimedOut)
         ));
         assert_dies(&hung);
@@ -718,55 +768,111 @@ mod tests {
     #[test]
     fn resolve_is_final_only_when_no_trusted_new_enough_candidate_exists() {
         let root = Root::new();
-        let transient = |candidates: &[PathBuf], timeout| {
-            resolve(candidates, &root.scratch, timeout, Some(&root.path)).transient
+        let found = |candidates: &[PathBuf], timeout| {
+            resolve(candidates, &root.scratch, timeout, Some(&root.path))
         };
         let short = Duration::from_millis(300);
         let no_interpreter = root.fake("");
         write_script(&no_interpreter, "#!/no/such/interpreter\n");
         std::fs::set_permissions(&no_interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Nothing usable was found: final.
-        assert!(!transient(&[], secs(2)));
+        assert_eq!(found(&[], secs(2)), Availability::Unavailable);
         let untrusted = root.passing("bubblewrap 0.13.1", 0o777);
-        assert!(!transient(&[untrusted, root.path.join("missing")], secs(2)));
-        assert!(!transient(
-            &[root.passing("bubblewrap 0.11.2", 0o755)],
-            secs(2)
-        ));
-        assert!(!transient(
-            &[root.passing("not bubblewrap", 0o755)],
-            secs(2)
-        ));
-        assert!(
-            !transient(&[root.fake("exit 1")], secs(2)),
+        assert_eq!(
+            found(&[untrusted, root.path.join("missing")], secs(2)),
+            Availability::Unavailable
+        );
+        assert_eq!(
+            found(&[root.passing("bubblewrap 0.11.2", 0o755)], secs(2)),
+            Availability::Unavailable
+        );
+        assert_eq!(
+            found(&[root.passing("not bubblewrap", 0o755)], secs(2)),
+            Availability::Unavailable
+        );
+        assert_eq!(
+            found(&[root.fake("exit 1")], secs(2)),
+            Availability::Unavailable,
             "--version fails"
         );
-        // A trusted file that would not run, or a new-enough one that would not start a sandbox:
-        // maybe temporary.
-        assert!(
-            transient(&[root.fake("exec sleep 30")], short),
+        // A trusted file that would not run, or a new-enough one that would not start a sandbox in
+        // time: maybe temporary.
+        assert_eq!(
+            found(&[root.fake("exec sleep 30")], short),
+            Availability::Retrying,
             "--version times out"
         );
-        assert!(transient(&[no_interpreter], secs(2)), "cannot start");
+        assert_eq!(
+            found(&[no_interpreter], secs(2)),
+            Availability::Retrying,
+            "cannot start"
+        );
         let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
-        assert!(
-            transient(&[root.fake(&format!("{new}exit 1;; esac"))], secs(2)),
-            "probe fails"
-        );
-        assert!(
-            transient(&[root.fake(&format!("{new}printf no;; esac"))], secs(2)),
-            "probe output"
-        );
-        assert!(
-            transient(&[root.fake(&format!("{new}exec sleep 30;; esac"))], short),
+        assert_eq!(
+            found(&[root.fake(&format!("{new}exec sleep 30;; esac"))], short),
+            Availability::Retrying,
             "probe times out"
         );
-        // A later good candidate still wins, and is not transient.
+        // A new-enough one that runs and fails to start a sandbox: blocked, asked again too.
+        assert_eq!(
+            found(&[root.fake(&format!("{new}exit 1;; esac"))], secs(2)),
+            Availability::Blocked,
+            "probe fails"
+        );
+        assert_eq!(
+            found(&[root.fake(&format!("{new}printf no;; esac"))], secs(2)),
+            Availability::Blocked,
+            "probe output"
+        );
+        // A later good candidate still wins.
         let blocked = root.fake(&format!("{new}exit 1;; esac"));
-        assert!(!transient(
-            &[blocked, root.passing("bubblewrap 0.13.1", 0o755)],
-            secs(2)
+        assert!(matches!(
+            found(
+                &[blocked, root.passing("bubblewrap 0.13.1", 0o755)],
+                secs(2)
+            ),
+            Availability::Available { .. }
         ));
+    }
+    #[test]
+    fn availability_remembers_answers_but_not_a_failure_to_prepare() {
+        let fresh =
+            |retry_after| -> &'static Memory { Box::leak(Box::new(Memory::new(retry_after))) };
+        let never = || -> Option<Availability> { panic!("asked again") };
+        // No probe folder (the data folder doesn't exist yet on a first launch): Retrying, but
+        // the next call looks again at once.
+        let memory = fresh(RETRY_AFTER);
+        assert_eq!(memory.answer(|| None), &Availability::Retrying);
+        assert_eq!(
+            memory.answer(|| Some(Availability::Blocked)),
+            &Availability::Blocked
+        );
+        // Blocked and Retrying are repeated until the retry time, then asked again.
+        assert_eq!(memory.answer(never), &Availability::Blocked);
+        let memory = fresh(RETRY_AFTER);
+        assert_eq!(
+            memory.answer(|| Some(Availability::Retrying)),
+            &Availability::Retrying
+        );
+        assert_eq!(memory.answer(never), &Availability::Retrying);
+        let memory = fresh(Duration::ZERO);
+        assert_eq!(
+            memory.answer(|| Some(Availability::Blocked)),
+            &Availability::Blocked
+        );
+        assert_eq!(
+            memory.answer(|| Some(Availability::Unavailable)),
+            &Availability::Unavailable
+        );
+        // Unavailable and Available are final.
+        assert_eq!(memory.answer(never), &Availability::Unavailable);
+        let memory = fresh(Duration::ZERO);
+        let found = Availability::Available {
+            bwrap: "/usr/lib/blackwall/bwrap".into(),
+            version: (0, 13, 1),
+        };
+        assert_eq!(memory.answer(|| Some(found.clone())), &found);
+        assert_eq!(memory.answer(never), &found);
     }
     #[test]
     fn trusted_file_requires_a_plain_unwritable_file_in_unwritable_directories() {
@@ -902,7 +1008,7 @@ mod tests {
         let root = Root::new();
         let found = candidates(Path::new("/usr/bin/blackwall"));
         let Availability::Available { bwrap, version } =
-            resolve(&found, &root.scratch, secs(5), None).availability
+            resolve(&found, &root.scratch, secs(5), None)
         else {
             panic!("no usable bwrap among {found:?}");
         };

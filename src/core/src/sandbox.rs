@@ -529,7 +529,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux_backend {
         use super::*;
-        use crate::sandbox::linux::{Availability, LINUX_RETRYING, LINUX_UNAVAILABLE};
+        use crate::sandbox::linux::{
+            Availability, LINUX_BLOCKED, LINUX_RETRYING, LINUX_UNAVAILABLE,
+        };
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
 
@@ -623,6 +625,7 @@ mod tests {
             for (availability, note) in [
                 (Availability::Unavailable, LINUX_UNAVAILABLE),
                 (Availability::Retrying, LINUX_RETRYING),
+                (Availability::Blocked, LINUX_BLOCKED),
             ] {
                 let error = project
                     .run("printf x > ran", &availability)
@@ -750,7 +753,11 @@ mod tests {
         async fn a_command_that_cannot_be_sandboxed_fails_before_any_approval_prompt() {
             use crate::{approvals::Approvals, command_tools::Isolation, protocol::AgentEvent};
             let mut project = Project::new();
-            for availability in [Availability::Unavailable, Availability::Retrying] {
+            for availability in [
+                Availability::Unavailable,
+                Availability::Retrying,
+                Availability::Blocked,
+            ] {
                 assert_eq!(
                     ready_with(&project.workspace, &availability)
                         .unwrap_err()
@@ -840,6 +847,7 @@ mod tests {
             for (availability, note) in [
                 (Availability::Unavailable, LINUX_UNAVAILABLE),
                 (Availability::Retrying, LINUX_RETRYING),
+                (Availability::Blocked, LINUX_BLOCKED),
             ] {
                 assert_eq!(
                     linux_status(&availability),
