@@ -17,6 +17,7 @@
   import Sidebar from './lib/components/Sidebar.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
+  import { sandboxClient, type SandboxStatus } from './lib/ipc';
 
   let composer: Composer;
   const controller = createChatController();
@@ -124,6 +125,34 @@
       authBusy = false;
     }
   }
+  // Only Linux reports a status. Unknown (other systems, the browser preview, or no answer)
+  // leaves every profile on offer; a command that can't be sandboxed still fails closed and says
+  // why. Read-only, the safe default, stays selectable even when the sandbox is unavailable.
+  let sandbox: SandboxStatus | null = null;
+  $: workspaceWrite = sandbox?.workspaceWrite ?? true;
+  const SANDBOX_RECHECK_MS = 30_000;
+  let sandboxRecheck: ReturnType<typeof setTimeout> | undefined;
+  let sandboxRequest = 0;
+  /** Ask again; when the sandbox is unavailable (bubblewrap may have failed only for a moment,
+   * or been installed since), ask once more about 30 seconds later. Only the latest answer counts. */
+  async function checkSandbox(recheck = false) {
+    if (!isDesktop()) return;
+    const request = ++sandboxRequest;
+    const status = await sandboxClient.status();
+    if (request !== sandboxRequest) return;
+    sandbox = status;
+    clearTimeout(sandboxRecheck);
+    sandboxRecheck = undefined;
+    if (!recheck && status && !status.available) {
+      sandboxRecheck = setTimeout(() => {
+        if ($agentMode) void checkSandbox(true);
+      }, SANDBOX_RECHECK_MS);
+    }
+  }
+  $: if ($agentMode) void checkSandbox();
+  function windowFocused() {
+    if ($agentMode) void checkSandbox();
+  }
   let setupOpen = false;
   let startupServers: LocalService[] | null = null;
   $: if (!setupOpen) startupServers = null;
@@ -168,11 +197,14 @@
     void initializeApp();
     void updateController.initialize();
     window.addEventListener('keydown', keydown);
+    window.addEventListener('focus', windowFocused);
   });
 
   onDestroy(() => {
     stopPairing();
     window.removeEventListener('keydown', keydown);
+    window.removeEventListener('focus', windowFocused);
+    clearTimeout(sandboxRecheck);
     controller.destroy();
   });
 </script>
@@ -263,7 +295,7 @@
                 disabled={$runState !== 'idle'}
               >
                 <option value="read-only">Read-only</option>
-                <option value="workspace-write">Workspace-write</option>
+                <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
                 <option value="unsandboxed">Unsandboxed (full access)</option>
               </select>
             </label><label class="web-toggle">
@@ -290,6 +322,21 @@
       {/if}
       {#if !setupOpen && isDesktop() && $agentMode && $workspace}
         <ProjectTrust workspace={$workspace} refresh={$runState} />
+      {/if}
+      {#if !setupOpen && isDesktop() && $agentMode && sandbox && !sandbox.available && sandbox.note}
+        <p class="sandbox-note" role="status">
+          {sandbox.note}<button
+            class="sandbox-help"
+            onclick={() => void setupClient.openLink('sandbox-docs').catch(() => {})}
+            >Learn more</button
+          >
+        </p>
+      {/if}
+      {#if !setupOpen && isDesktop() && $agentMode && $commandNetwork && $executionProfile !== 'unsandboxed'}
+        <p class="sandbox-note" role="note">
+          With command network on, sandboxed commands share this computer's network, so they can
+          reach services on this computer (localhost) and your local network.
+        </p>
       {/if}
       {#if $agentMode && $executionProfile === 'unsandboxed'}
         <div class="storage-error" role="status">
@@ -465,6 +512,21 @@
     background: var(--bg-panel);
     color: var(--text-primary);
     font-size: 12px;
+  }
+  .sandbox-note {
+    margin: 0;
+    padding: 6px 20px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .sandbox-help {
+    margin-left: 6px;
+    padding: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    text-decoration: underline;
   }
   .return-chat {
     padding: 12px;

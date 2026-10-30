@@ -78,6 +78,36 @@ jobs:
       - name: Run tests
         run: cargo test --locked --manifest-path src/Cargo.toml --workspace --all-features
 
+  linux-sandbox:
+    name: Linux sandbox (bubblewrap 0.13.1, ${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Install Linux desktop libraries
+        run: ./scripts/install-linux-deps.sh
+      - name: Build bubblewrap
+        run: ./scripts/build-bwrap.sh "$RUNNER_TEMP/bwrap"
+      - name: Install bubblewrap where the .deb puts it
+        # Root-owned, as Blackwall's own lookup requires, so the tests that find bubblewrap
+        # themselves (the probe and the approval test) use this build too.
+        run: sudo install -D -o root -g root -m 0755 "$RUNNER_TEMP/bwrap/bwrap" /usr/lib/blackwall/bwrap
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts them to AppArmor-profiled programs; the .deb ships that profile.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Run the sandbox tests with the real bubblewrap, as a normal user
+        env:
+          BLACKWALL_TEST_BWRAP: /usr/lib/blackwall/bwrap
+        run: cargo test --locked --manifest-path src/Cargo.toml -p blackwall-core --all-features -- --ignored linux_sandbox_
+
   relay-linux:
     name: Relay deployment checks
     runs-on: ubuntu-latest
@@ -173,6 +203,9 @@ jobs:
       - name: Install Linux desktop libraries
         if: runner.os == 'Linux'
         run: ./scripts/install-linux-deps.sh
+      - name: Build bubblewrap
+        if: runner.os == 'Linux'
+        run: ./scripts/build-bwrap.sh src/app/resources/linux
       - run: npm ci --prefix ui
       - name: Verify every desktop target without publication credentials
         shell: bash
@@ -183,7 +216,7 @@ jobs:
 
   quality-gate:
     name: Quality gate
-    needs: [detect, release-validation, rust, relay-linux, dependencies, dependency-review, ui, desktop]
+    needs: [detect, release-validation, rust, linux-sandbox, relay-linux, dependencies, dependency-review, ui, desktop]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -196,7 +229,7 @@ jobs:
         run: |
           node <<'NODE'
           const jobs = JSON.parse(process.env.RESULTS);
-          const required = ['detect', 'release-validation', 'rust', 'relay-linux', 'dependencies', 'ui'];
+          const required = ['detect', 'release-validation', 'rust', 'linux-sandbox', 'relay-linux', 'dependencies', 'ui'];
           if (process.env.DESKTOP_REQUIRED === 'true') required.push('desktop');
           if (process.env.DEPENDENCY_REVIEW_REQUIRED === 'true') required.push('dependency-review');
           const failed = required.filter(name => jobs[name].result !== 'success');

@@ -1,0 +1,22 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "depends": ["libcap2"],
+        "files": {
+          "/usr/lib/blackwall/bwrap": "resources/linux/bwrap",
+          "/usr/share/doc/blackwall/bubblewrap/COPYING": "resources/linux/COPYING",
+          "/usr/share/blackwall/apparmor/blackwall-bwrap": "linux/apparmor/blackwall-bwrap"
+        },
+        "postInstallScript": "linux/deb/postinst.sh",
+        "preRemoveScript": "linux/deb/prerm.sh"
+      },
+      "appimage": {
+        "files": {
+          "/usr/lib/blackwall/bwrap": "resources/linux/bwrap",
+          "/usr/share/doc/blackwall/bubblewrap/COPYING": "resources/linux/COPYING"
+        }
+      }
+    }
+  }
+}

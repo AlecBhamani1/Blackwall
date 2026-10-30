@@ -148,6 +148,163 @@ it('sends the selected command boundary and resets full access on a new session'
   expect(network).not.toBeChecked();
 });
 
+it('keeps Read-only, disables Workspace-write and shows the bubblewrap note when unavailable', async () => {
+  const user = userEvent.setup();
+  const note =
+    "Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.";
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'sandbox_status'
+      ? { available: false, note, workspaceWrite: false }
+      : fallback?.(command, args),
+  );
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  expect(screen.queryByText(note)).not.toBeInTheDocument();
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  expect(await screen.findByText(note)).toBeInTheDocument();
+  // Read-only is the safe default and stays on offer; commands fail closed until it works.
+  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  expect(profile).toHaveValue('read-only');
+  expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled();
+  expect(within(profile).getByRole('option', { name: 'Unsandboxed (full access)' })).toBeEnabled();
+  await user.click(screen.getByRole('button', { name: 'Learn more' }));
+  expect(native.invoke).toHaveBeenCalledWith('open_setup_link', {
+    kind: 'sandbox-docs',
+    invitation: null,
+  });
+  await user.selectOptions(profile, 'unsandboxed');
+  await user.selectOptions(profile, 'read-only');
+  expect(profile).toHaveValue('read-only');
+});
+
+it('checks the sandbox again on focus and about 30 seconds after it was unavailable', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const note = "Bubblewrap didn't start just now. Try again in a moment.";
+    let available = false;
+    const fallback = native.invoke.getMockImplementation();
+    native.invoke.mockImplementation(async (command, args) =>
+      command === 'sandbox_status'
+        ? { available, note: available ? null : note, workspaceWrite: false }
+        : fallback?.(command, args),
+    );
+    const checks = () =>
+      native.invoke.mock.calls.filter(([command]) => command === 'sandbox_status').length;
+    render(App);
+    await screen.findByRole('combobox', { name: 'Model' });
+    expect(checks()).toBe(0);
+    await fireEvent.click(
+      within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+    );
+    expect(await screen.findByText(note)).toBeInTheDocument();
+    expect(checks()).toBe(1);
+    // Still failing 30 seconds later: asked once more, and not again after that.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(checks()).toBe(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(checks()).toBe(2);
+    // Coming back to the window asks again, and a working sandbox clears the note.
+    available = true;
+    await fireEvent.focus(window);
+    await waitFor(() => expect(screen.queryByText(note)).not.toBeInTheDocument());
+    expect(checks()).toBe(3);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(checks()).toBe(3);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('applies only the latest sandbox answer and stops rechecking outside Agent mode', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const note = "Bubblewrap didn't start just now. Try again in a moment.";
+    const replies: ((status: unknown) => void)[] = [];
+    const fallback = native.invoke.getMockImplementation();
+    native.invoke.mockImplementation(async (command, args) =>
+      command === 'sandbox_status'
+        ? new Promise((resolve) => replies.push(resolve))
+        : fallback?.(command, args),
+    );
+    render(App);
+    await screen.findByRole('combobox', { name: 'Model' });
+    await fireEvent.click(
+      within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+    );
+    await waitFor(() => expect(replies).toHaveLength(1));
+    await fireEvent.focus(window);
+    await waitFor(() => expect(replies).toHaveLength(2));
+    // The newer answer arrives first; the older one, arriving late, is ignored.
+    replies[1]({ available: true, note: null, workspaceWrite: false });
+    replies[0]({ available: false, note, workspaceWrite: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+    // An unavailable answer arms the 30-second recheck, which is skipped once Agent mode is left.
+    await fireEvent.focus(window);
+    await waitFor(() => expect(replies).toHaveLength(3));
+    replies[2]({ available: false, note, workspaceWrite: false });
+    expect(await screen.findByText(note)).toBeInTheDocument();
+    await fireEvent.click(
+      within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Chat' }),
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(replies).toHaveLength(3);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('says what command network reaches when it is on', async () => {
+  const user = userEvent.setup();
+  const hint =
+    "With command network on, sandboxed commands share this computer's network, so they can reach services on this computer (localhost) and your local network.";
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const network = screen.getByRole('checkbox', { name: 'Command network' });
+  expect(screen.queryByText(hint)).not.toBeInTheDocument();
+  await user.click(network);
+  expect(screen.getByText(hint)).toBeInTheDocument();
+  // Unsandboxed has its own, stronger notice.
+  await user.selectOptions(
+    screen.getByRole('combobox', { name: 'Command execution profile' }),
+    'unsandboxed',
+  );
+  expect(screen.queryByText(hint)).not.toBeInTheDocument();
+  await user.selectOptions(
+    screen.getByRole('combobox', { name: 'Command execution profile' }),
+    'read-only',
+  );
+  await user.click(network);
+  expect(screen.queryByText(hint)).not.toBeInTheDocument();
+});
+
+it('offers Read-only but not yet Workspace-write where only Read-only is sandboxed', async () => {
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'sandbox_status'
+      ? { available: true, note: null, workspaceWrite: false }
+      : fallback?.(command, args),
+  );
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  await waitFor(() =>
+    expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
+  );
+  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  expect(screen.queryByRole('button', { name: 'Learn more' })).not.toBeInTheDocument();
+});
+
 it('asks which server to use on a first launch instead of connecting on its own', async () => {
   const user = userEvent.setup();
   const discoverModels = vi.spyOn(localModelClient, 'discoverModels');

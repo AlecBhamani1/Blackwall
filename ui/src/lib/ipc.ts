@@ -690,3 +690,27 @@ export const multiShareClient = {
   },
 };
 export type GuestShareClient = typeof guestShareClient;
+
+/** Whether sandboxed command profiles can run on this computer, and why not when they can't. */
+export interface SandboxStatus {
+  available: boolean;
+  note: string | null;
+  workspaceWrite: boolean;
+}
+
+export const sandboxClient = {
+  /** `null` outside the desktop app, or when the app can't say: nothing is disabled then, and a
+   * command that can't be sandboxed still fails closed with its reason. */
+  async status(): Promise<SandboxStatus | null> {
+    if (!isTauriRuntime()) return null;
+    const value = await invoke<unknown>('sandbox_status').catch(() => null);
+    if (!value || typeof value !== 'object') return null;
+    const record = value as Record<string, unknown>;
+    if (typeof record.available !== 'boolean') return null;
+    return {
+      available: record.available,
+      note: typeof record.note === 'string' ? record.note : null,
+      workspaceWrite: record.workspaceWrite !== false,
+    };
+  },
+};

@@ -513,6 +513,8 @@ pub async fn execute(
             if command.trim().is_empty() || command.len() > 8000 {
                 return Err(ToolError::Arguments);
             }
+            // Never ask to approve a command that can't run under the owner's profile.
+            crate::sandbox::ready(workspace).await?;
             let detail = format!(
                 "Project: {}\nCommand: {command}\n\n{}",
                 workspace.path.display(),
@@ -525,13 +527,19 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            run_with_timeout(
+            let (process, mut guard) =
+                crate::sandbox::prepare(workspace, shell_command(command), Scope::Shell, &[])
+                    .await?;
+            let outcome = run_with_input(
                 &workspace.path,
-                crate::sandbox::wrap(workspace, shell_command(command), Scope::Shell, &[])?,
+                process,
+                None,
                 command_timeout,
                 output,
+                Some(&mut guard),
             )
-            .await
+            .await;
+            guard.finish(outcome).await
         }
         "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
         _ => Err(ToolError::Arguments),
@@ -639,17 +647,20 @@ pub(crate) async fn program_with_timeout(
             // The owner chose to run command tools as themselves, whatever the shell profile.
             crate::child_env::from_process(Scope::Owner, &workspace.path, pass_through)
                 .apply(&mut process);
-            return run_with_input(&workspace.path, process, input, timeout, output).await;
+            return run_with_input(&workspace.path, process, input, timeout, output, None).await;
         }
-        let result = run_with_input(
+        let (process, mut guard) =
+            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through).await?;
+        let outcome = run_with_input(
             &workspace.path,
-            crate::sandbox::wrap(workspace, process, Scope::Owner, pass_through)?,
+            process,
             input,
             timeout,
             output,
+            Some(&mut guard),
         )
         .await;
-        match result {
+        match guard.finish(outcome).await {
             Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
                 text,
                 workspace.execution.profile,
@@ -662,7 +673,7 @@ pub(crate) async fn program_with_timeout(
 /// profile's display name.
 pub(crate) const SANDBOXED_TOOL_HINT: &str = "This may have been blocked by the {profile} sandbox. Command tools that need their own files or network can run outside it: Memory → Advanced · Subagents → Command tools, or `bw config set command-tools-isolation outside`.";
 /// What a sandbox denial prints, in lower case. A program that merely failed prints none.
-const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
+const SANDBOX_DENIAL_MARKERS: [&str; 10] = [
     "operation not permitted",
     "permission denied",
     "read-only file system",
@@ -672,6 +683,8 @@ const SANDBOX_DENIAL_MARKERS: [&str; 9] = [
     "could not resolve host",
     "connection refused",
     "not allowed",
+    // bubblewrap's own errors, such as a program that isn't in the sandbox.
+    "bwrap: ",
 ];
 /// `text` with the sandbox hint added when a sandboxed profile is in force and the failure looks
 /// like a denial. Never on the time limit, and never for a program that just exited non-zero.
@@ -774,16 +787,15 @@ pub(crate) fn spawn_server(
         Ok((ServerProcess { _child: child }, stdin, stdout, stderr))
     }
 }
-/// Bounded, time-limited capture with the same descendant cleanup for every process. Output over
-/// the cap is trimmed to its start and end.
-#[cfg(any(unix, windows))]
+/// [`run_with_input`] with no input, for a command that isn't from `sandbox::prepare`.
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) async fn run_with_timeout(
     directory: &Path,
     process: tokio::process::Command,
     timeout: Duration,
     output: &OutputCap,
 ) -> Result<String, ToolError> {
-    run_with_input(directory, process, None, timeout, output).await
+    run_with_input(directory, process, None, timeout, output, None).await
 }
 /// The start and end of one output stream, and how many bytes it had in all.
 #[cfg(any(unix, windows))]
@@ -829,18 +841,25 @@ impl Stream {
         pieces.push(Piece::Bytes(second));
     }
 }
-/// [`run_with_timeout`], writing `input` to standard input while output is captured. The command
-/// brings its own environment; this never adds to or inherits one on its behalf.
+/// Bounded, time-limited capture with the same descendant cleanup for every process, writing
+/// `input` to standard input while output is captured. Output over the cap is trimmed to its start
+/// and end. The command brings its own environment; this never adds to or inherits one on its behalf. It runs in
+/// `directory` unless it already has a working directory (the Linux sandbox launcher runs from
+/// `/` and moves the command into the project itself). A command from `sandbox::prepare` is
+/// started by its `guard`.
 #[cfg(any(unix, windows))]
-async fn run_with_input(
+pub(crate) async fn run_with_input(
     directory: &Path,
     mut process: tokio::process::Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
     output: &OutputCap,
+    guard: Option<&mut crate::sandbox::RunGuard>,
 ) -> Result<String, ToolError> {
+    if process.as_std().get_current_dir().is_none() {
+        process.current_dir(directory);
+    }
     process
-        .current_dir(directory)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -855,9 +874,11 @@ async fn run_with_input(
         process.as_std_mut().process_group(0);
     }
     #[cfg(unix)]
-    let mut child = process
-        .spawn()
-        .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+    let mut child = match guard {
+        Some(guard) => guard.spawn(&mut process),
+        None => process.spawn(),
+    }
+    .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
     #[cfg(unix)]
     let _group = ProcessGroup(
         child
@@ -868,6 +889,8 @@ async fn run_with_input(
     let mut child = {
         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        // Windows has no sandbox to hand anything to.
+        let _ = guard;
 
         let mut process = CommandWrap::from(process);
         // The wrapper spawns suspended, assigns the process to a kill-on-close job,
@@ -1005,6 +1028,12 @@ mod tests {
             ExecutionProfile::WorkspaceWrite
         )
         .contains("the Workspace-write sandbox."));
+        // bubblewrap's own failure, such as a program missing from the sandbox.
+        assert!(hinted(
+            "Exit: 1\nbwrap: execvp /x: No such file or directory\n",
+            ExecutionProfile::ReadOnly
+        )
+        .contains("the Read-only sandbox."));
         // A plain failure, the time limit, and an unsandboxed profile get no hint.
         for text in [
             "Exit: 3\n",
@@ -1080,8 +1109,10 @@ mod tests {
         let mut workspace = Workspace::open(&directory).unwrap();
         workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         // Cargo sets this for the test process: the shell keeps it, programs do not get it.
-        let process =
-            crate::sandbox::wrap(&workspace, shell_command("env"), Scope::Shell, &[]).unwrap();
+        let process = crate::sandbox::prepare(&workspace, shell_command("env"), Scope::Shell, &[])
+            .await
+            .unwrap()
+            .0;
         let out = run_with_timeout(
             &workspace.path,
             process,

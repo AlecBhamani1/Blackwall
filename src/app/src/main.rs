@@ -44,6 +44,16 @@ fn run() -> Result<(), StartupError> {
     #[cfg(target_os = "macos")]
     let builder = builder.on_window_event(lifecycle::on_window_event);
     let app = builder
+        .setup(|app| {
+            // Find bubblewrap now, off the main thread, so the first command doesn't wait for it.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Ok(directory) = identity::data_directory(&handle) {
+                    let _ = blackwall_core::sandbox::selector_status(&directory);
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             updates::check_app_update,
             pairing::pairing_status,
@@ -121,6 +131,7 @@ fn run() -> Result<(), StartupError> {
             setup::download_local_model,
             setup::cancel_request,
             setup::open_setup_link,
+            commands::sandbox_status,
             commands::model_endpoint,
             commands::discover_models,
             commands::chat,

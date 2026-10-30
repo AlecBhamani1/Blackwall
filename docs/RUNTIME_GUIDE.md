@@ -528,7 +528,9 @@ Agent mode, choose **Commands → Read-only / Workspace-write / Unsandboxed** an
 CLI owners use `bw config set profile read-only` (or `workspace-write` / `unsandboxed`) and
 `bw config set command-network on|off`; `/settings` offers the same controls. The default is
 read-only with command network disabled. Desktop selections reset when switching conversations;
-CLI selections persist. Old saved settings acquire the safe defaults.
+CLI selections persist. Old saved settings acquire the safe defaults. With command network on,
+sandboxed commands share this computer's network, so they can reach services on this computer
+(localhost) and your local network. Limiting them to the internet is not available yet.
 
 Command tools are the exception to the profile by default, because a program such as `claude -p`
 needs its own files and network. **Command tools** (Memory → Advanced · Subagents, or
@@ -554,7 +556,8 @@ On macOS, Seatbelt applies before the shell/program starts and is inherited by d
 
 Sandboxed commands cannot read or write Blackwall's data directory, credential directories such as
 `.ssh`, `.aws`, `.gnupg`, `.config`, or the owner's `Library`. Project metadata and agent configuration
-folders (`.git`, `.hg`, `.svn`, `.agents`, `.codex`, `.claude`) are protected at every depth;
+folders (`.git`, `.hg`, `.svn`, `.agents`, `.codex`, `.claude`) are protected at every depth on
+macOS (for Linux, see [Linux sandbox](#linux-sandbox));
 `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` remain readable but cannot be changed by commands.
 System runtime reads include `/System`, `/usr`, `/bin`, `/sbin`, and `/opt/homebrew`; arbitrary
 external source trees, home-installed runtimes and shared temporary folders are not granted. Put
@@ -562,9 +565,9 @@ build output and scratch files inside the project when using workspace-write.
 
 Approval still applies to commands, including exact command text and working folder. Approval or
 an allow rule never widens the profile. A denied action must be reported to the owner; change the
-profile explicitly before proposing it again. A missing/broken macOS backend fails closed with no
-unsandboxed retry. Linux and Windows currently fail closed for restricted profiles; full account
-execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
+profile explicitly before proposing it again. A missing/broken macOS or Linux backend fails
+closed with no unsandboxed retry. Windows currently fails closed for restricted profiles; full
+account execution there requires explicitly choosing unsandboxed. Unsandboxed Unix commands use `/bin/sh`;
 Windows uses Windows PowerShell.
 
 Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
@@ -574,6 +577,46 @@ create a new process group/session to escape cleanup: direct `setpgid`/`setsid` 
 `posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
 command tools when they are `sandboxed`; separately configured MCP servers retain their own account
 permissions and approvals.
+
+### Linux sandbox
+
+On Linux, Read-only runs each command under bubblewrap, which ships with the AppImage and the
+`.deb` (bubblewrap 0.13.1, LGPL, run as a separate program). The bundled `bwrap` is always tried
+first; a system `bwrap` is used only when it is version 0.12.0 or newer and starts a test sandbox,
+so its security is left to the vendor that ships it. A `bwrap` is trusted only when root owns it
+and the folders above it and nobody else can write to them; the one inside the running AppImage is
+the exception. The `.deb` also installs an AppArmor profile, where the system's AppArmor accepts
+it, that gives only the bundled `bwrap` user namespaces and mounts, and the programs it runs no
+capabilities. The AppImage has no profile, so on Ubuntu 24.04 and later AppArmor stops its `bwrap`:
+use the `.deb` there. The command sees the system folders (`/usr`, `/bin`, `/sbin`, `/lib`,
+`/lib64`, Linuxbrew) with `/usr/local/etc` and Linuxbrew's `etc` hidden, a short list of `/etc`
+files (certificates, `resolv.conf`, `hosts`, `passwd` and the like) and a private `/tmp`, with no
+`/run` and no home folder. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
+`.blackwall`, `.ssh`, `.aws`, `.gnupg`, `.config`, `.codex`, `.claude` and `.agents` are hidden.
+The exception is `node_modules`, `target`, `.venv`, `venv`, `__pycache__`, `dist` and `build`:
+only their direct children are checked for those names, so a protected name deeper inside them
+stays readable. Commands cannot open Unix-domain or VSOCK sockets, so they cannot reach the desktop
+session or a container daemon. They also cannot create user namespaces or use `io_uring`. The
+network is off unless Command network is on. The project cannot be your home folder, a folder
+that contains it, or `/`; Blackwall's data folder cannot be inside the project; a project that
+contains another mounted file system is refused; and so is a project with more than 500,000 files
+and folders, not counting the contents of the skipped folders, with the message naming its largest
+folder. If the check takes more than 10 seconds, the command doesn't run. Workspace-write is not
+available on Linux yet: the selector turns it off and `bw` refuses it.
+
+The sandbox mounts the project folder that was checked, by its descriptor, so a folder swapped in
+at the project's path after the check is not what the command sees. Inside the project the check
+goes by path: a program outside the sandbox that renames folders in the project while it is being
+checked can still leave a protected name readable.
+
+If bubblewrap is missing or older than 0.12, Read-only stays selectable with a note to install
+Blackwall's `.deb` or AppImage, or a newer `bwrap`, and commands fail closed without running. If
+bubblewrap is there but the system won't let it start a sandbox (the AppImage on Ubuntu 24.04, for
+example), the note says so and suggests the `.deb`. Both are checked before the approval prompt,
+and so is the project's location. Blackwall runs a real sandboxed command when the app starts, or
+on `bw`'s first sandboxed command; if that fails for a moment, the note says "Bubblewrap didn't
+start just now. Try again in a moment." A blocked or momentary failure is checked again after 30
+seconds; a missing or old bubblewrap needs a restart once it is installed.
 
 ### Child environments
 
@@ -590,8 +633,7 @@ credentials from reaching a program that does not need them.
   plus the names you list under `env` in `mcp.json` or `tools.json`.
 - An unsandboxed shell command runs with your environment (`SSH_AUTH_SOCK`, `KUBECONFIG`,
   `AWS_PROFILE`, `DISPLAY` and so on), minus Blackwall's own keys, loader and code-injection
-  variables, and the AppImage runtime's (`APPDIR`, `APPIMAGE`, `ARGV0`, `OWD` and similar). On
-  Linux every shell command currently runs unsandboxed, so this applies to all of them.
+  variables, and the AppImage runtime's (`APPDIR`, `APPIMAGE`, `ARGV0`, `OWD` and similar).
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
 - A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and

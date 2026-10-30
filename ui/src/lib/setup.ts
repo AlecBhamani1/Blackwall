@@ -146,6 +146,10 @@ export function detectedServerLabel(server: DetectedServer): string {
     : `Detected ${name} · no loaded context reported`;
 }
 
+/** Where the runtime guide explains what the Linux sandbox needs. */
+const SANDBOX_DOCS =
+  'https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#linux-sandbox';
+
 export const setupClient = {
   /** Which server answers at `endpoint`; the probe sends no credentials. */
   async detectServer(endpoint: string, model: string): Promise<DetectedServer | null> {
@@ -157,9 +161,16 @@ export const setupClient = {
     const found = await invoke<LocalService[] | null>('discover_local_services');
     return Array.isArray(found) ? found : [];
   },
-  async openLink(kind: 'download' | 'invitation', invitation?: string): Promise<void> {
+  async openLink(
+    kind: 'download' | 'invitation' | 'sandbox-docs',
+    invitation?: string,
+  ): Promise<void> {
     const target =
-      kind === 'invitation' ? invitationUrl(invitation ?? '') : platform.ollamaDownload;
+      kind === 'invitation'
+        ? invitationUrl(invitation ?? '')
+        : kind === 'sandbox-docs'
+          ? SANDBOX_DOCS
+          : platform.ollamaDownload;
     if (!isDesktop()) {
       const opened = window.open(target, '_blank', 'noopener,noreferrer');
       // noopener may return null even when the browser successfully opens the tab.
