@@ -3,6 +3,7 @@
 //! Dormant: `LocalStore::open` still opens v5. Nothing here runs outside tests until the upgrade lands.
 #![cfg_attr(not(test), allow(dead_code))] // the upgrade and the run recorder that call it land later
 
+use super::search;
 use super::view::{build_view, ContextRow, EventRow, Kind, ViewError};
 use super::{
     validate_id, LocalStore, StorageError, MAX_CHECKPOINTS, MAX_CHECKPOINT_BYTES, MAX_EVENT_BYTES,
@@ -147,7 +148,10 @@ pub(crate) fn statements() -> u64 {
 }
 
 /// Every chat-store statement goes through here, so the tests can count them.
-fn stmt<'c>(conn: &'c Connection, sql: &str) -> Result<CachedStatement<'c>, StorageError> {
+pub(super) fn stmt<'c>(
+    conn: &'c Connection,
+    sql: &str,
+) -> Result<CachedStatement<'c>, StorageError> {
     #[cfg(test)]
     STATEMENTS.with(|n| n.set(n.get() + 1));
     Ok(conn.prepare_cached(sql)?)
@@ -320,7 +324,7 @@ pub(crate) fn write_counters(
 }
 
 /// The counters as the rows say they should be. It reads every row, so it is for repairs and
-/// tests, never for a normal write. `search_bytes` cannot be derived from the log, so it stays.
+/// tests, never for a normal write. `search_bytes` comes from the rebuilt UI messages.
 #[derive(Default)]
 struct Tally {
     next_seq: i64,
@@ -374,29 +378,36 @@ pub(crate) fn recount(tx: &Connection, id: &str) -> Result<Counters, StorageErro
             .optional()?
             .ok_or(StorageError::NotFound)?;
     let mut tally = Tally::default();
+    let mut events = vec![];
     let mut statement = stmt(
         tx,
         "SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq",
     )?;
     let mut rows = statement.query([id])?;
     while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(0)?;
         let kind = parse_kind(&row.get::<_, String>(1)?)?;
-        let body: String = row.get(2)?;
-        let marked = matches!(kind, Kind::UiProgress | Kind::UiAssistant)
-            && marks_run(kind, &serde_json::from_str(&body)?);
-        tally.event(row.get(0)?, kind, body.len(), marked);
+        let text: String = row.get(2)?;
+        let body: Value = serde_json::from_str(&text)?;
+        tally.event(seq, kind, text.len(), marks_run(kind, &body));
+        events.push(EventRow { seq, kind, body });
     }
     drop(rows);
+    // The search allowance is what the rebuilt messages index to. If the log cannot be rebuilt
+    // there is nothing to derive it from, and a load of this chat fails anyway: keep what is stored.
+    let search_bytes = match build_view(&events, None, &[]) {
+        Ok(view) => search::derived_bytes(
+            &view.messages,
+            view.open_run.as_ref().map(|open| open.message_index),
+        ),
+        Err(_) => unsigned(search_bytes)?,
+    };
     let checkpoint_bytes: i64 = stmt(
         tx,
         "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM chat_checkpoints WHERE session_id=?1",
     )?
     .query_row([id], |row| row.get(0))?;
-    Ok(tally.finish(
-        &metadata,
-        unsigned(checkpoint_bytes)?,
-        unsigned(search_bytes)?,
-    ))
+    Ok(tally.finish(&metadata, unsigned(checkpoint_bytes)?, search_bytes))
 }
 
 // ---- message rules ----
@@ -830,11 +841,12 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
         },
     };
 
-    let counted = tally.finish(
-        &metadata_text,
-        checkpoint_bytes,
-        unsigned(stored[4]).unwrap_or(0),
+    // A run still open is not indexed until its terminal, so its folded message counts for nothing.
+    let search_bytes = search::derived_bytes(
+        &view.messages,
+        view.open_run.as_ref().map(|open| open.message_index),
     );
+    let counted = tally.finish(&metadata_text, checkpoint_bytes, search_bytes);
     let stored_ok = stored.iter().all(|value| *value >= 0);
     let stored = Counters {
         next_seq: stored[0],
@@ -1471,7 +1483,9 @@ mod tests {
     /// A complete run: user, start, one assistant turn, a progress delta and a terminal.
     fn run(db: &LocalStore, id: &str, n: usize) {
         write(db, id, |tx, c| {
+            let at = c.ui_count;
             let user = append_ui_user(tx, id, c, &user_message(n))?;
+            search::index_message(tx, id, c, user, at, &user_message(n))?;
             let start = append_run_start(tx, id, c, &format!("a{n}"), 7, user)?;
             let turn = append_model(tx, id, c, &json!({"role":"assistant","content":"hi"}))?;
             append(
@@ -1481,12 +1495,14 @@ mod tests {
                 Kind::UiProgress,
                 &json!({"run": start, "reasoning": "thinking"}),
             )?;
-            append_ui_assistant(
+            let end = append_ui_assistant(
                 tx,
                 id,
                 c,
                 &json!({"run": start, "content": {"turns": [turn]}, "status": "complete"}),
             )?;
+            let reply = json!({"id": format!("a{n}"), "role": "assistant", "content": "hi"});
+            search::index_message(tx, id, c, end, at + 1, &reply)?;
             Ok(())
         })
         .unwrap();
@@ -2392,9 +2408,13 @@ mod tests {
         run(&db, "gone", 0);
         run(&db, "kept", 0);
         let c = db.connection();
-        for (rowid, session, term) in [(1, "gone", "zqxjgoneterm"), (2, "kept", "zqxjkeptterm")] {
+        // `run` already indexed its own messages, so these keys use ids and seqs of their own.
+        for (rowid, session, term) in [
+            (1001, "gone", "zqxjgoneterm"),
+            (1002, "kept", "zqxjkeptterm"),
+        ] {
             c.execute(
-                "INSERT INTO chat_search_keys(id,session_id,seq,message_index,message_id,role) VALUES (?1,?2,0,0,'m','user')",
+                "INSERT INTO chat_search_keys(id,session_id,seq,message_index,message_id,role) VALUES (?1,?2,?1,0,'m','user')",
                 params![rowid, session],
             )
             .unwrap();

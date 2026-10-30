@@ -87,6 +87,7 @@ mod chats;
 pub(crate) mod fixtures;
 mod memory;
 mod recall;
+mod search;
 mod view;
 pub use chats::{Cap, MetadataPatch, NewSession, StoredChat, StoredContext};
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
