@@ -45,7 +45,8 @@ const BUILT_IN: [&str; 13] = [
 ];
 
 /// What an approval for an owner command tool that runs outside the sandbox says first.
-pub const OUTSIDE_NOTE: &str = "Runs outside the sandbox with your account permissions.";
+pub const OUTSIDE_NOTE: &str =
+    "Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.";
 
 /// Where the owner's command tools run: outside the sandbox, always asking (the default), or
 /// inside the Commands profile. Only the owner chooses; a project file cannot.

@@ -46,7 +46,7 @@ describe('action approval', () => {
           ...approval,
           kind: 'exec',
           detail:
-            'Runs outside the sandbox with your account permissions.\n\nTool: review\nProgram: /usr/local/bin/claude\nGets these variables from your environment: GITHUB_TOKEN',
+            'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.\n\nTool: review\nProgram: /usr/local/bin/claude\nGets these variables from your environment: GITHUB_TOKEN',
           tool: { server: 'docs', tool: 'docs__search' },
           remember: false,
           outsideSandbox: true,
@@ -55,7 +55,9 @@ describe('action approval', () => {
       },
     });
     expect(
-      screen.getByText('Runs outside the sandbox with your account permissions.'),
+      screen.getByText(
+        'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.',
+      ),
     ).toBeVisible();
     // The note is shown once, as the label, not again at the top of the details.
     expect(screen.getAllByText(/Runs outside the sandbox/)).toHaveLength(1);

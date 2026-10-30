@@ -14,7 +14,8 @@
     scope = 'tool';
     place = 'project';
   }
-  const OUTSIDE_NOTE = 'Runs outside the sandbox with your account permissions.';
+  const OUTSIDE_NOTE =
+    'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.';
   // The label already says it, so the details do not repeat it; the event keeps it for others.
   $: shownDetail =
     approval.outsideSandbox && approval.detail.startsWith(OUTSIDE_NOTE)

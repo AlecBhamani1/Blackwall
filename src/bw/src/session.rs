@@ -927,6 +927,11 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches(OUTSIDE_NOTE).count(), 1, "{text}");
+        // The whole note is printed once, then the detail without it.
+        assert!(
+            text.starts_with("\nRuns outside the sandbox with your account permissions. It can run code from this project and use your files and network.\n\nProject: /p\n"),
+            "{text}"
+        );
         // Only the event's mark adds it; text in the detail alone is printed as it is.
         let plain = approval_prompt("Program: /usr/bin/claude", false);
         assert!(!plain.contains(OUTSIDE_NOTE), "{plain}");

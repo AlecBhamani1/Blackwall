@@ -527,7 +527,8 @@ in the project folder, without the sandbox, with your account permissions and th
 environment plus the names it lists under `env` (see [Child environments](#child-environments)).
 It **always asks**: an allow rule or "allow identical action this run" never skips the prompt, and
 a deny rule still denies. The prompt says "Runs outside the sandbox with your account
-permissions." and shows the resolved absolute program, which the audit log records as `program`.
+permissions. It can run code from this project and use your files and network." and shows the
+resolved absolute program, which the audit log records as `program`.
 Because it always asks, `bw run --json` cannot run one, even with an allow rule. With `sandboxed`,
 command tools run under the profile as shell commands do; a failure that looks like a sandbox
 denial then adds a note that the tool may have been blocked by the profile and can run outside it.
