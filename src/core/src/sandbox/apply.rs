@@ -5,11 +5,13 @@
 //! writers left are the owner's own processes in the project. The project folder must still be
 //! the one the start walk saw (its device and inode), or nothing is applied.
 //!
-//! 1. **Plan.** Walk `upper` read-only. Every file and folder's xattrs are read first, so overlay
-//!    metadata this does not understand is found even on an entry refused for another reason:
-//!    redirect, metacopy, `trusted.*`, any `user.overlay.*` but origin, impure, nlink, uuid,
-//!    protattr and opaque `y`, or a list too long to read. That, or more than [`MAX_ENTRIES`]
-//!    entries, and nothing is applied at all. Otherwise each entry is refused (a protected name,
+//! 1. **Plan.** Walk `upper` read-only. The xattrs of every file and folder the walk reaches are
+//!    read before anything else about it, so overlay metadata this does not understand is found
+//!    even on an entry refused for another reason (a protected name, say): redirect, metacopy,
+//!    `trusted.*`, any `user.overlay.*` but origin, impure, nlink, uuid, protattr and opaque `y`,
+//!    or a list too long to read. A refused folder's contents are not read at all; that is safe
+//!    because any refusal holds back every delete (step 3). Unknown metadata, or more than
+//!    [`MAX_ENTRIES`] entries, and nothing is applied at all. Otherwise each entry is refused (a protected name,
 //!    an instruction file, a set-id file or file capability, a device, pipe or socket, a symlink
 //!    that leads out or could stand in for an instruction file's folder) or planned.
 //! 2. **Apply.** Folders, files and symlinks first. Every project folder is opened one name at a
@@ -38,13 +40,17 @@
 //! - A replacement is swapped in with `RENAME_EXCHANGE`. The displaced entry, now at the temp
 //!   name, must be the one just checked (device, inode, type, size, mtime; a rename moves its
 //!   ctime) or it is swapped back and reported as a conflict.
-//! - A delete first renames the entry aside (`RENAME_NOREPLACE`), checks it the same way, then
-//!   unlinks it, or renames it back. A folder is removed only once empty.
+//! - A delete first renames the entry aside (`RENAME_NOREPLACE`), checks it the same way (a
+//!   folder: the inode of the descriptor its contents were deleted through), then unlinks or
+//!   rmdirs it. If it isn't what was checked, or removing it fails, it is renamed back.
+//! - Temp names are fresh and random; a taken one is never touched (another is tried, up to 8).
+//!   Only a temp entry this apply made, by its recorded inode, is ever removed.
 //! - A file system without these flags gets nothing replaced or deleted; there is no fallback.
 //!
 //! What is left: a writer that changes a file in place, between its check and its swap, within
-//! one mtime tick; and the moment of a swap back, when the owner's entry briefly sits at the temp
-//! name. If putting it back fails, both paths are reported. There is no journal: the apply as a
+//! one mtime tick; and the moment of a swap back or a move back, when the owner's entry briefly
+//! sits at the temp name. If putting it back fails, both paths are reported as conflicts, and the
+//! report says the original name may hold Blackwall's staged copy. There is no journal: the apply as a
 //! whole is not atomic, and a crash part way leaves what was done so far, perhaps with a temp
 //! entry. A folder an outside process moves while it is pinned takes its changes with it.
 //!
@@ -171,9 +177,21 @@ impl fmt::Display for Report {
             "Conflicted, so Blackwall kept your version",
             self.conflicted.iter().map(|p| shown(p)),
         )?;
-        list(f, "Held back", self.held_back.iter().map(|p| shown(p)))
+        list(f, "Held back", self.held_back.iter().map(|p| shown(p)))?;
+        let stranded = |p: &&PathBuf| {
+            p.file_name()
+                .is_some_and(|name| name.as_bytes().windows(11).any(|w| w == b".blackwall-"))
+        };
+        if self.conflicted.iter().any(|p| stranded(&p)) {
+            write!(f, "\n{STRANDED}")?;
+        }
+        Ok(())
     }
 }
+const STRANDED: &str =
+    "A conflicted name with .blackwall- in it is an entry Blackwall moved aside \
+     and couldn't put back. Check it and the entry at its original name, which may be \
+     Blackwall's staged copy.";
 fn list(
     f: &mut fmt::Formatter<'_>,
     title: &str,
@@ -518,35 +536,75 @@ fn names(dir: impl AsFd, max: usize) -> rustix::io::Result<Vec<OsString>> {
     out.sort();
     Ok(out)
 }
+/// An entry's (device, inode).
+type Id = (u64, u64);
+fn id(stat: &Stat) -> Id {
+    (dev(stat), ino(stat))
+}
+/// How many fresh temp names to try before giving up on an entry.
+const TEMP_TRIES: usize = 8;
 /// `.<name>.blackwall-<16 hex>`, with the name cut so the whole stays within `NAME_MAX`.
 fn temp_name(name: &OsStr) -> OsString {
     let bytes = name.as_bytes();
     let mut temp = OsString::from(".");
     temp.push(OsStr::from_bytes(&bytes[..bytes.len().min(200)]));
-    temp.push(format!(".blackwall-{:016x}", rand::random::<u64>()));
+    temp.push(format!(".blackwall-{:016x}", temp_suffix()));
     temp
 }
+fn temp_suffix() -> u64 {
+    #[cfg(test)]
+    if let Some(suffix) = TEMP_SUFFIXES.with(|queue| queue.borrow_mut().pop_front()) {
+        return suffix;
+    }
+    rand::random()
+}
+/// Run `make` with a fresh temp name next to `name` until one isn't taken, at most
+/// [`TEMP_TRIES`] times (then `EEXIST`). A name that is taken is never touched.
+fn with_temp<T>(
+    name: &OsStr,
+    mut make: impl FnMut(&OsStr) -> rustix::io::Result<T>,
+) -> rustix::io::Result<(OsString, T)> {
+    for _ in 0..TEMP_TRIES {
+        let temp = temp_name(name);
+        match make(&temp) {
+            Err(Errno::EXIST) => continue,
+            made => return made.map(|made| (temp, made)),
+        }
+    }
+    Err(Errno::EXIST)
+}
 
+/// Where an outside writer can race an entry: just before its commit (or its move aside for a
+/// delete), just before undoing a swap, and just before removing what was moved aside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moment {
+    Commit,
+    Undo,
+    Unlink,
+}
 /// A test's stand-in for an outside writer.
 #[cfg(test)]
-type Racer = Box<dyn FnMut(&Path)>;
+type Racer = Box<dyn FnMut(&Path, Moment)>;
 #[cfg(test)]
 thread_local! {
-    /// Runs between an entry's last check and its commit, to race it in tests.
+    /// Runs at each [`Moment`], to race apply in tests.
     static BEFORE_COMMIT: std::cell::RefCell<Option<Racer>> =
         const { std::cell::RefCell::new(None) };
+    /// Temp-name suffixes to use before random ones, so a test can plant the next name.
+    static TEMP_SUFFIXES: std::cell::RefCell<std::collections::VecDeque<u64>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
-fn before_commit(path: &Path) {
+fn before_commit(path: &Path, moment: Moment) {
     #[cfg(test)]
     BEFORE_COMMIT.with(|hook| {
         let taken = hook.borrow_mut().take();
         if let Some(mut run) = taken {
-            run(path);
+            run(path, moment);
             *hook.borrow_mut() = Some(run);
         }
     });
     #[cfg(not(test))]
-    let _ = path;
+    let _ = (path, moment);
 }
 
 /// The project-relative components a symlink at `link` (project-relative) leads to, or `None`
@@ -893,40 +951,34 @@ impl Applier<'_> {
         Ok(fd)
     }
 
-    /// Put our `temp` entry (in `at.dir`) at `at`'s name, given what the last check found there.
-    /// Whatever happens, `temp` doesn't stay behind holding ours.
+    /// Put our `temp` entry (in `at.dir`, with identity `mine`) at `at`'s name, given what the
+    /// last check found there. Whatever happens, `temp` doesn't stay behind holding ours, and
+    /// nothing at `temp` that isn't ours is removed.
     fn commit(
         &mut self,
         at: &At<'_>,
         temp: &OsStr,
+        mine: Id,
         before: Judged,
         temp_is_dir: bool,
     ) -> Result<Outcome, Refusal> {
-        let discard = || {
-            let flags = if temp_is_dir {
-                AtFlags::REMOVEDIR
-            } else {
-                AtFlags::empty()
-            };
-            let _ = fs::unlinkat(at.dir, temp, flags);
-        };
         let failed = |error| match error {
             Errno::INVAL | Errno::NOSYS => Refusal::NoSafeReplace,
             _ => Refusal::Io,
         };
         let seen = match before {
             Judged::Changed => {
-                discard();
+                self.discard(at, temp, mine, temp_is_dir);
                 return Ok(Outcome::Conflict);
             }
             Judged::Absent => {
-                before_commit(&at.path);
+                before_commit(&at.path, Moment::Commit);
                 let renamed =
                     fs::renameat_with(at.dir, temp, at.dir, at.name(), RenameFlags::NOREPLACE);
                 return match renamed {
                     Ok(()) => Ok(Outcome::Applied),
                     Err(error) => {
-                        discard();
+                        self.discard(at, temp, mine, temp_is_dir);
                         match error {
                             Errno::EXIST => Ok(Outcome::Conflict),
                             _ => Err(failed(error)),
@@ -936,11 +988,11 @@ impl Applier<'_> {
             }
             Judged::Replaceable(seen) => seen,
         };
-        before_commit(&at.path);
+        before_commit(&at.path, Moment::Commit);
         if let Err(error) =
             fs::renameat_with(at.dir, temp, at.dir, at.name(), RenameFlags::EXCHANGE)
         {
-            discard();
+            self.discard(at, temp, mine, temp_is_dir);
             return match error {
                 Errno::NOENT => Ok(Outcome::Conflict),
                 _ => Err(failed(error)),
@@ -953,12 +1005,33 @@ impl Applier<'_> {
             }
             return Ok(Outcome::Applied);
         }
+        // Someone else's: swap back, then remove only what is ours.
+        before_commit(&at.path, Moment::Undo);
         match fs::renameat_with(at.dir, temp, at.dir, at.name(), RenameFlags::EXCHANGE) {
-            Ok(()) => discard(),
-            // Ours stays at the name and the owner's entry at the temp name: report both.
+            Ok(()) => self.discard(at, temp, mine, temp_is_dir),
+            // Ours may still be at the target and theirs at the temp name.
             Err(_) => self.report.conflict(&at.sibling(temp)),
         }
         Ok(Outcome::Conflict)
+    }
+
+    /// Remove our temp entry if `temp` still holds it (`mine`). Anything else there is left
+    /// alone and reported, as is a removal that fails.
+    fn discard(&mut self, at: &At<'_>, temp: &OsStr, mine: Id, is_dir: bool) {
+        let flags = if is_dir {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        match stat_at(at.dir, temp) {
+            Err(Errno::NOENT) => {}
+            Ok(stat) if id(&stat) == mine => {
+                if fs::unlinkat(at.dir, temp, flags).is_err() {
+                    self.report.refuse(&at.sibling(temp), Refusal::Io);
+                }
+            }
+            _ => self.report.conflict(&at.sibling(temp)),
+        }
     }
 
     fn record(&mut self, path: &Path, outcome: Result<Outcome, Refusal>) {
@@ -1026,14 +1099,34 @@ impl Applier<'_> {
     }
 
     /// Make and open a private folder `name` in `at.dir` (0o700 whatever the umask).
-    fn make_dir(&self, at: &At<'_>, name: &OsStr) -> Result<(OwnedFd, Stat), Errno> {
+    /// `Err(EXIST)`: the name is taken, and nothing was touched. If it was made but can't be
+    /// opened, it is taken away again, only if it is still the folder just made; otherwise it is
+    /// left and reported.
+    fn make_dir(&mut self, at: &At<'_>, name: &OsStr) -> Result<(OwnedFd, Stat), Errno> {
         fs::mkdirat(at.dir, name, Mode::from_raw_mode(0o700))?;
-        let stat = stat_at(at.dir, name)?;
-        let fd = self
-            .open_project_dir(at.dir, name, &stat)
-            .map_err(|_| Errno::IO)?;
-        fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
-        Ok((fd, stat))
+        let made = stat_at(at.dir, name);
+        let opened = made.as_ref().ok().and_then(|stat| {
+            let fd = self.open_project_dir(at.dir, name, stat).ok()?;
+            fs::fchmod(&fd, Mode::from_raw_mode(0o700)).ok()?;
+            Some(fd)
+        });
+        if let (Some(fd), Ok(stat)) = (opened, &made) {
+            return Ok((fd, *stat));
+        }
+        let path = at.sibling(name);
+        let taken_away = made.is_ok_and(|stat| {
+            let made = id(&stat);
+            let is_it = |moved: &Stat| kind(moved) == FileType::Directory && id(moved) == made;
+            matches!(
+                self.remove_checked(at.dir, &path, name, true, is_it),
+                Removal::Removed
+            )
+        });
+        // The caller reports its own path.
+        if !taken_away && path != at.path {
+            self.report.refuse(&path, Refusal::Io);
+        }
+        Err(Errno::IO)
     }
 
     fn new_dir<'p>(
@@ -1043,7 +1136,7 @@ impl Applier<'_> {
         entries: &'p [Entry],
         deletes: &mut Vec<Delete<'p>>,
     ) {
-        before_commit(&at.path);
+        before_commit(&at.path, Moment::Commit);
         match self.make_dir(at, at.name()) {
             Ok((fd, stat)) => self.fill(at, fd, &stat, mode, entries, deletes),
             Err(Errno::EXIST) => self.report.conflict(&at.path),
@@ -1059,16 +1152,12 @@ impl Applier<'_> {
         entries: &'p [Entry],
         deletes: &mut Vec<Delete<'p>>,
     ) {
-        let temp = temp_name(at.name());
-        let (fd, stat) = match self.make_dir(at, &temp) {
+        let (temp, (fd, stat)) = match with_temp(at.name(), |temp| self.make_dir(at, temp)) {
             Ok(made) => made,
-            Err(_) => {
-                let _ = fs::unlinkat(at.dir, &temp, AtFlags::REMOVEDIR);
-                return self.report.refuse(&at.path, Refusal::Io);
-            }
+            Err(_) => return self.report.refuse(&at.path, Refusal::Io),
         };
         let before = self.judge(at).unwrap_or(Judged::Changed);
-        match self.commit(at, &temp, before, true) {
+        match self.commit(at, &temp, id(&stat), before, true) {
             Ok(Outcome::Applied) => self.fill(at, fd, &stat, mode, entries, deletes),
             other => self.record(&at.path, other),
         }
@@ -1118,15 +1207,17 @@ impl Applier<'_> {
         if kind(&stat) != FileType::RegularFile || fingerprint(&stat) != *source {
             return Err(Refusal::Io);
         }
-        let temp = temp_name(at.name());
-        let out = fs::openat2(
-            at.dir,
-            &temp,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-            beneath(),
-        )
-        .map_err(|_| Refusal::Io)?;
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let created = with_temp(at.name(), |temp| {
+            fs::openat2(at.dir, temp, flags, Mode::from_raw_mode(0o600), beneath())
+        });
+        let (temp, out) = created.map_err(|_| Refusal::Io)?;
+        let Ok(mine) = fs::fstat(&out).map(|stat| id(&stat)) else {
+            // Without its identity it can't be told from anyone else's: leave it, and say so.
+            self.report.refuse(&at.sibling(&temp), Refusal::Io);
+            return Err(Refusal::Io);
+        };
         let filled = (|| -> std::io::Result<()> {
             let mut out = std::fs::File::from(out);
             // Bounded: `io::copy` uses copy_file_range, or a small buffer.
@@ -1140,10 +1231,10 @@ impl Applier<'_> {
         })();
         let before = filled.ok().and_then(|()| self.judge(at).ok());
         let Some(before) = before else {
-            let _ = fs::unlinkat(at.dir, &temp, AtFlags::empty());
+            self.discard(at, &temp, mine, false);
             return Err(Refusal::Io);
         };
-        self.commit(at, &temp, before, false)
+        self.commit(at, &temp, mine, before, false)
     }
 
     fn link(&mut self, at: &At<'_>, target: &OsStr) {
@@ -1151,7 +1242,7 @@ impl Applier<'_> {
             Ok(Judged::Changed) => Ok(Outcome::Conflict),
             Ok(_) if !self.through_real_entries(&at.path, target) => Err(Refusal::LinkOutside),
             Ok(Judged::Absent) => {
-                before_commit(&at.path);
+                before_commit(&at.path, Moment::Commit);
                 // symlinkat never replaces anything.
                 match fs::symlinkat(target, at.dir, at.name()) {
                     Ok(()) => Ok(Outcome::Applied),
@@ -1160,13 +1251,18 @@ impl Applier<'_> {
                 }
             }
             Ok(Judged::Replaceable(_)) => {
-                let temp = temp_name(at.name());
-                match fs::symlinkat(target, at.dir, &temp) {
-                    // Only once it is ours does the temp name get cleaned up.
-                    Ok(()) => {
-                        let before = self.judge(at).unwrap_or(Judged::Changed);
-                        self.commit(at, &temp, before, false)
-                    }
+                match with_temp(at.name(), |temp| fs::symlinkat(target, at.dir, temp)) {
+                    Ok((temp, ())) => match stat_at(at.dir, &temp) {
+                        Ok(made) if kind(&made) == FileType::Symlink => {
+                            let before = self.judge(at).unwrap_or(Judged::Changed);
+                            self.commit(at, &temp, id(&made), before, false)
+                        }
+                        // Not provably ours: leave it, and say so.
+                        _ => {
+                            self.report.refuse(&at.sibling(&temp), Refusal::Io);
+                            Err(Refusal::Io)
+                        }
+                    },
                     Err(_) => Err(Refusal::Io),
                 }
             }
@@ -1210,6 +1306,17 @@ impl Applier<'_> {
         ((dev(&stat), ino(&stat)) == (pin.dev, pin.ino)).then_some(fd)
     }
 
+    /// A project folder's names, or the refusal for a folder that can't be listed or has more
+    /// than the entry limit (so it can't be known in full).
+    fn listing(&self, fd: &OwnedFd) -> Result<Vec<OsString>, Refusal> {
+        let limit = self.rules.limit;
+        match names(fd, limit.saturating_add(1)) {
+            Ok(names) if names.len() > limit => Err(Refusal::TooMany),
+            Ok(names) => Ok(names),
+            Err(_) => Err(Refusal::Io),
+        }
+    }
+
     /// The whiteouts and opaque clears, after everything else: held back if anything so far was
     /// refused or conflicted.
     fn deletes(&mut self, deletes: Vec<Delete<'_>>) {
@@ -1234,10 +1341,10 @@ impl Applier<'_> {
                     .map(OsStr::to_os_string)
                     .into_iter()
                     .collect(),
-                Delete::Clear { keep, .. } => match names(&fd, MAX_ENTRIES) {
+                Delete::Clear { keep, .. } => match self.listing(&fd) {
                     Ok(names) => names.into_iter().filter(|n| !keep.contains(n)).collect(),
-                    Err(_) => {
-                        self.report.refuse(folder, Refusal::Io);
+                    Err(why) => {
+                        self.report.refuse(folder, why);
                         continue;
                     }
                 },
@@ -1295,7 +1402,12 @@ impl Applier<'_> {
             if !unchanged {
                 return kept(&mut self.report, None);
             }
-            return self.delete_entry(parent, path, name, &stat, removed);
+            let removal =
+                self.remove_checked(parent, path, name, false, |moved| same_entry(moved, &stat));
+            if let Removal::Removed = removal {
+                removed.push(path.to_path_buf());
+            }
+            return removal;
         }
         // A folder below one changed during the run is unknown: keep it whole.
         if fresh_above {
@@ -1306,10 +1418,7 @@ impl Applier<'_> {
         } else {
             self.open_project_dir(parent, name, &stat)
         };
-        let listed = opened.and_then(|fd| match names(&fd, MAX_ENTRIES) {
-            Ok(names) => Ok((fd, names)),
-            Err(_) => Err(Refusal::Io),
-        });
+        let listed = opened.and_then(|fd| self.listing(&fd).map(|names| (fd, names)));
         let (fd, names) = match listed {
             Ok(listed) => listed,
             Err(why) => return kept(&mut self.report, Some(why)),
@@ -1323,7 +1432,6 @@ impl Applier<'_> {
                 whole = false;
             }
         }
-        drop(fd);
         if !whole {
             removed.extend(inside);
             return Removal::Kept;
@@ -1333,36 +1441,42 @@ impl Applier<'_> {
             removed.extend(inside);
             return kept(&mut self.report, None);
         }
-        match fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
-            Ok(()) => {
+        // Only the folder just emptied (still held open) may go.
+        let Ok(held) = fs::fstat(&fd).map(|held| id(&held)) else {
+            removed.extend(inside);
+            return kept(&mut self.report, Some(Refusal::Io));
+        };
+        let is_it = |moved: &Stat| kind(moved) == FileType::Directory && id(moved) == held;
+        match self.remove_checked(parent, path, name, true, is_it) {
+            Removal::Removed => {
                 removed.push(path.to_path_buf());
                 Removal::Removed
             }
-            Err(Errno::NOENT) => Removal::Gone,
-            Err(error) => {
+            other => {
                 removed.extend(inside);
-                // Not empty any more: something new appeared in it.
-                let why = (!matches!(error, Errno::NOTEMPTY | Errno::EXIST)).then_some(Refusal::Io);
-                kept(&mut self.report, why)
+                other
             }
         }
     }
 
-    /// Delete a checked non-folder: rename it aside, check it is still what `seen` was, and
-    /// unlink it, or put it back.
-    fn delete_entry(
+    /// Delete `name` in `parent` without check-then-act: rename it aside to a fresh temp name,
+    /// check what moved with `is_it`, then unlink (or, for a folder, rmdir) it. If it isn't what
+    /// was checked, or removing it fails (a folder no longer empty, say), it is put back and
+    /// reported as a conflict; if putting it back fails too, the temp path is reported as well.
+    fn remove_checked(
         &mut self,
         parent: BorrowedFd<'_>,
         path: &Path,
         name: &OsStr,
-        seen: &Stat,
-        removed: &mut Vec<PathBuf>,
+        is_dir: bool,
+        is_it: impl Fn(&Stat) -> bool,
     ) -> Removal {
-        let temp = temp_name(name);
-        let aside = path.with_file_name(&temp);
-        before_commit(path);
-        match fs::renameat_with(parent, name, parent, &temp, RenameFlags::NOREPLACE) {
-            Ok(()) => {}
+        before_commit(path, Moment::Commit);
+        let moved = with_temp(name, |temp| {
+            fs::renameat_with(parent, name, parent, temp, RenameFlags::NOREPLACE)
+        });
+        let temp = match moved {
+            Ok((temp, ())) => temp,
             Err(Errno::NOENT) => return Removal::Gone,
             Err(Errno::INVAL | Errno::NOSYS) => {
                 self.report.refuse(path, Refusal::NoSafeReplace);
@@ -1372,23 +1486,22 @@ impl Applier<'_> {
                 self.report.refuse(path, Refusal::Io);
                 return Removal::Kept;
             }
-        }
-        if stat_at(parent, &temp).is_ok_and(|moved| same_entry(&moved, seen)) {
-            return match fs::unlinkat(parent, &temp, AtFlags::empty()) {
-                Ok(()) => {
-                    removed.push(path.to_path_buf());
-                    Removal::Removed
-                }
-                Err(_) => {
-                    self.report.refuse(&aside, Refusal::Io);
-                    Removal::Kept
-                }
+        };
+        if stat_at(parent, &temp).is_ok_and(|moved| is_it(&moved)) {
+            before_commit(path, Moment::Unlink);
+            let flags = if is_dir {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
             };
+            if fs::unlinkat(parent, &temp, flags).is_ok() {
+                return Removal::Removed;
+            }
         }
-        // Someone else's: put it back where it was.
+        // Not what was checked, or it can't be removed: put it back where it was.
         self.report.conflict(path);
         if fs::renameat_with(parent, &temp, parent, name, RenameFlags::NOREPLACE).is_err() {
-            self.report.conflict(&aside);
+            self.report.conflict(&path.with_file_name(&temp));
         }
         Removal::Kept
     }
@@ -1551,14 +1664,40 @@ mod tests {
         }
     }
     /// Run `hook` with each path just before its commit, for the rest of this thread's test.
-    fn race(hook: impl FnMut(&Path) + 'static) {
+    fn race(hook: impl FnMut(&Path, Moment) + 'static) {
         BEFORE_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
+    /// Use these temp-name suffixes next, before random ones.
+    fn suffixes(next: &[u64]) {
+        TEMP_SUFFIXES.with(|queue| queue.borrow_mut().extend(next));
+    }
+    /// Clears the racer and planted suffixes when a test ends.
     struct NoRace;
     impl Drop for NoRace {
         fn drop(&mut self) {
             BEFORE_COMMIT.with(|slot| *slot.borrow_mut() = None);
+            TEMP_SUFFIXES.with(|queue| queue.borrow_mut().clear());
         }
+    }
+    fn planted(dir: &Path, name: &str, suffix: u64) -> PathBuf {
+        dir.join(format!(".{name}.blackwall-{suffix:016x}"))
+    }
+    /// The one entry in `dir` that Blackwall moved aside from `name`.
+    fn aside(dir: &Path, name: &str) -> PathBuf {
+        let prefix = format!(".{name}.blackwall-");
+        let found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found[0].clone()
     }
     fn refusals(report: &Report) -> Vec<(&str, Refusal)> {
         report
@@ -2142,8 +2281,8 @@ mod tests {
         t.up("f", "command");
         let _clear = NoRace;
         let target = t.project.join("f");
-        race(move |path| {
-            if path == Path::new("f") {
+        race(move |path, moment| {
+            if path == Path::new("f") && moment == Moment::Commit {
                 save(&target, "owner saved");
             }
         });
@@ -2164,7 +2303,11 @@ mod tests {
         }
         let _clear = NoRace;
         let target = t.project.join("f");
-        race(move |_| save(&target, "owner saved"));
+        race(move |_, moment| {
+            if moment == Moment::Commit {
+                save(&target, "owner saved");
+            }
+        });
         let r = t.apply(&run);
         assert_eq!(paths(&r.conflicted), ["f"], "{r:?}");
         assert!(r.deleted.is_empty());
@@ -2181,7 +2324,10 @@ mod tests {
         t.up("new", "command");
         let _clear = NoRace;
         let project = t.project.clone();
-        race(move |path| {
+        race(move |path, moment| {
+            if moment != Moment::Commit {
+                return;
+            }
             if path == Path::new("f") {
                 std::fs::remove_file(project.join("f")).unwrap(); // the swap finds nothing
             } else {
@@ -2193,6 +2339,148 @@ mod tests {
         assert!(r.applied.is_empty());
         assert_eq!(t.listing(), ["new"]);
         assert_eq!(t.read("new"), "owner");
+    }
+
+    #[test]
+    fn apply_leaves_whatever_holds_the_temp_name_after_an_undo() {
+        let t = Tree::new();
+        t.proj("f", "before");
+        let run = t.run();
+        t.up("f", "command");
+        let _clear = NoRace;
+        let target = t.project.join("f");
+        race(move |path, moment| match moment {
+            _ if path != Path::new("f") => {}
+            // The check no longer holds once the swap is made ...
+            Moment::Commit => save(&target, "owner saved"),
+            // ... and the names change again just before the undo.
+            Moment::Undo => save(&target, "owner again"),
+            Moment::Unlink => {}
+        });
+        let r = t.apply(&run);
+        // The undo put "owner again" at the temp name. It isn't ours, so it stays.
+        assert_eq!(t.read("f"), "owner saved");
+        let temp = aside(&t.project, "f");
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), "owner again");
+        let temp = temp.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(paths(&r.conflicted), [temp.as_str(), "f"]);
+        assert!(r.applied.is_empty());
+        assert!(r.to_string().contains("moved aside and couldn't put back"));
+    }
+
+    #[test]
+    fn apply_keeps_a_folder_swapped_in_before_a_folder_delete() {
+        let t = Tree::new();
+        t.proj("d/old", "old");
+        let run = t.run();
+        if !whiteout(&t.upper.join("d")) {
+            return;
+        }
+        let _clear = NoRace;
+        let project = t.project.clone();
+        race(move |path, moment| {
+            if path == Path::new("d") && moment == Moment::Commit {
+                std::fs::rename(project.join("d"), project.join("d_moved")).unwrap();
+                std::fs::create_dir(project.join("d")).unwrap();
+            }
+        });
+        let r = t.apply(&run);
+        assert_eq!(paths(&r.deleted), ["d/old"]);
+        assert_eq!(paths(&r.conflicted), ["d"]);
+        assert_eq!(t.listing(), ["d", "d_moved"]);
+    }
+
+    #[test]
+    fn apply_puts_a_folder_back_when_it_cannot_be_removed() {
+        let t = Tree::new();
+        t.proj("d/old", "old");
+        let run = t.run();
+        if !whiteout(&t.upper.join("d")) {
+            return;
+        }
+        let _clear = NoRace;
+        let project = t.project.clone();
+        race(move |path, moment| {
+            if path == Path::new("d") && moment == Moment::Unlink {
+                // Something lands in it after it was moved aside: the rmdir fails.
+                std::fs::write(aside(&project, "d").join("late"), "late").unwrap();
+            }
+        });
+        let r = t.apply(&run);
+        assert_eq!(paths(&r.conflicted), ["d"]);
+        assert_eq!(t.read("d/late"), "late");
+        assert_eq!(t.listing(), ["d", "d/late"]);
+        t.no_temp_left();
+    }
+
+    #[test]
+    fn apply_never_touches_a_planted_temp_name() {
+        let t = Tree::new();
+        t.proj("f", "before");
+        t.proj("g", "file");
+        t.proj("h", "gone");
+        let run = t.run();
+        t.up("f", "after");
+        t.up("g/inside", "in"); // a folder replaces the file g
+        if !whiteout(&t.upper.join("h")) {
+            return;
+        }
+        let _clear = NoRace;
+        std::fs::write(planted(&t.project, "f", 1), "planted").unwrap();
+        std::fs::create_dir(planted(&t.project, "g", 3)).unwrap(); // an empty owner folder
+        std::fs::write(planted(&t.project, "h", 5), "planted").unwrap();
+        // f's temp file, g's temp folder, g/inside's temp file, then h's move aside.
+        suffixes(&[1, 2, 3, 4, 7, 5, 6]);
+        let r = t.apply(&run);
+        assert_eq!(paths(&r.applied), ["f", "g", "g/inside"], "{r:?}");
+        assert_eq!(paths(&r.deleted), ["h"]);
+        assert!(r.refused.is_empty() && r.conflicted.is_empty(), "{r:?}");
+        assert_eq!(t.read("f"), "after");
+        assert_eq!(
+            std::fs::read_to_string(planted(&t.project, "f", 1)).unwrap(),
+            "planted"
+        );
+        assert!(planted(&t.project, "g", 3).is_dir());
+        assert_eq!(
+            std::fs::read_to_string(planted(&t.project, "h", 5)).unwrap(),
+            "planted"
+        );
+    }
+
+    #[test]
+    fn apply_gives_up_after_eight_taken_temp_names() {
+        let t = Tree::new();
+        t.proj("k", "before");
+        let run = t.run();
+        t.up("k", "after");
+        let _clear = NoRace;
+        std::fs::write(planted(&t.project, "k", 7), "planted").unwrap();
+        suffixes(&[7; 8]);
+        let r = t.apply(&run);
+        assert_eq!(refusals(&r), [("k", Io)]);
+        assert_eq!(t.read("k"), "before");
+        assert_eq!(
+            std::fs::read_to_string(planted(&t.project, "k", 7)).unwrap(),
+            "planted"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_to_clear_a_folder_it_cannot_list_in_full() {
+        let t = Tree::new();
+        for n in 0..5 {
+            t.proj(&format!("d/f{n}"), "old");
+        }
+        let run = t.run();
+        t.up("d/new", "new");
+        if !xattr(&t.upper.join("d"), "user.overlay.opaque", b"y") {
+            return;
+        }
+        // The limit is three; d holds six entries by the time it is cleared.
+        let r = t.apply_with(&run, &[], 3);
+        assert_eq!(refusals(&r), [("d", TooMany)]);
+        assert!(r.deleted.is_empty());
+        assert_eq!(t.listing().len(), 7);
     }
 
     #[test]
