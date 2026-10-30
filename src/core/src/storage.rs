@@ -82,6 +82,8 @@ fn upgrade_text(backup: &Option<PathBuf>) -> String {
 pub struct LocalStore {
     connection: Connection,
 }
+#[allow(dead_code)] // used by the upgrade, which lands after this dormant module
+mod backup;
 mod chats;
 mod convert;
 #[cfg(test)]
