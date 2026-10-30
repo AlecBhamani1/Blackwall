@@ -128,7 +128,7 @@ impl LocalStore {
             let mut sessions = Vec::new();
             for row in rows {
                 let (id, body) = row?;
-                if body.len() > super::MAX_SESSION_BYTES {
+                if body.len() as u64 > super::MAX_SESSION_BYTES {
                     return Err(StorageError::Invalid(
                         "A saved conversation exceeds the migration limit.",
                     ));
