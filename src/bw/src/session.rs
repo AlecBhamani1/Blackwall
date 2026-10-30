@@ -830,7 +830,6 @@ fn render_event(
     }
 }
 
-/// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
 /// The JSON line for stdout, which may reach a model or a log, and the owner's details for the
 /// terminal. Server details never go in the line.
 fn json_line(event: &AgentEvent) -> (String, Vec<String>) {
@@ -853,6 +852,7 @@ fn detail_lines(diagnostics: &[ServerDiagnostic]) -> Vec<String> {
 }
 
 /// What to print under a server's warning: the variables it was not given, then its last output.
+/// Every line starts with the server name, so output from several failed servers stays apart.
 fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
     let mut lines = vec![];
     if !diagnostic.not_passed.is_empty() {
@@ -862,10 +862,16 @@ fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
             diagnostic.not_passed.join(", ")
         ));
     }
-    lines.extend(diagnostic.stderr.lines().map(str::to_owned));
+    lines.extend(
+        diagnostic
+            .stderr
+            .lines()
+            .map(|line| format!("{}: {line}", diagnostic.server)),
+    );
     lines
 }
 
+/// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
 fn approval_prompt(detail: &str) -> String {
     format!(
         "\n{}\n\nAllow this action once? Type yes to allow; anything else denies.",
@@ -917,8 +923,8 @@ mod tests {
             diagnostic_lines(&diagnostic),
             [
                 "docs: not passed: TOKEN, HOME_KEY",
-                "Traceback",
-                "no module named x"
+                "docs: Traceback",
+                "docs: no module named x"
             ]
         );
         let quiet = ServerDiagnostic {
@@ -951,7 +957,7 @@ mod tests {
             details,
             [
                 "  details: docs: not passed: TOKEN",
-                "  details: no module [2Jx"
+                "  details: docs: no module [2Jx"
             ]
         );
         assert!(details.iter().all(|line| !line.contains('\u{1b}')));

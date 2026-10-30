@@ -364,7 +364,8 @@ pub struct McpServers {
     servers: Vec<Server>,
     pub warnings: Vec<String>,
     /// What a server that did not start printed, for the owner only: never in `warnings`, which
-    /// reach saved conversations and the model's view of the run, and never traced.
+    /// are shown to the owner as they stand, and never traced. Neither reaches the model
+    /// (`Instructions::prompt()` leaves warnings out).
     pub diagnostics: Vec<ServerDiagnostic>,
 }
 
