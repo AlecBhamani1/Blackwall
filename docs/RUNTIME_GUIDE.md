@@ -1170,7 +1170,9 @@ chat. `bw status` also asks the configured service which server it is and its co
 [project settings](#project-settings). Saved CLI choices take precedence over saved desktop preferences, then `BLACKWALL_MODEL`,
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`), then the initial `llama3.2` and local Ollama defaults.
 CLI settings are separate from desktop preferences. They are stored in the same local SQLite
-database; `BLACKWALL_DATA_DIR` selects a different data folder, including its memory and skills.
+database; `BLACKWALL_DATA_DIR` selects a different data folder, including its memory and skills,
+for both `bw` and the desktop app. It must be an absolute path; a relative path, `/` or a path
+with `..` is refused.
 
 For an authenticated service, set `BLACKWALL_MODEL_API_KEY` and the matching
 `BLACKWALL_MODEL_ENDPOINT` (or `OLLAMA_HOST`). Environment keys are sent only to that origin, even

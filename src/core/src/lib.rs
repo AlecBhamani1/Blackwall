@@ -6,6 +6,7 @@
 
 pub mod connection;
 pub mod context;
+pub mod data_directory;
 pub mod jobs;
 pub mod memory;
 pub mod protocol;
