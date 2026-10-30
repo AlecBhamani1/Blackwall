@@ -28,7 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   copy of the project; when it has exited, Blackwall checks the changes and copies them into the
   project: new and changed files (keeping their modification times; new ones get your umask),
   deletes and new folders. It refuses protected names (`.git`, `.ssh` and the others) and
-  instruction files in any letter case, links that lead outside the project, set-user-ID,
+  instruction files in any letter case, links that lead outside the project (but not absolute
+  links into `/usr`, `/bin`, `/lib`, `/lib64` or `/opt`, as virtualenvs make), set-user-ID,
   set-group-ID and file-capability files, devices, pipes and sockets, and the output says why next
   to each path. Overlay metadata it can't apply safely, or more than 500,000
   changed entries, refuses the whole batch. Writes into the hidden folders succeed inside the

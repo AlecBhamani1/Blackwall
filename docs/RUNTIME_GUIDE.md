@@ -645,7 +645,9 @@ next to the path:
 - a protected name (`.git`, `.ssh` and the others listed above) in any letter case, at any depth;
 - an instruction file: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or an extra file you
   configured (see [Project instructions](#project-instructions)), in any letter case;
-- a link that leads outside the project, or that could stand in for an instruction file's folder;
+- a link that leads outside the project, or that could stand in for an instruction file's folder.
+  The exception is an absolute link into `/usr`, `/bin`, `/lib`, `/lib64` or `/opt` with no `.` or
+  `..` in it, such as a virtualenv's `.venv/bin/python -> /usr/bin/python3`, which is applied;
 - a set-user-ID or set-group-ID file, or one with file capabilities;
 - a device, pipe or socket.
 

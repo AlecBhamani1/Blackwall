@@ -59,7 +59,9 @@
 //! the only entries whose overlay metadata is read, and `trusted.*` is visible only to a
 //! privileged process. A symlink's target must be relative, stay inside the project lexically,
 //! use `..` only at its start, name no protected component and run through no symlink that
-//! already exists. A folder is never replaced by a file.
+//! already exists; or be absolute, under one of the read-only system folders in
+//! [`SYSTEM_TARGETS`], with no `.` or `..` (a virtualenv's `bin/python -> /usr/bin/python3`). A
+//! folder is never replaced by a file.
 
 use super::walk::{is_protected, Fingerprint, INSTRUCTION_FILES, MAX_ENTRIES};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -743,10 +745,35 @@ fn before_commit(path: &Path, moment: Moment) {
     let _ = (path, moment);
 }
 
-/// The project-relative components a symlink at `link` (project-relative) leads to, or `None`
-/// when its target is absolute or empty, leaves the project, has a `..` after a name (which a
-/// symlink in the project could turn into an escape) or names a protected component.
-fn link_destination(link: &Path, target: &OsStr) -> Option<Vec<OsString>> {
+/// The system folders an absolute symlink may lead into: what a virtualenv or a version manager
+/// links its interpreter to.
+const SYSTEM_TARGETS: [&str; 5] = ["usr", "bin", "lib", "lib64", "opt"];
+/// Where a staged symlink leads.
+enum Destination {
+    /// These project-relative components.
+    Project(Vec<OsString>),
+    /// An absolute path under [`SYSTEM_TARGETS`].
+    System,
+}
+/// Whether `target` is `/<one of SYSTEM_TARGETS>`, or lexically below one, with no `.` or `..`
+/// component (checked on the bytes: `Path` would drop a `.`).
+fn system_target(target: &OsStr) -> bool {
+    let Some(rest) = target.as_bytes().strip_prefix(b"/") else {
+        return false;
+    };
+    let mut parts = rest.split(|byte| *byte == b'/');
+    let first = parts.next().unwrap_or_default();
+    SYSTEM_TARGETS.iter().any(|root| root.as_bytes() == first)
+        && parts.all(|part| part != b"." && part != b"..")
+}
+/// Where a symlink at `link` (project-relative) leads: a system folder ([`system_target`]), or
+/// the project-relative components, or `None` when its target is otherwise absolute, or empty,
+/// leaves the project, has a `..` after a name (which a symlink in the project could turn into an
+/// escape) or names a protected component.
+fn link_destination(link: &Path, target: &OsStr) -> Option<Destination> {
+    if system_target(target) {
+        return Some(Destination::System);
+    }
     let target = Path::new(target);
     if target.as_os_str().is_empty() || target.is_absolute() {
         return None;
@@ -771,7 +798,7 @@ fn link_destination(link: &Path, target: &OsStr) -> Option<Vec<OsString>> {
             _ => return None,
         }
     }
-    Some(out)
+    Some(Destination::Project(out))
 }
 
 #[derive(PartialEq)]
@@ -1413,12 +1440,15 @@ impl Applier<'_> {
         self.record(&at.path, outcome);
     }
 
-    /// Whether a symlink at `link` with `target` stays in the project and runs through no
-    /// symlink already there: from the project root, one name at a time, it finds only real
-    /// entries, and then perhaps nothing (a dangling link is fine).
+    /// Whether a symlink at `link` with `target` leads into a system folder, or stays in the
+    /// project and runs through no symlink already there: from the project root, one name at a
+    /// time, it finds only real entries, and then perhaps nothing (a dangling link is fine).
     fn through_real_entries(&self, link: &Path, target: &OsStr) -> bool {
-        let Some(destination) = link_destination(link, target) else {
-            return false;
+        let destination = match link_destination(link, target) {
+            Some(Destination::Project(destination)) => destination,
+            // Outside the project, so no symlink in it is run through.
+            Some(Destination::System) => return true,
+            None => return false,
         };
         let mut current: Option<OwnedFd> = None;
         for name in &destination {
@@ -2012,6 +2042,66 @@ mod tests {
         );
         assert_ne!(ino(&t.project.join("h1")), ino(&t.project.join("h2")));
         assert_eq!(paths(&r.applied), ["h1", "h2"]);
+    }
+
+    #[test]
+    fn apply_takes_absolute_links_into_system_folders_only() {
+        let t = Tree::new();
+        let run = t.run();
+        t.up_dir(".venv/bin");
+        let link = |target: &str, name: &str| symlink(target, t.upper.join(name)).unwrap();
+        link("/usr/bin/python3", ".venv/bin/python");
+        for (n, target) in [
+            "/bin/sh",
+            "/lib/x",
+            "/lib64/ld.so",
+            "/opt/tool/bin/t",
+            "/usr",
+        ]
+        .iter()
+        .enumerate()
+        {
+            link(target, &format!("ok{n}"));
+        }
+        for (n, target) in [
+            "/etc/passwd",
+            "/home/x",
+            "/usr/../etc/x",
+            "/usr/./bin/x",
+            "/usr/bin/..",
+            "/usrx/bin",
+            "//usr/bin",
+            "/",
+            "/sbin/x",
+        ]
+        .iter()
+        .enumerate()
+        {
+            link(target, &format!("no{n}"));
+        }
+        let r = t.apply(&run);
+        assert_eq!(
+            paths(&r.applied),
+            [
+                ".venv",
+                ".venv/bin",
+                ".venv/bin/python",
+                "ok0",
+                "ok1",
+                "ok2",
+                "ok3",
+                "ok4"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_link(t.project.join(".venv/bin/python")).unwrap(),
+            Path::new("/usr/bin/python3")
+        );
+        let refused: Vec<(&str, Refusal)> = refusals(&r);
+        assert_eq!(refused.len(), 9, "{refused:?}");
+        assert!(refused
+            .iter()
+            .all(|(path, why)| path.starts_with("no") && *why == LinkOutside));
     }
 
     #[test]
