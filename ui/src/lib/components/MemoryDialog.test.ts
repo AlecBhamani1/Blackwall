@@ -91,6 +91,7 @@ describe('memory management', () => {
       subagentMaxSteps: 12,
       subagentTools: ['read_file', 'shell'],
       subagentRunsOn: 'local',
+      commandToolsIsolation: 'outside',
     });
     await user.click(screen.getByLabelText('A command tool'));
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
@@ -101,6 +102,7 @@ describe('memory management', () => {
       subagentMaxSteps: 12,
       subagentTools: ['read_file', 'shell'],
       subagentRunsOn: { tool: 'review' },
+      commandToolsIsolation: 'outside',
     });
   });
   it('loads saved subagent settings that run on a command tool', async () => {
@@ -116,6 +118,68 @@ describe('memory management', () => {
     expect(name).toHaveValue('review');
     expect(screen.getByLabelText('Subagent step limit')).toHaveValue(3);
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
+  });
+  const isolationHint = 'Command tools run with your account permissions and always ask first.';
+  it('saves command tools isolation and shows the account-permissions label', async () => {
+    const user = userEvent.setup();
+    const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const outside = await screen.findByLabelText('Outside the sandbox (asks every time)');
+    await vi.waitFor(() => expect(outside).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Subagents'));
+    const sandboxed = screen.getByLabelText('Inside the Commands profile');
+    expect(screen.getByRole('group', { name: 'Command tools' })).toBeInTheDocument();
+    expect(outside).toHaveAttribute('value', 'outside');
+    expect(sandboxed).toHaveAttribute('value', 'sandboxed');
+    expect(outside).toBeChecked();
+    expect(screen.getByText(isolationHint)).toBeVisible();
+    await user.click(sandboxed);
+    expect(screen.queryByText(isolationHint)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
+    expect(save).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandToolsIsolation: 'sandboxed' }),
+    );
+  });
+  it('keeps command tools isolation through a save, a reload and an unrelated save', async () => {
+    const user = userEvent.setup();
+    // The desktop merges each save into the stored preferences (patch_preferences).
+    let stored: Record<string, unknown> = { memoryEnabled: false };
+    vi.spyOn(persistence, 'preferences').mockImplementation(async () => ({ ...stored }));
+    vi.spyOn(persistence, 'savePreferences').mockImplementation(async (patch) => {
+      stored = { ...stored, ...patch };
+    });
+    const first = render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const sandboxed = await screen.findByLabelText('Inside the Commands profile');
+    await vi.waitFor(() => expect(sandboxed).toBeEnabled());
+    await user.click(screen.getByText('Advanced · Subagents'));
+    await user.click(sandboxed);
+    await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
+    expect(stored.commandToolsIsolation).toBe('sandboxed');
+    first.unmount();
+
+    // Reopened: the saved choice is shown, and the other saves do not reset it.
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const reloaded = await screen.findByLabelText('Inside the Commands profile');
+    await vi.waitFor(() => expect(reloaded).toBeEnabled());
+    expect(reloaded).toBeChecked();
+    expect(screen.queryByText(isolationHint)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Save context limit' }));
+    await user.click(screen.getByText('Advanced · Instructions'));
+    await user.click(screen.getByRole('button', { name: 'Save instruction limits' }));
+    expect(stored.commandToolsIsolation).toBe('sandboxed');
+    expect(stored.instructionMaxFileKib).toBe(8);
+
+    // Choosing the default again is saved too.
+    await user.click(screen.getByLabelText('Outside the sandbox (asks every time)'));
+    await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
+    expect(stored.commandToolsIsolation).toBe('outside');
+  });
+  it('loads a saved sandboxed choice', async () => {
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({ commandToolsIsolation: 'sandboxed' });
+    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const sandboxed = await screen.findByLabelText('Inside the Commands profile');
+    await vi.waitFor(() => expect(sandboxed).toBeEnabled());
+    expect(sandboxed).toBeChecked();
   });
   it('saves instruction limits and extra files only within their ranges', async () => {
     const user = userEvent.setup();
