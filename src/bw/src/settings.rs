@@ -1,5 +1,6 @@
 use blackwall_core::command_tools::Isolation;
 use blackwall_core::instructions::InstructionSettings;
+use blackwall_core::sandbox::{ExecutionProfile, SandboxStatus};
 use blackwall_core::subagents::{RunsOn, SubagentSettings};
 use blackwall_core::{
     connection::normalize_endpoint,
@@ -122,6 +123,33 @@ impl Settings {
 
     pub fn set(&mut self, store: &LocalStore, key: &str, value: &str) -> Result<(), String> {
         self.set_with_persistence(key, value, |updated| updated.save(store))
+    }
+
+    /// [`Settings::set`], refusing a sandboxed `profile` that `sandbox` says can't run on this
+    /// computer, with the reason. `sandbox` is asked only for a sandboxed profile.
+    pub fn set_with_sandbox(
+        &mut self,
+        store: &LocalStore,
+        key: &str,
+        value: &str,
+        sandbox: impl FnOnce() -> SandboxStatus,
+    ) -> Result<(), String> {
+        if key == "profile" {
+            let profile: ExecutionProfile = value.parse()?;
+            if profile != ExecutionProfile::Unsandboxed {
+                let status = sandbox();
+                if !status.available {
+                    return Err(status
+                        .note
+                        .unwrap_or("Sandboxed commands can't run on this computer.")
+                        .into());
+                }
+                if profile == ExecutionProfile::WorkspaceWrite && !status.workspace_write {
+                    return Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into());
+                }
+            }
+        }
+        self.set(store, key, value)
     }
 
     fn set_with_persistence(
@@ -886,6 +914,53 @@ mod tests {
             .set(&store, "timeout", "9")
             .unwrap_err()
             .contains("between 10 and 3,600 seconds"));
+    }
+
+    #[test]
+    fn profile_set_refuses_sandboxed_when_unavailable() {
+        let directory = TestDirectory::new();
+        let store = LocalStore::open(&directory.0).unwrap();
+        let mut settings = defaults(&store);
+        settings.set(&store, "profile", "unsandboxed").unwrap();
+        let unavailable = || SandboxStatus {
+            available: false,
+            note: Some("Install Bubblewrap."),
+            workspace_write: false,
+        };
+        let before = settings.clone();
+        for profile in ["read-only", "workspace-write"] {
+            assert_eq!(
+                settings.set_with_sandbox(&store, "profile", profile, unavailable),
+                Err("Install Bubblewrap.".into())
+            );
+            assert_eq!(settings, before);
+            assert_eq!(defaults(&store), before, "nothing saved");
+        }
+        // Unsandboxed never needs the sandbox, so it isn't even asked.
+        settings
+            .set_with_sandbox(&store, "profile", "unsandboxed", || unreachable!())
+            .unwrap();
+        // Read-only alone, as on Linux until Workspace-write arrives.
+        let read_only = || SandboxStatus {
+            available: true,
+            note: None,
+            workspace_write: false,
+        };
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "workspace-write", read_only),
+            Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into())
+        );
+        settings
+            .set_with_sandbox(&store, "profile", "read-only", read_only)
+            .unwrap();
+        assert_eq!(
+            defaults(&store).execution_profile,
+            ExecutionProfile::ReadOnly
+        );
+        // Other settings don't ask either.
+        settings
+            .set_with_sandbox(&store, "web", "on", || unreachable!())
+            .unwrap();
     }
 
     #[test]

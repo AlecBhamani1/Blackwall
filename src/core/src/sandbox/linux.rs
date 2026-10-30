@@ -1,8 +1,8 @@
 //! Linux sandbox backend: find a trusted bubblewrap and prove it works on this kernel.
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,9 +16,23 @@ pub enum Availability {
         bwrap: PathBuf,
         version: (u32, u32, u32),
     },
+    /// No trusted, new-enough bubblewrap that works here. Asking again won't change it.
     Unavailable,
+    /// A trusted bubblewrap failed to start just now. It's asked again after about 30 seconds.
+    Retrying,
+}
+impl Availability {
+    /// What to tell the owner when sandboxed commands can't run, or `None` when they can.
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            Self::Available { .. } => None,
+            Self::Unavailable => Some(LINUX_UNAVAILABLE),
+            Self::Retrying => Some(LINUX_RETRYING),
+        }
+    }
 }
 pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
+pub const LINUX_RETRYING: &str = "Bubblewrap didn't start just now. Try again in a moment.";
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
 /// After a timeout or a setup failure, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -36,6 +50,8 @@ pub(crate) enum ProbeError {
     Failed(std::process::ExitStatus),
     #[error("bubblewrap ran but the command inside did not print the expected output")]
     UnexpectedOutput,
+    #[error("could not write the sandbox files: {0}")]
+    Files(std::io::Error),
 }
 
 /// What `resolve` found. `transient` means a trusted bubblewrap failed to run, or a new-enough one
@@ -175,10 +191,16 @@ fn run(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), ProbeError> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).env_clear();
+    run_command(command, timeout)
+}
+/// [`run`] for a command that already has its program, arguments, directory and environment.
+fn run_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>), ProbeError> {
+    let mut child = command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -277,29 +299,43 @@ pub(crate) fn resolve(
     }
 }
 
-/// Start the smallest possible sandbox and print `ok` from inside it. This catches kernels and
-/// security policies (disabled user namespaces, AppArmor) that allow `--version` but not a sandbox.
+/// Start a sandbox exactly as a Read-only command gets one (the same mounts, user namespace,
+/// `--disable-userns` and seccomp filter, with a new folder in `scratch` as the project) and print
+/// `ok` from inside it. This catches kernels and security policies (disabled user namespaces,
+/// AppArmor) that allow `--version` but not a sandbox, so such a host is unavailable up front.
 pub(crate) fn probe(bwrap: &Path, scratch: &Path, timeout: Duration) -> Result<(), ProbeError> {
-    let mut args = vec![
-        "--unshare-all",
-        "--die-with-parent",
-        "--new-session",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--symlink",
-        "usr/bin",
-        "/bin",
-        // The dynamic loader lives under /lib (arm64) or /lib64 (x86-64) on merged-/usr systems.
-        "--symlink",
-        "usr/lib",
-        "/lib",
-    ];
-    if Path::new("/usr/lib64").is_dir() {
-        args.extend(["--symlink", "usr/lib64", "/lib64"]);
-    }
-    args.extend(["--", "/bin/sh", "-c", "printf ok"]);
-    let (status, stdout) = run(bwrap, &args, scratch, timeout)?;
+    let project = scratch.join(format!("{:016x}", rand::random::<u64>()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&project)
+        .map_err(ProbeError::Files)?;
+    let result = probe_in(bwrap, &project, timeout);
+    let _ = std::fs::remove_dir_all(&project);
+    result
+}
+fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), ProbeError> {
+    let plan = super::bwrap::MountPlan {
+        project,
+        network: false,
+        roots: super::bwrap::host_roots(),
+        etc: super::bwrap::host_etc(),
+        masks: &[],
+    };
+    let seccomp = super::seccomp::program().ok_or(ProbeError::UnexpectedOutput)?;
+    let args =
+        super::bwrap::args_file(&super::bwrap::args(&plan)).ok_or(ProbeError::UnexpectedOutput)?;
+    let (seccomp_file, args_file) = (project.join("seccomp.bpf"), project.join("args"));
+    write_private(&seccomp_file, &super::seccomp::to_bytes(&seccomp)).map_err(ProbeError::Files)?;
+    write_private(&args_file, &args).map_err(ProbeError::Files)?;
+    let launcher = super::bwrap::launcher(
+        bwrap,
+        &seccomp_file,
+        &args_file,
+        OsStr::new("/bin/sh"),
+        &["-c".into(), "printf ok".into()],
+    )
+    .ok_or(ProbeError::UnexpectedOutput)?;
+    let (status, stdout) = run_command(launcher.into_std(), timeout)?;
     if !status.success() {
         return Err(ProbeError::Failed(status));
     }
@@ -323,14 +359,32 @@ fn private_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create `path` for this user only (0600) and write `bytes` to it. An existing file is refused.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
 /// A fresh private `<data>/staging/probe-<random>` directory. A symlinked data directory or
 /// staging directory is refused. Probe directories left over from crashes are removed after a day.
 fn prepare_scratch(data_directory: &Path) -> std::io::Result<PathBuf> {
+    private_scratch(data_directory, "probe-")
+}
+/// A fresh private (0700) `<data>/staging/run-<random>` directory for one sandboxed command's
+/// files, with the same checks and clean-up as the probe's.
+pub(crate) fn run_directory(data_directory: &Path) -> std::io::Result<PathBuf> {
+    private_scratch(data_directory, "run-")
+}
+fn private_scratch(data_directory: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     real_directory(data_directory)?;
     let staging = data_directory.join("staging");
     private_directory(&staging)?;
     for entry in std::fs::read_dir(&staging)?.flatten() {
-        let stale = entry.file_name().to_string_lossy().starts_with("probe-")
+        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
             && entry
                 .metadata()
                 .ok()
@@ -342,20 +396,26 @@ fn prepare_scratch(data_directory: &Path) -> std::io::Result<PathBuf> {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
-    let scratch = staging.join(format!("probe-{:016x}", rand::random::<u64>()));
+    let scratch = staging.join(format!("{prefix}{:016x}", rand::random::<u64>()));
     std::fs::DirBuilder::new().mode(0o700).create(&scratch)?;
     Ok(scratch)
 }
 
 static UNAVAILABLE: Availability = Availability::Unavailable;
+static RETRYING: Availability = Availability::Retrying;
 static AVAILABLE: OnceLock<Availability> = OnceLock::new();
 static NEVER_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static RETRY_NOT_BEFORE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Whether sandboxed commands can run on this machine. Finding a working bubblewrap and finding
 /// none are both remembered for the life of the process (the first data directory wins). A
-/// timeout or a scratch-directory failure is not: it is retried after about 30 seconds.
+/// timeout or a scratch-directory failure is not: the answer is `Retrying`, and it is asked again
+/// after about 30 seconds. A processor the seccomp filter doesn't support is never available.
+/// Blocking: async callers use `spawn_blocking`.
 pub fn availability(data_directory: &Path) -> &'static Availability {
+    if super::seccomp::NATIVE_ARCH.is_none() {
+        return &UNAVAILABLE;
+    }
     if let Some(found) = AVAILABLE.get() {
         return found;
     }
@@ -369,10 +429,11 @@ pub fn availability(data_directory: &Path) -> &'static Availability {
     if let Some(found) = AVAILABLE.get() {
         return found;
     }
-    if NEVER_AVAILABLE.load(Ordering::Acquire)
-        || retry_not_before.is_some_and(|instant| Instant::now() < instant)
-    {
+    if NEVER_AVAILABLE.load(Ordering::Acquire) {
         return &UNAVAILABLE;
+    }
+    if retry_not_before.is_some_and(|instant| Instant::now() < instant) {
+        return &RETRYING;
     }
     let resolution = match prepare_scratch(data_directory) {
         Ok(scratch) => {
@@ -405,7 +466,7 @@ pub fn availability(data_directory: &Path) -> &'static Availability {
             transient: true, ..
         } => {
             *retry_not_before = Some(Instant::now() + RETRY_AFTER);
-            &UNAVAILABLE
+            &RETRYING
         }
         _ => {
             NEVER_AVAILABLE.store(true, Ordering::Release);
@@ -451,7 +512,7 @@ mod tests {
             std::fs::create_dir(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = dir.join("bwrap");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            write_script(&path, &format!("#!/bin/sh\n{body}\n"));
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             path
         }
@@ -473,6 +534,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+    /// Write a script that a test then runs, from a separate `cp` process. Written from this
+    /// process, a test running in parallel could fork while the file is still open for writing,
+    /// and its child would hold that descriptor until it execs: running the script in that moment
+    /// fails with ETXTBSY ("text file busy"), which the resolver rightly calls transient.
+    fn write_script(path: &Path, body: &str) {
+        let mut source = path.as_os_str().to_owned();
+        source.push(".source");
+        std::fs::write(&source, body).unwrap();
+        let _ = std::fs::remove_file(path);
+        let copied = Command::new("/bin/cp")
+            .arg(&source)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        std::fs::remove_file(&source).unwrap();
     }
 
     #[test]
@@ -645,7 +723,8 @@ mod tests {
         };
         let short = Duration::from_millis(300);
         let no_interpreter = root.fake("");
-        std::fs::write(&no_interpreter, "#!/no/such/interpreter\n").unwrap();
+        write_script(&no_interpreter, "#!/no/such/interpreter\n");
+        std::fs::set_permissions(&no_interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Nothing usable was found: final.
         assert!(!transient(&[], secs(2)));
         let untrusted = root.passing("bubblewrap 0.13.1", 0o777);

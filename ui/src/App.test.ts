@@ -148,6 +148,57 @@ it('sends the selected command boundary and resets full access on a new session'
   expect(network).not.toBeChecked();
 });
 
+it('disables sandboxed profiles and shows the bubblewrap note when unavailable', async () => {
+  const user = userEvent.setup();
+  const note =
+    "Sandboxed commands on Linux need Bubblewrap (bwrap). Install it with your system's package manager, then restart Blackwall.";
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'sandbox_status'
+      ? { available: false, note, workspaceWrite: false }
+      : fallback?.(command, args),
+  );
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  expect(screen.queryByText(note)).not.toBeInTheDocument();
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeDisabled();
+  expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled();
+  expect(within(profile).getByRole('option', { name: 'Unsandboxed (full access)' })).toBeEnabled();
+  expect(await screen.findByText(note)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Learn more' }));
+  expect(native.invoke).toHaveBeenCalledWith('open_setup_link', {
+    kind: 'sandbox-docs',
+    invitation: null,
+  });
+  // Choosing Unsandboxed is still possible, and explicit.
+  await user.selectOptions(profile, 'unsandboxed');
+  expect(profile).toHaveValue('unsandboxed');
+});
+
+it('offers Read-only but not yet Workspace-write where only Read-only is sandboxed', async () => {
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'sandbox_status'
+      ? { available: true, note: null, workspaceWrite: false }
+      : fallback?.(command, args),
+  );
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  await waitFor(() =>
+    expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
+  );
+  expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  expect(screen.queryByRole('button', { name: 'Learn more' })).not.toBeInTheDocument();
+});
+
 it('asks which server to use on a first launch instead of connecting on its own', async () => {
   const user = userEvent.setup();
   const discoverModels = vi.spyOn(localModelClient, 'discoverModels');

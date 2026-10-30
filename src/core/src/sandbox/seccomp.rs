@@ -26,8 +26,6 @@
 //!
 //! Only x86-64 and arm64 are supported. On any other architecture [`program`] returns `None` and
 //! the Linux sandbox is unavailable there.
-#![allow(dead_code)] // Used by D5 (`prepare` and the probe).
-
 use libc::sock_filter;
 
 // uapi/linux/audit.h: AUDIT_ARCH_* = EM_* | __AUDIT_ARCH_64BIT (for 64-bit ABIs) | __AUDIT_ARCH_LE.
@@ -37,7 +35,9 @@ const AUDIT_ARCH_LE: u32 = 0x4000_0000;
 pub(crate) const AUDIT_ARCH_X86_64: u32 = libc::EM_X86_64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
 pub(crate) const AUDIT_ARCH_AARCH64: u32 =
     libc::EM_AARCH64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
+#[cfg(test)]
 pub(crate) const AUDIT_ARCH_I386: u32 = libc::EM_386 as u32 | AUDIT_ARCH_LE;
+#[cfg(test)]
 pub(crate) const AUDIT_ARCH_ARM: u32 = libc::EM_ARM as u32 | AUDIT_ARCH_LE;
 
 /// The audit architecture of the syscalls this build makes, or `None` where the sandbox is unsupported.

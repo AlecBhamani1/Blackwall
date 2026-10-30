@@ -525,13 +525,11 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            run_with_timeout(
-                &workspace.path,
-                crate::sandbox::wrap(workspace, shell_command(command), Scope::Shell, &[])?,
-                command_timeout,
-                output,
-            )
-            .await
+            let (process, guard) =
+                crate::sandbox::prepare(workspace, shell_command(command), Scope::Shell, &[])
+                    .await?;
+            let outcome = run_with_timeout(&workspace.path, process, command_timeout, output).await;
+            guard.finish(outcome).await
         }
         "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
         _ => Err(ToolError::Arguments),
@@ -641,15 +639,10 @@ pub(crate) async fn program_with_timeout(
                 .apply(&mut process);
             return run_with_input(&workspace.path, process, input, timeout, output).await;
         }
-        let result = run_with_input(
-            &workspace.path,
-            crate::sandbox::wrap(workspace, process, Scope::Owner, pass_through)?,
-            input,
-            timeout,
-            output,
-        )
-        .await;
-        match result {
+        let (process, guard) =
+            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through).await?;
+        let outcome = run_with_input(&workspace.path, process, input, timeout, output).await;
+        match guard.finish(outcome).await {
             Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
                 text,
                 workspace.execution.profile,
@@ -830,7 +823,9 @@ impl Stream {
     }
 }
 /// [`run_with_timeout`], writing `input` to standard input while output is captured. The command
-/// brings its own environment; this never adds to or inherits one on its behalf.
+/// brings its own environment; this never adds to or inherits one on its behalf. It runs in
+/// `directory` unless it already has a working directory (the Linux sandbox launcher runs from
+/// `/` and moves the command into the project itself).
 #[cfg(any(unix, windows))]
 async fn run_with_input(
     directory: &Path,
@@ -839,8 +834,10 @@ async fn run_with_input(
     timeout: Duration,
     output: &OutputCap,
 ) -> Result<String, ToolError> {
+    if process.as_std().get_current_dir().is_none() {
+        process.current_dir(directory);
+    }
     process
-        .current_dir(directory)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -1080,8 +1077,10 @@ mod tests {
         let mut workspace = Workspace::open(&directory).unwrap();
         workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         // Cargo sets this for the test process: the shell keeps it, programs do not get it.
-        let process =
-            crate::sandbox::wrap(&workspace, shell_command("env"), Scope::Shell, &[]).unwrap();
+        let process = crate::sandbox::prepare(&workspace, shell_command("env"), Scope::Shell, &[])
+            .await
+            .unwrap()
+            .0;
         let out = run_with_timeout(
             &workspace.path,
             process,

@@ -17,6 +17,7 @@
   import Sidebar from './lib/components/Sidebar.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
+  import { sandboxClient, type SandboxStatus } from './lib/ipc';
 
   let composer: Composer;
   const controller = createChatController();
@@ -124,6 +125,11 @@
       authBusy = false;
     }
   }
+  // Unknown (the browser preview, or no answer) leaves every profile on offer; a command that
+  // can't be sandboxed still fails closed and says why.
+  let sandbox: SandboxStatus | null = null;
+  $: sandboxed = sandbox?.available ?? true;
+  $: workspaceWrite = sandboxed && (sandbox?.workspaceWrite ?? true);
   let setupOpen = false;
   let startupServers: LocalService[] | null = null;
   $: if (!setupOpen) startupServers = null;
@@ -166,6 +172,7 @@
 
   onMount(() => {
     void initializeApp();
+    if (isDesktop()) void sandboxClient.status().then((status) => (sandbox = status));
     void updateController.initialize();
     window.addEventListener('keydown', keydown);
   });
@@ -262,8 +269,8 @@
                 bind:value={$executionProfile}
                 disabled={$runState !== 'idle'}
               >
-                <option value="read-only">Read-only</option>
-                <option value="workspace-write">Workspace-write</option>
+                <option value="read-only" disabled={!sandboxed}>Read-only</option>
+                <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
                 <option value="unsandboxed">Unsandboxed (full access)</option>
               </select>
             </label><label class="web-toggle">
@@ -290,6 +297,15 @@
       {/if}
       {#if !setupOpen && isDesktop() && $agentMode && $workspace}
         <ProjectTrust workspace={$workspace} refresh={$runState} />
+      {/if}
+      {#if !setupOpen && isDesktop() && $agentMode && sandbox && !sandbox.available && sandbox.note}
+        <p class="sandbox-note" role="status">
+          {sandbox.note}<button
+            class="sandbox-help"
+            onclick={() => void setupClient.openLink('sandbox-docs').catch(() => {})}
+            >Learn more</button
+          >
+        </p>
       {/if}
       {#if $agentMode && $executionProfile === 'unsandboxed'}
         <div class="storage-error" role="status">
@@ -465,6 +481,21 @@
     background: var(--bg-panel);
     color: var(--text-primary);
     font-size: 12px;
+  }
+  .sandbox-note {
+    margin: 0;
+    padding: 6px 20px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .sandbox-help {
+    margin-left: 6px;
+    padding: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    text-decoration: underline;
   }
   .return-chat {
     padding: 12px;

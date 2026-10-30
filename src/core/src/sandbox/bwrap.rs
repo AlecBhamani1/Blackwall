@@ -18,10 +18,8 @@
 //! Masks: a directory becomes an empty read-only tmpfs; a file becomes a read-only bind of
 //! `/dev/null`. bubblewrap mounts binds `nodev`, so opening a masked file fails with "permission
 //! denied" (EACCES) rather than reading as empty. Either way its content can't be read.
-#![allow(dead_code)] // Used by D5 (`prepare` and the probe).
 
 use super::walk::{Mask, MaskKind};
-use super::ExecutionProfile;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -52,18 +50,15 @@ pub(crate) const ETC_FILES: [&str; 12] = [
 /// one exception: a single regular file (see [`etc_at`]).
 const SOCKET_DIRS: [&str; 2] = ["run", "var/run"];
 
+/// Every profile mounts the project read-only for now, the strictest choice.
 pub(crate) struct MountPlan<'a> {
     pub project: &'a Path,
-    /// Read in E3. Until then every profile mounts the project read-only, the strictest choice.
-    pub profile: ExecutionProfile,
     pub network: bool,
     pub roots: Vec<Root>,
     /// Absolute `/etc/<name>` paths that exist on the host.
     pub etc: Vec<PathBuf>,
     /// Relative to `project`.
     pub masks: &'a [Mask],
-    /// (upper, work) for the Workspace-write overlay; E3.
-    pub overlay: Option<(PathBuf, PathBuf)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,7 +314,6 @@ mod tests {
     fn plan<'a>(project: &'a Path, network: bool, masks: &'a [Mask]) -> MountPlan<'a> {
         MountPlan {
             project,
-            profile: ExecutionProfile::ReadOnly,
             network,
             roots: vec![
                 Root::Bind("/usr".into()),
@@ -331,7 +325,6 @@ mod tests {
             ],
             etc: vec!["/etc/hosts".into(), "/etc/ssl".into()],
             masks,
-            overlay: None,
         }
     }
     fn strs(args: &[OsString]) -> Vec<String> {
@@ -631,12 +624,10 @@ mod tests {
             std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
             let plan = MountPlan {
                 project: &self.project,
-                profile: ExecutionProfile::ReadOnly,
                 network,
                 roots: host_roots(),
                 etc: host_etc(),
                 masks: &self.masks,
-                overlay: None,
             };
             let seccomp = run.join("seccomp.bpf");
             let args_path = run.join("args");

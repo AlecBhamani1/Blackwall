@@ -84,10 +84,15 @@ const OLLAMA_DOWNLOAD: &str = if cfg!(target_os = "macos") {
     "https://ollama.com/download/linux"
 };
 
+/// Where the runtime guide explains command profiles and what the Linux sandbox needs.
+const SANDBOX_DOCS: &str =
+    "https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#work-in-a-project";
+
 #[tauri::command]
 pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result<(), String> {
     let target = match kind.as_str() {
         "download" => OLLAMA_DOWNLOAD.to_owned(),
+        "sandbox-docs" => SANDBOX_DOCS.to_owned(),
         "invitation" => connection::validate_invitation(invitation.as_deref().unwrap_or_default())
             .map_err(|_| {
                 "Paste the complete invitation link from Blackwall, including its access key."

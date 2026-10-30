@@ -429,7 +429,9 @@ fn set_setting(
         )?;
     }
     let recording = settings.trace.enabled;
-    settings.set(store, key, value)?;
+    settings.set_with_sandbox(store, key, value, || {
+        blackwall_core::sandbox::sandbox_status(directory)
+    })?;
     if settings.trace.enabled != recording {
         blackwall_core::usage::mark_recording(
             directory,

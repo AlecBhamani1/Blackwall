@@ -1,6 +1,5 @@
 //! Find the protected names under a project before a sandboxed Linux command runs, so they can be
-//! masked, and record the start state of every file for the copy-back. Std only, and it never
-//! follows a symlink. Callers run it in `spawn_blocking`.
+//! masked. Std only, and it never follows a symlink. Callers run it in `spawn_blocking`.
 //!
 //! Known limits, accepted on purpose:
 //! - A protected name more than one level below a skipped directory (`node_modules/x/.git`) is not
@@ -11,15 +10,10 @@
 //!   in between (a `read_dir` race) is not caught here. A later task closes it with `openat`.
 //! - Names compare as raw bytes with ASCII case folding. A case-folding filesystem that also folds
 //!   non-ASCII (or non-UTF-8) names can reach a protected name this does not recognise.
-//!
-//! `allow(dead_code)` stays until the mask builder and staging code (D4, D5, E1) use this module;
-//! remove it in the task that wires the last of them.
-#![allow(dead_code)]
 
 use crate::tools::ToolError;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) const PROTECTED: [&str; 11] = [
@@ -35,7 +29,6 @@ pub(crate) const PROTECTED: [&str; 11] = [
     ".claude",
     ".agents",
 ];
-pub(crate) const INSTRUCTION_FILES: [&str; 3] = ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"];
 pub(crate) const SKIP_BELOW_ROOT: [&str; 7] = [
     "node_modules",
     "target",
@@ -65,30 +58,9 @@ pub(crate) struct Mask {
     pub kind: MaskKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Fingerprint {
-    pub dev: u64,
-    pub ino: u64,
-    pub size: u64,
-    pub mtime_ns: i128,
-}
-
-impl Fingerprint {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.size(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-        }
-    }
-}
-
 pub(crate) struct Walk {
     /// Sorted by path.
     pub masks: Vec<Mask>,
-    /// Relative path to start state, for every regular file that is not masked or skipped.
-    pub files: HashMap<PathBuf, Fingerprint>,
 }
 
 /// Paths are relative to the walked root.
@@ -129,7 +101,6 @@ impl From<WalkError> for ToolError {
 /// lower name), or the root itself when its direct entries alone are over the limit.
 pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
     let mut masks = Vec::new();
-    let mut files = HashMap::new();
     let mut count = 0usize;
     let mut per_top: HashMap<OsString, usize> = HashMap::new();
     // (relative directory, whether only its direct children are checked)
@@ -186,21 +157,17 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
                     MaskKind::File
                 };
                 masks.push(Mask { path, kind });
-            } else if file_type.is_dir() {
-                if !shallow {
-                    let skipped = SKIP_BELOW_ROOT.iter().any(|s| name == OsStr::new(s));
-                    pending.push((path, skipped));
-                }
-            } else if file_type.is_file() && !shallow {
-                files.insert(path, Fingerprint::of(&meta));
+            } else if file_type.is_dir() && !shallow {
+                let skipped = SKIP_BELOW_ROOT.iter().any(|s| name == OsStr::new(s));
+                pending.push((path, skipped));
             }
         }
     }
     masks.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Walk { masks, files })
+    Ok(Walk { masks })
 }
 
-const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
+pub(crate) const OUTSIDE_HOME: &str = "Choose a project folder inside your home folder";
 const DATA_INSIDE_PROJECT: &str = "Blackwall's data folder is inside this project. Choose a project folder that doesn't contain Blackwall's data.";
 const NO_HOME: &str = "Blackwall couldn't find your home folder, so it won't sandbox this command.";
 const UNRESOLVED: &str =
@@ -317,11 +284,6 @@ mod tests {
                 ("a/b/.ssh", &MaskKind::Dir),
             ]
         );
-        // Masked directories are not entered; ordinary files are recorded.
-        assert!(w.files.contains_key(Path::new("a/b/keep.txt")));
-        assert!(!w.files.keys().any(|p| p.starts_with(".git")));
-        let meta = std::fs::symlink_metadata(root.0.join("a/b/keep.txt")).unwrap();
-        assert_eq!(w.files[Path::new("a/b/keep.txt")], Fingerprint::of(&meta));
     }
 
     #[test]
@@ -341,7 +303,6 @@ mod tests {
                 ("src/target/.ssh", &MaskKind::Dir),
             ]
         );
-        assert!(w.files.is_empty());
     }
 
     #[test]
@@ -355,7 +316,6 @@ mod tests {
         symlink(root.0.join("inside"), root.0.join("inside/.git")).unwrap();
         let w = walk(&root.0, MAX_ENTRIES).unwrap();
         assert!(w.masks.is_empty());
-        assert!(w.files.is_empty());
     }
 
     #[test]
@@ -474,7 +434,6 @@ mod tests {
         assert!(status.success());
         let w = walk(&root.0, MAX_ENTRIES).unwrap();
         assert_eq!(kinds(&w), [(".git", &MaskKind::File)]);
-        assert!(w.files.is_empty());
     }
 
     #[test]
