@@ -3,6 +3,30 @@ use crate::tools::{ToolError, Workspace};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+/// Whether the owner's sandbox profiles can run on this machine.
+pub fn sandbox_available(data_directory: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = data_directory;
+        Path::new("/usr/bin/sandbox-exec").is_file()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            linux::availability(data_directory),
+            linux::Availability::Available { .. }
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = data_directory;
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionProfile {
