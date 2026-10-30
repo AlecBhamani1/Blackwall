@@ -743,7 +743,11 @@ fn render_event(
             *snapshot = Some(state);
             return;
         }
-        println!("{}", serde_json::to_string(&event).unwrap_or_default());
+        let (line, details) = json_line(&event);
+        for detail in details {
+            eprintln!("{detail}");
+        }
+        println!("{line}");
         match event {
             AgentEvent::AssistantDelta { delta, .. } => answer.push_str(&delta),
             AgentEvent::ApprovalRequest {
@@ -790,10 +794,8 @@ fn render_event(
                 eprintln!("Instruction warning: {}", safe(&warning));
             }
             // For the owner at this terminal only; the model never sees them.
-            for diagnostic in diagnostics {
-                for line in diagnostic_lines(&diagnostic) {
-                    eprintln!("  details: {}", safe(&line));
-                }
+            for line in detail_lines(&diagnostics) {
+                eprintln!("{line}");
             }
         }
         AgentEvent::ToolCall { name, .. } => eprintln!("\n[{}]", safe(&name)),
@@ -829,6 +831,27 @@ fn render_event(
 }
 
 /// Model and tool text can carry terminal escapes, so it is made visible-only before printing.
+/// The JSON line for stdout, which may reach a model or a log, and the owner's details for the
+/// terminal. Server details never go in the line.
+fn json_line(event: &AgentEvent) -> (String, Vec<String>) {
+    let mut event = event.clone();
+    let mut details = vec![];
+    if let AgentEvent::InstructionsLoaded { diagnostics, .. } = &mut event {
+        details = detail_lines(diagnostics);
+        diagnostics.clear();
+    }
+    (serde_json::to_string(&event).unwrap_or_default(), details)
+}
+
+/// The terminal lines for the owner, each prefixed and made safe to print.
+fn detail_lines(diagnostics: &[ServerDiagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .flat_map(diagnostic_lines)
+        .map(|line| format!("  details: {}", safe(&line)))
+        .collect()
+}
+
 /// What to print under a server's warning: the variables it was not given, then its last output.
 fn diagnostic_lines(diagnostic: &ServerDiagnostic) -> Vec<String> {
     let mut lines = vec![];
@@ -904,6 +927,34 @@ mod tests {
             ..diagnostic
         };
         assert!(diagnostic_lines(&quiet).is_empty());
+    }
+
+    #[test]
+    fn json_events_carry_no_server_details_while_the_terminal_gets_them() {
+        let event = AgentEvent::InstructionsLoaded {
+            request_id: "r".into(),
+            agent_id: None,
+            sources: vec![],
+            warnings: vec!["MCP server docs did not start: stopped.".into()],
+            diagnostics: vec![ServerDiagnostic {
+                server: "docs".into(),
+                stderr: "no module \u{1b}[2Jx".into(),
+                not_passed: vec!["TOKEN".into()],
+            }],
+        };
+        let (line, details) = json_line(&event);
+        assert!(line.contains("did not start"), "{line}");
+        for secret in ["diagnostics", "no module", "TOKEN"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+        assert_eq!(
+            details,
+            [
+                "  details: docs: not passed: TOKEN",
+                "  details: no module [2Jx"
+            ]
+        );
+        assert!(details.iter().all(|line| !line.contains('\u{1b}')));
     }
 
     #[test]
