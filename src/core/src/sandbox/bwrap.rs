@@ -289,12 +289,29 @@ pub(crate) fn args_file(args: &[OsString]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The launcher's script. It opens the seccomp file on fd 3 and the args file on fd 4, closes every
+/// other descriptor except 0-2 and the project's (`$3`), so nothing Blackwall inherited reaches
+/// bubblewrap and through it the command (bubblewrap passes unknown descriptors on), then execs
+/// bubblewrap. A descriptor above 9 needs bash to be closed: under dash `exec 142>&-` is a
+/// command that isn't found, so the shell exits instead of going on with it open (fail closed).
+pub(crate) const TRAMPOLINE: &str = r#"exec 3<"$1" 4<"$2" && keep=$3 && shift 3 && test -d /proc/self/fd && for f in /proc/self/fd/*; do n=${f##*/}; case $n in 0|1|2|3|4|"$keep"|*[!0-9]*|"") ;; *) if test -L "$f"; then eval "exec $n>&-"; fi ;; esac; done && exec "$@""#;
+
+/// The shell that runs [`TRAMPOLINE`]: bash where it is installed (Debian and Ubuntu mark it
+/// essential), which can close any descriptor, or else `/bin/sh`.
+fn trampoline_shell() -> &'static str {
+    if Path::new("/bin/bash").is_file() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    }
+}
+
 /// `None` unless `bwrap`, `seccomp_file` and `args_file` are all absolute: bubblewrap is never
 /// found through PATH, and the shell runs in `/`.
 ///
-/// `/bin/sh` opens the seccomp file on fd 3 and the args file on fd 4, then execs bubblewrap:
-/// `/bin/sh -c 'exec 3<"$1" 4<"$2" && shift 2 && exec "$@"' blackwall-sandbox <seccomp_file>
-/// <args_file> <bwrap> --args 4 -- <program> <program args>`.
+/// The shell runs [`TRAMPOLINE`], which execs bubblewrap with only fds 0-4 and `project_fd` open:
+/// `<shell> -c <TRAMPOLINE> blackwall-sandbox <seccomp_file> <args_file> <project_fd> <bwrap>
+/// --args 4 -- <program> <program args>`.
 ///
 /// The environment starts empty, so bubblewrap (which is pid 1 in the sandbox, and whose
 /// `/proc/1/environ` the command can read) never carries Blackwall's own variables. The caller
@@ -305,6 +322,7 @@ pub(crate) fn launcher(
     bwrap: &Path,
     seccomp_file: &Path,
     args_file: &Path,
+    project_fd: RawFd,
     program: &OsStr,
     program_args: &[OsString],
 ) -> Option<tokio::process::Command> {
@@ -314,15 +332,16 @@ pub(crate) fn launcher(
     {
         return None;
     }
-    let mut command = tokio::process::Command::new("/bin/sh");
+    let mut command = tokio::process::Command::new(trampoline_shell());
     command
         .env_clear()
         .current_dir("/")
         .arg("-c")
-        .arg(r#"exec 3<"$1" 4<"$2" && shift 2 && exec "$@""#)
+        .arg(TRAMPOLINE)
         .arg("blackwall-sandbox")
         .arg(seccomp_file)
         .arg(args_file)
+        .arg(project_fd.to_string())
         .arg(bwrap)
         .args(["--args", "4", "--"])
         .arg(program)
@@ -647,21 +666,23 @@ mod tests {
             Path::new("/opt/bwrap"),
             Path::new("/d/seccomp.bpf"),
             Path::new("/d/args"),
+            12,
             OsStr::new("/bin/sh"),
             &["-c".into(), "echo hi".into()],
         )
         .unwrap();
         let std = command.as_std();
-        assert_eq!(std.get_program(), "/bin/sh");
+        assert!(["/bin/bash", "/bin/sh"].contains(&std.get_program().to_str().unwrap()));
         let argv: Vec<&OsStr> = std.get_args().collect();
         assert_eq!(
             argv,
             [
                 "-c",
-                r#"exec 3<"$1" 4<"$2" && shift 2 && exec "$@""#,
+                TRAMPOLINE,
                 "blackwall-sandbox",
                 "/d/seccomp.bpf",
                 "/d/args",
+                "12",
                 "/opt/bwrap",
                 "--args",
                 "4",
@@ -675,11 +696,43 @@ mod tests {
         // env_clear: nothing is inherited and nothing is set.
         assert_eq!(std.get_envs().count(), 0);
         // std's Debug output is the only public view of env_clear.
-        assert!(
-            format!("{std:?}").contains(" env -i \"/bin/sh\""),
-            "{std:?}"
-        );
+        assert!(format!("{std:?}").contains(" env -i \""), "{std:?}");
         assert_eq!(std.get_current_dir(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn the_trampoline_keeps_only_the_standard_streams_its_files_and_the_project() {
+        assert!(TRAMPOLINE.starts_with(r#"exec 3<"$1" 4<"$2" && keep=$3 && shift 3 && "#));
+        assert!(TRAMPOLINE.contains(r#"case $n in 0|1|2|3|4|"$keep"|*[!0-9]*|"") ;;"#));
+        assert!(TRAMPOLINE.contains(r#"if test -L "$f"; then eval "exec $n>&-"; fi"#));
+        assert!(TRAMPOLINE.ends_with(r#"done && exec "$@""#));
+        // Run it with `ls` in bubblewrap's place, holding stray descriptors 6, 7 and 11 open and
+        // keeping 9 as the project's. `ls` reads the listing on the lowest free one, 5.
+        let run = |shell: &str| {
+            std::process::Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    r#"exec 6</dev/null 7</dev/null 9</dev/null 11</dev/null; exec "$0" -c "$1" x /dev/null /dev/null 9 /bin/ls /proc/self/fd"#,
+                    shell,
+                    TRAMPOLINE,
+                ])
+                .output()
+                .unwrap()
+        };
+        let out = run(trampoline_shell());
+        let mut fds: Vec<u32> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|n| n.parse().unwrap())
+            .collect();
+        fds.sort_unstable();
+        assert_eq!(fds, [0, 1, 2, 3, 4, 5, 9]);
+        // dash can't name 11, so it stops instead of running the program with it open.
+        if std::fs::read_link("/bin/sh").is_ok_and(|target| target.ends_with("dash")) {
+            let out = run("/bin/sh");
+            assert!(!out.status.success());
+            assert!(out.stdout.is_empty());
+        }
     }
 
     #[test]
@@ -687,9 +740,9 @@ mod tests {
         let abs = Path::new("/a");
         let rel = Path::new("bwrap");
         for (bwrap, seccomp, args) in [(rel, abs, abs), (abs, rel, abs), (abs, abs, rel)] {
-            assert!(launcher(bwrap, seccomp, args, OsStr::new("/bin/true"), &[]).is_none());
+            assert!(launcher(bwrap, seccomp, args, 10, OsStr::new("/bin/true"), &[]).is_none());
         }
-        assert!(launcher(Path::new(""), abs, abs, OsStr::new("/bin/true"), &[]).is_none());
+        assert!(launcher(Path::new(""), abs, abs, 10, OsStr::new("/bin/true"), &[]).is_none());
     }
 
     #[test]
@@ -763,6 +816,7 @@ mod tests {
                 &self.bwrap,
                 &seccomp,
                 &args_path,
+                std::os::fd::AsRawFd::as_raw_fd(&project_fd),
                 OsStr::new("/bin/sh"),
                 &["-c".into(), script.into()],
             )

@@ -395,7 +395,9 @@ mod tests {
         let p = program().unwrap();
         let bytes = to_bytes(&p);
         assert_eq!(bytes.len(), p.len() * 8);
-        for (i, chunk) in p.iter().zip(bytes.chunks_exact(8)) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        assert!(rest.is_empty());
+        for (i, chunk) in p.iter().zip(chunks) {
             assert_eq!(u16::from_ne_bytes([chunk[0], chunk[1]]), i.code);
             assert_eq!((chunk[2], chunk[3]), (i.jt, i.jf));
             assert_eq!(u32::from_ne_bytes(chunk[4..8].try_into().unwrap()), i.k);

@@ -349,6 +349,7 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
         bwrap,
         &seccomp_file,
         &args_file,
+        project_fd.as_raw_fd(),
         OsStr::new("/bin/sh"),
         &["-c".into(), "printf ok".into()],
     )

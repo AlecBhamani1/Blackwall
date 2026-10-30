@@ -126,8 +126,9 @@ impl RunGuard {
             project: None,
         }
     }
-    /// Start the command [`prepare`] returned. A Linux sandbox gets the project descriptor its
+    /// Start the command [`prepare`] returned. Unix only: Windows starts commands its own way. A Linux sandbox gets the project descriptor its
     /// arguments name, which is closed here once bubblewrap has started.
+    #[cfg(unix)]
     pub(crate) fn spawn(
         &mut self,
         process: &mut tokio::process::Command,
@@ -338,10 +339,16 @@ pub(crate) async fn prepare_with(
     let original = process.as_std();
     let program_args: Vec<std::ffi::OsString> =
         original.get_args().map(ToOwned::to_owned).collect();
+    let project_fd = guard
+        .project
+        .as_ref()
+        .map(std::os::fd::AsRawFd::as_raw_fd)
+        .ok_or_else(|| ToolError::Execution(PREPARE_FAILED.into()))?;
     let mut launcher = bwrap::launcher(
         &bwrap,
         &run.join("seccomp.bpf"),
         &run.join("args"),
+        project_fd,
         original.get_program(),
         &program_args,
     )
@@ -720,9 +727,14 @@ mod tests {
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
-            // seccomp file, args file, bubblewrap, then the original command after `--`.
+            // seccomp file, args file, the project descriptor's number, bubblewrap, then the
+            // original command after `--`.
             assert_eq!(
-                argv[5..],
+                argv[5],
+                std::os::fd::AsRawFd::as_raw_fd(guard.project.as_ref().unwrap()).to_string()
+            );
+            assert_eq!(
+                argv[6..],
                 [
                     "/bin/true",
                     "--args",
@@ -1001,6 +1013,24 @@ mod tests {
             .await;
             let output = guard.finish(outcome).await.unwrap();
             assert_eq!(output, "Exit: 0\nCHECKEDinput\n");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_closes_descriptors_blackwall_inherited() {
+            use rustix::fs::{Mode, OFlags};
+            use rustix::io::{fcntl_dupfd_cloexec, fcntl_setfd, FdFlags};
+            let bw = test_bwrap();
+            let project = Project::new();
+            // Descriptors this process holds without close-on-exec, as when whatever started
+            // Blackwall (a CI runner, a desktop launcher) leaves some open: a low one and a high
+            // one, since /bin/sh (dash) can't name a descriptor above 9.
+            let low = rustix::fs::open("/dev/null", OFlags::RDONLY, Mode::empty()).unwrap();
+            let high = fcntl_dupfd_cloexec(&low, 142).unwrap();
+            fcntl_setfd(&high, FdFlags::empty()).unwrap();
+            let fds = project.run("ls /proc/$$/fd", &bw).await.unwrap();
+            assert_eq!(fds, "Exit: 0\n0\n1\n2\n");
+            drop((low, high));
         }
 
         #[tokio::test]
