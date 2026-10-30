@@ -1995,6 +1995,278 @@ else:
             assert!(out.contains("1 applied"), "{out}");
             assert_eq!(std::fs::read_to_string(path.join("next.txt")).unwrap(), "c");
         }
+
+        /// Waits until the running command has staged `marker` (it writes it first thing, so the
+        /// command has started and the start walk is long done), then returns the staging
+        /// folder's `upper`.
+        async fn upper_once_staged(project: &Project, marker: &str) -> PathBuf {
+            for _ in 0..250 {
+                if let Some(staged) = project.staged_left().first() {
+                    let upper = staged.join("upper");
+                    if upper.join(marker).exists() {
+                        return upper;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("the command never staged {marker}");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_applies_writes_deletes_and_recreated_dirs() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file("old", "o");
+            project.file("keep", "k");
+            project.file("d/old", "o");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let out = project
+                .run(
+                    "printf a > a; mkdir -p n/m; rm old; \
+                     rm -rf d && mkdir d && printf x > d/new",
+                    &bw,
+                )
+                .await
+                .unwrap();
+            assert!(out.starts_with("Exit: 0\n"), "{out}");
+            assert!(out.contains("0 refused, 0 conflicted"), "{out}");
+            assert!(
+                !out.contains("held back") && !out.contains("kept for"),
+                "{out}"
+            );
+            let path = &project.workspace.path;
+            assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "a");
+            assert!(path.join("n/m").is_dir());
+            assert!(!path.join("old").exists());
+            // The recreated folder holds only what the command put in it: `d/old` is gone.
+            assert_eq!(std::fs::read_to_string(path.join("d/new")).unwrap(), "x");
+            assert_eq!(std::fs::read_to_string(path.join("keep")).unwrap(), "k");
+            assert_eq!(tree(path), ["a", "d", "d/new", "keep", "n", "n/m"]);
+            // Everything applied: nothing is kept.
+            assert!(project.staged_left().is_empty());
+            assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_refuses_new_protected_names() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file("src/lib.rs", "code");
+            project.file("a/keep", "k");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let out = project
+                .run(
+                    "mkdir .git && printf '[core]' > .git/config; mkdir -p a/.claude; \
+                     mv src .agents; printf x > AGENTS.md; printf x > .GIT",
+                    &bw,
+                )
+                .await
+                .unwrap();
+            let path = &project.workspace.path;
+            // The real tree is as it was: `src` survives, and nothing refused got in.
+            assert_eq!(tree(path), ["a", "a/keep", "src", "src/lib.rs"], "{out}");
+            assert_eq!(
+                std::fs::read_to_string(path.join("src/lib.rs")).unwrap(),
+                "code"
+            );
+            // Each is named, with its reason.
+            for refused in [
+                ".git (a protected name",
+                "a/.claude (a protected name",
+                ".agents (a protected name",
+                ".GIT (a protected name",
+                "AGENTS.md (an agent instruction file)",
+            ] {
+                assert!(out.contains(refused), "{refused} in {out}");
+            }
+            assert!(
+                out.contains("5 refused, 0 conflicted, 1 held back"),
+                "{out}"
+            );
+            // `mv src .agents` left a whiteout at `src`: its delete waits, so `src` isn't lost.
+            assert!(out.contains("\nHeld back:\n  src"), "{out}");
+            // Kept for the owner to look at.
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1, "{out}");
+            assert!(out.ends_with(&format!("kept for 24 hours in {}.", staged[0].display())));
+            assert!(staged[0].join("upper/.agents/lib.rs").exists());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_refuses_escaping_links_and_setuid() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file("f", "plain");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let out = project
+                .run(
+                    "ln -s /etc/passwd p; ln -s ../../outside q; ln -s f ok; chmod u+s f",
+                    &bw,
+                )
+                .await
+                .unwrap();
+            let path = &project.workspace.path;
+            assert!(out.contains("3 refused, 0 conflicted"), "{out}");
+            let link = "a link that leads outside the project";
+            assert!(out.contains(&format!("p ({link}")), "{out}");
+            assert!(out.contains(&format!("q ({link}")), "{out}");
+            assert!(
+                out.contains("f (set-user-ID, set-group-ID or file capabilities)"),
+                "{out}"
+            );
+            // Neither link was made, and the file kept its mode and text.
+            assert!(std::fs::symlink_metadata(path.join("p")).is_err());
+            assert!(std::fs::symlink_metadata(path.join("q")).is_err());
+            let meta = std::fs::metadata(path.join("f")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7000, 0);
+            assert_eq!(std::fs::read_to_string(path.join("f")).unwrap(), "plain");
+            // A link that stays inside the project is fine.
+            assert_eq!(std::fs::read_link(path.join("ok")).unwrap(), Path::new("f"));
+            assert_eq!(project.staged_left().len(), 1, "{out}");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_conflict_keeps_owner_edit() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file("shared.txt", "original");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let real = project.workspace.path.join("shared.txt");
+            let command =
+                "touch started; sleep 1; printf staged > shared.txt; printf more > extra.txt";
+            let (out, ()) = tokio::join!(project.run(command, &bw), async {
+                // Once the command has started (and the walk before it is done), the owner edits
+                // the file; the command writes its own version a second later.
+                upper_once_staged(&project, "started").await;
+                std::fs::write(&real, "the owner's edit, longer than before").unwrap();
+            });
+            let out = out.unwrap();
+            assert!(
+                out.contains("2 applied, 0 deleted, 0 refused, 1 conflicted"),
+                "{out}"
+            );
+            assert!(
+                out.contains("\nConflicted, so Blackwall kept your version:\n  shared.txt"),
+                "{out}"
+            );
+            let path = &project.workspace.path;
+            assert_eq!(
+                std::fs::read_to_string(&real).unwrap(),
+                "the owner's edit, longer than before"
+            );
+            // The rest of the command's work still went in.
+            assert_eq!(
+                std::fs::read_to_string(path.join("extra.txt")).unwrap(),
+                "more"
+            );
+            // Its version of the conflicted file is kept.
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1, "{out}");
+            assert!(out.ends_with(&format!("kept for 24 hours in {}.", staged[0].display())));
+            assert_eq!(
+                std::fs::read_to_string(staged[0].join("upper/shared.txt")).unwrap(),
+                "staged"
+            );
+            assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_workspace_write_cancel_applies_nothing() {
+            let bw = test_bwrap();
+            let mut project = Project::new();
+            project.file("old", "o");
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            let mut run = Box::pin(project.run(
+                "touch started; printf partial > made.txt; rm old; sleep 30; printf late > late.txt",
+                &bw,
+            ));
+            let upper = tokio::select! {
+                result = &mut run => panic!("ended before cancellation: {result:?}"),
+                upper = upper_once_staged(&project, "started") => upper,
+            };
+            drop(run);
+            let path = &project.workspace.path;
+            // Nothing was applied, and the delete wasn't either.
+            assert_eq!(tree(path), ["old"]);
+            // The staging is kept, and the command was stopped: it never got to its last write.
+            let staged = project.staged_left();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(upper, staged[0].join("upper"));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(upper.join("made.txt").exists());
+            assert!(!upper.join("late.txt").exists());
+            assert_eq!(tree(path), ["old"]);
+            // The project's lock was let go: the next command runs and applies.
+            let out = project.run("printf c > next.txt", &bw).await.unwrap();
+            assert!(out.contains("1 applied"), "{out}");
+            assert_eq!(tree(path), ["next.txt", "old"]);
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_command_tool_sandboxed_workspace_write_writes_through() {
+            use crate::{
+                approvals::Approvals,
+                command_tools::Isolation,
+                protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
+            };
+            let mut project = Project::new();
+            // This goes through the real `prepare`, which finds bubblewrap itself.
+            let data = project.data();
+            let found = tokio::task::spawn_blocking(move || super::linux::availability(&data))
+                .await
+                .unwrap();
+            assert_eq!(
+                found,
+                &test_bwrap(),
+                "install BLACKWALL_TEST_BWRAP root-owned at /usr/lib/blackwall/bwrap"
+            );
+            project.workspace.execution.profile = ExecutionProfile::WorkspaceWrite;
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
+            let approvals = Approvals::default();
+            let decisions = approvals.clone();
+            let allow = move |event| {
+                if let AgentEvent::ApprovalRequest {
+                    request_id,
+                    approval_id,
+                    ..
+                } = event
+                {
+                    decisions
+                        .resolve(ResolveApprovalRequest {
+                            request_id,
+                            approval_id,
+                            decision: ApprovalDecision::Allow,
+                        })
+                        .unwrap();
+                }
+            };
+            let tool: crate::command_tools::CommandTool = serde_json::from_value(serde_json::json!({"name":"write_probe", "description":"Linux fixture", "command":["/usr/bin/touch", "{path}"]})).unwrap();
+            let out = tool
+                .run(
+                    &project.workspace,
+                    r#"{"path":"tool-write"}"#,
+                    "run",
+                    &approvals,
+                    &allow,
+                    Duration::from_secs(10),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                out.contains("1 applied, 0 deleted, 0 refused, 0 conflicted"),
+                "{out}"
+            );
+            assert!(project.workspace.path.join("tool-write").is_file());
+            assert!(project.staged_left().is_empty());
+            assert!(project.runs_left().is_empty());
+        }
     }
 
     #[cfg(target_os = "macos")]
