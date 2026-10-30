@@ -290,17 +290,22 @@ fn progress(rows: &Index<'_>, run: &Run) -> Result<Map<String, Value>, ViewError
                 Value::Array(list(children, seq)?.clone()),
             );
         }
+        // Set, as `RunFold` sets them on each `TurnComplete` (ruling A4).
         if let Some(reasoning) = delta.get("reasoning") {
-            let added = reasoning.as_str().ok_or(ViewError::BadBody { seq })?;
-            let mut text = match message.get("reasoning") {
-                Some(Value::String(text)) => text.clone(),
-                _ => String::new(),
-            };
-            text.push_str(added);
-            message.insert("reasoning".into(), json!(text));
+            if !reasoning.is_string() {
+                return Err(ViewError::BadBody { seq });
+            }
+            message.insert("reasoning".into(), reasoning.clone());
         }
-        if let Some(ms) = delta.get("reasoningMs") {
-            message.insert("reasoningMs".into(), ms.clone());
+        match delta.get("reasoningMs") {
+            None => {}
+            Some(Value::Null) => {
+                message.remove("reasoningMs");
+            }
+            Some(ms) if ms.is_number() => {
+                message.insert("reasoningMs".into(), ms.clone());
+            }
+            Some(_) => return Err(ViewError::BadBody { seq }),
         }
     }
     Ok(message)
@@ -823,7 +828,7 @@ mod tests {
                 json!({
                     "id": "a", "role": "assistant", "content": "Looking\n\n\n\nNext", "attachments": [],
                     "status": "streaming", "createdAt": 7,
-                    "reasoning": "think more", "reasoningMs": 12,
+                    "reasoning": "more", "reasoningMs": 12,
                     "children": [{"id": "k", "state": "running", "summary": ""}],
                     "tools": [
                         {"id": "c1", "name": "read_file", "arguments": "{}", "output": "data",
@@ -897,6 +902,38 @@ mod tests {
         let loaded = view(&rows);
         assert_eq!(loaded.messages[1], stopped);
         assert_eq!(loaded.open_run, None);
+    }
+
+    #[test]
+    fn progress_reasoning_is_set_and_a_null_reasoning_ms_removes_it_as_fold_run_does() {
+        use crate::run_fold::fold_run;
+        let events: Vec<crate::protocol::AgentEvent> = serde_json::from_value(json!([
+            {"type": "assistant_delta", "requestId": "r", "delta": "One"},
+            {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "One"},
+             "reasoning": "first thought", "reasoningMs": 40},
+            {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "One"},
+             "reasoning": "second"},
+        ]))
+        .unwrap();
+        let open = fold_run("a", 7, AssistantShape::Desktop, &events, None);
+        let rows = [
+            user(0, "u", "Think"),
+            reference(1, 0),
+            start(2, "a", 7, 0),
+            said(3, "One"),
+            progress(
+                4,
+                json!({"run": 2, "reasoning": "first thought", "reasoningMs": 40}),
+            ),
+            progress(
+                5,
+                json!({"run": 2, "reasoning": "second", "reasoningMs": null}),
+            ),
+        ];
+        let loaded = view(&rows);
+        assert_eq!(loaded.messages[1]["reasoning"], "second");
+        assert!(loaded.messages[1].get("reasoningMs").is_none());
+        assert_eq!(loaded.messages[1], open);
     }
 
     #[test]
