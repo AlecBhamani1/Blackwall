@@ -604,7 +604,8 @@ async fn shell_with_timeout(
 }
 /// Run a resolved program with separate arguments, never parsed by a shell. `input`, when
 /// given, is written to its standard input, which is otherwise empty. `pass_through` names the
-/// owner's variables the program also receives, unless the profile is sandboxed.
+/// owner's variables the program also receives, unless it runs sandboxed. It runs outside the
+/// sandbox unless the owner chose `Isolation::Sandboxed`.
 pub(crate) async fn program_with_timeout(
     workspace: &Workspace,
     program: &Path,
@@ -633,16 +634,41 @@ pub(crate) async fn program_with_timeout(
     {
         let mut process = tokio::process::Command::new(program);
         process.args(args);
-        run_with_input(
+        if workspace.execution.command_tools == crate::command_tools::Isolation::Outside {
+            // The owner chose to run command tools as themselves, whatever the shell profile.
+            crate::child_env::from_process(Scope::Owner, &workspace.path, pass_through)
+                .apply(&mut process);
+            return run_with_input(&workspace.path, process, input, timeout, output).await;
+        }
+        let result = run_with_input(
             &workspace.path,
             crate::sandbox::wrap(workspace, process, Scope::Owner, pass_through)?,
             input,
             timeout,
             output,
         )
-        .await
+        .await;
+        use crate::sandbox::ExecutionProfile;
+        match (result, workspace.execution.profile) {
+            (
+                Err(ToolError::Execution(text)),
+                profile @ (ExecutionProfile::ReadOnly | ExecutionProfile::WorkspaceWrite),
+            ) => {
+                let name = match profile {
+                    ExecutionProfile::ReadOnly => "Read-only",
+                    _ => "Workspace-write",
+                };
+                Err(ToolError::Execution(format!(
+                    "{text}\n{}",
+                    SANDBOXED_TOOL_HINT.replace("{profile}", name)
+                )))
+            }
+            (result, _) => result,
+        }
     }
 }
+/// Added to a failed command tool that ran sandboxed; `{profile}` is the profile's display name.
+pub(crate) const SANDBOXED_TOOL_HINT: &str = "Blocked by the {profile} sandbox. Command tools that need their own files or network must run outside the sandbox: Settings → Command tools.";
 static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
 /// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
 /// start with only the system directories, so tools installed with Homebrew or npm are missing.

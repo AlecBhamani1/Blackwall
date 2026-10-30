@@ -1044,6 +1044,85 @@ mod tests {
         tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
+    /// Run a tool that creates `tool-write` in the project, approving its prompt.
+    #[cfg(unix)]
+    async fn touch_probe(
+        isolation: Isolation,
+        profile: crate::sandbox::ExecutionProfile,
+    ) -> (Result<String, ToolError>, PathBuf) {
+        use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
+        let (tools, directory) = load(
+            r#"{"tools":[{"name":"touch_probe","description":"Touch","command":["/usr/bin/touch","tool-write"]}]}"#,
+        )
+        .await;
+        let mut workspace = crate::tools::Workspace::open(&directory).unwrap();
+        workspace.execution.profile = profile;
+        workspace.execution.command_tools = isolation;
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let allow = move |event| {
+            if let AgentEvent::ApprovalRequest {
+                request_id,
+                approval_id,
+                ..
+            } = event
+            {
+                decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap();
+            }
+        };
+        let result = tools
+            .get("touch_probe")
+            .unwrap()
+            .run(
+                &workspace,
+                r#"{}"#,
+                "run",
+                &approvals,
+                &allow,
+                Duration::from_secs(5),
+                &Default::default(),
+            )
+            .await;
+        (result, workspace.path.clone())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outside_tool_runs_even_when_shell_profile_is_read_only() {
+        let (result, path) = touch_probe(
+            Isolation::Outside,
+            crate::sandbox::ExecutionProfile::ReadOnly,
+        )
+        .await;
+        result.unwrap();
+        assert!(path.join("tool-write").exists());
+        tokio::fs::remove_dir_all(&path).await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandboxed_tool_failure_names_the_setting() {
+        let (result, path) = touch_probe(
+            Isolation::Sandboxed,
+            crate::sandbox::ExecutionProfile::ReadOnly,
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("Blocked by the Read-only sandbox."),
+            "{error}"
+        );
+        assert!(error.contains("Settings → Command tools"), "{error}");
+        assert!(!path.join("tool-write").exists());
+        tokio::fs::remove_dir_all(&path).await.unwrap();
+    }
+
     fn schema(value: Value) -> Schema {
         serde_json::from_value(value).unwrap()
     }

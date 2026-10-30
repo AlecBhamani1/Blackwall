@@ -433,10 +433,12 @@ mod tests {
         async fn native_approval_does_not_expand_shell_or_command_tool_access() {
             use crate::{
                 approvals::Approvals,
+                command_tools::Isolation,
                 model::{ToolCall, ToolFunction},
                 protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
             };
             let mut project = Project::new(ExecutionProfile::ReadOnly);
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
             let approvals = Approvals::default();
             let decisions = approvals.clone();
             let allow = move |event| {
@@ -509,9 +511,11 @@ mod tests {
         async fn native_stdin_json_reaches_a_sandboxed_command_tool() {
             use crate::{
                 approvals::Approvals,
+                command_tools::Isolation,
                 protocol::{AgentEvent, ApprovalDecision, ResolveApprovalRequest},
             };
-            let project = Project::new(ExecutionProfile::WorkspaceWrite);
+            let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
+            project.workspace.execution.command_tools = Isolation::Sandboxed;
             let approvals = Approvals::default();
             let decisions = approvals.clone();
             let allow = move |event| {
