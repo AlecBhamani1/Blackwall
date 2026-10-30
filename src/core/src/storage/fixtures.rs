@@ -7,6 +7,12 @@
 //! is the last `ContextUpdated` snapshot. Stopped, crashed and failed runs therefore leave exactly the
 //! partial state v5 left. A few fixtures are deliberately edited afterwards (missing ids, a bad role,
 //! a null context, a content mismatch); those edits are named where they happen.
+//!
+//! `system_in_transcript` is different: it is a synthetic legacy/imported shape. v5 never writes it
+//! and cannot continue it (the agent and CLI paths partition `system` messages out of the source,
+//! and the desktop computes its source before adding its own), so its saved hash covers an entry no
+//! later source holds. It exists only to prove verbatim copy of non-user/assistant/tool roles.
+//! `NON_CONTINUABLE` lists every fixture a v5 continuation cannot restore.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::{
@@ -17,6 +23,13 @@ use crate::{
 };
 use serde_json::Map;
 use std::path::PathBuf;
+
+/// Fixtures that v5 cannot continue: restoring the saved context against the rows plus a new user
+/// message fails. Continuation tests must skip them. `system_in_transcript` is a synthetic
+/// legacy/imported shape (v5 never writes it); `text_tool_mismatch` was edited after its run, so its
+/// rows no longer match the saved hash; `bad_role` is refused by v5 validation.
+pub(crate) const NON_CONTINUABLE: &[&str] =
+    &["system_in_transcript", "text_tool_mismatch", "bad_role"];
 
 pub(crate) const RECALL_QUERIES: [&str; 7] = [
     "needle",
@@ -771,6 +784,8 @@ fn instructions_and_children() -> Value {
     chat.desktop("instructions_and_children", true)
 }
 
+/// SYNTHETIC legacy/imported shape: v5 never writes it and cannot continue it; used only to prove
+/// verbatim copy of non-user/assistant/tool roles. See `NON_CONTINUABLE`.
 fn system_in_transcript() -> Value {
     let mut chat = Chat::new(12);
     chat.system =
@@ -868,8 +883,9 @@ pub(crate) fn build_v5(directory: &Path, bodies: &[Value], version: i64) -> Path
     fs::create_dir_all(directory).unwrap();
     let path = directory.join(DATABASE_FILE);
     let connection = Connection::open(&path).unwrap();
+    // `sqlite_master` records the file's whitespace, so a CRLF checkout must not change it.
     connection
-        .execute_batch(include_str!("fixtures/v5_schema.sql"))
+        .execute_batch(&include_str!("fixtures/v5_schema.sql").replace("\r\n", "\n"))
         .unwrap();
     let transaction = connection.unchecked_transaction().unwrap();
     for body in bodies {
@@ -1220,5 +1236,33 @@ fn completed_runs_cover_the_ui_and_stopped_runs_do_not() {
             covered < session["messages"].as_array().unwrap().len() as u64,
             "{id}"
         );
+    }
+}
+
+#[test]
+fn non_continuable_fixtures_are_exactly_those_v5_cannot_restore() {
+    // What a v5 desktop or CLI continuation does: the rows plus a new user message become the
+    // source, and the saved context must restore against it.
+    for session in v5_sessions() {
+        let id = session["id"].as_str().unwrap();
+        let cli = id.starts_with("cli_");
+        let mut chat = Chat::new(99);
+        chat.messages = session["messages"].as_array().unwrap().clone();
+        chat.user("Continue please", vec![]);
+        let source = chat.source(cli);
+        let saved: Option<ContextState> = session
+            .get("contextState")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value(v.clone()).unwrap());
+        let restored = ContextState::restore(&source, saved.as_ref());
+        assert_eq!(
+            restored.is_err(),
+            NON_CONTINUABLE.contains(&id),
+            "{id}: continuable={}",
+            restored.is_ok()
+        );
+    }
+    for id in NON_CONTINUABLE {
+        assert!(v5_sessions().iter().any(|s| s["id"] == *id));
     }
 }
