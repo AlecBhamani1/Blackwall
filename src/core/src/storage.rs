@@ -82,7 +82,7 @@ pub struct LocalStore {
 }
 mod chats;
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 mod memory;
 mod recall;
 pub use chats::Cap;

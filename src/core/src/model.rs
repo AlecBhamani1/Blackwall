@@ -1,7 +1,7 @@
 //! Headless streaming model transport, including fragmented OpenAI-compatible tool calls.
 use crate::{
     connection::normalize_endpoint,
-    protocol::{ChatRequest, MessageRole, TokenUsage},
+    protocol::{Attachment, ChatMessage, ChatRequest, MessageRole, TokenUsage},
 };
 use futures_util::{future::BoxFuture, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -608,6 +608,40 @@ fn one_system_message(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// The one model form of a saved chat message: its text with text and binary attachments
+/// inlined, and its images as parts. `extra` are attachments sent with the request rather than
+/// the message (`ChatRequest::attachments`, for the newest user message). `messages` sends this
+/// for every message, and stored model rows that reference a user message resolve to it.
+pub fn message_form(message: &ChatMessage, extra: &[Attachment]) -> Value {
+    let mut text = message.content.clone();
+    let mut images = vec![];
+    for attachment in message.attachments.iter().chain(extra) {
+        if let Some(url) = attachment
+            .data_url
+            .as_ref()
+            .filter(|_| attachment.mime_type.starts_with("image/"))
+        {
+            images.push(json!({"type":"image_url","image_url":{"url":url}}));
+        } else if let Some(content) = &attachment.text_content {
+            text.push_str(&format!(
+                "\n<attachment name={:?}>\n{}\n</attachment>",
+                attachment.name, content
+            ));
+        } else {
+            text.push_str(&format!(
+                "\n[Attached file: {}. Binary contents are not available.]",
+                attachment.name
+            ));
+        }
+    }
+    if images.is_empty() {
+        json!({"role":message.role,"content":text})
+    } else {
+        images.insert(0, json!({"type":"text","text":text}));
+        json!({"role":message.role,"content":images})
+    }
+}
+
 pub fn messages(request: &ChatRequest) -> Vec<Value> {
     let last_user = request
         .messages
@@ -618,39 +652,12 @@ pub fn messages(request: &ChatRequest) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            let attachments = message.attachments.iter().chain(
-                request
-                    .attachments
-                    .iter()
-                    .filter(|_| Some(index) == last_user),
-            );
-            let mut text = message.content.clone();
-            let mut images = vec![];
-            for attachment in attachments {
-                if let Some(url) = attachment
-                    .data_url
-                    .as_ref()
-                    .filter(|_| attachment.mime_type.starts_with("image/"))
-                {
-                    images.push(json!({"type":"image_url","image_url":{"url":url}}));
-                } else if let Some(content) = &attachment.text_content {
-                    text.push_str(&format!(
-                        "\n<attachment name={:?}>\n{}\n</attachment>",
-                        attachment.name, content
-                    ));
-                } else {
-                    text.push_str(&format!(
-                        "\n[Attached file: {}. Binary contents are not available.]",
-                        attachment.name
-                    ));
-                }
-            }
-            if images.is_empty() {
-                json!({"role":message.role,"content":text})
+            let extra = if Some(index) == last_user {
+                request.attachments.as_slice()
             } else {
-                images.insert(0, json!({"type":"text","text":text}));
-                json!({"role":message.role,"content":images})
-            }
+                &[]
+            };
+            message_form(message, extra)
         })
         .collect()
 }
@@ -658,6 +665,87 @@ pub fn messages(request: &ChatRequest) -> Vec<Value> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn message_form_is_what_messages_sends() {
+        let extra = [Attachment {
+            id: "extra".into(),
+            name: "extra.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 1,
+            data_url: None,
+            text_content: Some("E".into()),
+        }];
+        let mut seen = 0;
+        for session in crate::storage::fixtures::v5_sessions() {
+            for row in session["messages"].as_array().unwrap() {
+                let message: ChatMessage = serde_json::from_value(row.clone()).unwrap();
+                let mut request = ChatRequest::new("r", "m", vec![message.clone()]);
+                assert_eq!(message_form(&message, &[]), messages(&request)[0], "{row}");
+                if message.role == MessageRole::User {
+                    seen += 1;
+                    request.attachments = extra.to_vec();
+                    assert_eq!(
+                        message_form(&message, &extra),
+                        messages(&request)[0],
+                        "{row}"
+                    );
+                }
+            }
+        }
+        assert!(seen > 20, "{seen}");
+    }
+    #[test]
+    fn messages_output_is_pinned() {
+        let attachment =
+            |id: &str, mime: &str, data: Option<&str>, text: Option<&str>| Attachment {
+                id: id.into(),
+                name: format!("{id}.file"),
+                mime_type: mime.into(),
+                size_bytes: 3,
+                data_url: data.map(Into::into),
+                text_content: text.map(Into::into),
+            };
+        let mut first = ChatMessage::new(MessageRole::User, "First");
+        first.attachments = vec![
+            attachment("notes", "text/plain", None, Some("a \"quoted\" line")),
+            attachment("blob", "application/octet-stream", None, None),
+        ];
+        let mut last = ChatMessage::new(MessageRole::User, "Last");
+        last.attachments = vec![attachment(
+            "pic",
+            "image/png",
+            Some("data:image/png;base64,AA"),
+            None,
+        )];
+        let mut request = ChatRequest::new(
+            "r",
+            "m",
+            vec![
+                ChatMessage::new(MessageRole::System, "Sys"),
+                first,
+                ChatMessage::new(MessageRole::Assistant, "Reply"),
+                last,
+                ChatMessage::new(MessageRole::Assistant, "Tail"),
+            ],
+        );
+        request.attachments = vec![
+            attachment("extra", "text/plain", None, Some("x")),
+            attachment("img", "image/jpeg", None, Some("not an image url")),
+        ];
+        assert_eq!(
+            messages(&request),
+            [
+                json!({"role":"system","content":"Sys"}),
+                json!({"role":"user","content":"First\n<attachment name=\"notes.file\">\na \"quoted\" line\n</attachment>\n[Attached file: blob.file. Binary contents are not available.]"}),
+                json!({"role":"assistant","content":"Reply"}),
+                json!({"role":"user","content":[
+                    {"type":"text","text":"Last\n<attachment name=\"extra.file\">\nx\n</attachment>\n<attachment name=\"img.file\">\nnot an image url\n</attachment>"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}},
+                ]}),
+                json!({"role":"assistant","content":"Tail"}),
+            ]
+        );
+    }
     #[test]
     fn fragmented_tool_calls_and_unicode_survive_chunk_boundaries() {
         let frames = [
