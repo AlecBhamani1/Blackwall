@@ -37,10 +37,8 @@ mod tests {
     #[test]
     fn override_wins_and_unset_uses_the_established_default() {
         let home = Path::new("/Users/owner");
-        assert_eq!(
-            resolve(Some(OsStr::new("/var/blackwall-owner")), Some(home)).unwrap(),
-            Path::new("/var/blackwall-owner")
-        );
+        let owner = std::env::temp_dir().join("blackwall-owner");
+        assert_eq!(resolve(Some(owner.as_os_str()), Some(home)).unwrap(), owner);
         assert_eq!(resolve(None, Some(home)).unwrap(), home.join(".blackwall"));
         assert_eq!(
             resolve(Some(OsStr::new("")), Some(home)).unwrap(),

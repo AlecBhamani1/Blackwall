@@ -109,15 +109,16 @@ mod tests {
     fn production_data_uses_the_shared_override_and_default_rules() {
         let home = Path::new("/Users/owner");
         let app_data = Path::new("/acceptance/data");
+        let owner = std::env::temp_dir().join("blackwall-owner");
         assert_eq!(
             data_directory_for(
                 PRODUCTION_ID,
-                Some(OsStr::new("/var/blackwall-owner")),
+                Some(owner.as_os_str()),
                 Some(home),
                 Some(app_data),
             )
             .unwrap(),
-            Path::new("/var/blackwall-owner")
+            owner
         );
         assert_eq!(
             data_directory_for(PRODUCTION_ID, None, Some(home), Some(app_data)).unwrap(),
