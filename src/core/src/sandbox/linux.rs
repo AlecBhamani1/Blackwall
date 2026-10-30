@@ -38,7 +38,8 @@ pub(crate) enum ProbeError {
     UnexpectedOutput,
 }
 
-/// What `resolve` found. `transient` means a timeout, so the answer may change if asked again.
+/// What `resolve` found. `transient` means a trusted bubblewrap failed to run, or a new-enough one
+/// failed to start a sandbox, so the answer may change if asked again. Without one it is final.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Resolution {
     pub availability: Availability,
@@ -83,15 +84,23 @@ pub(crate) fn candidates(current_exe: &Path) -> Vec<PathBuf> {
 }
 
 /// The mounted AppImage, when the process says it runs from one. Its files may belong to the
-/// current user, because the image is a read-only mount that user started.
+/// current user, because the image is a mount that user started. Only that mount gets the
+/// exception: every directory above it must still belong to root.
 pub(crate) fn appimage_dir(
     appimage: Option<OsString>,
     appdir: Option<OsString>,
+    current_exe: &Path,
 ) -> Option<PathBuf> {
     let appdir = PathBuf::from(appdir.filter(|value| !value.is_empty())?);
     appimage.filter(|value| !value.is_empty())?;
     appdir.is_absolute().then_some(())?;
-    std::fs::canonicalize(appdir).ok()
+    let appdir = std::fs::canonicalize(appdir).ok()?;
+    // "/" would make every file "inside the image". Blackwall itself must be running from it.
+    (appdir.parent().is_some()
+        && std::fs::canonicalize(current_exe)
+            .ok()?
+            .starts_with(&appdir))
+    .then_some(appdir)
 }
 
 /// Root owns it, or (inside the AppImage mount only) the user running Blackwall does.
@@ -119,7 +128,8 @@ pub(crate) fn trusted_file(path: &Path, appimage: Option<&Path>) -> Option<PathB
 }
 fn trusted_file_as(path: &Path, appimage: Option<&Path>, euid: u32) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
-    let in_appimage = appimage.is_some_and(|mount| canonical.starts_with(mount));
+    let inside = |path: &Path| appimage.is_some_and(|mount| path.starts_with(mount));
+    let in_appimage = inside(&canonical);
     let meta = std::fs::metadata(&canonical).ok()?;
     let mode = meta.mode();
     (meta.is_file()
@@ -130,7 +140,7 @@ fn trusted_file_as(path: &Path, appimage: Option<&Path>, euid: u32) -> Option<Pa
         && canonical
             .ancestors()
             .skip(1)
-            .all(|directory| directory_trusted(directory, euid, in_appimage)))
+            .all(|directory| directory_trusted(directory, euid, inside(directory))))
     .then_some(canonical)
 }
 
@@ -141,6 +151,15 @@ fn kill_group(child: &Child) {
     {
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
+}
+/// Whether the child has exited, without reaping it (so its process group id stays reserved).
+fn has_exited(child: &Child) -> std::io::Result<bool> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) else {
+        return Err(std::io::Error::other("invalid process id"));
+    };
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    Ok(waitid(WaitId::Pid(pid), options)?.is_some())
 }
 fn kill_and_reap(child: &mut Child) {
     kill_group(child);
@@ -183,11 +202,13 @@ fn run(
         return Err(ProbeError::Spawn(error));
     }
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
+    loop {
+        match has_exited(&child) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(false) => {
                 kill_and_reap(&mut child);
                 return Err(ProbeError::TimedOut);
             }
@@ -196,16 +217,16 @@ fn run(
                 return Err(ProbeError::Wait(error));
             }
         }
-    };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining.max(Duration::from_millis(50))) {
-        Ok(output) => Ok((status, output)),
-        Err(_) => {
-            // A leftover process still holds the pipe; end it so the reader thread can finish.
-            kill_group(&child);
-            Err(ProbeError::TimedOut)
-        }
     }
+    // The leader has exited but is not yet reaped, so its group id cannot have been reused:
+    // end anything it left behind, then collect it.
+    kill_group(&child);
+    let status = child.wait().map_err(ProbeError::Wait)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let output = receiver
+        .recv_timeout(remaining.max(Duration::from_millis(50)))
+        .map_err(|_| ProbeError::TimedOut)?;
+    Ok((status, output))
 }
 
 /// The first candidate that is trusted, new enough and able to start a sandbox on this kernel.
@@ -225,9 +246,10 @@ pub(crate) fn resolve(
         if !seen.insert(bwrap.clone()) {
             continue;
         }
-        let output = run(&bwrap, &["--version"], scratch, timeout);
-        transient |= matches!(output, Err(ProbeError::TimedOut));
-        let Ok((status, stdout)) = output else {
+        // Failing to run a file we trust (out of memory or processes, a busy file, a timeout) can
+        // pass; a file that runs and says it is too old or not bubblewrap cannot.
+        let Ok((status, stdout)) = run(&bwrap, &["--version"], scratch, timeout) else {
+            transient = true;
             continue;
         };
         let version = status
@@ -244,7 +266,9 @@ pub(crate) fn resolve(
                     transient: false,
                 }
             }
-            Err(error) => transient |= matches!(error, ProbeError::TimedOut),
+            // A trusted, new-enough bubblewrap that cannot start a sandbox may be blocked by
+            // policy for good, or short of a resource for a moment. Ask again later to find out.
+            Err(_) => transient = true,
         }
     }
     Resolution {
@@ -353,7 +377,11 @@ pub fn availability(data_directory: &Path) -> &'static Availability {
     let resolution = match prepare_scratch(data_directory) {
         Ok(scratch) => {
             let exe = std::env::current_exe().unwrap_or_default();
-            let appimage = appimage_dir(std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR"));
+            let appimage = appimage_dir(
+                std::env::var_os("APPIMAGE"),
+                std::env::var_os("APPDIR"),
+                &exe,
+            );
             let resolution = resolve(
                 &candidates(&exe),
                 &scratch,
@@ -505,12 +533,12 @@ mod tests {
             resolution.availability,
             Availability::Available { bwrap, .. } if bwrap == ok
         ));
-        // A probe that fails outright is a firm no, not something to retry.
+        // A usable-looking bubblewrap that cannot start a sandbox may recover (resources, policy).
         assert_eq!(
             root.resolve(&[blocked]),
             Resolution {
                 availability: Availability::Unavailable,
-                transient: false
+                transient: true
             }
         );
     }
@@ -579,11 +607,87 @@ mod tests {
     fn a_forking_program_cannot_outlive_the_timeout() {
         let root = Root::new();
         let started = Instant::now();
-        let forking = root.fake("sleep 30 &\nsleep 30");
-        assert!(probe(&forking, &root.scratch, Duration::from_millis(300)).is_err());
-        let leaks = root.fake("sleep 30 &\nprintf ok");
-        assert!(probe(&leaks, &root.scratch, Duration::from_millis(300)).is_err());
+        // Gives up waiting while a background process is still running.
+        let hung = root.fake("sleep 30 &\necho $! > \"$0.pid\"\nsleep 30");
+        assert!(matches!(
+            probe(&hung, &root.scratch, Duration::from_millis(300)),
+            Err(ProbeError::TimedOut)
+        ));
+        assert_dies(&hung);
+        // Exits at once but leaves a background process holding the output pipe.
+        let leaves = root.fake("sleep 30 &\necho $! > \"$0.pid\"\nprintf ok");
+        assert!(probe(&leaves, &root.scratch, secs(2)).is_ok());
+        assert_dies(&leaves);
         assert!(started.elapsed() < secs(5));
+    }
+    /// The background process the fake recorded in `<script>.pid` is gone (or a zombie).
+    fn assert_dies(script: &Path) {
+        let mut pid_file = script.as_os_str().to_owned();
+        pid_file.push(".pid");
+        let pid = std::fs::read_to_string(PathBuf::from(pid_file)).unwrap();
+        let pid = pid.trim();
+        assert!(!pid.is_empty());
+        for _ in 0..40 {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|stat| !stat.contains(") Z"));
+            if !alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("background process {pid} outlived the probe");
+    }
+    #[test]
+    fn resolve_is_final_only_when_no_trusted_new_enough_candidate_exists() {
+        let root = Root::new();
+        let transient = |candidates: &[PathBuf], timeout| {
+            resolve(candidates, &root.scratch, timeout, Some(&root.path)).transient
+        };
+        let short = Duration::from_millis(300);
+        let no_interpreter = root.fake("");
+        std::fs::write(&no_interpreter, "#!/no/such/interpreter\n").unwrap();
+        // Nothing usable was found: final.
+        assert!(!transient(&[], secs(2)));
+        let untrusted = root.passing("bubblewrap 0.13.1", 0o777);
+        assert!(!transient(&[untrusted, root.path.join("missing")], secs(2)));
+        assert!(!transient(
+            &[root.passing("bubblewrap 0.11.2", 0o755)],
+            secs(2)
+        ));
+        assert!(!transient(
+            &[root.passing("not bubblewrap", 0o755)],
+            secs(2)
+        ));
+        assert!(
+            !transient(&[root.fake("exit 1")], secs(2)),
+            "--version fails"
+        );
+        // A trusted file that would not run, or a new-enough one that would not start a sandbox:
+        // maybe temporary.
+        assert!(
+            transient(&[root.fake("exec sleep 30")], short),
+            "--version times out"
+        );
+        assert!(transient(&[no_interpreter], secs(2)), "cannot start");
+        let new = "case $1 in --version) echo 'bubblewrap 0.13.1';; *) ";
+        assert!(
+            transient(&[root.fake(&format!("{new}exit 1;; esac"))], secs(2)),
+            "probe fails"
+        );
+        assert!(
+            transient(&[root.fake(&format!("{new}printf no;; esac"))], secs(2)),
+            "probe output"
+        );
+        assert!(
+            transient(&[root.fake(&format!("{new}exec sleep 30;; esac"))], short),
+            "probe times out"
+        );
+        // A later good candidate still wins, and is not transient.
+        let blocked = root.fake(&format!("{new}exit 1;; esac"));
+        assert!(!transient(
+            &[blocked, root.passing("bubblewrap 0.13.1", 0o755)],
+            secs(2)
+        ));
     }
     #[test]
     fn trusted_file_requires_a_plain_unwritable_file_in_unwritable_directories() {
@@ -639,22 +743,53 @@ mod tests {
         assert_eq!(trusted_file_as(&file, Some(&elsewhere.path), owner), None);
     }
     #[test]
-    fn the_appimage_mount_needs_both_environment_variables() {
+    fn the_user_owned_exception_stops_at_the_appimage_mount() {
+        // The image is mounted inside a directory the user owns (their home, say). The mount may
+        // be theirs; what it sits in may not.
         let root = Root::new();
+        if root.path.metadata().unwrap().uid() == 0 {
+            std::os::unix::fs::chown(&root.path, Some(12345), None).unwrap();
+        }
+        let owner = root.path.metadata().unwrap().uid();
+        let mount = root.path.join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = mount.join("bwrap");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(&file, Some(owner), None).unwrap();
+        std::os::unix::fs::chown(&mount, Some(owner), None).unwrap();
+        assert_eq!(
+            trusted_file_as(&file, Some(&mount), owner),
+            None,
+            "the user-owned directory above the mount"
+        );
+        // Were the whole of it the mount, the same file would pass.
+        assert_eq!(trusted_file_as(&file, Some(&root.path), owner), Some(file));
+    }
+    #[test]
+    fn the_appimage_mount_needs_both_variables_and_the_running_program_inside_it() {
+        let root = Root::new();
+        let exe = root.fake("true");
         let dir = || Some(root.path.clone().into_os_string());
         let image = || Some(OsString::from("/home/u/Blackwall.AppImage"));
-        assert_eq!(appimage_dir(image(), dir()), Some(root.path.clone()));
-        assert_eq!(appimage_dir(None, dir()), None);
-        assert_eq!(appimage_dir(image(), None), None);
-        assert_eq!(appimage_dir(Some(OsString::new()), dir()), None);
+        assert_eq!(appimage_dir(image(), dir(), &exe), Some(root.path.clone()));
+        assert_eq!(appimage_dir(None, dir(), &exe), None);
+        assert_eq!(appimage_dir(image(), None, &exe), None);
+        assert_eq!(appimage_dir(Some(OsString::new()), dir(), &exe), None);
+        let relative = Some(OsString::from("relative"));
+        assert_eq!(appimage_dir(image(), relative, &exe), None);
+        let missing = Some(OsString::from("/no/such/dir"));
+        assert_eq!(appimage_dir(image(), missing, &exe), None);
+        // Not running from the image, or "/" as the image.
+        let other = Root::new();
+        let elsewhere = other.fake("true");
+        assert_eq!(appimage_dir(image(), dir(), &elsewhere), None);
         assert_eq!(
-            appimage_dir(image(), Some(OsString::from("relative"))),
+            appimage_dir(image(), dir(), Path::new("/no/such/exe")),
             None
         );
-        assert_eq!(
-            appimage_dir(image(), Some(OsString::from("/no/such/dir"))),
-            None
-        );
+        assert_eq!(appimage_dir(image(), Some(OsString::from("/")), &exe), None);
     }
     #[test]
     fn scratch_is_private_and_refuses_a_symlinked_data_directory() {
