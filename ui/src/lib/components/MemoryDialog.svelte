@@ -87,6 +87,8 @@
   let instructionMaxFileKib = 8;
   let instructionMaxTotalKib = 32;
   let instructionFiles = '';
+  let maxSkillSizeMode: 'auto' | 'manual' = 'auto';
+  let maxSkillSizeKib = 32;
   $: instructionFileList = instructionFiles
     .split('\n')
     .map((name) => name.trim())
@@ -98,6 +100,10 @@
     Number.isInteger(Number(instructionMaxTotalKib)) &&
     instructionMaxTotalKib >= 8 &&
     instructionMaxTotalKib <= 256 &&
+    (maxSkillSizeMode === 'auto' ||
+      (Number.isInteger(Number(maxSkillSizeKib)) &&
+        maxSkillSizeKib >= 32 &&
+        maxSkillSizeKib <= 256)) &&
     instructionFileList.length <= MAX_INSTRUCTION_FILES &&
     new Set(instructionFileList).size === instructionFileList.length &&
     instructionFileList.every(instructionFileValid);
@@ -109,6 +115,7 @@
         instructionMaxFileKib: Number(instructionMaxFileKib),
         instructionMaxTotalKib: Number(instructionMaxTotalKib),
         instructionExtraFiles: instructionFileList,
+        maxSkillSizeKib: maxSkillSizeMode === 'auto' ? null : Number(maxSkillSizeKib),
       });
     } catch (cause) {
       error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
@@ -266,6 +273,8 @@
         commandToolsIsolation = savedPreferences.commandToolsIsolation ?? 'outside';
         instructionMaxFileKib = savedPreferences.instructionMaxFileKib ?? 8;
         instructionMaxTotalKib = savedPreferences.instructionMaxTotalKib ?? 32;
+        maxSkillSizeMode = savedPreferences.maxSkillSizeKib == null ? 'auto' : 'manual';
+        maxSkillSizeKib = savedPreferences.maxSkillSizeKib ?? 32;
         instructionFiles = (savedPreferences.instructionExtraFiles ?? []).join('\n');
         await refresh();
         loaded = true;
@@ -618,6 +627,31 @@
           Read after AGENTS.md in each folder, up to 8 paths inside the project, such as CLAUDE.md
           or .github/copilot-instructions.md. A longer file is cut at the limit with a warning.
           Projects can lower these limits but never add files.
+        </p>
+        <fieldset disabled={busy || !loaded}>
+          <legend>Max skill size</legend>
+          <label
+            ><input type="radio" bind:group={maxSkillSizeMode} value="auto" /> Auto (10% of the
+            configured context window, 32–256 KiB)</label
+          >
+          <label
+            ><input type="radio" bind:group={maxSkillSizeMode} value="manual" /> Manual</label
+          >
+        </fieldset>
+        {#if maxSkillSizeMode === 'manual'}
+          <label for="max-skill-size-kib">Max skill size (KiB)</label>
+          <input
+            id="max-skill-size-kib"
+            type="number"
+            min="32"
+            max="256"
+            bind:value={maxSkillSizeKib}
+            disabled={busy || !loaded}
+          />
+        {/if}
+        <p class="hint">
+          Auto uses the same configured-window limit for importing and every chat path. Installed
+          skills over the current limit stay available to remove but are skipped during chats.
         </p>
         <button
           class="secondary"

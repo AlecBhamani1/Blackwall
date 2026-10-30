@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A Max skill size preference (Memory → Advanced · Instructions, or
+  `bw config set max-skill-kib`) defaults to 10% of the configured context window at about four bytes
+  per token, clamped to 32–256 KiB, and accepts a manual 32–256 KiB override. Skill import and
+  loading use the same limit, and refusals now identify the failed rule and exact sizes.
+  Before downgrading to an older `bw`, reset a manual value with
+  `bw config set max-skill-kib auto`; older versions reject settings containing the manual key.
 - On Linux, Read-only commands now run in a sandbox: the project is read-only with `.git`, `.ssh`
   and the other protected folders hidden (below `node_modules`, `target` and the other skipped
   folders, only their direct children), of the home folder only `~/.cargo`, `~/.rustup`,

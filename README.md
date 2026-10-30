@@ -126,7 +126,9 @@ covers MCP commands, headers, and secret handling. Settings supports purpose sea
 
 Use `/learn` to propose a skill, `bw skills` to review proposals, and `bw skills approve <id>` or
 `bw skills reject <id>` to decide them. Use `bw skills import <path>` to import `SKILL.md` skills
-and `bw skills get <name>` to download a suggested one. Blackwall scans them before use. Run a
+and `bw skills get <name>` to download a suggested one. `bw skills list` lists saved skills, and
+`bw skills remove <name>` removes one even when its size prevents loading. Blackwall scans them
+before use. Run a
 saved skill with `/name`, such as `/pdf fill form.pdf`.
 
 `bw status` shows the model server and context window. `bw config set text-tool-calls on` reads

@@ -79,7 +79,8 @@ USAGE:
                              read_file,list_files), subagent-runs-on <local|TOOL> (default local;
                              a stdin JSON command tool, always asks), instruction-file-kib <1-64>
                              (default 8), instruction-total-kib <8-256> (default 32), and
-                             instruction-files <CLAUDE.md,...|none> (default none)
+                             instruction-files <CLAUDE.md,...|none> (default none), and
+                             max-skill-kib <auto|32-256> (default auto)
   bw status                  Show the detected model server, its context window, and settings
   bw sessions search <words> [--project <path>] [--after <unix-ms>] [--before <unix-ms>] [--limit <n>]
   bw commands                List interactive slash commands
@@ -92,6 +93,8 @@ USAGE:
   bw sessions                List saved conversations
   bw memory <action>         Review or manage saved memories (bw memory for list)
   bw skills <action>         Review learned skill proposals (bw skills for pending)
+  bw skills list             List saved skills, including oversized skills
+  bw skills remove <name>    Remove a saved skill without loading it
   bw skills import [<path>]  Import SKILL.md skills from other harnesses (list without a path)
   bw skills suggested        List suggested skills; bw skills get <name> downloads, scans, and imports one
   bw traces [show <id>]      List recent agent-run traces or show one as a tree
@@ -404,7 +407,7 @@ fn configure(
         }
         _ => {
             return Err(
-                "Use bw config show or bw config set <model|endpoint|profile|command-network|command-tools-isolation|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
+                "Use bw config show or bw config set <model|endpoint|profile|command-network|command-tools-isolation|web|memory|recall|text-tool-calls|context|output|output-bytes|compact|iterations|timeout|subagent-steps|subagent-tools|subagent-runs-on|instruction-file-kib|instruction-total-kib|instruction-files|max-skill-kib|otlp-endpoint|otlp-protocol|otlp-signals|otlp-include-project|usage-retention-days> <value>.".into(),
             )
         }
     };
@@ -438,6 +441,7 @@ fn setting_label(key: &str) -> Result<&'static str, String> {
         "output-bytes" => "command output cap:",
         "subagent-steps" | "subagent-tools" | "subagent-runs-on" => "subagents:",
         "instruction-file-kib" | "instruction-total-kib" | "instruction-files" => "instructions:",
+        "max-skill-kib" => "max skill size:",
         "profile" => "execution profile:",
         "command-network" => "command network:",
         "command-tools-isolation" => "command tools:",
@@ -649,7 +653,7 @@ async fn chat(
                             .await
                     }
                     // A saved skill's name runs it; the agent loads the skill for this turn.
-                    _ if saved_skill(directory, name) => {
+                    _ if saved_skill(directory, settings, name) => {
                         conversation
                             .turn(store, directory, settings, line, Some(input))
                             .await
@@ -672,10 +676,15 @@ async fn chat(
     }
 }
 
-fn saved_skill(directory: &std::path::Path, name: &str) -> bool {
+fn saved_skill(directory: &std::path::Path, settings: &Settings, name: &str) -> bool {
     !blackwall_core::skills::COMMANDS.contains(&name)
-        && blackwall_core::skills::SkillStore::open(&directory.join("skills"))
-            .is_ok_and(|skills| skills.contains(name))
+        && blackwall_core::skills::SkillStore::open_with_limit(
+            &directory.join("skills"),
+            settings
+                .instructions
+                .effective_skill_kib(settings.budget.context_window),
+        )
+        .is_ok_and(|skills| skills.contains(name))
 }
 
 fn slash(
@@ -747,4 +756,31 @@ fn slash(
         _ => return Err("Unknown command or invalid arguments. Type /commands.".into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn config_set_max_skill_kib_reports_success() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = LocalStore::open(&directory).unwrap();
+        let mut settings = Settings::load(&store).unwrap();
+        configure(
+            &store,
+            &directory,
+            &mut settings,
+            &["set".into(), "max-skill-kib".into(), "64".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(&store).unwrap().instructions.max_skill_kib,
+            Some(64)
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -6,12 +6,44 @@ use blackwall_core::{
 };
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "Use bw skills pending|approve <id>|reject <id>, bw skills import [<path>], bw skills suggested, or bw skills get <name>. Add --replace to overwrite a saved skill and --allow-anyway to import one with scan warnings.";
+const USAGE: &str = "Use bw skills list|remove <name>|pending|approve <id>|reject <id>, bw skills import [<path>], bw skills suggested, or bw skills get <name>. Add --replace to overwrite a saved skill and --allow-anyway to import one with scan warnings.";
 
 pub async fn run(directory: &Path, args: &[String]) -> Result<(), String> {
-    let store = SkillStore::open(&directory.join("skills")).map_err(|e| e.to_string())?;
+    let local = blackwall_core::storage::LocalStore::open(directory).map_err(|e| e.to_string())?;
+    let max_skill_kib = match crate::settings::Settings::load(&local) {
+        Ok(settings) => settings
+            .instructions
+            .effective_skill_kib(settings.budget.context_window),
+        Err(error) => {
+            eprintln!("Warning: {error} Using the default skill size limit.");
+            blackwall_core::instructions::InstructionSettings::default()
+                .effective_skill_kib_or_default_window()
+        }
+    };
+    let store = SkillStore::open_with_limit(&directory.join("skills"), max_skill_kib)
+        .map_err(|e| e.to_string())?;
     let id = || args.get(1).map(String::as_str).unwrap_or_default();
     match args.first().map(String::as_str).unwrap_or("pending") {
+        "list" if args.len() == 1 => {
+            let (skills, warnings) = store.list().map_err(|e| e.to_string())?;
+            if skills.is_empty() {
+                println!("No saved skills.");
+            }
+            for entry in skills {
+                if let Some(warning) = entry.warning {
+                    println!("{} — {warning}", entry.skill.name);
+                } else {
+                    println!("{} — {}", entry.skill.name, entry.skill.description);
+                }
+            }
+            for warning in warnings {
+                eprintln!("Skill: {warning}");
+            }
+        }
+        "remove" if args.len() == 2 => {
+            store.remove(id()).map_err(|e| e.to_string())?;
+            println!("Skill {} removed.", id());
+        }
         "pending" if args.len() <= 1 => {
             let (proposals, warnings) = store.proposals().map_err(|e| e.to_string())?;
             for warning in warnings {
@@ -170,10 +202,12 @@ fn import(store: &SkillStore, args: &[String]) -> Result<(), String> {
                 .ok_or("Your home folder could not be found. Use bw skills import <path>.")?;
             skill_import::known_folders(&home)
                 .into_iter()
-                .flat_map(|(origin, folder)| skill_import::scan(origin, &folder))
+                .flat_map(|(origin, folder)| {
+                    skill_import::scan_with_limit(origin, &folder, store.max_skill_kib())
+                })
                 .collect()
         }
-        [path] => skill_import::scan("Chosen", Path::new(path)),
+        [path] => skill_import::scan_with_limit("Chosen", Path::new(path), store.max_skill_kib()),
         _ => return Err(USAGE.into()),
     };
     skill_import::mark(store, &mut found);
@@ -232,7 +266,8 @@ async fn get(store: &SkillStore, args: &[String]) -> Result<(), String> {
         suggested.name, suggested.repository
     );
     let source = skill_suggest::download(suggested, &std::env::temp_dir()).await?;
-    let mut found = skill_import::scan(suggested.repository, &source);
+    let mut found =
+        skill_import::scan_with_limit(suggested.repository, &source, store.max_skill_kib());
     skill_import::mark(store, &mut found);
     let candidate = found.first();
     if let Some(candidate) = candidate {
@@ -264,7 +299,7 @@ mod tests {
             "---\nname: review-diff\ndescription: Review changes.\n---\nRead the diff.",
         )
         .unwrap();
-        let store = SkillStore::open(&root.join("skills")).unwrap();
+        let store = SkillStore::open_with_limit(&root.join("skills"), 32).unwrap();
         let path = root.join("source").to_string_lossy().into_owned();
         import(&store, std::slice::from_ref(&path)).unwrap();
         assert_eq!(store.read("review-diff").unwrap().body, "Read the diff.");
@@ -279,6 +314,39 @@ mod tests {
         assert_eq!(store.read("review-diff").unwrap().body, "Read it twice.");
         assert!(import(&store, &["a".into(), "b".into()]).is_err());
         drop(store); // Windows cannot remove a folder the store still holds open.
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_works_with_invalid_unrelated_settings() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-skill-remove-invalid-settings-{}-{unique}",
+            std::process::id()
+        ));
+        let local = blackwall_core::storage::LocalStore::open(&root).unwrap();
+        local
+            .save_setting("cli-settings", r#"{"webEnabled":"not-a-boolean"}"#)
+            .unwrap();
+        let store = SkillStore::open_with_limit(&root.join("skills"), 32).unwrap();
+        store
+            .save(&blackwall_core::skills::Skill {
+                name: "removable".into(),
+                description: "Remove me.".into(),
+                body: "Body".into(),
+                enabled: true,
+                user_only: false,
+            })
+            .unwrap();
+        drop(store);
+        run(&root, &["remove".into(), "removable".into()])
+            .await
+            .unwrap();
+        assert!(!root.join("skills/removable.md").exists());
+        drop(local);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

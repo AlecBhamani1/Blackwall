@@ -304,23 +304,24 @@ impl Agent<'_> {
         let mut tool_workspace = self.workspace.clone();
         tool_workspace.instruction_files = instruction_settings.extra_files.clone();
         let instruction_settings = instruction_settings.within(project_instructions.as_ref());
+        let max_skill_kib = instruction_settings.effective_skill_kib_or_default_window();
         if let Some(limits) = &limits {
             budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
         }
         let subagents = subagents.within(limits.as_ref());
         let mcp_directory = user_directory.map(std::path::Path::to_path_buf);
         let skills_directory = user_directory.map(|directory| directory.join("skills"));
-        let skills = match user_directory {
+        let (skills, skill_warnings) = match user_directory {
             Some(directory) => {
                 let directory = directory.join("skills");
                 instruction_task(move || {
-                    crate::skills::SkillStore::open(&directory).and_then(|store| store.list())
+                    crate::skills::SkillStore::open_with_limit(&directory, max_skill_kib)
+                        .and_then(|store| store.load())
                 })
                 .await?
                 .map_err(|_| AgentError::Instructions)?
-                .0
             }
-            None => vec![],
+            None => (vec![], vec![]),
         };
         // Proposals need the owner's skill folder and the message they came from.
         let proposals = user_directory
@@ -338,6 +339,11 @@ impl Agent<'_> {
         .await?;
         guidance.warnings.extend(command_tools.error.clone());
         guidance.warnings.extend(project_settings.warnings);
+        guidance.warnings.extend(
+            skill_warnings
+                .into_iter()
+                .map(|warning| format!("Skill skipped: {warning}")),
+        );
         if !compact
             && source.last().is_some_and(|message| {
                 message["role"] == "user"
@@ -764,6 +770,7 @@ impl Agent<'_> {
                                     directory.clone(),
                                     source.clone(),
                                     &call.function.arguments,
+                                    max_skill_kib,
                                 )
                                 .await
                                 .map_err(tools::ToolError::Execution),
@@ -1887,6 +1894,7 @@ mod tests {
             max_file_kib: 2,
             max_total_kib: 32,
             extra_files: vec!["CLAUDE.md".into(), "GEMINI.md".into()],
+            max_skill_kib: None,
         };
         // Untrusted first, then trusted: (sources, cap named in the truncation warning).
         for (trusted, sources, cap) in [

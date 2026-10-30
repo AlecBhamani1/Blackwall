@@ -260,6 +260,18 @@ impl Settings {
                     list => list.split(',').map(|name| name.trim().to_owned()).collect(),
                 }
             }
+            "max-skill-kib" => {
+                updated.instructions.max_skill_kib = match value.trim().to_ascii_lowercase().as_str() {
+                    "auto" => None,
+                    value => Some(
+                        value
+                            .parse()
+                            .ok()
+                            .filter(|n| blackwall_core::instructions::SKILL_KIB_RANGE.contains(n))
+                            .ok_or("Enter auto or a skill size limit between 32 and 256 KiB.")?,
+                    ),
+                }
+            }
             "iterations" => {
                 updated.budget.max_iterations = value
                     .parse()
@@ -275,7 +287,7 @@ impl Settings {
                     .ok_or("Enter a command time limit between 10 and 3,600 seconds.")?
             }
             _ => return Err(
-                "Choose a setting: model, endpoint, profile, command-network, command-tools-isolation, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, instruction-file-kib, instruction-total-kib, instruction-files, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
+                "Choose a setting: model, endpoint, profile, command-network, command-tools-isolation, web, memory, recall, traces, trace-content, text-tool-calls, context, output, output-bytes, compact, iterations, timeout, subagent-steps, subagent-tools, subagent-runs-on, instruction-file-kib, instruction-total-kib, instruction-files, max-skill-kib, otlp-endpoint, otlp-protocol, otlp-signals, otlp-include-project, or usage-retention-days."
                     .into(),
             ),
         }
@@ -292,7 +304,7 @@ impl Settings {
             validated_endpoint(&self.endpoint).unwrap_or_else(|_| "[invalid endpoint]".into());
         let model = validated_model(&self.model).unwrap_or_else(|_| "[invalid model]".into());
         format!(
-            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\ninstructions: {}\nexecution profile: {}\ncommand network: {}\ncommand tools: {}\notlp export: {}\nusage history: {}",
+            "model: {model}\nendpoint: {endpoint}\nweb: {}\nmemory: {}\nagent recall: {}\ntraces: {}\ntrace content: {}\ntext tool calls: {}\ncontext: {} tokens\noutput: {} tokens\nautomatic compaction: {}\niterations: {}\ncommand time limit: {} seconds\ncommand output cap: {} bytes\nsubagents: {}\ninstructions: {}\nmax skill size: {}\nexecution profile: {}\ncommand network: {}\ncommand tools: {}\notlp export: {}\nusage history: {}",
             if self.web_enabled { "on" } else { "off" },
             if self.memory_enabled { "on" } else { "off" },
             if self.recall_enabled { "on" } else { "off" },
@@ -305,6 +317,10 @@ impl Settings {
             self.budget.max_output_bytes,
             describe_subagents(&self.subagents),
             describe_instructions(&self.instructions),
+            self.instructions.max_skill_kib.map_or_else(
+                || format!("Auto ({} KiB)", self.instructions.effective_skill_kib(self.budget.context_window)),
+                |kib| format!("{kib} KiB"),
+            ),
             self.execution_profile.name(),
             if self.execution_profile == blackwall_core::sandbox::ExecutionProfile::Unsandboxed { "on (unsandboxed)" } else if self.command_network { "on" } else { "off" },
             match self.command_tools_isolation {
@@ -1236,6 +1252,7 @@ mod tests {
                 max_file_kib: 64,
                 max_total_kib: 256,
                 extra_files: vec!["CLAUDE.md".into(), ".github/copilot-instructions.md".into()],
+                max_skill_kib: None,
             }
         );
         assert!(reopened.describe().contains(
@@ -1244,6 +1261,14 @@ mod tests {
         let saved: Value =
             serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
         assert_eq!(saved["instructions"]["maxFileKib"], 64);
+        assert!(saved["instructions"].get("maxSkillKib").is_none());
+        settings.set(&store, "max-skill-kib", "96").unwrap();
+        assert_eq!(defaults(&store).instructions.max_skill_kib, Some(96));
+        settings.set(&store, "max-skill-kib", "AuTo").unwrap();
+        assert_eq!(defaults(&store).instructions.max_skill_kib, None);
+        let saved: Value =
+            serde_json::from_str(&store.setting(SETTINGS_KEY).unwrap().unwrap()).unwrap();
+        assert!(saved["instructions"].get("maxSkillKib").is_none());
         for (key, value) in [
             ("instruction-file-kib", "0"),
             ("instruction-file-kib", "65"),

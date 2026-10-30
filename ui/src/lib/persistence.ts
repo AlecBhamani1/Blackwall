@@ -61,6 +61,8 @@ export interface Preferences {
   instructionMaxTotalKib?: number;
   /** Extra guidance files read after AGENTS.md, such as CLAUDE.md. */
   instructionExtraFiles?: string[];
+  /** Skill cap in KiB, 32 to 256; absent/null uses the active context window. */
+  maxSkillSizeKib?: number | null;
   memoryEnabled?: boolean;
   recallEnabled?: boolean;
   tracesEnabled?: boolean;
@@ -96,6 +98,8 @@ export interface Skill {
   enabled: boolean;
   /** Runs only when the user types /name; the model never picks it on its own. */
   userOnly?: boolean;
+  /** Present when the installed skill is retained for management but cannot enter context. */
+  warning?: string;
 }
 export interface SkillProposal {
   id: string;

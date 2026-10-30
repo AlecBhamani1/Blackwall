@@ -486,6 +486,7 @@ pub async fn save_preferences(app: AppHandle, preferences: Value) -> Result<(), 
                 | "instructionMaxFileKib"
                 | "instructionMaxTotalKib"
                 | "instructionExtraFiles"
+                | "maxSkillSizeKib"
                 | "memoryEnabled"
                 | "recallEnabled"
                 | "tracesEnabled"
@@ -656,9 +657,25 @@ pub async fn with_skills<T: Send + 'static>(
         + 'static,
 ) -> Result<T, String> {
     crate::auth::require_unlocked(app).await?;
-    let directory = crate::identity::data_directory(app)?.join("skills");
+    let data_directory = crate::identity::data_directory(app)?;
+    let directory = data_directory.join("skills");
     tokio::task::spawn_blocking(move || {
-        let store = blackwall_core::skills::SkillStore::open(&directory)?;
+        let preferences = saved_preferences(&data_directory).unwrap_or_else(|error| {
+            eprintln!("Instruction settings warning: {error}; using defaults for skills.");
+            Default::default()
+        });
+        let settings =
+            blackwall_core::instructions::InstructionSettings::from_preferences(&preferences)
+                .unwrap_or_else(|error| {
+                    eprintln!("Instruction settings warning: {error}; using defaults for skills.");
+                    Default::default()
+                });
+        let context_window = preferences
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .unwrap_or(32_000);
+        let max_skill_kib = settings.effective_skill_kib(context_window);
+        let store = blackwall_core::skills::SkillStore::open_with_limit(&directory, max_skill_kib)?;
         store.seed()?;
         operation(store)
     })
@@ -673,10 +690,11 @@ pub async fn list_skills(app: AppHandle) -> Result<serde_json::Value, String> {
         // Scanned on every listing, so a badge follows edits made here or on disk.
         let scans: serde_json::Map<_, _> = skills
             .iter()
-            .map(|skill| {
+            .filter(|entry| entry.warning.is_none())
+            .map(|entry| {
                 (
-                    skill.name.clone(),
-                    serde_json::json!(store.scan(&skill.name)),
+                    entry.skill.name.clone(),
+                    serde_json::json!(store.scan(&entry.skill.name)),
                 )
             })
             .collect();
@@ -823,7 +841,13 @@ pub async fn find_skill_imports(
     with_skills(&app, move |store| {
         let mut found: Vec<_> = blackwall_core::skill_import::known_folders(&home)
             .into_iter()
-            .flat_map(|(origin, folder)| blackwall_core::skill_import::scan(origin, &folder))
+            .flat_map(|(origin, folder)| {
+                blackwall_core::skill_import::scan_with_limit(
+                    origin,
+                    &folder,
+                    store.max_skill_kib(),
+                )
+            })
             .collect();
         blackwall_core::skill_import::mark(&store, &mut found);
         Ok(found)
@@ -860,7 +884,8 @@ pub async fn choose_skill_import(
         "Chosen file"
     };
     with_skills(&app, move |store| {
-        let mut found = blackwall_core::skill_import::scan(origin, &path);
+        let mut found =
+            blackwall_core::skill_import::scan_with_limit(origin, &path, store.max_skill_kib());
         blackwall_core::skill_import::mark(&store, &mut found);
         Ok(Some(found))
     })
@@ -911,7 +936,8 @@ pub async fn get_suggested_skill(
     let origin = suggested.repository;
     let scanned = source.clone();
     let found = with_skills(&app, move |store| {
-        let mut found = blackwall_core::skill_import::scan(origin, &scanned);
+        let mut found =
+            blackwall_core::skill_import::scan_with_limit(origin, &scanned, store.max_skill_kib());
         blackwall_core::skill_import::mark(&store, &mut found);
         Ok(found)
     })

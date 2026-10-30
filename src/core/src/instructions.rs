@@ -11,6 +11,7 @@ use std::{
 
 pub const FILE_KIB_RANGE: std::ops::RangeInclusive<u16> = 1..=64;
 pub const TOTAL_KIB_RANGE: std::ops::RangeInclusive<u16> = 8..=256;
+pub const SKILL_KIB_RANGE: std::ops::RangeInclusive<u16> = 32..=256;
 pub const MAX_EXTRA_FILES: usize = 8;
 const AGENTS_FILES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
 const MAX_DIRECTORIES: usize = 128;
@@ -27,6 +28,9 @@ pub struct InstructionSettings {
     pub max_total_kib: u16,
     /// Up to 8 relative names such as `CLAUDE.md`; see [`valid_extra_file`].
     pub extra_files: Vec<String>,
+    /// Skill cap in KiB. None chooses 10% of the configured context window at four bytes/token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_skill_kib: Option<u16>,
 }
 impl Default for InstructionSettings {
     fn default() -> Self {
@@ -34,6 +38,7 @@ impl Default for InstructionSettings {
             max_file_kib: 8,
             max_total_kib: 32,
             extra_files: vec![],
+            max_skill_kib: None,
         }
     }
 }
@@ -44,6 +49,12 @@ impl InstructionSettings {
         }
         if !TOTAL_KIB_RANGE.contains(&self.max_total_kib) {
             return Err("The total instruction limit must be between 8 and 256 KiB.");
+        }
+        if self
+            .max_skill_kib
+            .is_some_and(|kib| !SKILL_KIB_RANGE.contains(&kib))
+        {
+            return Err("The skill size limit must be between 32 and 256 KiB.");
         }
         if self.extra_files.len() > MAX_EXTRA_FILES
             || self.extra_files.iter().enumerate().any(|(index, name)| {
@@ -81,9 +92,37 @@ impl InstructionSettings {
                 .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid))
                 .transpose()?
                 .unwrap_or(defaults.extra_files),
+            max_skill_kib: preferences
+                .get("maxSkillSizeKib")
+                .map(|value| {
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        value
+                            .as_u64()
+                            .and_then(|n| u16::try_from(n).ok())
+                            .map(Some)
+                            .ok_or(invalid)
+                    }
+                })
+                .transpose()?
+                .flatten(),
         };
         settings.validate()?;
         Ok(settings)
+    }
+
+    pub fn effective_skill_kib(&self, context_window: u64) -> u16 {
+        self.max_skill_kib.unwrap_or_else(|| {
+            // 10% of tokens at approximately four bytes/token, rounded down to KiB.
+            (context_window.saturating_mul(4) / 10 / 1024).clamp(32, 256) as u16
+        })
+    }
+
+    /// Resolve a limit for paths without saved configuration. Auto uses the configured default,
+    /// never a server-probed context window.
+    pub fn effective_skill_kib_or_default_window(&self) -> u16 {
+        self.effective_skill_kib(crate::context::ContextBudget::default().context_window)
     }
 
     /// These settings under a trusted project's `instructions`: the smaller caps, and only the
@@ -108,6 +147,7 @@ impl InstructionSettings {
                     .collect(),
                 None => self.extra_files.clone(),
             },
+            max_skill_kib: self.max_skill_kib,
         }
     }
 }
@@ -164,6 +204,7 @@ impl Instructions {
                     .max_total_kib
                     .clamp(*TOTAL_KIB_RANGE.start(), *TOTAL_KIB_RANGE.end()),
                 extra_files: vec![],
+                max_skill_kib: settings.max_skill_kib,
             },
             ..Self::default()
         };
@@ -676,6 +717,7 @@ mod tests {
             max_file_kib: file,
             max_total_kib: total,
             extra_files: extra.iter().map(|name| (*name).to_owned()).collect(),
+            max_skill_kib: None,
         }
     }
 
@@ -705,6 +747,38 @@ mod tests {
         assert_eq!(instructions.bytes, 32 * 1024);
         assert!(instructions.warnings[0].contains("a/b/c/AGENTS.md: skipped"));
         assert!(instructions.warnings[0].contains("32 KiB total"));
+    }
+
+    #[test]
+    fn skill_limit_auto_tracks_context_and_clamps() {
+        let settings = InstructionSettings::default();
+        assert_eq!(settings.effective_skill_kib(32_000), 32);
+        assert_eq!(settings.effective_skill_kib(128_000), 50);
+        assert_eq!(settings.effective_skill_kib(1_000_000), 256);
+        assert_eq!(settings.effective_skill_kib(u64::MAX), 256);
+        assert_eq!(settings.effective_skill_kib_or_default_window(), 32);
+        assert_eq!(
+            InstructionSettings {
+                max_skill_kib: Some(96),
+                ..settings
+            }
+            .effective_skill_kib_or_default_window(),
+            96
+        );
+    }
+
+    #[test]
+    fn skill_limit_manual_is_checked_and_respected() {
+        let preferences = serde_json::json!({"maxSkillSizeKib": 96});
+        let settings =
+            InstructionSettings::from_preferences(preferences.as_object().unwrap()).unwrap();
+        assert_eq!(settings.effective_skill_kib(32_000), 96);
+        for value in [31, 257] {
+            let preferences = serde_json::json!({"maxSkillSizeKib": value});
+            assert!(
+                InstructionSettings::from_preferences(preferences.as_object().unwrap()).is_err()
+            );
+        }
     }
 
     #[test]
