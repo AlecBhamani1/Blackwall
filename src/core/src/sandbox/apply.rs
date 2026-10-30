@@ -18,9 +18,10 @@
 //!    time from its already-open parent with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
 //!    RESOLVE_NO_XDEV)`, so no symlink and no other mount in the project is followed. A file is
 //!    copied into a fresh temp file (`.<name>.blackwall-<hex>`) next to its target, with no
-//!    xattrs and only the `0o777` mode bits, synced, and then committed (below). The staged inode
-//!    itself never enters the project. A new folder gets its staged `0o777` bits (no set-id); an
-//!    existing folder keeps its mode.
+//!    xattrs, only the `0o777` mode bits (less the umask for a new file) and the staged access
+//!    and modification times, synced, and then committed (below). The staged inode itself never
+//!    enters the project. A new folder gets its staged `0o777` bits less the umask (no set-id);
+//!    an existing folder keeps its mode.
 //! 3. **Delete.** Whiteouts and what opaque folders hide, last, and only when nothing above was
 //!    refused or conflicted: a refused `.agents` that a command moved `src` to comes with a
 //!    whiteout at `src`, and deleting `src` would lose it. Held-back deletes are reported.
@@ -73,15 +74,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The deepest folder nesting applied or deleted. Each level holds a descriptor open.
 const MAX_DEPTH: usize = 256;
-/// How many paths each list in the report shows.
-const LIST_LIMIT: usize = 200;
+/// How many paths each list in the report shows (and keeps).
+const LIST_LIMIT: usize = 50;
+/// How many characters of each path the report shows; a longer one loses its middle.
+const SHOWN_CHARS: usize = 160;
 const SET_ID: u32 = 0o6000;
 /// How long before `run_started` a ctime already counts as a change during the run (2 s): the
 /// kernel stamps ctime from a coarse clock that can lag the one `run_started` was read from.
 const CLOCK_MARGIN_NS: i128 = 2_000_000_000;
 
 /// Why a staged change was not applied.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     ProtectedName,
@@ -120,30 +122,86 @@ impl Refusal {
     }
 }
 
+/// One of the report's lists: how many entries it has, and the first [`LIST_LIMIT`] of them
+/// (sorted by [`Report::sorted`]). The rest are only counted, so a huge staged tree can't fill
+/// memory with paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Capped<T> {
+    pub total: usize,
+    pub first: Vec<T>,
+}
+impl<T> Default for Capped<T> {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            first: Vec::new(),
+        }
+    }
+}
+impl<T> FromIterator<T> for Capped<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(items: I) -> Self {
+        let mut capped = Self::default();
+        capped.extend(items);
+        capped
+    }
+}
+impl<T> Capped<T> {
+    fn push(&mut self, item: T) {
+        self.total += 1;
+        if !self.full() {
+            self.first.push(item);
+        }
+    }
+    fn extend(&mut self, items: impl IntoIterator<Item = T>) {
+        for item in items {
+            self.push(item);
+        }
+    }
+    /// Add `other`'s entries, the ones it only counted too.
+    fn append(&mut self, other: Self) {
+        let counted = other.total - other.first.len();
+        self.extend(other.first);
+        self.total += counted;
+    }
+    fn full(&self) -> bool {
+        self.first.len() >= LIST_LIMIT
+    }
+    pub fn len(&self) -> usize {
+        self.total
+    }
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
 /// What [`apply`] did, each list sorted by path. An empty path stands for the whole apply.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Report {
-    pub applied: Vec<PathBuf>,
-    pub refused: Vec<(PathBuf, Refusal)>,
-    pub conflicted: Vec<PathBuf>,
-    pub deleted: Vec<PathBuf>,
+    pub applied: Capped<PathBuf>,
+    pub refused: Capped<(PathBuf, Refusal)>,
+    pub conflicted: Capped<PathBuf>,
+    pub deleted: Capped<PathBuf>,
     /// Deletes not done because something else was refused or conflicted.
-    pub held_back: Vec<PathBuf>,
+    pub held_back: Capped<PathBuf>,
+    /// A conflicted path is a temp name of Blackwall's (see [`STRANDED`]).
+    stranded: bool,
 }
 impl Report {
     fn refuse(&mut self, path: &Path, why: Refusal) {
         self.refused.push((path.to_path_buf(), why));
     }
     fn conflict(&mut self, path: &Path) {
+        self.stranded |= path
+            .file_name()
+            .is_some_and(|name| name.as_bytes().windows(11).any(|w| w == b".blackwall-"));
         self.conflicted.push(path.to_path_buf());
     }
     fn sorted(mut self) -> Self {
-        self.applied.sort();
-        self.deleted.sort();
-        self.conflicted.sort();
-        self.held_back.sort();
-        self.refused.sort_by(|a, b| a.0.cmp(&b.0));
+        self.applied.first.sort();
+        self.deleted.first.sort();
+        self.conflicted.first.sort();
+        self.held_back.first.sort();
+        self.refused.first.sort_by(|a, b| a.0.cmp(&b.0));
         self
     }
 }
@@ -163,78 +221,108 @@ impl fmt::Display for Report {
         if !self.held_back.is_empty() {
             write!(f, ", {} {HELD_BACK}", self.held_back.len())?;
         }
-        list(f, "Applied", self.applied.iter().map(|p| shown(p)))?;
-        list(f, "Deleted", self.deleted.iter().map(|p| shown(p)))?;
-        list(
-            f,
-            "Refused",
-            self.refused
-                .iter()
-                .map(|(p, why)| format!("{} ({})", shown(p), why.reason())),
-        )?;
+        // What the owner may need to act on comes first: a long report is cut at its end.
+        list(f, "Refused", &self.refused, |(p, why)| {
+            format!("{} ({})", shown(p), why.reason())
+        })?;
         list(
             f,
             "Conflicted, so Blackwall kept your version",
-            self.conflicted.iter().map(|p| shown(p)),
+            &self.conflicted,
+            |p| shown(p),
         )?;
-        list(f, "Held back", self.held_back.iter().map(|p| shown(p)))?;
-        let stranded = |p: &&PathBuf| {
-            p.file_name()
-                .is_some_and(|name| name.as_bytes().windows(11).any(|w| w == b".blackwall-"))
-        };
-        if self.conflicted.iter().any(|p| stranded(&p)) {
+        if self.stranded {
             write!(f, "\n{STRANDED}")?;
         }
-        Ok(())
+        list(f, "Held back", &self.held_back, |p| shown(p))?;
+        list(f, "Applied", &self.applied, |p| shown(p))?;
+        list(f, "Deleted", &self.deleted, |p| shown(p))
     }
 }
 const STRANDED: &str =
     "A conflicted name with .blackwall- in it is an entry Blackwall moved aside \
      and couldn't put back. Check it and the entry at its original name, which may be \
      Blackwall's staged copy.";
-fn list(
+fn list<T>(
     f: &mut fmt::Formatter<'_>,
     title: &str,
-    items: impl ExactSizeIterator<Item = String>,
+    items: &Capped<T>,
+    show: impl Fn(&T) -> String,
 ) -> fmt::Result {
-    let total = items.len();
-    if total == 0 {
+    if items.is_empty() {
         return Ok(());
     }
     write!(f, "\n{title}:")?;
-    for item in items.take(LIST_LIMIT) {
-        write!(f, "\n  {item}")?;
+    for item in &items.first {
+        write!(f, "\n  {}", show(item))?;
     }
-    if total > LIST_LIMIT {
-        write!(f, "\n  … and {} more", total - LIST_LIMIT)?;
+    if items.total > items.first.len() {
+        write!(f, "\n  … and {} more", items.total - items.first.len())?;
     }
     Ok(())
 }
-/// A path as one line of plain text. Control characters, line and paragraph separators,
-/// bidirectional controls and invisible format characters are escaped, so a file name can't add
-/// or disguise a line of the report.
+/// A path as one line of plain text, at most [`SHOWN_CHARS`] characters (a longer one loses its
+/// middle, shown as `…`). Control characters, line and paragraph separators and every format
+/// character (bidirectional controls, invisible ones, tags) are escaped as `\u{..}`, bytes that
+/// aren't UTF-8 as `\xNN` and a backslash as `\\`, so a file name can't add, hide or disguise a
+/// line of the report, and two different names never look the same (unless cut).
 fn shown(path: &Path) -> String {
     if path.as_os_str().is_empty() {
         return "(all changes)".into();
     }
     let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
-        let hidden = matches!(
-            c,
-            '\u{061c}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-        );
-        if c.is_control() || hidden {
-            out.extend(c.escape_unicode());
-        } else {
-            out.push(c);
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c == '\\' {
+                out.push_str("\\\\");
+            } else if c.is_control() || is_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                out.extend(c.escape_unicode());
+            } else {
+                out.push(c);
+            }
+        }
+        for byte in chunk.invalid() {
+            out.push_str(&format!("\\x{byte:02x}"));
         }
     }
-    out
+    let count = out.chars().count();
+    if count <= SHOWN_CHARS {
+        return out;
+    }
+    let head = (SHOWN_CHARS - 1) / 2;
+    let tail = SHOWN_CHARS - 1 - head;
+    let mut clipped: String = out.chars().take(head).collect();
+    clipped.push('…');
+    clipped.extend(out.chars().skip(count - tail));
+    clipped
+}
+/// Unicode general category Cf, format characters (Unicode 15.1): invisible, and able to
+/// reorder or hide the text around them.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// Apply the changes staged in `upper` to `project`. Blocking: call it in `spawn_blocking`, and
@@ -245,7 +333,9 @@ fn shown(path: &Path) -> String {
 /// - `run_started`: read before the sandbox started; what changed since is the owner's.
 /// - `instruction_names`: the owner's configured extra instruction files (relative, `/`-separated,
 ///   such as `.github/copilot-instructions.md`), refused on top of [`INSTRUCTION_FILES`].
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// New files and folders get their staged `0o777` bits less the process umask, read now, as a
+/// direct write would.
 pub(crate) fn apply(
     upper: &Path,
     project: &Path,
@@ -259,6 +349,7 @@ pub(crate) fn apply(
         since: to_ns(run_started) - CLOCK_MARGIN_NS,
         names: Names::new(instruction_names),
         limit: MAX_ENTRIES,
+        umask: process_umask(),
     };
     apply_within(upper, project, expected_root, &rules)
 }
@@ -270,6 +361,25 @@ struct Rules<'a> {
     since: i128,
     names: Names,
     limit: usize,
+    /// Taken off a new file's or folder's mode.
+    umask: u32,
+}
+
+/// The process umask, from `/proc/self/status` (Linux 4.7 and later): `umask(2)` can only read
+/// it by changing it, for every thread, for a moment. Unknown counts as `0o077`.
+fn process_umask() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| umask_in(&status))
+        .unwrap_or(0o077)
+}
+fn umask_in(status: &str) -> Option<u32> {
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))?;
+    u32::from_str_radix(value.trim(), 8)
+        .ok()
+        .map(|mask| mask & 0o777)
 }
 
 fn to_ns(time: SystemTime) -> i128 {
@@ -286,7 +396,7 @@ fn apply_within(
     rules: &Rules<'_>,
 ) -> Report {
     let nothing = |why| Report {
-        refused: vec![(PathBuf::new(), why)],
+        refused: [(PathBuf::new(), why)].into_iter().collect(),
         ..Report::default()
     };
     let open_root = |path: &Path| {
@@ -317,7 +427,7 @@ fn apply_within(
         too_many: false,
         unsupported: false,
         buffer: vec![0; 64 * 1024],
-        refused: Vec::new(),
+        refused: Capped::default(),
     };
     let entries = match plan.metadata(&upper) {
         Ok(Meta::Plain) => plan
@@ -336,7 +446,7 @@ fn apply_within(
         } else {
             Refusal::Io
         });
-        report.refused.extend(plan.refused);
+        report.refused.append(plan.refused);
         return report.sorted();
     };
     let mut report = Report {
@@ -349,11 +459,7 @@ fn apply_within(
         } else {
             Refusal::UnsupportedOverlay
         };
-        let mut paths = Vec::new();
-        every_path(&entries, Path::new(""), &mut paths);
-        report
-            .refused
-            .extend(paths.into_iter().map(|path| (path, why)));
+        refuse_all(&entries, Path::new(""), why, &mut report.refused);
         return report.sorted();
     }
     let mut applier = Applier {
@@ -404,13 +510,30 @@ enum Node {
     Whiteout,
 }
 
-fn every_path(entries: &[Entry], parent: &Path, out: &mut Vec<PathBuf>) {
+/// Refuse every planned entry for `why`: only the paths `out` keeps are made, the rest counted.
+fn refuse_all(
+    entries: &[Entry],
+    parent: &Path,
+    why: Refusal,
+    out: &mut Capped<(PathBuf, Refusal)>,
+) {
     for entry in entries {
+        if out.full() {
+            out.total += count(entry);
+            continue;
+        }
         let path = parent.join(&entry.name);
         if let Node::Dir { entries, .. } = &entry.node {
-            every_path(entries, &path, out);
+            refuse_all(entries, &path, why, out);
         }
-        out.push(path);
+        out.push((path, why));
+    }
+}
+/// `entry` and every entry planned below it.
+fn count(entry: &Entry) -> usize {
+    match &entry.node {
+        Node::Dir { entries, .. } => 1 + entries.iter().map(count).sum::<usize>(),
+        _ => 1,
     }
 }
 
@@ -507,6 +630,19 @@ fn fingerprint(stat: &Stat) -> Fingerprint {
         size: stat.st_size as u64,
         mtime_ns: ns(stat.st_mtime as i64, stat.st_mtime_nsec as i64),
         ctime_ns: ns(stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+    }
+}
+#[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+fn times(stat: &Stat) -> fs::Timestamps {
+    fs::Timestamps {
+        last_access: fs::Timespec {
+            tv_sec: stat.st_atime as i64,
+            tv_nsec: stat.st_atime_nsec as _,
+        },
+        last_modification: fs::Timespec {
+            tv_sec: stat.st_mtime as i64,
+            tv_nsec: stat.st_mtime_nsec as _,
+        },
     }
 }
 fn same_inode(a: &Stat, b: &Stat) -> bool {
@@ -654,7 +790,7 @@ struct Planner<'a> {
     /// Overlay metadata that isn't understood was found: nothing is applied.
     unsupported: bool,
     buffer: Vec<u8>,
-    refused: Vec<(PathBuf, Refusal)>,
+    refused: Capped<(PathBuf, Refusal)>,
 }
 impl Planner<'_> {
     fn refuse(&mut self, path: PathBuf, why: Refusal) {
@@ -1163,7 +1299,8 @@ impl Applier<'_> {
         }
     }
 
-    /// Apply a new folder's entries, then give it its staged mode (no set-id bits).
+    /// Apply a new folder's entries, then give it its staged mode less the umask (no set-id
+    /// bits).
     fn fill<'p>(
         &mut self,
         at: &At<'_>,
@@ -1180,7 +1317,7 @@ impl Applier<'_> {
             fresh: true,
         };
         self.entries(fd.as_fd(), &at.path, entries, pin, false, deletes);
-        match fs::fchmod(&fd, Mode::from_raw_mode(mode & 0o777)) {
+        match fs::fchmod(&fd, Mode::from_raw_mode(mode & 0o777 & !self.rules.umask)) {
             Ok(()) => self.report.applied.push(at.path.clone()),
             Err(_) => self.report.refuse(&at.path, Refusal::Io),
         }
@@ -1189,13 +1326,17 @@ impl Applier<'_> {
     fn file(&mut self, at: &At<'_>, source: &Fingerprint, mode: u32) {
         let outcome = match self.judge(at) {
             Ok(Judged::Changed) => Ok(Outcome::Conflict),
-            Ok(_) => self.copy_in(at, source, mode),
+            // A new file gets what a direct write would; a replaced one keeps its staged mode.
+            Ok(Judged::Absent) => self.copy_in(at, source, mode & !self.rules.umask),
+            Ok(Judged::Replaceable(_)) => self.copy_in(at, source, mode),
             Err(_) => Err(Refusal::Io),
         };
         self.record(&at.path, outcome);
     }
 
-    /// Copy the staged file into a fresh temp file next to its target, then commit it.
+    /// Copy the staged file into a fresh temp file next to its target, with `mode` and the staged
+    /// file's access and modification times (so a build tool's freshness checks still hold; the
+    /// conflict checks go by ctime, which can't be set), then commit it.
     fn copy_in(
         &mut self,
         at: &At<'_>,
@@ -1226,6 +1367,7 @@ impl Applier<'_> {
                 return Err(std::io::Error::other("the staged file changed size"));
             }
             fs::fchmod(&out, Mode::from_raw_mode(mode & 0o777))?;
+            fs::futimens(&out, &times(&stat))?;
             fs::fsync(&out)?;
             Ok(())
         })();
@@ -1542,7 +1684,16 @@ mod tests {
                 std::fs::create_dir(&root).unwrap();
                 root
             };
-            let root = std::fs::canonicalize(root).unwrap();
+            Self::at(std::fs::canonicalize(root).unwrap())
+        }
+        /// [`Tree::new`] in the temp folder, never tmpfs.
+        fn on_disk() -> Self {
+            let name = format!("blackwall-apply-{:016x}", rand::random::<u64>());
+            let root = std::env::temp_dir().join(name);
+            std::fs::create_dir(&root).unwrap();
+            Self::at(std::fs::canonicalize(root).unwrap())
+        }
+        fn at(root: PathBuf) -> Self {
             let tree = Self {
                 upper: root.join("upper"),
                 project: root.join("project"),
@@ -1590,6 +1741,7 @@ mod tests {
                 since: run.since,
                 names: Names::new(&names),
                 limit,
+                umask: 0o022,
             };
             apply_within(&self.upper, &self.project, run.root, &rules)
         }
@@ -1700,14 +1852,21 @@ mod tests {
         found[0].clone()
     }
     fn refusals(report: &Report) -> Vec<(&str, Refusal)> {
+        assert_eq!(report.refused.total, report.refused.first.len());
         report
             .refused
+            .first
             .iter()
             .map(|(path, why)| (path.to_str().unwrap(), *why))
             .collect()
     }
-    fn paths(list: &[PathBuf]) -> Vec<&str> {
-        list.iter().map(|path| path.to_str().unwrap()).collect()
+    /// A list's paths, which must all have been kept.
+    fn paths(list: &Capped<PathBuf>) -> Vec<&str> {
+        assert_eq!(list.total, list.first.len());
+        list.first
+            .iter()
+            .map(|path| path.to_str().unwrap())
+            .collect()
     }
     fn mode(path: &Path) -> u32 {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
@@ -1944,7 +2103,7 @@ mod tests {
         t.proj("f", "owner edit!");
         t.up("f", "command");
         let r = t.apply(&run);
-        assert_eq!(r.conflicted, [PathBuf::from("f")]);
+        assert_eq!(paths(&r.conflicted), ["f"]);
         assert_eq!(t.read("f"), "owner edit!");
         assert!(r.applied.is_empty());
     }
@@ -2494,7 +2653,7 @@ mod tests {
         t.up("keep", "changed"); // the fifth entry, and the limit is four
         let r = t.apply_with(&run, &[], 4);
         assert!(r.applied.is_empty() && r.deleted.is_empty(), "{r:?}");
-        assert!(!r.refused.is_empty() && r.refused.iter().all(|(_, why)| *why == TooMany));
+        assert!(!r.refused.is_empty() && r.refused.first.iter().all(|(_, why)| *why == TooMany));
         assert_eq!(t.listing(), ["keep"]);
         assert_eq!(t.read("keep"), "k");
     }
@@ -2544,21 +2703,28 @@ mod tests {
 
     #[test]
     fn report_display_is_capped_and_plain() {
-        let report = Report {
+        let mut report = Report {
             applied: (0..250)
                 .map(|i| PathBuf::from(format!("f{i:03}")))
                 .collect(),
-            refused: vec![
+            refused: [
                 (PathBuf::from(".git"), ProtectedName),
                 (
                     PathBuf::from("evil\nWorkspace changes: 0 applied"),
                     LinkOutside,
                 ),
-            ],
-            conflicted: vec![PathBuf::from("mine.txt")],
-            deleted: vec![],
-            held_back: vec![PathBuf::from("src")],
+            ]
+            .into_iter()
+            .collect(),
+            held_back: [PathBuf::from("src")].into_iter().collect(),
+            ..Report::default()
         };
+        report.conflict(Path::new("mine.txt"));
+        // Only the first 50 of each list are kept; the rest are counted.
+        assert_eq!(
+            (report.applied.total, report.applied.first.len()),
+            (250, 50)
+        );
         let text = report.to_string();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -2566,14 +2732,29 @@ mod tests {
             "Workspace changes: 250 applied, 0 deleted, 2 refused, 1 conflicted, 1 held back \
              (not deleted because other changes were refused or conflicted)"
         );
-        assert_eq!(lines[1], "Applied:");
-        assert_eq!(lines[2], "  f000");
-        assert_eq!(lines[201], "  f199");
-        assert_eq!(lines[202], "  … and 50 more");
-        assert!(!text.contains("Deleted"));
-        assert!(text.contains("  .git (a protected name such as .git or .ssh)"));
+        // What needs the owner comes first, then what was applied.
+        assert_eq!(lines[1], "Refused:");
+        assert_eq!(lines[2], "  .git (a protected name such as .git or .ssh)");
         // A name can't fake a line of the report.
-        assert!(text.contains(r"evil\u{a}Workspace changes: 0 applied (a link"));
+        assert_eq!(
+            lines[3],
+            r"  evil\u{a}Workspace changes: 0 applied (a link that leads outside the project, or a path through a link)"
+        );
+        assert_eq!(
+            lines[4..8],
+            [
+                "Conflicted, so Blackwall kept your version:",
+                "  mine.txt",
+                "Held back:",
+                "  src"
+            ]
+        );
+        assert_eq!(lines[8], "Applied:");
+        assert_eq!(lines[9], "  f000");
+        assert_eq!(lines[58], "  f049");
+        assert_eq!(lines[59], "  … and 200 more");
+        assert_eq!(lines.len(), 60);
+        assert!(!text.contains("Deleted"));
         assert_eq!(
             lines
                 .iter()
@@ -2581,15 +2762,215 @@ mod tests {
                 .count(),
             1
         );
-        assert!(text.contains("\n  mine.txt"));
-        assert!(text.contains("kept your version"));
-        assert!(text.ends_with("Held back:\n  src"));
+        // Separators, controls and every format character (Cf) are escaped.
         for c in [
-            '\u{2028}', '\u{2029}', '\u{061c}', '\u{feff}', '\u{2060}', '\u{2064}', '\u{202a}',
-            '\u{202e}', '\u{2066}', '\u{2069}', '\u{200b}', '\u{7f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{061c}',
+            '\u{feff}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{202a}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{200b}',
+            '\u{7f}',
+            '\u{ad}',
+            '\u{600}',
+            '\u{6dd}',
+            '\u{180e}',
+            '\u{206f}',
+            '\u{fffb}',
+            '\u{110bd}',
+            '\u{1bca3}',
+            '\u{1d17a}',
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}',
         ] {
             let name = PathBuf::from(format!("a{c}b"));
             assert_eq!(shown(&name), format!("a{}b", c.escape_unicode()), "{c:?}");
         }
+        // Bytes that aren't UTF-8 are shown one by one, and a backslash is escaped too, so
+        // different names never look the same.
+        let raw = |bytes: &[u8]| shown(Path::new(OsStr::from_bytes(bytes)));
+        assert_eq!(raw(b".g\xffit"), r".g\xffit");
+        assert_eq!(raw(b".g\xfe\xffit"), r".g\xfe\xffit");
+        assert_eq!(raw(br".g\xffit"), r".g\\xffit");
+        assert_eq!(raw("caf\u{e9}/\u{1f600}".as_bytes()), "caf\u{e9}/\u{1f600}");
+        // A long path loses its middle, so its start and its name both show.
+        let long = format!("{}/{}/name.txt", "a".repeat(300), "b".repeat(300));
+        let clipped = shown(Path::new(&long));
+        assert_eq!(clipped.chars().count(), SHOWN_CHARS);
+        assert!(clipped.starts_with("aaa") && clipped.ends_with("bbb/name.txt"));
+        assert!(clipped.contains('…'));
+    }
+
+    #[test]
+    fn report_keeps_the_stranded_notice_for_a_conflict_it_does_not_list() {
+        let mut report = Report::default();
+        for i in 0..LIST_LIMIT {
+            report.conflict(&PathBuf::from(format!("a{i:02}")));
+        }
+        report.conflict(Path::new("z/.f.blackwall-0000000000000001"));
+        let text = report.sorted().to_string();
+        assert!(text.contains("  … and 1 more"));
+        assert!(text.contains(STRANDED));
+    }
+
+    /// A chain of `depth` folders with 255-byte names in `base`, made one level at a time from
+    /// the folder above (the whole path is far longer than PATH_MAX), with `files` empty files in
+    /// the deepest.
+    fn deep_chain(base: &Path, depth: usize, files: usize) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut dir = fs::open(base, flags, Mode::empty()).unwrap();
+        for level in 0..depth {
+            let name = format!("{level:03}{}", "d".repeat(252));
+            fs::mkdirat(&dir, name.as_str(), Mode::from_raw_mode(0o755)).unwrap();
+            dir = fs::openat(&dir, name.as_str(), flags, Mode::empty()).unwrap();
+        }
+        let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+        for n in 0..files {
+            fs::openat(
+                &dir,
+                format!("f{n}").as_str(),
+                create,
+                Mode::from_raw_mode(0o644),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn apply_report_stays_small_for_a_deep_tree_of_long_names() {
+        let t = Tree::new();
+        let run = t.run();
+        // About 51 KB a path at the bottom: unclipped, 200 of them would be 5 MB of report.
+        deep_chain(&t.upper, 200, 3);
+        let r = t.apply(&run);
+        assert_eq!((r.applied.total, r.applied.first.len()), (200, LIST_LIMIT));
+        let kept: usize = [&r.applied, &r.deleted, &r.conflicted, &r.held_back]
+            .iter()
+            .map(|list| list.first.len())
+            .sum::<usize>()
+            + r.refused.first.len();
+        assert!(kept <= 5 * LIST_LIMIT);
+        let text = r.to_string();
+        for line in text.lines().skip(1) {
+            let path = line
+                .strip_prefix("  ")
+                .map(|line| line.split(" (").next().unwrap_or(line));
+            assert!(
+                path.is_none_or(|path| path.chars().count() <= SHOWN_CHARS),
+                "{line}"
+            );
+        }
+        assert!(text.len() < 5 * (LIST_LIMIT + 2) * 300, "{}", text.len());
+        assert!(text.contains("  … and 150 more"));
+    }
+
+    #[test]
+    fn apply_counts_past_the_entry_limit_without_keeping_every_path() {
+        // On disk, not tmpfs: half a million inodes.
+        let t = Tree::on_disk();
+        let run = t.run();
+        let upper = fs::open(&t.upper, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+        for n in 0..=MAX_ENTRIES {
+            fs::openat(
+                &upper,
+                format!("f{n:06}").as_str(),
+                create,
+                Mode::from_raw_mode(0o644),
+            )
+            .unwrap();
+        }
+        let r = t.apply(&run);
+        assert!(r.applied.is_empty() && r.deleted.is_empty());
+        assert_eq!(r.refused.total, MAX_ENTRIES + 1);
+        assert_eq!(r.refused.first.len(), LIST_LIMIT);
+        assert!(r.refused.first.iter().all(|(_, why)| *why == TooMany));
+        let text = r.to_string();
+        assert_eq!(text.lines().count(), 1 + 1 + LIST_LIMIT + 1);
+        assert!(text.ends_with(&format!("  … and {} more", MAX_ENTRIES + 1 - LIST_LIMIT)));
+        assert!(text.len() < 4096, "{}", text.len());
+        assert!(t.listing().is_empty());
+    }
+
+    #[test]
+    fn apply_keeps_the_staged_modification_and_access_times() {
+        let t = Tree::new();
+        t.proj("out.o", "old");
+        let run = t.run();
+        let at = |secs: u64, nanos: u32| UNIX_EPOCH + Duration::new(secs, nanos);
+        // As a build leaves them: the source older than the output built from it.
+        let staged = [
+            (
+                "src.c",
+                at(1_000_000_000, 123_456_789),
+                at(1_000_000_100, 1),
+            ),
+            (
+                "out.o",
+                at(1_000_000_500, 987_654_321),
+                at(1_000_000_600, 2),
+            ),
+            ("new/deep.o", at(1_000_000_700, 5), at(1_000_000_800, 3)),
+        ];
+        for (name, modified, accessed) in staged {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(t.up(name, name))
+                .unwrap();
+            let times = std::fs::FileTimes::new()
+                .set_modified(modified)
+                .set_accessed(accessed);
+            file.set_times(times).unwrap();
+        }
+        let r = t.apply(&run);
+        assert_eq!(paths(&r.applied), ["new", "new/deep.o", "out.o", "src.c"]);
+        for (name, modified, accessed) in staged {
+            let meta = std::fs::symlink_metadata(t.project.join(name)).unwrap();
+            assert_eq!(meta.modified().unwrap(), modified, "{name}");
+            assert_eq!(meta.accessed().unwrap(), accessed, "{name}");
+        }
+        // A second build sees the output still newer than its source: nothing to redo.
+        let mtime = |name: &str| t.project.join(name).metadata().unwrap().modified().unwrap();
+        assert!(mtime("out.o") > mtime("src.c"));
+        assert_eq!(t.read("out.o"), "out.o");
+    }
+
+    #[test]
+    fn apply_gives_new_entries_the_mode_a_direct_write_would() {
+        let t = Tree::new();
+        t.proj("shared.txt", "old");
+        chmod(&t.project.join("shared.txt"), 0o664);
+        let run = t.run();
+        chmod(&t.up("new.txt", "new"), 0o666);
+        chmod(&t.up("tool", "#!/bin/sh"), 0o777);
+        t.up("dir/inside", "x");
+        chmod(&t.upper.join("dir"), 0o777);
+        chmod(&t.up("shared.txt", "changed"), 0o664);
+        // `apply_with` uses umask 022.
+        let r = t.apply(&run);
+        assert_eq!(
+            paths(&r.applied),
+            ["dir", "dir/inside", "new.txt", "shared.txt", "tool"]
+        );
+        assert_eq!(mode(&t.project.join("new.txt")), 0o644);
+        assert_eq!(mode(&t.project.join("tool")), 0o755);
+        assert_eq!(mode(&t.project.join("dir")), 0o755);
+        // A file that was there keeps the mode it had (the overlay copied it up).
+        assert_eq!(mode(&t.project.join("shared.txt")), 0o664);
+    }
+
+    #[test]
+    fn umask_is_read_from_the_process_status() {
+        let status = "Name:\tblackwall\nUmask:\t0027\nState:\tR (running)\n";
+        assert_eq!(umask_in(status), Some(0o027));
+        assert_eq!(umask_in("Name:\tx\n"), None);
+        assert_eq!(umask_in("Umask:\tzz\n"), None);
+        assert!(process_umask() <= 0o777);
     }
 }

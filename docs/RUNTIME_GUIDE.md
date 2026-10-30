@@ -624,11 +624,18 @@ seconds; a missing or old bubblewrap needs a restart once it is installed.
 A Workspace-write command doesn't write to the project. It sees the project through a private
 overlay, and its writes go to a staged copy in Blackwall's data folder. When the command has
 exited, Blackwall checks the staged changes and copies them into the project. The output ends with
-a report: how many files were applied, deleted, refused and conflicted, and each path (up to 200
-paths per list, then "… and N more").
+a report: how many files were applied, deleted, refused and conflicted, and each path, what was
+refused, conflicted or held back first. Each list shows up to 50 paths, then "… and N more"; a path
+longer than 160 characters loses its middle, and invisible characters and bytes that aren't UTF-8
+are shown escaped (`\u{202e}`, `\xff`). The report takes at most half the command output limit,
+and never more than 8 KiB: the command's own output is trimmed to leave it room, and a longer report
+is cut at its end.
 
-New and changed files, deletes and new folders are copied. Blackwall refuses, and says why next
-to the path:
+New and changed files, deletes and new folders are copied. A copied file keeps the modification
+and access times the command gave it, so a build tool sees what it built as up to date. New files
+and folders get the permissions the command gave them less your umask, as a direct write would;
+a changed file keeps the permissions it has in the staged copy. Blackwall refuses, and says why
+next to the path:
 
 - a protected name (`.git`, `.ssh` and the others listed above) in any letter case, at any depth;
 - an instruction file: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or an extra file you
@@ -657,14 +664,17 @@ staged copy is kept for at least 24 hours and the output names its folder, so yo
 you need from it. Blackwall removes it in a later sweep, which skips a folder while a run still
 holds it. When everything was applied, nothing is kept.
 
-One Workspace-write command runs in a project at a time. A second waits for the first, then fails
-with a note that another is still running.
+One Workspace-write command runs in a project at a time. A second waits for the first, up to its
+own time limit, and fails with a note that another is still running only if the first still is.
 
 It needs Linux 5.11 or newer with overlay mounts allowed. Without them, the selector turns
 Workspace-write off with a note, `bw` refuses it, and Read-only keeps working. A project on an
 overlay file system (as inside a container), inside Blackwall's data folder, or holding the
 `bwrap` Blackwall uses or the app's own files (the AppImage folder) is refused up front with a
-plain note.
+plain note, and so is a project or data folder whose path has a comma, colon or backslash, since
+bubblewrap passes those paths in the overlay's mount options. A project on a file system the kernel
+can't use as an overlay's lower layer isn't caught up front: the command fails with bubblewrap's own
+error, and the report after it says "Workspace changes: 0 applied", since nothing was changed.
 
 One gap remains: a process of your user, outside the sandbox, that renames the project folder in
 the instant before the command starts makes the sandbox read the folder that was put there. The

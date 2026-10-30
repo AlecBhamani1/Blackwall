@@ -101,7 +101,6 @@ pub(crate) struct Walk {
     pub masks: Vec<Mask>,
     /// Relative path to start fingerprint, for every regular file that is not masked, below a
     /// skipped directory or a symlink. Empty unless [`walk_with_files`] was used.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub files: HashMap<PathBuf, Fingerprint>,
     /// The walked folder's device and inode (from the `lstat` it started with), to check against
     /// the pinned project.
@@ -165,7 +164,6 @@ pub(crate) fn walk_within(root: &Path, limit: usize, time: Duration) -> Result<W
 }
 /// [`walk`] that also records the start fingerprint of every regular file it can see, for
 /// Workspace-write staging. Read-only runs use [`walk`] and don't pay for the extra work.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn walk_with_files(root: &Path, limit: usize) -> Result<Walk, WalkError> {
     scan(root, limit, TIME_LIMIT, true)
 }

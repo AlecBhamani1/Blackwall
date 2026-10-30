@@ -23,6 +23,9 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: usize = 64 * 1024;
 /// A command whose standard output or error passes this many bytes is stopped.
 const MAX_STREAMED: u64 = 64 * 1024 * 1024;
+/// The most of the output cap a Linux Workspace-write command's report takes.
+const MAX_REPORT: usize = 8 * 1024;
+pub(crate) const NOT_STARTED: &str = "The command could not start.";
 
 /// One tool call's command output cap ([`crate::context::ContextBudget::max_output_bytes`]),
 /// and whether that call's output was trimmed to fit it.
@@ -54,10 +57,31 @@ impl OutputCap {
         if text.len() <= self.bytes {
             return text;
         }
-        self.trim(&[Piece::Bytes(text.as_bytes())])
+        self.trim(&[Piece::Bytes(text.as_bytes())], self.bytes)
     }
-    fn trim(&self, pieces: &[Piece<'_>]) -> String {
-        let (text, trimmed) = trim_pieces(pieces, self.bytes);
+    /// How much of the cap a Linux Workspace-write command's report may take: half, and at most
+    /// 8 KiB. The command's own output gets the rest.
+    pub(crate) fn report_room(&self) -> usize {
+        (self.bytes / 2).min(MAX_REPORT)
+    }
+    /// `text`'s first lines that fit in `max` bytes, then a line saying the rest was cut.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux stages Workspace-write
+    pub(crate) fn clip_lines(&self, text: String, max: usize) -> String {
+        const CUT: &str = "\n… (the rest was cut to fit the output limit)";
+        if text.len() <= max {
+            return text;
+        }
+        let mut end = max.saturating_sub(CUT.len()).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = text[..end].rfind('\n').unwrap_or(end);
+        self.trimmed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        format!("{}{CUT}", &text[..end])
+    }
+    fn trim(&self, pieces: &[Piece<'_>], cap: usize) -> String {
+        let (text, trimmed) = trim_pieces(pieces, cap);
         if trimmed {
             self.trimmed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -588,7 +612,7 @@ pub async fn execute(
                 Some(&mut guard),
             )
             .await;
-            guard.finish(outcome).await
+            guard.finish(outcome, output).await
         }
         "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
         _ => Err(ToolError::Arguments),
@@ -710,14 +734,24 @@ pub(crate) async fn program_with_timeout(
             Some(&mut guard),
         )
         .await;
-        match guard.finish(outcome).await {
-            Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
-                text,
-                workspace.execution.profile,
-            ))),
-            result => result,
-        }
+        finish_tool(guard, outcome, workspace.execution.profile, output).await
     }
+}
+/// A sandboxed command tool's outcome with the sandbox hint, judged on the command's own output
+/// only (a Workspace-write report's file names don't count), then the guard's report.
+pub(crate) async fn finish_tool(
+    guard: crate::sandbox::RunGuard,
+    outcome: Result<String, ToolError>,
+    profile: ExecutionProfile,
+    output: &OutputCap,
+) -> Result<String, ToolError> {
+    let outcome = match outcome {
+        Err(ToolError::Execution(text)) => {
+            Err(ToolError::Execution(with_sandbox_hint(text, profile)))
+        }
+        other => other,
+    };
+    guard.finish(outcome, output).await
 }
 /// Added to a command tool failure that looks like a sandbox denial; `{profile}` is the
 /// profile's display name.
@@ -745,7 +779,6 @@ fn with_sandbox_hint(text: String, profile: ExecutionProfile) -> String {
         ExecutionProfile::Unsandboxed => return text,
     };
     let lower = text.to_lowercase();
-    // A Workspace-write command's time limit comes back with a note about its staged changes.
     if text.starts_with(TIME_LIMIT_MESSAGE)
         || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m))
     {
@@ -1020,12 +1053,22 @@ pub(crate) async fn run_with_input(
         use std::os::unix::process::CommandExt;
         process.as_std_mut().process_group(0);
     }
+    // A Linux Workspace-write command's report takes part of the cap, so trim to the rest.
+    let cap = if guard
+        .as_deref()
+        .is_some_and(crate::sandbox::RunGuard::reports)
+    {
+        output.bytes - output.report_room()
+    } else {
+        output.bytes
+    };
     #[cfg(unix)]
     let mut child = match guard {
-        Some(guard) => guard.spawn(&mut process),
-        None => process.spawn(),
-    }
-    .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+        Some(guard) => guard.spawn(&mut process)?,
+        None => process
+            .spawn()
+            .map_err(|_| ToolError::Execution(NOT_STARTED.into()))?,
+    };
     #[cfg(unix)]
     let _group = ProcessGroup(
         child
@@ -1048,7 +1091,7 @@ pub(crate) async fn run_with_input(
             .wrap(JobObject);
         process
             .spawn()
-            .map_err(|_| ToolError::Execution("The command could not start.".into()))?
+            .map_err(|_| ToolError::Execution(NOT_STARTED.into()))?
     };
     #[cfg(unix)]
     let stdout = child.stdout.take().ok_or(ToolError::File)?;
@@ -1126,7 +1169,7 @@ pub(crate) async fn run_with_input(
         let mut pieces = vec![Piece::Bytes(exit.as_bytes())];
         out.pieces(&mut pieces);
         err.pieces(&mut pieces);
-        let mut text = output.trim(&pieces);
+        let mut text = output.trim(&pieces, cap);
         if stopped {
             text.push_str("\nThe command was stopped after 64 MiB of output.");
         }

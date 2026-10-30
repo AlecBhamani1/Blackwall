@@ -288,7 +288,7 @@ it('says what command network reaches when it is on', async () => {
 
 it('offers Workspace-write only where its overlay works, and says why when it does not', async () => {
   const note =
-    "Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.";
+    "Workspace-write isn't available on this computer: the overlay mount it needs didn't work here. It needs Linux 5.11 or newer, with Blackwall's data folder on a file system that allows overlays. Read-only commands still run in the sandbox.";
   let status = { available: true, note: note as string | null, workspaceWrite: false };
   const fallback = native.invoke.getMockImplementation();
   native.invoke.mockImplementation(async (command, args) =>

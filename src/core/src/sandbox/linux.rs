@@ -56,7 +56,7 @@ impl Availability {
 pub const LINUX_UNAVAILABLE: &str = "Sandboxed commands on Linux need Bubblewrap (bwrap) 0.12 or newer. Install Blackwall's .deb or AppImage, which include it, or a newer bwrap, then restart Blackwall.";
 pub const LINUX_RETRYING: &str = "Bubblewrap didn't start just now. Try again in a moment.";
 pub const LINUX_BLOCKED: &str = "Bubblewrap is installed but this system won't let it start a sandbox. On Ubuntu 24.04 or later, install Blackwall's .deb, which adds the AppArmor profile it needs. Blackwall checks again in a moment.";
-pub const LINUX_NO_OVERLAY: &str = "Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.";
+pub const LINUX_NO_OVERLAY: &str = "Workspace-write isn't available on this computer: the overlay mount it needs didn't work here. It needs Linux 5.11 or newer, with Blackwall's data folder on a file system that allows overlays. Read-only commands still run in the sandbox.";
 /// Also enough for Workspace-write: bubblewrap has had `--overlay` since 0.11.0. The overlay
 /// probe, not this number, decides whether it works.
 pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
@@ -528,13 +528,17 @@ const PROJECT_HOLDS_DATA: &str = "Blackwall's data folder is inside this project
 const PROJECT_HOLDS_BWRAP: &str = "This project folder contains the Bubblewrap program Blackwall sandboxes commands with, so Workspace-write can't run in it. Choose a smaller project folder.";
 const PROJECT_HOLDS_APP: &str = "This project folder contains Blackwall's own app files, so Workspace-write can't run in it. Choose a project folder outside them.";
 pub(crate) const PROJECT_ON_OVERLAY: &str = "This project folder is on an overlay file system (as inside a container), which Workspace-write can't stage. Choose Read-only, or a project folder on another file system.";
+pub(crate) const PATH_NOT_MOUNTABLE: &str = "The path of this project folder or of Blackwall's data folder has a comma, colon or backslash in it, which Workspace-write's overlay mount can't take. Choose Read-only, or a folder whose path has none of them.";
 const LOCATION_UNRESOLVED: &str =
     "Blackwall couldn't resolve a folder it needs to check, so it won't run this Workspace-write command.";
 
 /// Where a Workspace-write project may not be, on top of `walk::check_location`: inside the data
 /// folder (where its staging lives) or holding it, holding the resolved bubblewrap or the
 /// AppImage folder (`appdir`, canonical), whose files the apply step could then replace, or on an
-/// overlay file system. Read-only is not affected. Blocking (it resolves paths).
+/// overlay file system. Nor may the project's or the data folder's resolved path (the staging
+/// folders are in the data folder) have a `,`, `:` or `\`: bubblewrap passes the overlay's paths
+/// in its mount options, where those mean something. Read-only, mounted by descriptor, is not
+/// affected. Blocking (it resolves paths).
 pub(crate) fn check_workspace_write_location(
     project: &Path,
     data: &Path,
@@ -549,6 +553,16 @@ pub(crate) fn check_workspace_write_location(
     ) else {
         return refuse(LOCATION_UNRESOLVED);
     };
+    let mountable = |path: &Path| {
+        !path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b',' | b':' | b'\\'))
+    };
+    if !mountable(&project) || !mountable(&data) {
+        return refuse(PATH_NOT_MOUNTABLE);
+    }
     if project.starts_with(&data) {
         return refuse(PROJECT_INSIDE_DATA);
     }
@@ -855,7 +869,7 @@ mod tests {
         assert_eq!(read_only.note(), None);
         assert_eq!(
             read_only.workspace_write_note(),
-            Some("Workspace-write isn't available on this computer: it needs overlay mounts inside the sandbox, which this system doesn't allow (they need Linux 5.11 or newer). Read-only commands still run in the sandbox.")
+            Some("Workspace-write isn't available on this computer: the overlay mount it needs didn't work here. It needs Linux 5.11 or newer, with Blackwall's data folder on a file system that allows overlays. Read-only commands still run in the sandbox.")
         );
         for other in [
             Availability::Unavailable,
@@ -1030,6 +1044,30 @@ mod tests {
             check(&root.path.join("missing"), &data, &bwrap, None),
             Err(LOCATION_UNRESOLVED.into())
         );
+        // A path bubblewrap would have to put in the overlay's mount options as it is, whether
+        // the project's, the data folder's or reached through a link: refused.
+        for odd in ["a,b", "a:b", "a\\b"] {
+            let folder = root.path.join(odd);
+            std::fs::create_dir_all(folder.join("data")).unwrap();
+            assert_eq!(
+                check(&folder, &data, &bwrap, None),
+                Err(PATH_NOT_MOUNTABLE.into()),
+                "{odd}"
+            );
+            assert_eq!(
+                check(&project, &folder.join("data"), &bwrap, None),
+                Err(PATH_NOT_MOUNTABLE.into()),
+                "{odd}"
+            );
+            let link = root.path.join(format!("link-{}", odd.len()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&folder, &link).unwrap();
+            assert_eq!(
+                check(&link, &data, &bwrap, None),
+                Err(PATH_NOT_MOUNTABLE.into()),
+                "{odd}"
+            );
+        }
         // The root of a container is an overlay.
         if on_overlayfs(open_directory(Path::new("/")).unwrap()) {
             assert_eq!(
