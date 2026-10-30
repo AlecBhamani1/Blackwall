@@ -137,13 +137,32 @@ impl ExecutionPolicy {
 /// What a sandboxed command leaves behind until it ends: its run folder
 /// (`<data>/staging/<run-id>`, holding the seccomp filter and the bubblewrap arguments) on Linux,
 /// nothing elsewhere. [`RunGuard::finish`] removes it, and so does dropping the guard, so a
-/// cancelled command cleans up too.
+/// cancelled command cleans up too. On Linux it also holds the checked project's descriptor
+/// until [`RunGuard::spawn`] hands it to bubblewrap.
 pub(crate) struct RunGuard {
     run: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    project: Option<std::os::fd::OwnedFd>,
 }
 impl RunGuard {
     fn empty() -> Self {
-        Self { run: None }
+        Self {
+            run: None,
+            #[cfg(target_os = "linux")]
+            project: None,
+        }
+    }
+    /// Start the command [`prepare`] returned. A Linux sandbox gets the project descriptor its
+    /// arguments name, which is closed here once bubblewrap has started.
+    pub(crate) fn spawn(
+        &mut self,
+        process: &mut tokio::process::Command,
+    ) -> std::io::Result<tokio::process::Child> {
+        #[cfg(target_os = "linux")]
+        if let Some(project) = self.project.take() {
+            return linux::spawn_with(project, || process.spawn());
+        }
+        process.spawn()
     }
     /// Remove the run folder and hand back the command's outcome.
     pub(crate) async fn finish(
@@ -167,8 +186,8 @@ impl Drop for RunGuard {
 
 /// Prepare `process` for the owner's execution profile and give it its environment: the minimal
 /// sandbox one, or, when unsandboxed, the one for `unsandboxed` (the shell's own, or the owner
-/// one plus the `pass_through` variables). Spawn the result from the async runtime as usual, and
-/// pass its outcome through the guard's `finish`.
+/// one plus the `pass_through` variables). Spawn the result from the async runtime with the guard's
+/// [`RunGuard::spawn`], and pass its outcome through the guard's `finish`.
 pub(crate) async fn prepare(
     workspace: &Workspace,
     process: tokio::process::Command,
@@ -265,6 +284,9 @@ const NO_DATA_FOLDER: &str =
     "Blackwall couldn't find its data folder, so it won't sandbox this command.";
 #[cfg(target_os = "linux")]
 const WHOLE_COMPUTER: &str = "Blackwall won't sandbox the whole computer. Choose a project folder.";
+#[cfg(target_os = "linux")]
+const PROJECT_CHANGED: &str =
+    "The project folder changed while Blackwall was checking it. The command was not run.";
 
 /// [`prepare`] with `availability` given, rather than found. Linux only: Read-only runs under
 /// bubblewrap, and anything that can't be checked or set up fails closed without running.
@@ -306,8 +328,12 @@ pub(crate) async fn prepare_with(
     let (guard, run) = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
         walk::check_location(&project, home.as_deref(), Some(&data))?;
         let found = walk::walk(&project, walk::MAX_ENTRIES)?;
+        // Mount the folder that was walked, by descriptor, so the path can't be swapped after.
+        let project_fd = linux::open_project(&project, found.root)
+            .ok_or_else(|| ToolError::Execution(PROJECT_CHANGED.into()))?;
         let plan = bwrap::MountPlan {
             project: &project,
+            project_fd: std::os::fd::AsRawFd::as_raw_fd(&project_fd),
             network,
             roots: bwrap::host_roots(),
             etc: bwrap::host_etc(),
@@ -320,6 +346,7 @@ pub(crate) async fn prepare_with(
         // From here on, dropping the guard removes the folder, even on an early return.
         let guard = RunGuard {
             run: Some(run.clone()),
+            project: Some(project_fd),
         };
         linux::write_private(&run.join("seccomp.bpf"), &seccomp::to_bytes(&seccomp))
             .map_err(failed)?;
@@ -603,7 +630,7 @@ mod tests {
             ) -> Result<String, ToolError> {
                 let mut process = tokio::process::Command::new("/bin/sh");
                 process.args(["-c", command]);
-                let (process, guard) = prepare_with(
+                let (process, mut guard) = prepare_with(
                     &self.workspace,
                     process,
                     crate::child_env::Scope::Shell,
@@ -611,11 +638,13 @@ mod tests {
                     availability,
                 )
                 .await?;
-                let outcome = crate::tools::run_with_timeout(
+                let outcome = crate::tools::run_with_input(
                     &self.workspace.path,
                     process,
+                    None,
                     timeout,
                     &Default::default(),
+                    Some(&mut guard),
                 )
                 .await;
                 guard.finish(outcome).await
@@ -738,6 +767,21 @@ mod tests {
                 project.workspace.path.join(".git").display()
             );
             assert!(args.windows(mask.len()).any(|w| w == mask.as_bytes()));
+            // The project is mounted from the descriptor the guard holds for the checked folder.
+            let fd = guard.project.as_ref().unwrap();
+            let bind = format!(
+                "--ro-bind-fd\0{}\0{}\0",
+                std::os::fd::AsRawFd::as_raw_fd(fd),
+                project.workspace.path.display()
+            );
+            assert!(args.windows(bind.len()).any(|w| w == bind.as_bytes()));
+            let ino = |meta: std::fs::Metadata| std::os::unix::fs::MetadataExt::ino(&meta);
+            assert_eq!(
+                ino(std::fs::File::from(fd.try_clone().unwrap())
+                    .metadata()
+                    .unwrap()),
+                ino(std::fs::metadata(&project.workspace.path).unwrap())
+            );
             // The launcher runs from / with only the sandbox environment.
             assert_eq!(std.get_current_dir(), Some(Path::new("/")));
             let names: Vec<String> = std
@@ -940,6 +984,43 @@ mod tests {
             assert_eq!(fds, "Exit: 0\n0\n1\n2\n");
             assert_eq!(project.run("cat", &bw).await.unwrap(), "Exit: 0\n");
             assert!(project.runs_left().is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_binds_the_project_it_checked_even_if_the_path_is_swapped() {
+            let bw = test_bwrap();
+            let project = Project::new();
+            project.file("input", "CHECKED");
+            let mut process = tokio::process::Command::new("/bin/sh");
+            process.args(["-c", "cat input; ls -A"]);
+            let (process, mut guard) = prepare_with(
+                &project.workspace,
+                process,
+                crate::child_env::Scope::Shell,
+                &[],
+                &bw,
+            )
+            .await
+            .unwrap();
+            // After the check and before the start, the folder at the project's path is swapped
+            // for another one, as a process outside the sandbox could.
+            let path = &project.workspace.path;
+            std::fs::rename(path, project.root.join("checked")).unwrap();
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("input"), "SWAPPED").unwrap();
+            std::fs::write(path.join("secret"), "SWAPPED").unwrap();
+            let outcome = crate::tools::run_with_input(
+                path,
+                process,
+                None,
+                Duration::from_secs(10),
+                &Default::default(),
+                Some(&mut guard),
+            )
+            .await;
+            let output = guard.finish(outcome).await.unwrap();
+            assert_eq!(output, "Exit: 0\nCHECKEDinput\n");
         }
 
         #[tokio::test]

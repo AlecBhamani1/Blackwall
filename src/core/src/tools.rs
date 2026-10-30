@@ -527,10 +527,18 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            let (process, guard) =
+            let (process, mut guard) =
                 crate::sandbox::prepare(workspace, shell_command(command), Scope::Shell, &[])
                     .await?;
-            let outcome = run_with_timeout(&workspace.path, process, command_timeout, output).await;
+            let outcome = run_with_input(
+                &workspace.path,
+                process,
+                None,
+                command_timeout,
+                output,
+                Some(&mut guard),
+            )
+            .await;
             guard.finish(outcome).await
         }
         "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
@@ -639,11 +647,19 @@ pub(crate) async fn program_with_timeout(
             // The owner chose to run command tools as themselves, whatever the shell profile.
             crate::child_env::from_process(Scope::Owner, &workspace.path, pass_through)
                 .apply(&mut process);
-            return run_with_input(&workspace.path, process, input, timeout, output).await;
+            return run_with_input(&workspace.path, process, input, timeout, output, None).await;
         }
-        let (process, guard) =
+        let (process, mut guard) =
             crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through).await?;
-        let outcome = run_with_input(&workspace.path, process, input, timeout, output).await;
+        let outcome = run_with_input(
+            &workspace.path,
+            process,
+            input,
+            timeout,
+            output,
+            Some(&mut guard),
+        )
+        .await;
         match guard.finish(outcome).await {
             Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
                 text,
@@ -771,16 +787,15 @@ pub(crate) fn spawn_server(
         Ok((ServerProcess { _child: child }, stdin, stdout, stderr))
     }
 }
-/// Bounded, time-limited capture with the same descendant cleanup for every process. Output over
-/// the cap is trimmed to its start and end.
-#[cfg(any(unix, windows))]
+/// [`run_with_input`] with no input, for a command that isn't from `sandbox::prepare`.
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) async fn run_with_timeout(
     directory: &Path,
     process: tokio::process::Command,
     timeout: Duration,
     output: &OutputCap,
 ) -> Result<String, ToolError> {
-    run_with_input(directory, process, None, timeout, output).await
+    run_with_input(directory, process, None, timeout, output, None).await
 }
 /// The start and end of one output stream, and how many bytes it had in all.
 #[cfg(any(unix, windows))]
@@ -826,17 +841,20 @@ impl Stream {
         pieces.push(Piece::Bytes(second));
     }
 }
-/// [`run_with_timeout`], writing `input` to standard input while output is captured. The command
-/// brings its own environment; this never adds to or inherits one on its behalf. It runs in
+/// Bounded, time-limited capture with the same descendant cleanup for every process, writing
+/// `input` to standard input while output is captured. Output over the cap is trimmed to its start
+/// and end. The command brings its own environment; this never adds to or inherits one on its behalf. It runs in
 /// `directory` unless it already has a working directory (the Linux sandbox launcher runs from
-/// `/` and moves the command into the project itself).
+/// `/` and moves the command into the project itself). A command from `sandbox::prepare` is
+/// started by its `guard`.
 #[cfg(any(unix, windows))]
-async fn run_with_input(
+pub(crate) async fn run_with_input(
     directory: &Path,
     mut process: tokio::process::Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
     output: &OutputCap,
+    guard: Option<&mut crate::sandbox::RunGuard>,
 ) -> Result<String, ToolError> {
     if process.as_std().get_current_dir().is_none() {
         process.current_dir(directory);
@@ -856,9 +874,11 @@ async fn run_with_input(
         process.as_std_mut().process_group(0);
     }
     #[cfg(unix)]
-    let mut child = process
-        .spawn()
-        .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+    let mut child = match guard {
+        Some(guard) => guard.spawn(&mut process),
+        None => process.spawn(),
+    }
+    .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
     #[cfg(unix)]
     let _group = ProcessGroup(
         child
@@ -869,6 +889,8 @@ async fn run_with_input(
     let mut child = {
         use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        // Windows has no sandbox to hand anything to.
+        let _ = guard;
 
         let mut process = CommandWrap::from(process);
         // The wrapper spawns suspended, assigns the process to a kill-on-close job,

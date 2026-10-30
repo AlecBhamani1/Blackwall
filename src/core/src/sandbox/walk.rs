@@ -6,8 +6,10 @@
 //!   found, because scanning huge dependency and build trees before every command is too slow.
 //!   Only a skipped directory's direct children are checked. Network is off by default, so the
 //!   exposure is read-only.
-//! - The walk and the mount that uses it are separate steps, so a directory swapped for a symlink
-//!   in between (a `read_dir` race) is not caught here. A later task closes it with `openat`.
+//! - The project itself is mounted from a descriptor for the folder whose identity the walk
+//!   recorded, so swapping the whole folder is caught. Inside it, the walk goes by path: a process
+//!   outside the sandbox that renames folders within the project while the walk runs (moving a
+//!   protected name into a folder already walked, say) can still leave that name unmasked.
 //! - Names compare as raw bytes with ASCII case folding. A case-folding filesystem that also folds
 //!   non-ASCII (or non-UTF-8) names can reach a protected name this does not recognise.
 
@@ -61,6 +63,9 @@ pub(crate) struct Mask {
 pub(crate) struct Walk {
     /// Sorted by path.
     pub masks: Vec<Mask>,
+    /// The walked folder's device and inode, so the folder that gets mounted can be checked
+    /// against it.
+    pub root: (u64, u64),
 }
 
 /// Paths are relative to the walked root.
@@ -100,6 +105,14 @@ impl From<WalkError> for ToolError {
 /// the error names the top-level entry that has the most entries counted so far (ties go to the
 /// lower name), or the root itself when its direct entries alone are over the limit.
 pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
+    use std::os::unix::fs::MetadataExt;
+    let unreadable_root = || WalkError::Unreadable {
+        path: PathBuf::new(),
+    };
+    let top = std::fs::symlink_metadata(root).map_err(|_| unreadable_root())?;
+    if !top.is_dir() {
+        return Err(unreadable_root());
+    }
     let mut masks = Vec::new();
     let mut count = 0usize;
     let mut per_top: HashMap<OsString, usize> = HashMap::new();
@@ -164,7 +177,10 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
         }
     }
     masks.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Walk { masks })
+    Ok(Walk {
+        masks,
+        root: (top.dev(), top.ino()),
+    })
 }
 
 const CONTAINS_HOME: &str =
@@ -342,6 +358,22 @@ mod tests {
                 path: PathBuf::new()
             })
         );
+        // A link in the project's place is not walked through.
+        symlink(&root.0, root.0.join("link")).unwrap();
+        assert_eq!(
+            walk(&root.0.join("link"), 10).err(),
+            Some(WalkError::Unreadable {
+                path: PathBuf::new()
+            })
+        );
+    }
+
+    #[test]
+    fn walk_records_the_identity_of_the_folder_it_walked() {
+        use std::os::unix::fs::MetadataExt;
+        let root = Root::new();
+        let meta = std::fs::metadata(&root.0).unwrap();
+        assert_eq!(walk(&root.0, 10).unwrap().root, (meta.dev(), meta.ino()));
     }
 
     #[test]

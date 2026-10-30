@@ -9,7 +9,9 @@
 //!
 //! What the sandbox sees: the system roots read-only (merged-/usr links recreated as symlinks), a
 //! short list of `/etc` entries, a private `/dev`, `/proc` and `/tmp`, empty parent folders down
-//! to the project, and the project itself read-only with every protected name masked. No folder
+//! to the project, and the project itself read-only with every protected name masked. The project
+//! is mounted from a descriptor (`--ro-bind-fd`) for the folder that was checked, not by its path,
+//! so swapping the folder at that path after the check changes nothing. No folder
 //! under `/run` or `/var/run` is ever mounted, because host pathname sockets live there (the user
 //! session bus, docker.sock); the one thing from there that can appear is a single regular `/etc`
 //! file reached through a link, such as `resolv.conf` (see [`etc_at`]). The home folder, the data
@@ -21,6 +23,7 @@
 
 use super::walk::{Mask, MaskKind};
 use std::ffi::{OsStr, OsString};
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -52,7 +55,11 @@ const SOCKET_DIRS: [&str; 2] = ["run", "var/run"];
 
 /// Every profile mounts the project read-only for now, the strictest choice.
 pub(crate) struct MountPlan<'a> {
+    /// Where the project appears inside the sandbox: its own (canonical) path.
     pub project: &'a Path,
+    /// What is mounted there: a descriptor for the checked folder, open in bubblewrap at this
+    /// number (see `linux::open_project` and `linux::spawn_with`).
+    pub project_fd: RawFd,
     pub network: bool,
     pub roots: Vec<Root>,
     /// Absolute `/etc/<name>` paths that exist on the host.
@@ -215,7 +222,8 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
         push(&[s("--dir"), dir.as_os_str()]);
     }
     let project = plan.project.as_os_str();
-    push(&[s("--ro-bind"), project, project]);
+    let project_fd = OsString::from(plan.project_fd.to_string());
+    push(&[s("--ro-bind-fd"), &project_fd, project]);
     for mask in plan.masks {
         let path = plan.project.join(&mask.path);
         let path = path.as_os_str();
@@ -314,6 +322,7 @@ mod tests {
     fn plan<'a>(project: &'a Path, network: bool, masks: &'a [Mask]) -> MountPlan<'a> {
         MountPlan {
             project,
+            project_fd: 10,
             network,
             roots: vec![
                 Root::Bind("/usr".into()),
@@ -375,8 +384,8 @@ mod tests {
         assert!(pos(&a, "--tmpfs /tmp") < pos(&a, "--dir /home/u"));
         // /home sits above the linuxbrew root but isn't under it, so it still gets a --dir.
         assert!(pos(&a, "--dir /home") < pos(&a, "--dir /home/u"));
-        assert!(pos(&a, "--dir /home/u") < pos(&a, "--ro-bind /home/u/p /home/u/p"));
-        assert!(pos(&a, "--ro-bind /home/u/p /home/u/p") < pos(&a, "--tmpfs /home/u/p/.git"));
+        assert!(pos(&a, "--dir /home/u") < pos(&a, "--ro-bind-fd 10 /home/u/p"));
+        assert!(pos(&a, "--ro-bind-fd 10 /home/u/p") < pos(&a, "--tmpfs /home/u/p/.git"));
         pos(&a, "--tmpfs /home/u/p/.git --remount-ro /home/u/p/.git");
         assert!(
             pos(&a, "--remount-ro /home/u/p/.git")
@@ -398,10 +407,21 @@ mod tests {
         for dir in ["/usr", "/usr/local", "/usr/local/src"] {
             assert!(!a.windows(2).any(|w| w == ["--dir", dir]), "{dir}");
         }
-        pos(
-            &a,
-            "--tmpfs /tmp --ro-bind /usr/local/src/p /usr/local/src/p",
+        pos(&a, "--tmpfs /tmp --ro-bind-fd 10 /usr/local/src/p");
+    }
+
+    #[test]
+    fn the_project_is_mounted_from_its_descriptor_never_its_path() {
+        let a = strs(&args(&plan(Path::new("/home/u/p"), false, &[])));
+        assert_eq!(
+            a.windows(3)
+                .filter(|w| w[0].starts_with("--ro-bind") && w[2] == "/home/u/p")
+                .collect::<Vec<_>>(),
+            [["--ro-bind-fd", "10", "/home/u/p"]]
         );
+        assert!(!a
+            .windows(2)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/home/u/p"));
     }
 
     #[test]
@@ -622,8 +642,10 @@ mod tests {
             let run = self.temp.0.join(format!("run-{}", rand::random::<u32>()));
             std::fs::create_dir(&run).unwrap();
             std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let project_fd = super::super::linux::open_directory(&self.project).unwrap();
             let plan = MountPlan {
                 project: &self.project,
+                project_fd: std::os::fd::AsRawFd::as_raw_fd(&project_fd),
                 network,
                 roots: host_roots(),
                 etc: host_etc(),
@@ -642,8 +664,13 @@ mod tests {
                 &["-c".into(), script.into()],
             )
             .unwrap();
-            command.env("PATH", "/usr/bin:/bin").env("LANG", "C.UTF-8");
-            let out = command.output().await.unwrap();
+            command
+                .env("PATH", "/usr/bin:/bin")
+                .env("LANG", "C.UTF-8")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = super::super::linux::spawn_with(project_fd, || command.spawn()).unwrap();
+            let out = child.wait_with_output().await.unwrap();
             Output {
                 code: out.status.code(),
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

@@ -1,13 +1,15 @@
 //! Linux sandbox backend: find a trusted bubblewrap and prove it works on this kernel.
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,9 @@ pub(crate) const MIN_VERSION: (u32, u32, u32) = (0, 12, 0);
 /// After a Retrying or Blocked answer, ask again no sooner than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const STALE_PROBE_DIRECTORY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The lowest number a descriptor handed to bubblewrap gets: clear of the standard streams and of
+/// the seccomp (3) and argument (4) files that the launcher opens.
+const FIRST_HANDED_FD: RawFd = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProbeError {
@@ -190,20 +195,25 @@ fn run(
 ) -> Result<(std::process::ExitStatus, Vec<u8>), ProbeError> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd).env_clear();
-    run_command(command, timeout)
+    run_command(command, timeout, None)
 }
 /// [`run`] for a command that already has its program, arguments, directory and environment.
+/// `handed`, when given, is passed to it with [`spawn_with`].
 fn run_command(
     mut command: Command,
     timeout: Duration,
+    handed: Option<OwnedFd>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), ProbeError> {
-    let mut child = command
+    command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ProbeError::Spawn)?;
+        .stderr(Stdio::null());
+    let spawned = match handed {
+        Some(fd) => spawn_with(fd, || command.spawn()),
+        None => command.spawn(),
+    };
+    let mut child = spawned.map_err(ProbeError::Spawn)?;
     let Some(stdout) = child.stdout.take() else {
         kill_and_reap(&mut child);
         return Err(ProbeError::UnexpectedOutput);
@@ -318,8 +328,10 @@ pub(crate) fn probe(bwrap: &Path, scratch: &Path, timeout: Duration) -> Result<(
     result
 }
 fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), ProbeError> {
+    let project_fd = open_directory(project).map_err(ProbeError::Files)?;
     let plan = super::bwrap::MountPlan {
         project,
+        project_fd: project_fd.as_raw_fd(),
         network: false,
         roots: super::bwrap::host_roots(),
         etc: super::bwrap::host_etc(),
@@ -339,7 +351,7 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
         &["-c".into(), "printf ok".into()],
     )
     .ok_or(ProbeError::UnexpectedOutput)?;
-    let (status, stdout) = run_command(launcher.into_std(), timeout)?;
+    let (status, stdout) = run_command(launcher.into_std(), timeout, Some(project_fd))?;
     if !status.success() {
         return Err(ProbeError::Failed(status));
     }
@@ -347,6 +359,44 @@ fn probe_in(bwrap: &Path, project: &Path, timeout: Duration) -> Result<(), Probe
         return Err(ProbeError::UnexpectedOutput);
     }
     Ok(())
+}
+
+/// `directory` as a path-only descriptor (`O_PATH | O_DIRECTORY | O_NOFOLLOW`) for bubblewrap's
+/// `--ro-bind-fd`. It is numbered 10 or higher and closed on exec, so only [`spawn_with`] hands it
+/// on. A symlink in place of the last name is refused.
+pub(crate) fn open_directory(directory: &Path) -> std::io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    let path = CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("a NUL in the path"))?;
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let opened = rustix::fs::open(path.as_c_str(), flags, Mode::empty())?;
+    Ok(rustix::io::fcntl_dupfd_cloexec(&opened, FIRST_HANDED_FD)?)
+}
+
+/// The project for `--ro-bind-fd`, or `None` unless it is the very folder the walk checked
+/// (`identity`, its device and inode) and `project` is still its canonical path.
+pub(crate) fn open_project(project: &Path, identity: (u64, u64)) -> Option<OwnedFd> {
+    let file = std::fs::File::from(open_directory(project).ok()?);
+    let meta = file.metadata().ok()?;
+    ((meta.dev(), meta.ino()) == identity
+        && std::fs::canonicalize(project).ok().as_deref() == Some(project))
+    .then(|| file.into())
+}
+
+/// Run `spawn` with `fd` open in the new process at the same number, then close it here. The
+/// descriptor is close-on-exec except during this call, and every call takes one lock, so no
+/// other sandbox started at the same moment inherits it. A program started at that moment
+/// without the sandbox might; it gains nothing it couldn't open itself.
+pub(crate) fn spawn_with<T>(
+    fd: OwnedFd,
+    spawn: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty())?;
+    let spawned = spawn();
+    drop(fd);
+    spawned
 }
 
 fn real_directory(path: &Path) -> std::io::Result<()> {
@@ -978,6 +1028,59 @@ mod tests {
             None
         );
         assert_eq!(appimage_dir(image(), Some(OsString::from("/")), &exe), None);
+    }
+    #[test]
+    fn the_project_opens_only_as_the_folder_that_was_checked() {
+        let root = Root::new();
+        let project = root.path.join("p");
+        std::fs::create_dir(&project).unwrap();
+        let meta = std::fs::metadata(&project).unwrap();
+        let checked = (meta.dev(), meta.ino());
+        let fd = open_project(&project, checked).unwrap();
+        assert!(fd.as_raw_fd() >= FIRST_HANDED_FD);
+        let flags = rustix::io::fcntl_getfd(&fd).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        assert_eq!(
+            std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap(),
+            project
+        );
+        assert!(open_project(&project, (checked.0, checked.1 + 1)).is_none());
+        // A link to it, or a name for it that isn't canonical, is not the project's path.
+        let link = root.path.join("link");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        assert!(open_project(&link, checked).is_none());
+        assert!(open_project(&project.join("../p"), checked).is_none());
+        // Another folder put in its place.
+        std::fs::rename(&project, root.path.join("moved")).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        assert!(open_project(&project, checked).is_none());
+        std::fs::remove_dir(&project).unwrap();
+        std::os::unix::fs::symlink(root.path.join("moved"), &project).unwrap();
+        assert!(open_project(&project, checked).is_none());
+    }
+    #[test]
+    fn only_spawn_with_hands_the_descriptor_on() {
+        let root = Root::new();
+        let shell = |script: String| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &script]).stdout(Stdio::piped());
+            command
+        };
+        let fd = open_directory(&root.path).unwrap();
+        let number = fd.as_raw_fd();
+        let mut command = shell(format!("readlink /proc/$$/fd/{number}"));
+        let child = spawn_with(fd, || command.spawn()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim_end(),
+            root.path.to_str().unwrap()
+        );
+        // Opened, it is close-on-exec: a plain spawn doesn't get it.
+        let fd = open_directory(&root.path).unwrap();
+        let status = shell(format!("test ! -e /proc/$$/fd/{}", fd.as_raw_fd()))
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
     #[test]
     fn scratch_is_private_and_refuses_a_symlinked_data_directory() {
