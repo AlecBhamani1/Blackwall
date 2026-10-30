@@ -182,6 +182,40 @@ it('keeps Read-only, disables Workspace-write and shows the bubblewrap note when
   expect(profile).toHaveValue('read-only');
 });
 
+it('keeps the Learn more link clickable while the profile picker has focus', async () => {
+  const user = userEvent.setup();
+  const note =
+    "Workspace-write isn't available on this computer: the overlay mount it needs didn't work here.";
+  const fallback = native.invoke.getMockImplementation();
+  native.invoke.mockImplementation(async (command, args) =>
+    command === 'sandbox_status'
+      ? { available: true, note, workspaceWrite: false }
+      : fallback?.(command, args),
+  );
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const profile = screen.getByRole('combobox', { name: 'Command execution profile' });
+  await waitFor(() =>
+    expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
+  );
+  // The note shows only because the picker has focus; pressing the link must not take it away.
+  await fireEvent.focus(profile);
+  const link = await screen.findByRole('button', { name: 'Learn more' });
+  expect(link.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))).toBe(
+    false,
+  );
+  native.invoke.mockClear();
+  profile.focus();
+  await user.click(link);
+  expect(native.invoke).toHaveBeenCalledWith('open_setup_link', {
+    kind: 'sandbox-docs',
+    invitation: null,
+  });
+});
+
 it('checks the sandbox again on focus and about 30 seconds after it was unavailable', async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
@@ -286,12 +320,13 @@ it('says what command network reaches when it is on', async () => {
   expect(screen.queryByText(hint)).not.toBeInTheDocument();
 });
 
-it('offers Read-only but not yet Workspace-write where only Read-only is sandboxed', async () => {
+it('offers Workspace-write only where its overlay works, and says why when it does not', async () => {
+  const note =
+    "Workspace-write isn't available on this computer: the overlay mount it needs didn't work here. It needs Linux 5.11 or newer, with Blackwall's data folder on a file system that allows overlays. Read-only commands still run in the sandbox.";
+  let status = { available: true, note: note as string | null, workspaceWrite: false };
   const fallback = native.invoke.getMockImplementation();
   native.invoke.mockImplementation(async (command, args) =>
-    command === 'sandbox_status'
-      ? { available: true, note: null, workspaceWrite: false }
-      : fallback?.(command, args),
+    command === 'sandbox_status' ? status : fallback?.(command, args),
   );
   render(App);
   await screen.findByRole('combobox', { name: 'Model' });
@@ -303,7 +338,29 @@ it('offers Read-only but not yet Workspace-write where only Read-only is sandbox
     expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeDisabled(),
   );
   expect(within(profile).getByRole('option', { name: 'Read-only' })).toBeEnabled();
+  // Read-only works, so its owner isn't told about Workspace-write ...
+  expect(profile).toHaveValue('read-only');
+  expect(screen.queryByText(note)).not.toBeInTheDocument();
+  // ... until they open the profile picker.
+  await fireEvent.focus(profile);
+  expect(await screen.findByText(note)).toBeInTheDocument();
+  await fireEvent.blur(profile);
+  await waitFor(() => expect(screen.queryByText(note)).not.toBeInTheDocument());
+  // Where the overlay works too, Workspace-write is on offer and there is nothing to explain.
+  status = { available: true, note: null, workspaceWrite: true };
+  await fireEvent.focus(window);
+  await waitFor(() =>
+    expect(within(profile).getByRole('option', { name: 'Workspace-write' })).toBeEnabled(),
+  );
+  await fireEvent.focus(profile);
   expect(screen.queryByRole('button', { name: 'Learn more' })).not.toBeInTheDocument();
+  await fireEvent.change(profile, { target: { value: 'workspace-write' } });
+  await fireEvent.blur(profile);
+  expect(profile).toHaveValue('workspace-write');
+  // With Workspace-write selected, a later check that finds no overlay says why.
+  status = { available: true, note, workspaceWrite: false };
+  await fireEvent.focus(window);
+  expect(await screen.findByText(note)).toBeInTheDocument();
 });
 
 it('asks which server to use on a first launch instead of connecting on its own', async () => {

@@ -126,7 +126,8 @@ impl Settings {
     }
 
     /// [`Settings::set`], checking a sandboxed `profile` against `sandbox`, which is `None` where
-    /// nothing is gated (every OS but Linux). Workspace-write is refused where it can't run yet.
+    /// nothing is gated (every OS but Linux). Workspace-write is refused where it can't run, with
+    /// the reason.
     /// Read-only is always accepted, since it is the safe default: when the sandbox is unavailable
     /// the note comes back as a warning, and commands fail closed until it is fixed.
     pub fn set_with_sandbox(
@@ -142,7 +143,10 @@ impl Settings {
             if profile != ExecutionProfile::Unsandboxed {
                 if let Some(status) = sandbox() {
                     if profile == ExecutionProfile::WorkspaceWrite && !status.workspace_write {
-                        return Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into());
+                        return Err(status
+                            .note
+                            .unwrap_or(blackwall_core::sandbox::WORKSPACE_WRITE_UNAVAILABLE)
+                            .into());
                     }
                     if !status.available {
                         warning = status.note;
@@ -931,11 +935,11 @@ mod tests {
                 workspace_write: false,
             })
         };
-        // Workspace-write can't run here yet: refused, nothing changes or is saved.
+        // Workspace-write can't run here: refused with the reason, nothing changes or is saved.
         let before = settings.clone();
         assert_eq!(
             settings.set_with_sandbox(&store, "profile", "workspace-write", unavailable),
-            Err(blackwall_core::sandbox::LINUX_WORKSPACE_WRITE_LATER.into())
+            Err("Install Bubblewrap.".into())
         );
         assert_eq!(settings, before);
         assert_eq!(defaults(&store), before, "nothing saved");
@@ -957,11 +961,11 @@ mod tests {
             settings.set_with_sandbox(&store, "web", "on", || unreachable!()),
             Ok(None)
         );
-        // Available, Read-only only (Linux until Workspace-write arrives).
+        // Available, Read-only only (no overlay on this Linux): its note says why.
         let read_only = || {
             Some(SandboxStatus {
                 available: true,
-                note: None,
+                note: Some("No overlay here."),
                 workspace_write: false,
             })
         };
@@ -969,9 +973,38 @@ mod tests {
             settings.set_with_sandbox(&store, "profile", "read-only", read_only),
             Ok(None)
         );
-        assert!(settings
-            .set_with_sandbox(&store, "profile", "workspace-write", read_only)
-            .is_err());
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "workspace-write", read_only),
+            Err("No overlay here.".into())
+        );
+        let no_note = || {
+            Some(SandboxStatus {
+                available: true,
+                note: None,
+                workspace_write: false,
+            })
+        };
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "workspace-write", no_note),
+            Err(blackwall_core::sandbox::WORKSPACE_WRITE_UNAVAILABLE.into())
+        );
+        // Both run (Linux with a working overlay): accepted.
+        let both = || {
+            Some(SandboxStatus {
+                available: true,
+                note: None,
+                workspace_write: true,
+            })
+        };
+        assert_eq!(
+            settings.set_with_sandbox(&store, "profile", "workspace-write", both),
+            Ok(None)
+        );
+        assert_eq!(
+            defaults(&store).execution_profile,
+            ExecutionProfile::WorkspaceWrite
+        );
+        settings.set(&store, "profile", "read-only").unwrap();
         // Where nothing is gated (every OS but Linux), every profile is accepted as before.
         assert_eq!(
             settings.set_with_sandbox(&store, "profile", "workspace-write", || None),

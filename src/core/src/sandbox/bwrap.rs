@@ -17,14 +17,38 @@
 //! so swapping the folder at that path after the check changes nothing. No folder
 //! under `/run` or `/var/run` is ever mounted, because host pathname sockets live there (the user
 //! session bus, docker.sock); the one thing from there that can appear is a single regular `/etc`
-//! file reached through a link, such as `resolv.conf` (see [`etc_at`]). The home folder, the data
-//! folder and the host root are not mounted.
+//! file reached through a link, such as `resolv.conf` (see [`etc_at`]). The data folder and the
+//! host root are not mounted, and of the home folder only the toolchain folders in
+//! [`HOME_TOOLCHAINS`] are, read-only, with their credential files and folders masked (see
+//! [`toolchains_at`]).
 //!
 //! Masks: a directory becomes an empty read-only tmpfs; a file becomes a read-only bind of
 //! `/dev/null`. bubblewrap mounts binds `nodev`, so opening a masked file fails with "permission
 //! denied" (EACCES) rather than reading as empty. Either way its content can't be read.
+//!
+//! Workspace-write differs in three places:
+//! - The project is an overlay (`--overlay-src P --overlay <upper> <work> P`): the project is
+//!   the read-only lower layer and every write lands in `upper` under `<data>/staging/<id>`, which
+//!   the apply step copies back after the command. It is the one mount the command can write
+//!   through to the host. bubblewrap 0.13.1 has no descriptor form of `--overlay-src` (it opens
+//!   the path itself, refusing magic links such as `/proc/self/fd/N`), so the project is pinned
+//!   by device and inode instead and checked again just before bubblewrap starts (see
+//!   `RunGuard::spawn`). What is left: a process of the same user that swaps the project folder
+//!   in the instant between that check and bubblewrap opening the path makes the sandbox read the
+//!   folder put there instead. It never writes to it (writes go to `upper`), and the apply step
+//!   refuses everything when the project is no longer the folder the command started with.
+//! - Directory masks are writable tmpfs mounts, mounted after the overlay, so a write into a
+//!   masked folder succeeds inside and is thrown away with the sandbox. File masks stay
+//!   read-only binds of `/dev/null`.
+//! - The command runs as pid 1 (`--as-pid-1`). With bubblewrap's own init as pid 1, bubblewrap
+//!   exits as soon as the command does, and anything the command left in the background is
+//!   killed only afterwards, by the parent-death signal. As pid 1, the command's exit ends the
+//!   PID namespace, and the kernel kills and waits for every process left in it before
+//!   bubblewrap sees that exit. So once bubblewrap has exited and been reaped, nothing in the
+//!   sandbox can still write to `upper`.
 
 use super::walk::{Mask, MaskKind};
+use crate::sandbox::ExecutionProfile;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -55,23 +79,50 @@ pub(crate) const ETC_FILES: [&str; 12] = [
 /// Locally managed configuration under the system roots, rather than the distribution's own files.
 /// Each one that exists is hidden behind an empty read-only tmpfs.
 pub(crate) const SYSTEM_MASKS: [&str; 2] = ["/usr/local/etc", "/home/linuxbrew/.linuxbrew/etc"];
+/// Toolchain folders in the home folder that every sandbox gets read-only, where each is a real
+/// folder, so tools installed with rustup, nvm, pyenv or uv run inside it.
+pub(crate) const HOME_TOOLCHAINS: [&str; 6] = [
+    ".cargo",
+    ".rustup",
+    ".nvm",
+    ".pyenv",
+    ".local/bin",
+    ".local/share/uv",
+];
+/// Credential files inside [`HOME_TOOLCHAINS`], each hidden behind a read-only `/dev/null`.
+const HOME_CREDENTIALS: [&str; 2] = [".cargo/credentials", ".cargo/credentials.toml"];
+/// Credential folders inside [`HOME_TOOLCHAINS`], each hidden behind an empty read-only tmpfs.
+const HOME_CREDENTIAL_DIRS: [&str; 1] = [".local/share/uv/credentials"];
 /// Where host pathname sockets live. Nothing that resolves under these is ever mounted, with
 /// one exception: a single regular file (see [`etc_at`]).
 const SOCKET_DIRS: [&str; 2] = ["run", "var/run"];
 
-/// Every profile mounts the project read-only for now, the strictest choice.
+/// The overlay's write side for a Workspace-write project: two folders under
+/// `<data>/staging/<id>` on the same file system (see `staging::create`).
+pub(crate) struct Overlay<'a> {
+    pub upper: &'a Path,
+    pub work: &'a Path,
+}
+
 pub(crate) struct MountPlan<'a> {
     /// Where the project appears inside the sandbox: its own (canonical) path.
     pub project: &'a Path,
-    /// What is mounted there: a descriptor for the checked folder, open in bubblewrap at this
-    /// number (see `linux::pin_project` and `linux::spawn_with`).
+    /// For Read-only, what is mounted there: a descriptor for the checked folder, open in
+    /// bubblewrap at this number (see `linux::pin_project` and `linux::spawn_with`). Not used,
+    /// and not handed on, for Workspace-write.
     pub project_fd: RawFd,
+    /// Only Workspace-write with an [`Overlay`] gets a writable project; anything else, a
+    /// Workspace-write plan without one included, mounts it read-only.
+    pub profile: ExecutionProfile,
+    pub overlay: Option<Overlay<'a>>,
     pub network: bool,
     pub roots: Vec<Root>,
     /// Absolute `/etc/<name>` paths that exist on the host.
     pub etc: Vec<PathBuf>,
     /// Absolute paths from [`SYSTEM_MASKS`] to hide.
     pub system_masks: Vec<PathBuf>,
+    /// The home folder's toolchains to bind read-only (see [`toolchains_at`]).
+    pub toolchains: Toolchains,
     /// Relative to `project`.
     pub masks: &'a [Mask],
 }
@@ -84,6 +135,69 @@ pub(crate) enum Root {
         target: PathBuf,
         link: PathBuf,
     },
+}
+
+/// What of the home folder a sandbox gets: [`HOME_TOOLCHAINS`] folders, bound read-only at their
+/// own paths, and the credential files and folders in them to mask.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Toolchains {
+    pub binds: Vec<PathBuf>,
+    pub masks: Vec<PathBuf>,
+    pub dir_masks: Vec<PathBuf>,
+}
+
+/// Each of [`HOME_TOOLCHAINS`] under the absolute `home` that is a real folder, reached from
+/// `home` through real folders only (a symlink anywhere below `home` leaves it out), with each of
+/// [`HOME_CREDENTIALS`] in it that is a regular file, and each of [`HOME_CREDENTIAL_DIRS`] that is
+/// a real folder, to mask. A credential name that is anything else (a link, or a file where a
+/// folder belongs and the other way round), or can't be checked, leaves its toolchain folder out:
+/// fail closed.
+pub(crate) fn toolchains_at(home: &Path) -> Toolchains {
+    let mut found = Toolchains::default();
+    if !home.is_absolute() {
+        return found;
+    }
+    let real_dir = |relative: &Path| {
+        std::fs::symlink_metadata(home.join(relative)).is_ok_and(|meta| meta.is_dir())
+    };
+    for dir in HOME_TOOLCHAINS {
+        let dir = Path::new(dir);
+        let chain = dir.ancestors().filter(|a| !a.as_os_str().is_empty());
+        if !chain.into_iter().all(real_dir) {
+            continue;
+        }
+        let mut masks = Vec::new();
+        let mut dir_masks = Vec::new();
+        let mut safe = true;
+        for credential in HOME_CREDENTIALS.iter().map(Path::new) {
+            if credential.parent() != Some(dir) {
+                continue;
+            }
+            let path = home.join(credential);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => masks.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => safe = false,
+            }
+        }
+        for credential in HOME_CREDENTIAL_DIRS.iter().map(Path::new) {
+            if credential.parent() != Some(dir) {
+                continue;
+            }
+            let path = home.join(credential);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => dir_masks.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => safe = false,
+            }
+        }
+        if safe {
+            found.binds.push(home.join(dir));
+            found.masks.extend(masks);
+            found.dir_masks.extend(dir_masks);
+        }
+    }
+    found
 }
 
 /// The system roots on this host.
@@ -198,13 +312,20 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&OsStr]| a.extend(items.iter().map(|s| s.to_os_string()));
     let s = |s: &'static str| OsStr::new(s);
+    let staged = match &plan.overlay {
+        Some(overlay) if plan.profile == ExecutionProfile::WorkspaceWrite => Some(overlay),
+        _ => None,
+    };
 
     push(&[s("--unshare-all")]);
     if plan.network {
         push(&[s("--share-net")]);
     }
+    push(&[s("--die-with-parent")]);
+    if staged.is_some() {
+        push(&[s("--as-pid-1")]);
+    }
     push(&[
-        s("--die-with-parent"),
         s("--new-session"),
         // No user namespaces inside, so no nested sandbox, mount or capability games. The
         // AppImage has no AppArmor child profile to forbid them. --disable-userns needs an
@@ -240,6 +361,16 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
         s("--tmpfs"),
         s("/tmp"),
     ]);
+    for dir in &plan.toolchains.binds {
+        push(&[s("--ro-bind"), dir.as_os_str(), dir.as_os_str()]);
+    }
+    for file in &plan.toolchains.masks {
+        push(&[s("--ro-bind"), s("/dev/null"), file.as_os_str()]);
+    }
+    for dir in &plan.toolchains.dir_masks {
+        let dir = dir.as_os_str();
+        push(&[s("--tmpfs"), dir, s("--remount-ro"), dir]);
+    }
     let bound: Vec<&Path> = plan
         .roots
         .iter()
@@ -260,12 +391,25 @@ pub(crate) fn args(plan: &MountPlan) -> Vec<OsString> {
         push(&[s("--dir"), dir.as_os_str()]);
     }
     let project = plan.project.as_os_str();
-    let project_fd = OsString::from(plan.project_fd.to_string());
-    push(&[s("--ro-bind-fd"), &project_fd, project]);
+    match staged {
+        Some(overlay) => push(&[
+            s("--overlay-src"),
+            project,
+            s("--overlay"),
+            overlay.upper.as_os_str(),
+            overlay.work.as_os_str(),
+            project,
+        ]),
+        None => {
+            let project_fd = OsString::from(plan.project_fd.to_string());
+            push(&[s("--ro-bind-fd"), &project_fd, project]);
+        }
+    }
     for mask in plan.masks {
         let path = plan.project.join(&mask.path);
         let path = path.as_os_str();
         match mask.kind {
+            MaskKind::Dir if staged.is_some() => push(&[s("--tmpfs"), path]),
             MaskKind::Dir => push(&[s("--tmpfs"), path, s("--remount-ro"), path]),
             MaskKind::File => push(&[s("--ro-bind"), s("/dev/null"), path]),
         }
@@ -290,7 +434,7 @@ pub(crate) fn args_file(args: &[OsString]) -> Option<Vec<u8>> {
 }
 
 /// The launcher's script. It opens the seccomp file on fd 3 and the args file on fd 4, closes every
-/// other descriptor except 0-2 and the project's (`$3`), so nothing Blackwall inherited reaches
+/// other descriptor except 0-2 and the project's (`$3`, `none` for none), so nothing Blackwall inherited reaches
 /// bubblewrap and through it the command (bubblewrap passes unknown descriptors on), then execs
 /// bubblewrap. A descriptor above 9 needs bash to be closed: under dash `exec 142>&-` is a
 /// command that isn't found, so the shell exits instead of going on with it open (fail closed).
@@ -311,7 +455,9 @@ fn trampoline_shell() -> &'static str {
 ///
 /// The shell runs [`TRAMPOLINE`], which execs bubblewrap with only fds 0-4 and `project_fd` open:
 /// `<shell> -c <TRAMPOLINE> blackwall-sandbox <seccomp_file> <args_file> <project_fd> <bwrap>
-/// --args 4 -- <program> <program args>`.
+/// --args 4 -- <program> <program args>`. Workspace-write passes no `project_fd` (`none`):
+/// bubblewrap hands descriptors it doesn't use on to the command, and one for the real project
+/// folder would let it write there directly, past the overlay.
 ///
 /// The environment starts empty, so bubblewrap (which is pid 1 in the sandbox, and whose
 /// `/proc/1/environ` the command can read) never carries Blackwall's own variables. The caller
@@ -322,7 +468,7 @@ pub(crate) fn launcher(
     bwrap: &Path,
     seccomp_file: &Path,
     args_file: &Path,
-    project_fd: RawFd,
+    project_fd: Option<RawFd>,
     program: &OsStr,
     program_args: &[OsString],
 ) -> Option<tokio::process::Command> {
@@ -341,7 +487,7 @@ pub(crate) fn launcher(
         .arg("blackwall-sandbox")
         .arg(seccomp_file)
         .arg(args_file)
-        .arg(project_fd.to_string())
+        .arg(project_fd.map_or_else(|| "none".to_owned(), |fd| fd.to_string()))
         .arg(bwrap)
         .args(["--args", "4", "--"])
         .arg(program)
@@ -380,6 +526,8 @@ mod tests {
         MountPlan {
             project,
             project_fd: 10,
+            profile: ExecutionProfile::ReadOnly,
+            overlay: None,
             network,
             roots: vec![
                 Root::Bind("/usr".into()),
@@ -391,6 +539,7 @@ mod tests {
             ],
             etc: vec!["/etc/hosts".into(), "/etc/ssl".into()],
             system_masks: Vec::new(),
+            toolchains: Toolchains::default(),
             masks,
         }
     }
@@ -457,6 +606,248 @@ mod tests {
         ]));
         // The only bare "/" is the final remount.
         assert_eq!(a.iter().filter(|x| *x == "/").count(), 1);
+    }
+
+    #[test]
+    fn home_toolchains_are_bound_read_only_only_where_they_are_real_folders() {
+        let home = Temp::new();
+        let h = &home.0;
+        let none = toolchains_at(h);
+        assert_eq!(none, Toolchains::default());
+        for dir in [
+            ".cargo",
+            ".rustup",
+            ".local/bin",
+            ".ssh",
+            "elsewhere/uv",
+            "share/x",
+        ] {
+            std::fs::create_dir_all(h.join(dir)).unwrap();
+        }
+        std::fs::write(h.join(".cargo/credentials.toml"), "token").unwrap();
+        // A link in place of a toolchain folder, or above one, is left out.
+        symlink(h.join("elsewhere"), h.join(".nvm")).unwrap();
+        std::fs::create_dir_all(h.join(".local")).unwrap();
+        symlink(h.join("elsewhere"), h.join(".local/share")).unwrap();
+        let found = toolchains_at(h);
+        assert_eq!(
+            found.binds,
+            [h.join(".cargo"), h.join(".rustup"), h.join(".local/bin")]
+        );
+        assert_eq!(found.masks, [h.join(".cargo/credentials.toml")]);
+        // In the arguments: read-only binds after the private /tmp, then the masks, then the
+        // project; nothing else of home, and nothing writable.
+        let project = h.join("work/p");
+        let plan = MountPlan {
+            toolchains: found,
+            ..plan(&project, false, &[])
+        };
+        let a = strs(&args(&plan));
+        let cargo = h.join(".cargo").display().to_string();
+        let bind = format!("--ro-bind {cargo} {cargo}");
+        let masked = format!("--ro-bind /dev/null {cargo}/credentials.toml");
+        assert!(pos(&a, "--tmpfs /tmp") < pos(&a, &bind));
+        assert!(pos(&a, &bind) < pos(&a, &masked));
+        assert!(pos(&a, &masked) < pos(&a, &format!("--ro-bind-fd 10 {}", project.display())));
+        for dir in [".rustup", ".local/bin"] {
+            let dir = h.join(dir).display().to_string();
+            pos(&a, &format!("--ro-bind {dir} {dir}"));
+        }
+        let home_args: Vec<&String> = a
+            .iter()
+            .filter(|x| x.starts_with(&*h.to_string_lossy()))
+            .collect();
+        assert_eq!(home_args.len(), 2 * 3 + 1 + 4, "{home_args:?}"); // binds, mask, --dir x2, project x2
+        assert!(!a
+            .iter()
+            .any(|x| x.contains(".ssh") || x.contains(".nvm") || x.contains("uv")));
+        assert!(!a.iter().any(|x| x == "--bind" || x == "--dev-bind"));
+        // A credential name that isn't a plain file keeps its whole toolchain folder out.
+        std::fs::remove_file(h.join(".cargo/credentials.toml")).unwrap();
+        symlink(h.join(".ssh"), h.join(".cargo/credentials")).unwrap();
+        let found = toolchains_at(h);
+        assert_eq!(found.binds, [h.join(".rustup"), h.join(".local/bin")]);
+        assert!(found.masks.is_empty());
+        // Only an absolute home counts.
+        assert_eq!(toolchains_at(Path::new("relative")), Toolchains::default());
+    }
+
+    #[test]
+    fn uv_credentials_are_masked_with_an_empty_read_only_tmpfs() {
+        let home = Temp::new();
+        let h = &home.0;
+        std::fs::create_dir_all(h.join(".local/share/uv/python")).unwrap();
+        // Absent: uv is bound as it is, with nothing masked.
+        let found = toolchains_at(h);
+        assert_eq!(found.binds, [h.join(".local/share/uv")]);
+        assert!(found.dir_masks.is_empty());
+        // A real folder: bound, then masked.
+        std::fs::create_dir(h.join(".local/share/uv/credentials")).unwrap();
+        let found = toolchains_at(h);
+        assert_eq!(found.dir_masks, [h.join(".local/share/uv/credentials")]);
+        let project = h.join("work/p");
+        let plan = MountPlan {
+            toolchains: found,
+            ..plan(&project, false, &[])
+        };
+        let a = strs(&args(&plan));
+        let uv = h.join(".local/share/uv").display().to_string();
+        let masked = format!("--tmpfs {uv}/credentials --remount-ro {uv}/credentials");
+        assert!(pos(&a, &format!("--ro-bind {uv} {uv}")) < pos(&a, &masked));
+        assert!(pos(&a, &masked) < pos(&a, &format!("--ro-bind-fd 10 {}", project.display())));
+        // A link, or a file, in its place keeps the whole folder out (fail closed).
+        std::fs::remove_dir(h.join(".local/share/uv/credentials")).unwrap();
+        symlink(h.join("work"), h.join(".local/share/uv/credentials")).unwrap();
+        assert_eq!(toolchains_at(h), Toolchains::default());
+        std::fs::remove_file(h.join(".local/share/uv/credentials")).unwrap();
+        std::fs::write(h.join(".local/share/uv/credentials"), "x").unwrap();
+        assert_eq!(toolchains_at(h), Toolchains::default());
+    }
+
+    const UPPER: &str = "/d/staging/0123456789abcdef/upper";
+    const WORK: &str = "/d/staging/0123456789abcdef/work";
+    fn staged<'a>(project: &'a Path, masks: &'a [Mask]) -> MountPlan<'a> {
+        MountPlan {
+            profile: ExecutionProfile::WorkspaceWrite,
+            overlay: Some(Overlay {
+                upper: Path::new(UPPER),
+                work: Path::new(WORK),
+            }),
+            ..plan(project, false, masks)
+        }
+    }
+
+    #[test]
+    fn workspace_write_args_use_overlay_and_writable_masks() {
+        let masks = [mask(".git", MaskKind::Dir), mask("x/.ssh", MaskKind::File)];
+        let project = Path::new("/home/u/p");
+        let a = strs(&args(&staged(project, &masks)));
+        // The project is an overlay of its own path, in the read-only bind's place.
+        let overlay = pos(
+            &a,
+            &format!("--overlay-src /home/u/p --overlay {UPPER} {WORK} /home/u/p"),
+        );
+        assert!(!a.iter().any(|x| x == "--ro-bind-fd"));
+        assert!(pos(&a, "--dir /home/u") < overlay);
+        // Masks come after it: a folder is a writable tmpfs whose writes are thrown away, a file
+        // stays a read-only bind of /dev/null.
+        let git = pos(&a, "--tmpfs /home/u/p/.git");
+        assert!(overlay < git);
+        assert!(!a
+            .windows(2)
+            .any(|w| w == ["--remount-ro", "/home/u/p/.git"]));
+        assert!(git < pos(&a, "--ro-bind /dev/null /home/u/p/x/.ssh"));
+        assert!(a.ends_with(&[
+            "--remount-ro".into(),
+            "/".into(),
+            "--chdir".into(),
+            "/home/u/p".into()
+        ]));
+        // The command is pid 1, so the sandbox is gone once bubblewrap has exited.
+        for flag in ["--unshare-all", "--die-with-parent", "--as-pid-1"] {
+            assert_eq!(a.iter().filter(|x| *x == flag).count(), 1, "{flag}");
+        }
+        // Everything else is as Read-only has it.
+        let ro = strs(&args(&plan(project, false, &masks)));
+        assert!(!ro
+            .iter()
+            .any(|x| x == "--as-pid-1" || x.starts_with("--overlay")));
+        let common = |args: &[String]| args[..pos(args, "--dir /home/u")].to_vec();
+        let mut without = common(&a);
+        without.retain(|x| x != "--as-pid-1");
+        assert_eq!(without, common(&ro));
+    }
+
+    #[test]
+    fn a_mismatched_plan_falls_back_to_the_read_only_bind() {
+        // Workspace-write without its overlay, or an overlay on a Read-only plan: read-only.
+        let masks = [mask(".git", MaskKind::Dir)];
+        let project = Path::new("/home/u/p");
+        let ro = strs(&args(&plan(project, false, &masks)));
+        let mut missing = staged(project, &masks);
+        missing.overlay = None;
+        let mut extra = staged(project, &masks);
+        extra.profile = ExecutionProfile::ReadOnly;
+        for mismatched in [missing, extra] {
+            assert_eq!(strs(&args(&mismatched)), ro);
+        }
+    }
+
+    /// Every mount in `args` that the command could write through to the host, as
+    /// (option, host source, sandbox destination). tmpfs mounts hold only the sandbox's own memory.
+    fn host_writable(args: &[String]) -> Vec<(String, Vec<String>)> {
+        let mut writable = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arity = match args[i].as_str() {
+                "--unshare-all" | "--share-net" | "--die-with-parent" | "--new-session"
+                | "--unshare-user" | "--disable-userns" | "--as-pid-1" => 0,
+                "--cap-drop" | "--seccomp" | "--dir" | "--dev" | "--proc" | "--tmpfs"
+                | "--remount-ro" | "--chdir" | "--overlay-src" => 1,
+                "--ro-bind" | "--symlink" | "--ro-bind-fd" => 2,
+                "--overlay" => 3,
+                // Anything else (--bind, --dev-bind, --bind-fd, --bind-data, --file, ...) is
+                // writable or unknown: either way the test must look at it.
+                other => panic!("unexpected option {other} in {args:?}"),
+            };
+            if args[i] == "--overlay" {
+                writable.push((args[i].clone(), args[i + 1..=i + 3].to_vec()));
+            }
+            i += 1 + arity;
+        }
+        writable
+    }
+
+    #[test]
+    fn workspace_write_argv_has_exactly_one_writable_bind() {
+        // An AppImage run with extract-and-run unpacks into a writable /tmp folder; the data
+        // folder and bubblewrap sit outside the project.
+        let bwrap = Path::new("/tmp/appimage_extracted_1/usr/lib/blackwall/bwrap");
+        let appdir = Path::new("/tmp/appimage_extracted_1");
+        let data = Path::new("/d");
+        let masks = [
+            mask(".git", MaskKind::Dir),
+            mask("a/.claude", MaskKind::Dir),
+            mask(".ssh", MaskKind::File),
+        ];
+        let project = Path::new("/home/u/p");
+        let mut host = staged(project, &masks);
+        host.roots = host_roots();
+        host.etc = host_etc();
+        host.system_masks = host_system_masks(&host.roots);
+        let a = strs(&args(&host));
+        let writable = host_writable(&a);
+        assert_eq!(
+            writable,
+            [(
+                "--overlay".to_owned(),
+                vec![UPPER.to_owned(), WORK.to_owned(), "/home/u/p".to_owned()]
+            )]
+        );
+        let staging = data.join("staging");
+        for dir in [UPPER, WORK] {
+            let id = Path::new(dir).parent().unwrap();
+            assert_eq!(id.parent(), Some(staging.as_path()), "{dir}");
+        }
+        // The only writable destination doesn't cover bubblewrap, the AppImage or the data.
+        for covered in [bwrap, appdir, data] {
+            assert!(!covered.starts_with(project), "{covered:?}");
+        }
+        // The other writable mounts are tmpfs: /tmp and the project's folder masks.
+        let tmpfs: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--tmpfs")
+            .map(|w| w[1].as_str())
+            .filter(|dest| !host.system_masks.iter().any(|m| m.as_os_str() == *dest))
+            .collect();
+        assert_eq!(tmpfs, ["/tmp", "/home/u/p/.git", "/home/u/p/a/.claude"]);
+        // Read-only has no writable bind at all.
+        let ro = MountPlan {
+            profile: ExecutionProfile::ReadOnly,
+            overlay: None,
+            ..host
+        };
+        assert!(host_writable(&strs(&args(&ro))).is_empty());
     }
 
     #[test]
@@ -666,7 +1057,7 @@ mod tests {
             Path::new("/opt/bwrap"),
             Path::new("/d/seccomp.bpf"),
             Path::new("/d/args"),
-            12,
+            Some(12),
             OsStr::new("/bin/sh"),
             &["-c".into(), "echo hi".into()],
         )
@@ -740,9 +1131,19 @@ mod tests {
         let abs = Path::new("/a");
         let rel = Path::new("bwrap");
         for (bwrap, seccomp, args) in [(rel, abs, abs), (abs, rel, abs), (abs, abs, rel)] {
-            assert!(launcher(bwrap, seccomp, args, 10, OsStr::new("/bin/true"), &[]).is_none());
+            assert!(
+                launcher(bwrap, seccomp, args, Some(10), OsStr::new("/bin/true"), &[]).is_none()
+            );
         }
-        assert!(launcher(Path::new(""), abs, abs, 10, OsStr::new("/bin/true"), &[]).is_none());
+        assert!(launcher(
+            Path::new(""),
+            abs,
+            abs,
+            Some(10),
+            OsStr::new("/bin/true"),
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -801,10 +1202,13 @@ mod tests {
             let plan = MountPlan {
                 project: &self.project,
                 project_fd: std::os::fd::AsRawFd::as_raw_fd(&project_fd),
+                profile: ExecutionProfile::ReadOnly,
+                overlay: None,
                 network,
                 roots: host_roots(),
                 etc: host_etc(),
                 system_masks: host_system_masks(&host_roots()),
+                toolchains: Toolchains::default(),
                 masks: &self.masks,
             };
             let seccomp = run.join("seccomp.bpf");
@@ -816,7 +1220,7 @@ mod tests {
                 &self.bwrap,
                 &seccomp,
                 &args_path,
-                std::os::fd::AsRawFd::as_raw_fd(&project_fd),
+                Some(std::os::fd::AsRawFd::as_raw_fd(&project_fd)),
                 OsStr::new("/bin/sh"),
                 &["-c".into(), script.into()],
             )

@@ -38,7 +38,7 @@ tokio-tungstenite.workspace = true
 security-framework = { version = "3.7.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "process"] }
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"], optional = true }
 
 [target.'cfg(windows)'.dependencies]

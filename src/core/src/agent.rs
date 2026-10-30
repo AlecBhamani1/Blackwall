@@ -299,6 +299,10 @@ impl Agent<'_> {
         // caps or drop extra files, never raise or add them.
         let limits = project_settings.limits;
         let project_instructions = project_settings.instructions;
+        // Every extra instruction file the owner set up, before a project drops any: a Linux
+        // Workspace-write command can create or change none of them.
+        let mut tool_workspace = self.workspace.clone();
+        tool_workspace.instruction_files = instruction_settings.extra_files.clone();
         let instruction_settings = instruction_settings.within(project_instructions.as_ref());
         if let Some(limits) = &limits {
             budget.max_output_bytes = limits.output_cap(budget.max_output_bytes);
@@ -637,6 +641,7 @@ impl Agent<'_> {
                     let proposals = &proposals;
                     let invoked = &invoked;
                     let subagents = &subagents;
+                    let tool_workspace = &tool_workspace;
                     async move {
                         let output_cap = tools::OutputCap::new(budget.max_output_bytes);
                         let permitted = definitions.iter().any(|definition| {
@@ -770,7 +775,7 @@ impl Agent<'_> {
                             crate::subagents::run_with_instructions(
                                 &crate::subagents::Parent {
                                     backend: self.backend,
-                                    workspace: &self.workspace,
+                                    workspace: tool_workspace,
                                     request_id,
                                     approvals: &self.approvals,
                                     emit: self.emit.clone(),
@@ -798,7 +803,7 @@ impl Agent<'_> {
                             .await
                         } else if let Some(tool) = command_tools.get(&call.function.name) {
                             tool.run(
-                                &self.workspace,
+                                tool_workspace,
                                 &call.function.arguments,
                                 request_id,
                                 &self.approvals,
@@ -809,7 +814,7 @@ impl Agent<'_> {
                             .await
                         } else {
                             tools::execute(
-                                &self.workspace,
+                                tool_workspace,
                                 &call,
                                 request_id,
                                 &self.approvals,
@@ -1757,6 +1762,92 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// The owner's extra instruction files reach every command's sandbox setup, so a Linux
+    /// Workspace-write command can create or change none of them, even ones a trusted project
+    /// dropped from what the model is given.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_instruction_files_reach_commands_even_when_a_project_drops_them() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-owner-names-{}", rand::random::<u64>()));
+        let (project, user) = (directory.join("project"), directory.join("user"));
+        std::fs::create_dir_all(project.join(crate::project::PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        for name in ["CLAUDE.md", "GEMINI.md"] {
+            std::fs::write(project.join(name), name).unwrap();
+        }
+        let file = project
+            .join(crate::project::PROJECT_DIRECTORY)
+            .join(crate::project::PROJECT_FILE);
+        let body = json!({"instructions":{"extra_files":["CLAUDE.md"]}});
+        std::fs::write(&file, body.to_string()).unwrap();
+        let sha = crate::project::status(&project, &user).sha256.unwrap();
+        crate::project::trust(&project, &user, &sha).unwrap();
+        let owner: Vec<String> = ["CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md"]
+            .map(String::from)
+            .to_vec();
+        let approvals = Approvals::default();
+        let decisions = approvals.clone();
+        let loaded = Arc::new(Mutex::new(vec![]));
+        let seen = loaded.clone();
+        let mut workspace = Workspace::open(&project).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        let agent = Agent {
+            backend: &LargeOutput,
+            workspace,
+            web_enabled: false,
+            approvals,
+            emit: Arc::new(move |event| match event {
+                AgentEvent::ApprovalRequest {
+                    request_id,
+                    approval_id,
+                    ..
+                } => decisions
+                    .resolve(ResolveApprovalRequest {
+                        request_id,
+                        approval_id,
+                        decision: ApprovalDecision::Allow,
+                    })
+                    .unwrap(),
+                AgentEvent::InstructionsLoaded { sources, .. } => {
+                    seen.lock().unwrap().push(sources)
+                }
+                _ => {}
+            }),
+        };
+        let source = vec![json!({"role":"user","content":"Run it."})];
+        let run = crate::context::ContextRun {
+            state: crate::context::ContextState::restore(&source, None).unwrap(),
+            source,
+            budget: Default::default(),
+            instructions: vec![],
+            compact: false,
+            trace: None,
+            subagents: Default::default(),
+            instruction_settings: crate::instructions::InstructionSettings {
+                extra_files: owner.clone(),
+                ..Default::default()
+            },
+        };
+        agent
+            .run_context_with_guidance("owner-names", run, None, Some(&user))
+            .await
+            .unwrap();
+        // The project dropped GEMINI.md from what the model reads ...
+        assert_eq!(loaded.lock().unwrap()[0], ["CLAUDE.md"]);
+        // ... but the command was set up with every name the owner configured.
+        let prepared: Vec<Vec<String>> = crate::sandbox::PREPARED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| *path == project)
+            .map(|(_, names)| names.clone())
+            .collect();
+        assert_eq!(prepared, [owner]);
+        drop(agent);
         std::fs::remove_dir_all(directory).unwrap();
     }
     struct Answers;

@@ -182,8 +182,8 @@ diff and compare the original file again before an atomic replacement.
 
 Shell actions display the exact command and working directory. They run under the owner's
 execution profile: **read-only** by default, **workspace-write**, or **unsandboxed** (full account
-permissions). On macOS the restricted profiles are enforced by Seatbelt before the program starts;
-Linux and Windows refuse restricted profiles rather than run unconfined (see
+permissions). On macOS the restricted profiles are enforced by Seatbelt before the program starts,
+and on Linux by bubblewrap; Windows refuses restricted profiles rather than run unconfined (see
 [Runtime guide](RUNTIME_GUIDE.md)). Each command has a configurable deadline (two minutes by default), output
 trimmed to its start and end above a configurable cap (64 KiB by default) with a stream stopped
 past 64 MiB, and a process-group guard that kills descendants on cancellation. Known model,

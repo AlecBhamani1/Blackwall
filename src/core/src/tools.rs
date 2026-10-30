@@ -23,6 +23,9 @@ use tokio::io::AsyncReadExt;
 const MAX_FILE: usize = 64 * 1024;
 /// A command whose standard output or error passes this many bytes is stopped.
 const MAX_STREAMED: u64 = 64 * 1024 * 1024;
+/// The most of the output cap a Linux Workspace-write command's report takes.
+const MAX_REPORT: usize = 8 * 1024;
+pub(crate) const NOT_STARTED: &str = "The command could not start.";
 
 /// One tool call's command output cap ([`crate::context::ContextBudget::max_output_bytes`]),
 /// and whether that call's output was trimmed to fit it.
@@ -54,10 +57,31 @@ impl OutputCap {
         if text.len() <= self.bytes {
             return text;
         }
-        self.trim(&[Piece::Bytes(text.as_bytes())])
+        self.trim(&[Piece::Bytes(text.as_bytes())], self.bytes)
     }
-    fn trim(&self, pieces: &[Piece<'_>]) -> String {
-        let (text, trimmed) = trim_pieces(pieces, self.bytes);
+    /// How much of the cap a Linux Workspace-write command's report may take: half, and at most
+    /// 8 KiB. The command's own output gets the rest.
+    pub(crate) fn report_room(&self) -> usize {
+        (self.bytes / 2).min(MAX_REPORT)
+    }
+    /// `text`'s first lines that fit in `max` bytes, then a line saying the rest was cut.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux stages Workspace-write
+    pub(crate) fn clip_lines(&self, text: String, max: usize) -> String {
+        const CUT: &str = "\n… (the rest was cut to fit the output limit)";
+        if text.len() <= max {
+            return text;
+        }
+        let mut end = max.saturating_sub(CUT.len()).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = text[..end].rfind('\n').unwrap_or(end);
+        self.trimmed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        format!("{}{CUT}", &text[..end])
+    }
+    fn trim(&self, pieces: &[Piece<'_>], cap: usize) -> String {
+        let (text, trimmed) = trim_pieces(pieces, cap);
         if trimmed {
             self.trimmed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -208,6 +232,10 @@ pub struct Workspace {
     pub(crate) directory: Arc<Dir>,
     pub path: PathBuf,
     pub execution: crate::sandbox::ExecutionPolicy,
+    /// The owner's extra instruction files (relative names such as
+    /// `.github/copilot-instructions.md`), which a Linux Workspace-write command can't create or
+    /// change, on top of the built-in ones. The agent sets them for each run.
+    pub(crate) instruction_files: Vec<String>,
 }
 impl Workspace {
     pub fn open(path: &Path) -> Result<Self, ToolError> {
@@ -218,6 +246,7 @@ impl Workspace {
             directory: Arc::new(directory),
             path,
             execution: Default::default(),
+            instruction_files: Vec::new(),
         })
     }
     pub(crate) fn checked(&self, path: &str) -> Result<PathBuf, ToolError> {
@@ -566,9 +595,14 @@ pub async fn execute(
             {
                 return Err(ToolError::Denied);
             }
-            let (process, mut guard) =
-                crate::sandbox::prepare(workspace, shell_command(command), Scope::Shell, &[])
-                    .await?;
+            let (process, mut guard) = crate::sandbox::prepare(
+                workspace,
+                shell_command(command),
+                Scope::Shell,
+                &[],
+                command_timeout,
+            )
+            .await?;
             let outcome = run_with_input(
                 &workspace.path,
                 process,
@@ -578,7 +612,7 @@ pub async fn execute(
                 Some(&mut guard),
             )
             .await;
-            guard.finish(outcome).await
+            guard.finish(outcome, output).await
         }
         "web_fetch" | "web_search" => crate::web::execute(call, request_id, approvals, emit).await,
         _ => Err(ToolError::Arguments),
@@ -689,7 +723,8 @@ pub(crate) async fn program_with_timeout(
             return run_with_input(&workspace.path, process, input, timeout, output, None).await;
         }
         let (process, mut guard) =
-            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through).await?;
+            crate::sandbox::prepare(workspace, process, Scope::Owner, pass_through, timeout)
+                .await?;
         let outcome = run_with_input(
             &workspace.path,
             process,
@@ -699,14 +734,24 @@ pub(crate) async fn program_with_timeout(
             Some(&mut guard),
         )
         .await;
-        match guard.finish(outcome).await {
-            Err(ToolError::Execution(text)) => Err(ToolError::Execution(with_sandbox_hint(
-                text,
-                workspace.execution.profile,
-            ))),
-            result => result,
-        }
+        finish_tool(guard, outcome, workspace.execution.profile, output).await
     }
+}
+/// A sandboxed command tool's outcome with the sandbox hint, judged on the command's own output
+/// only (a Workspace-write report's file names don't count), then the guard's report.
+pub(crate) async fn finish_tool(
+    guard: crate::sandbox::RunGuard,
+    outcome: Result<String, ToolError>,
+    profile: ExecutionProfile,
+    output: &OutputCap,
+) -> Result<String, ToolError> {
+    let outcome = match outcome {
+        Err(ToolError::Execution(text)) => {
+            Err(ToolError::Execution(with_sandbox_hint(text, profile)))
+        }
+        other => other,
+    };
+    guard.finish(outcome, output).await
 }
 /// Added to a command tool failure that looks like a sandbox denial; `{profile}` is the
 /// profile's display name.
@@ -734,10 +779,28 @@ fn with_sandbox_hint(text: String, profile: ExecutionProfile) -> String {
         ExecutionProfile::Unsandboxed => return text,
     };
     let lower = text.to_lowercase();
-    if text == TIME_LIMIT_MESSAGE || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m)) {
+    if text.starts_with(TIME_LIMIT_MESSAGE)
+        || !SANDBOX_DENIAL_MARKERS.iter().any(|m| lower.contains(m))
+    {
         return text;
     }
     format!("{text}\n{}", SANDBOXED_TOOL_HINT.replace("{profile}", name))
+}
+/// Whether a sandboxed command ran to its end, so that a Linux Workspace-write command's staged
+/// changes may be applied: it succeeded (`Ok`), or failed with an exit code (`Exit: ` and an ASCII
+/// digit, as [`run_with_input`] writes it). Both come only after the process was waited for and
+/// reaped. The time limit, a cancel (no outcome at all), the 64 MiB stop (`Exit: stopped`), a
+/// signal (`Exit: signal`), a failure to start, and every other error are not.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux stages Workspace-write
+pub(crate) fn completed(outcome: &Result<String, ToolError>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(ToolError::Execution(text)) => text
+            .strip_prefix("Exit: ")
+            .and_then(|rest| rest.bytes().next())
+            .is_some_and(|first| first.is_ascii_digit()),
+        Err(_) => false,
+    }
 }
 static SEARCH_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
 /// Use the owner's login-shell `PATH` to find and run programs. Apps opened from the macOS Dock
@@ -990,12 +1053,22 @@ pub(crate) async fn run_with_input(
         use std::os::unix::process::CommandExt;
         process.as_std_mut().process_group(0);
     }
+    // A Linux Workspace-write command's report takes part of the cap, so trim to the rest.
+    let cap = if guard
+        .as_deref()
+        .is_some_and(crate::sandbox::RunGuard::reports)
+    {
+        output.bytes - output.report_room()
+    } else {
+        output.bytes
+    };
     #[cfg(unix)]
     let mut child = match guard {
-        Some(guard) => guard.spawn(&mut process),
-        None => process.spawn(),
-    }
-    .map_err(|_| ToolError::Execution("The command could not start.".into()))?;
+        Some(guard) => guard.spawn(&mut process)?,
+        None => process
+            .spawn()
+            .map_err(|_| ToolError::Execution(NOT_STARTED.into()))?,
+    };
     #[cfg(unix)]
     let _group = ProcessGroup(
         child
@@ -1018,7 +1091,7 @@ pub(crate) async fn run_with_input(
             .wrap(JobObject);
         process
             .spawn()
-            .map_err(|_| ToolError::Execution("The command could not start.".into()))?
+            .map_err(|_| ToolError::Execution(NOT_STARTED.into()))?
     };
     #[cfg(unix)]
     let stdout = child.stdout.take().ok_or(ToolError::File)?;
@@ -1096,7 +1169,7 @@ pub(crate) async fn run_with_input(
         let mut pieces = vec![Piece::Bytes(exit.as_bytes())];
         out.pieces(&mut pieces);
         err.pieces(&mut pieces);
-        let mut text = output.trim(&pieces);
+        let mut text = output.trim(&pieces, cap);
         if stopped {
             text.push_str("\nThe command was stopped after 64 MiB of output.");
         }
@@ -1161,6 +1234,43 @@ mod tests {
         );
     }
     #[test]
+    fn completed_only_for_real_exits() {
+        let execution = |text: &str| Err(ToolError::Execution(text.into()));
+        for done in [
+            Ok("Exit: 0\nout".to_owned()),
+            Ok(String::new()),
+            execution("Exit: 1\n"),
+            execution("Exit: 0"),
+            execution("Exit: 127"),
+            execution("Exit: 1\nbwrap: execvp /x: No such file or directory\n"),
+        ] {
+            assert!(completed(&done), "{done:?}");
+        }
+        for not_done in [
+            execution("Exit: stopped"),
+            execution("Exit: stopped\noverflow\nThe command was stopped after 64 MiB of output."),
+            execution("Exit: signal\n"),
+            execution("Exit: "),
+            execution("Exit: x"),
+            execution("Exit: \u{0661}"),
+            execution("Exit:1"),
+            execution(" Exit: 1"),
+            execution("exit: 1"),
+            execution(""),
+            execution(TIME_LIMIT_MESSAGE),
+            execution("The command could not start."),
+            execution("The command did not start."),
+            Err(ToolError::Path),
+            Err(ToolError::File),
+            Err(ToolError::Limit),
+            Err(ToolError::Arguments),
+            Err(ToolError::Denied),
+            Err(ToolError::Changed),
+        ] {
+            assert!(!completed(&not_done), "{not_done:?}");
+        }
+    }
+    #[test]
     fn sandbox_hint_only_follows_a_failure_that_looks_like_a_denial() {
         let hinted = |text: &str, profile| with_sandbox_hint(text.to_owned(), profile);
         let denied = "Exit: 1\ntouch: x: Operation not permitted\n";
@@ -1180,10 +1290,12 @@ mod tests {
         )
         .contains("the Read-only sandbox."));
         // A plain failure, the time limit, and an unsandboxed profile get no hint.
+        let staged = format!("{TIME_LIMIT_MESSAGE}\n\nNot applied; kept in /sandbox/staging/x.");
         for text in [
             "Exit: 3\n",
             "Exit: 1\nFAILED tests::a\n",
             TIME_LIMIT_MESSAGE,
+            staged.as_str(),
         ] {
             assert_eq!(hinted(text, ExecutionProfile::ReadOnly), text);
         }
@@ -1254,10 +1366,16 @@ mod tests {
         let mut workspace = Workspace::open(&directory).unwrap();
         workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
         // Cargo sets this for the test process: the shell keeps it, programs do not get it.
-        let process = crate::sandbox::prepare(&workspace, shell_command("env"), Scope::Shell, &[])
-            .await
-            .unwrap()
-            .0;
+        let process = crate::sandbox::prepare(
+            &workspace,
+            shell_command("env"),
+            Scope::Shell,
+            &[],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .0;
         let out = run_with_timeout(
             &workspace.path,
             process,

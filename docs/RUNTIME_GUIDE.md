@@ -591,7 +591,15 @@ capabilities. The AppImage has no profile, so on Ubuntu 24.04 and later AppArmor
 use the `.deb` there. The command sees the system folders (`/usr`, `/bin`, `/sbin`, `/lib`,
 `/lib64`, Linuxbrew) with `/usr/local/etc` and Linuxbrew's `etc` hidden, a short list of `/etc`
 files (certificates, `resolv.conf`, `hosts`, `passwd` and the like) and a private `/tmp`, with no
-`/run` and no home folder. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
+`/run`. Of your home folder it sees only the toolchain folders `~/.cargo`, `~/.rustup`, `~/.nvm`,
+`~/.pyenv`, `~/.local/bin` and `~/.local/share/uv`, read-only, each where it is a real folder (not
+a link, and not reached through one), so tools installed there run. `~/.cargo/credentials` and
+`~/.cargo/credentials.toml` are hidden inside them; if either is anything but a plain file,
+`~/.cargo` is left out. `~/.local/share/uv/credentials` is hidden too (it shows as an empty
+folder); if it is anything but a real folder, `~/.local/share/uv` is left out. Keep registry
+tokens in `credentials.toml`, which is hidden, not in `config.toml`, which the command can read.
+Nothing else in your home folder is there, and no command can write to any
+of it. The project is read-only. Inside it, `.git`, `.hg`, `.svn`,
 `.blackwall`, `.ssh`, `.aws`, `.gnupg`, `.config`, `.codex`, `.claude` and `.agents` are hidden.
 The exception is `node_modules`, `target`, `.venv`, `venv`, `__pycache__`, `dist` and `build`:
 only their direct children are checked for those names, so a protected name deeper inside them
@@ -601,13 +609,14 @@ network is off unless Command network is on. The project cannot be your home fol
 that contains it, or `/`; Blackwall's data folder cannot be inside the project; a project that
 contains another mounted file system is refused; and so is a project with more than 500,000 files
 and folders, not counting the contents of the skipped folders, with the message naming its largest
-folder. If the check takes more than 10 seconds, the command doesn't run. Workspace-write is not
-available on Linux yet: the selector turns it off and `bw` refuses it.
+folder. If the check takes more than 10 seconds, the command doesn't run. Workspace-write has
+extra rules, [below](#workspace-write-on-linux).
 
-The sandbox mounts the project folder that was checked, by its descriptor, so a folder swapped in
-at the project's path after the check is not what the command sees. Inside the project the check
-goes by path: a program outside the sandbox that renames folders in the project while it is being
-checked can still leave a protected name readable.
+A Read-only command gets the project folder that was checked, mounted by its descriptor, so a
+folder swapped in at the project's path after the check is not what the command sees.
+(Workspace-write mounts by path; see the last paragraph of its section below.) Inside the project
+the check goes by path: a program outside the sandbox that renames folders in the project while it
+is being checked can still leave a protected name readable.
 
 If bubblewrap is missing or older than 0.12, Read-only stays selectable with a note to install
 Blackwall's `.deb` or AppImage, or a newer `bwrap`, and commands fail closed without running. If
@@ -617,6 +626,72 @@ and so is the project's location. Blackwall runs a real sandboxed command when t
 on `bw`'s first sandboxed command; if that fails for a moment, the note says "Bubblewrap didn't
 start just now. Try again in a moment." A blocked or momentary failure is checked again after 30
 seconds; a missing or old bubblewrap needs a restart once it is installed.
+
+#### Workspace-write on Linux
+
+A Workspace-write command doesn't write to the project. It sees the project through a private
+overlay, and its writes go to a staged copy in Blackwall's data folder. When the command has
+exited, Blackwall checks the staged changes and copies them into the project. The output ends with
+a report: how many files were applied, deleted, refused and conflicted, and each path, what was
+refused, conflicted or held back first. Each list shows up to 50 paths, then "… and N more"; a path
+longer than 160 characters loses its middle, and invisible characters and bytes that aren't UTF-8
+are shown escaped (`\u{202e}`, `\xff`). The report takes at most half the command output limit,
+and never more than 8 KiB: the command's own output is trimmed to leave it room, and a longer report
+is cut at its end.
+
+New and changed files, deletes and new folders are copied. A copied file keeps the modification
+and access times the command gave it, so a build tool sees what it built as up to date. New files
+and folders get the permissions the command gave them less your umask, as a direct write would;
+a changed file keeps the permissions it has in the staged copy. Blackwall refuses, and says why
+next to the path:
+
+- a protected name (`.git`, `.ssh` and the others listed above) in any letter case, at any depth;
+- an instruction file: `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or an extra file you
+  configured (see [Project instructions](#project-instructions)), in any letter case;
+- a link that leads outside the project, or that could stand in for an instruction file's folder.
+  The exception is an absolute link into `/usr`, `/bin`, `/lib`, `/lib64` or `/opt` with no `.` or
+  `..` in it, such as a virtualenv's `.venv/bin/python -> /usr/bin/python3`, which is applied;
+- a set-user-ID or set-group-ID file, or one with file capabilities;
+- a device, pipe or socket.
+
+Two cases refuse the whole batch, not one path: overlay metadata Blackwall can't apply safely, and
+more than 500,000 changed entries. Then nothing at all is applied.
+
+Writes into the hidden folders (`.git`, `.ssh` and the rest) succeed inside the sandbox, but they
+are thrown away and never applied.
+
+A file you changed in the project while the command ran is a conflict: your version stays and the
+path is listed. Deletes are held back, and listed as such, when anything else was refused or
+conflicted, because a refused change can make a delete lose it. Applying is not atomic: if
+Blackwall stops part way, what was done stays.
+
+Nothing is applied when the command hits its time limit, is cancelled, or is stopped for too much
+output, when the launcher is killed from outside the sandbox (`Exit: signal`), or when it can't
+start. A command that exits with any code still has its changes checked
+and applied, including one killed inside the sandbox (for example by running out of memory, exit
+128 plus the signal number). When anything was refused, conflicted, held back or not applied, the
+staged copy is kept for at least 24 hours and the output names its folder, so you can take what
+you need from it. Blackwall removes it in a later sweep, which skips a folder while a run still
+holds it. When everything was applied, nothing is kept.
+
+One Workspace-write command runs in a project at a time. A second waits for the first, up to its
+own time limit, and fails with a note that another is still running only if the first still is.
+
+It needs Linux 5.11 or newer with overlay mounts allowed. Without them, the selector turns
+Workspace-write off with a note, shown while you choose a profile or when Workspace-write is still
+selected (Read-only users aren't shown it), `bw` refuses it, and Read-only keeps working. A project on an
+overlay file system (as inside a container), inside Blackwall's data folder, or holding the
+`bwrap` Blackwall uses or the app's own files (the AppImage folder) is refused up front with a
+plain note, and so is a project or data folder whose path has a comma, colon or backslash, since
+bubblewrap passes those paths in the overlay's mount options. A project on a file system the kernel
+can't use as an overlay's lower layer isn't caught up front: the command fails with bubblewrap's own
+error, and the report after it says "Workspace changes: 0 applied", since nothing was changed.
+
+One gap remains: a process of your user, outside the sandbox, that renames the project folder in
+the instant before the command starts makes the sandbox read the folder that was put there. The
+project is mounted by path, pinned and checked again just before the command starts. The sandbox
+never writes to the folder put there, and Blackwall applies nothing if the project is no longer the
+folder the command started with.
 
 ### Child environments
 
