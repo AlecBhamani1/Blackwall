@@ -1145,6 +1145,43 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_allows_only_connected_unix_socketpairs() {
+            let bw = test_bwrap();
+            let project = Project::new();
+            project.file(
+                "socketpair.py",
+                r#"import errno
+import socket
+
+socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+try:
+    socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+except OSError as error:
+    assert error.errno == errno.EPERM
+else:
+    raise AssertionError("SOCK_DGRAM socketpair succeeded")
+"#,
+            );
+            let output = project.run("python3 socketpair.py", &bw).await.unwrap();
+            assert_eq!(output, "Exit: 0\n");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+        async fn linux_sandbox_can_spawn_a_subprocess() {
+            let bw = test_bwrap();
+            let project = Project::new();
+            project
+                .run(
+                    "python3 -c 'import subprocess; subprocess.run([\"true\"], check=True)'",
+                    &bw,
+                )
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
         async fn linux_sandbox_cancel_and_timeout_kill_setsid_descendants() {
             let bw = test_bwrap();
             let mut project = Project::new();

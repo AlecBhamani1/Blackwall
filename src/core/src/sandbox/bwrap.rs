@@ -876,9 +876,9 @@ mod tests {
         let off = sb.run(false, &connect).await;
         assert_ne!(off.code, Some(0), "connected with the network off");
 
-        // Only a stream socketpair is allowed; datagram, raw (which becomes datagram) and
-        // seqpacket pairs fail with EPERM.
-        for ty in ["SOCK_DGRAM", "SOCK_RAW", "SOCK_SEQPACKET"] {
+        // Only stream and seqpacket socketpairs are allowed; datagram and raw (which becomes
+        // datagram) pairs fail with EPERM.
+        for ty in ["SOCK_DGRAM", "SOCK_RAW"] {
             let out = sb
                 .run(
                     true,

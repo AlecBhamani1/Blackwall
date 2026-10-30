@@ -13,13 +13,14 @@
 //!   returns ENOSYS; libseccomp does the same), and any other x32 syscall (`nr & 0x4000_0000`)
 //!   kills the process, since x32 numbers mean different syscalls too;
 //! - `socket(AF_UNIX, …)` and `socket(AF_VSOCK, …)` fail with `EPERM`; other families are allowed;
-//! - `socketpair` is allowed only for `SOCK_STREAM` (with any of `SOCK_NONBLOCK`/`SOCK_CLOEXEC`);
-//!   every other type fails with `EPERM`. A `SOCK_DGRAM` pair can `sendto()` any datagram socket
-//!   it can name, `SOCK_RAW` is turned into `SOCK_DGRAM` by the kernel, and `SOCK_SEQPACKET` is
-//!   refused too because nothing needs it. A stream pair is already connected and can't connect
-//!   anywhere else. One of its ends can still `bind()` an abstract name in the host network
-//!   namespace under `--share-net`, but a connected socket can't `listen()`, so no host process
-//!   can connect through it;
+//! - `socketpair` is allowed only for `SOCK_STREAM` and `SOCK_SEQPACKET` (with any of
+//!   `SOCK_NONBLOCK`/`SOCK_CLOEXEC`); every other type fails with `EPERM`. A `SOCK_DGRAM` pair can
+//!   `sendto()` any datagram socket it can name, and `SOCK_RAW` is turned into `SOCK_DGRAM` by the
+//!   kernel. Stream and seqpacket pairs are already connected. For a connected Unix seqpacket
+//!   socket Linux ignores a destination supplied to `sendmsg()` (`unix_seqpacket_sendmsg` clears
+//!   `msg_namelen`), and a connected socket can't `listen()`, so it can't reach any other socket.
+//!   One end can still `bind()` an abstract name in the host network namespace under `--share-net`,
+//!   but no host process can connect through it;
 //! - `io_uring_setup`, `io_uring_enter` and `io_uring_register` fail with `ENOSYS`, which programs
 //!   treat as "no io_uring here" and fall back;
 //! - everything else is allowed.
@@ -85,8 +86,9 @@ pub(crate) fn program() -> Option<Vec<sock_filter>> {
 /// 13  jeq AF_VSOCK           ; EPERM else ALLOW
 /// 14  PAIR: ld args[1] (low 32 bits)
 /// 15  and SOCK_TYPE_MASK (0xf)
-/// 16  jeq SOCK_STREAM        ; ALLOW else EPERM
-/// 17  ret ERRNO(EPERM) / 18 ret ERRNO(ENOSYS) / 19 ret KILL_PROCESS / 20 ret ALLOW
+/// 16  jeq SOCK_STREAM        ; ALLOW else continue
+/// 17  jeq SOCK_SEQPACKET     ; ALLOW else EPERM
+/// 18  ret ERRNO(EPERM) / 19 ret ERRNO(ENOSYS) / 20 ret KILL_PROCESS / 21 ret ALLOW
 /// ```
 fn build(native: u32, x86_64: bool) -> Vec<sock_filter> {
     let uring = [
@@ -96,7 +98,7 @@ fn build(native: u32, x86_64: bool) -> Vec<sock_filter> {
     ];
     let socket = 3 + 2 * usize::from(x86_64) + 2 + uring.len() + 1;
     let pair = socket + 3;
-    let eperm = pair + 3;
+    let eperm = pair + 4;
     let (enosys, kill, allow) = (eperm + 1, eperm + 2, eperm + 3);
     let jeq = |k: u32, jt: usize, jf: usize, at: usize| jump(libc::BPF_JEQ, k, jt, jf, at);
 
@@ -127,7 +129,8 @@ fn build(native: u32, x86_64: bool) -> Vec<sock_filter> {
         0,
         0,
     ));
-    p.push(jeq(libc::SOCK_STREAM as u32, allow, eperm, p.len()));
+    p.push(jeq(libc::SOCK_STREAM as u32, allow, p.len() + 1, p.len()));
+    p.push(jeq(libc::SOCK_SEQPACKET as u32, allow, eperm, p.len()));
     debug_assert_eq!(p.len(), eperm);
     p.push(ret(errno(libc::EPERM)));
     p.push(ret(errno(libc::ENOSYS)));
@@ -309,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn socketpair_allows_only_stream_and_socket_refuses_vsock() {
+    fn socketpair_allows_stream_and_seqpacket_and_socket_refuses_vsock() {
         for (arch, p) in [
             (NATIVE, program().unwrap()),
             (AUDIT_ARCH_X86_64, build(AUDIT_ARCH_X86_64, true)),
@@ -319,6 +322,8 @@ mod tests {
             assert_eq!(pair(libc::SOCK_STREAM), ALLOW);
             assert_eq!(pair(libc::SOCK_STREAM | libc::SOCK_CLOEXEC), ALLOW);
             assert_eq!(pair(libc::SOCK_STREAM | libc::SOCK_NONBLOCK), ALLOW);
+            assert_eq!(pair(libc::SOCK_SEQPACKET), ALLOW);
+            assert_eq!(pair(libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC), ALLOW);
             // High bits of the int don't count, as in the kernel.
             assert_eq!(
                 eval(&p, arch, libc::SYS_socketpair, &[1, 1 << 32 | 1]),
@@ -327,7 +332,6 @@ mod tests {
             for ty in [
                 libc::SOCK_DGRAM,
                 libc::SOCK_RAW,
-                libc::SOCK_SEQPACKET,
                 libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK,
                 0,
