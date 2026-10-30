@@ -107,6 +107,26 @@ mod platform {
             Err(error) => Err(classify(error)),
         }
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+        #[test]
+        fn locked_or_dismissed_keyring_is_failed_not_unavailable() {
+            assert_eq!(
+                classify(Error::NoStorageAccess(Box::new(std::io::Error::other(
+                    "dismissed"
+                )))),
+                SecretError::Failed
+            );
+            assert_eq!(
+                classify(Error::PlatformFailure(Box::new(std::io::Error::other(
+                    "no dbus"
+                )))),
+                SecretError::Unavailable
+            );
+        }
+    }
 }
 
 #[cfg(not(all(
