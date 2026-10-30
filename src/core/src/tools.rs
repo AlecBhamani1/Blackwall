@@ -1,6 +1,7 @@
 //! Workspace-capability file tools and explicitly approved shell execution.
 use crate::{
     approvals::Approvals,
+    child_env::Scope,
     model::ToolCall,
     protocol::{AgentEvent, ApprovalKind},
 };
@@ -525,7 +526,7 @@ pub async fn execute(
             }
             run_with_timeout(
                 &workspace.path,
-                crate::sandbox::wrap(workspace, shell_command(command), &[])?,
+                crate::sandbox::wrap(workspace, shell_command(command), Scope::Shell, &[])?,
                 command_timeout,
                 output,
             )
@@ -634,7 +635,7 @@ pub(crate) async fn program_with_timeout(
         process.args(args);
         run_with_input(
             &workspace.path,
-            crate::sandbox::wrap(workspace, process, pass_through)?,
+            crate::sandbox::wrap(workspace, process, Scope::Owner, pass_through)?,
             input,
             timeout,
             output,
@@ -965,21 +966,63 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn unsandboxed_shell_does_not_inherit_unlisted_variables() {
-        use crate::child_env::{build, Scope};
+    async fn unsandboxed_shell_inherits_the_owner_environment_minus_blackwall_and_loader_variables()
+    {
+        use crate::child_env::build;
         let directory = std::env::temp_dir();
-        let source = [("HOME", "/h"), ("AWS_SECRET_ACCESS_KEY", "leak")]
-            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        let source = [
+            ("HOME", "/h"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("KUBECONFIG", "/k"),
+            ("BLACKWALL_MODEL_API_KEY", "key"),
+            ("PYTHONHOME", "/py"),
+            ("LD_PRELOAD", "/x.so"),
+            ("APPDIR", "/tmp/.mount_x"),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
         let env = build(
             source,
-            Scope::Owner,
+            Scope::Shell,
             Some(std::ffi::OsStr::new("/usr/bin:/bin")),
             &directory,
             &[],
         );
         let out = run_env_probe(&directory, &env, "env").await.unwrap();
-        assert!(!out.contains("AWS_SECRET_ACCESS_KEY"), "{out}");
-        assert!(out.contains("HOME=/h"), "{out}");
+        for kept in ["HOME=/h", "SSH_AUTH_SOCK=/s", "KUBECONFIG=/k"] {
+            assert!(out.contains(kept), "{out}");
+        }
+        for gone in [
+            "BLACKWALL_MODEL_API_KEY",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "APPDIR",
+        ] {
+            assert!(!out.contains(gone), "{out}");
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shell_tool_is_wired_to_the_shell_scope_and_programs_to_the_owner_scope() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-shell-env-{}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut workspace = Workspace::open(&directory).unwrap();
+        workspace.execution.profile = crate::sandbox::ExecutionProfile::Unsandboxed;
+        // Cargo sets this for the test process: the shell keeps it, programs do not get it.
+        let process =
+            crate::sandbox::wrap(&workspace, shell_command("env"), Scope::Shell, &[]).unwrap();
+        let out = run_with_timeout(
+            &workspace.path,
+            process,
+            Duration::from_secs(30),
+            &OutputCap::default(),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("CARGO_MANIFEST_DIR="), "{out}");
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

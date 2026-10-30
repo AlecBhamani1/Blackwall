@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 pub(crate) enum Scope {
     Sandboxed,
     Owner,
+    /// An unsandboxed shell command: the owner's whole environment, minus Blackwall's own secrets,
+    /// loader and code-injection variables and the AppImage runtime's.
+    Shell,
 }
 
 /// The variables a child starts with, plus the names (never values) that were left out.
@@ -62,6 +65,7 @@ pub(crate) const INJECTION: &[&str] = &[
     "PROMPT_COMMAND",
     "GIT_SSH_COMMAND",
     "GIT_ASKPASS",
+    "BROWSER",
 ];
 /// What Windows programs need to start at all. Owner and sandboxed children keep these on Windows.
 pub(crate) const WINDOWS_ALLOW: [&str; 24] = [
@@ -89,6 +93,17 @@ pub(crate) const WINDOWS_ALLOW: [&str; 24] = [
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
     "OS",
+];
+/// Variables the AppImage runtime sets for itself (`GIO_MODULE_DIR` and the Python, GTK and Qt ones
+/// are in [`INJECTION`]); a shell command must not inherit them.
+pub(crate) const APPIMAGE_ENV: [&str; 7] = [
+    "APPDIR",
+    "APPIMAGE",
+    "ARGV0",
+    "OWD",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
 ];
 /// Blackwall's model and relay secrets, which child programs never inherit.
 pub(crate) const SECRET_ENV: [&str; 4] = [
@@ -128,9 +143,7 @@ pub(crate) fn build(
             .find(|(k, _)| k.to_str().is_some_and(|k| same_name(k, name)))
             .map(|(_, v)| v)
     };
-    let appdir = lookup("APPDIR")
-        .map(Path::new)
-        .filter(|dir| dir.is_absolute() && dir.parent().is_some());
+    let appdir = valid_appdir(lookup("APPDIR").map(Path::new));
     let mut vars: Vec<(OsString, OsString)> = Vec::new();
     for (key, value) in &source {
         let Some(name) = key.to_str() else { continue };
@@ -138,6 +151,7 @@ pub(crate) fn build(
         let on_windows = cfg!(windows) && listed(&WINDOWS_ALLOW);
         let allowed = on_windows
             || match scope {
+                Scope::Shell => !same_name(name, "PATH") && !shell_refuses(name),
                 Scope::Sandboxed => listed(&SANDBOX_ALLOW),
                 Scope::Owner => {
                     listed(&OWNER_ALLOW)
@@ -148,7 +162,7 @@ pub(crate) fn build(
                 }
             };
         if allowed && name == "XDG_DATA_DIRS" {
-            // Passed through only for the desktop openers; the AppImage's own folders are removed.
+            // Kept for openers and shells, never with the AppImage's own folders in it.
             if let Some(dirs) = validated_data_dirs(value, appdir) {
                 vars.push((key.clone(), dirs));
             }
@@ -179,6 +193,11 @@ pub(crate) fn build(
     dropped.dedup();
     dropped.truncate(MAX_DROPPED);
     ChildEnv { vars, dropped }
+}
+
+/// `APPDIR` as the AppImage mount to strip, when it is an absolute path other than the root.
+pub(crate) fn valid_appdir(dir: Option<&Path>) -> Option<&Path> {
+    dir.filter(|dir| dir.is_absolute() && dir.parent().is_some())
 }
 
 /// [`build`] from this process's environment and the login-shell `PATH`.
@@ -229,6 +248,18 @@ fn keep_entries(list: &OsStr, appdir: Option<&Path>, project: Option<&Path>) -> 
         return None;
     }
     std::env::join_paths(kept).ok()
+}
+
+/// Whether a shell command must not inherit `name`: Blackwall's secrets, variables that load
+/// code, and the AppImage runtime's. Compared without regard to case, which only errs on the safe
+/// side.
+fn shell_refuses(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_ENV.contains(&upper.as_str())
+        || INJECTION.contains(&upper.as_str())
+        || APPIMAGE_ENV.contains(&upper.as_str())
+        || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
 }
 
 /// Checks a name the owner asked to pass through to children.
@@ -354,6 +385,7 @@ mod tests {
             "PROMPT_COMMAND",
             "GIT_SSH_COMMAND",
             "GIT_ASKPASS",
+            "BROWSER",
         ] {
             assert!(INJECTION.contains(&name), "{name}");
         }
@@ -384,6 +416,54 @@ mod tests {
         assert_eq!(get(&env, "PYTHONHOME"), None);
         assert_eq!(get(&env, "APPDIR"), None);
         assert_eq!(get(&env, "XDG_DATA_DIRS"), None);
+    }
+
+    #[test]
+    fn shell_scope_keeps_the_owner_environment_minus_secrets_loader_and_appimage_variables() {
+        let env = build(
+            vars(&[
+                ("HOME", "/h"),
+                ("SSH_AUTH_SOCK", "/s"),
+                ("KUBECONFIG", "/k"),
+                ("AWS_PROFILE", "dev"),
+                ("BLACKWALL_MODEL_API_KEY", "key"),
+                ("BLACKWALL_RELAY_TOKEN", "tok"),
+                ("PYTHONHOME", "/py"),
+                ("BROWSER", "x"),
+                ("LD_PRELOAD", "/x.so"),
+                ("DYLD_INSERT_LIBRARIES", "/x"),
+                ("APPDIR", "/tmp/.mount_x"),
+                ("APPIMAGE", "/a.AppImage"),
+                ("ARGV0", "a"),
+                ("OWD", "/o"),
+                ("GDK_PIXBUF_MODULE_FILE", "/g"),
+                ("GST_PLUGIN_SYSTEM_PATH_1_0", "/gst"),
+                ("XDG_DATA_DIRS", "/tmp/.mount_x/usr/share:/usr/share"),
+                ("PATH", "/tmp/.mount_x/usr/bin:./bin:/usr/bin"),
+            ]),
+            Scope::Shell,
+            None,
+            Path::new("/p"),
+            &[],
+        );
+        assert_eq!(
+            names(&env),
+            [
+                "AWS_PROFILE",
+                "HOME",
+                "KUBECONFIG",
+                "PATH",
+                "SSH_AUTH_SOCK",
+                "XDG_DATA_DIRS"
+            ]
+        );
+        assert_eq!(get(&env, "PATH"), Some("/usr/bin"));
+        assert_eq!(get(&env, "XDG_DATA_DIRS"), Some("/usr/share"));
+        assert!(env.dropped().contains(&"APPDIR".to_owned()));
+        assert!(env
+            .dropped()
+            .contains(&"BLACKWALL_MODEL_API_KEY".to_owned()));
+        assert!(!env.dropped().contains(&"SSH_AUTH_SOCK".to_owned()));
     }
 
     #[cfg(target_os = "linux")]

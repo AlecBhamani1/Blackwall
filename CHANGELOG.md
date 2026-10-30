@@ -169,21 +169,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Start child programs from an allow-listed environment instead of Blackwall's own, which changes
+- Start child programs from a cleaned environment instead of Blackwall's own, which changes
   what they see. This covers shell commands, command tools, MCP servers, the git and browser-opener
   helpers (the Linux opener also gets the desktop-session variables it needs), and listening-port
-  discovery (`lsof`, `netstat`), on every system. They keep `HOME`, `LANG`, `LC_*`, `TERM`,
-  `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ`, `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed
-  commands get less. An MCP server or unsandboxed command tool that relied on an inherited
+  discovery (`lsof`, `netstat`), on every system. MCP servers, command tools and the other helpers
+  keep `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ`,
+  `XDG_RUNTIME_DIR` and a cleaned `PATH`; sandboxed commands get less. Unsandboxed shell commands
+  keep your whole environment (`SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE` and so on) minus
+  Blackwall's own keys, loader and code-injection variables, and the AppImage runtime's. An MCP server or unsandboxed command tool that relied on an inherited
   variable (a token, a proxy setting, a custom config path) stops seeing it. To migrate, add its
   name to the new `env` list in `mcp.json` or `tools.json`, such as `"env":["GITHUB_TOKEN"]`. `env`
   is owner-only (not allowed in project servers), is refused on URL servers and HTTP tools, is
   ignored for sandboxed commands, and cannot name `PATH`, loader-injection variables or
   Blackwall's own secrets.
-  Unsandboxed shell commands lose inherited variables the same way: only the list above reaches
-  them, so `SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE`, `DISPLAY` and similar no longer arrive.
-  On Linux every shell command currently runs unsandboxed, so this applies to all of them. The
-  shell has no `env` list.
+  A bare program name in `mcp.json` or `tools.json` is now found only in that cleaned `PATH`, so a
+  project folder on your `PATH` (direnv, `node_modules/.bin`) cannot supply the program. `BROWSER`
+  is no longer passed to the browser opener and cannot be listed in `env`.
 
 - A first launch with no saved connection lists the servers found on this computer and connects
   only to the one chosen, instead of connecting to the first that answered.

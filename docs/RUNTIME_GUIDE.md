@@ -544,21 +544,25 @@ command tools; separately configured MCP servers retain their own account permis
 
 ### Child environments
 
-Every program Blackwall starts gets an allow-listed environment instead of Blackwall's own. This
+Every program Blackwall starts gets a cleaned environment instead of Blackwall's own: an allow-list,
+except for unsandboxed shell commands (below). This
 covers shell commands, command tools, MCP servers, and the git, browser-opener and listening-port
 discovery (`lsof`, `netstat`) helpers, on every system. The Linux browser opener also gets the
 desktop-session variables it needs. It keeps the AppImage's runtime variables (`PYTHONHOME`,
 `LD_LIBRARY_PATH` and similar) from breaking Python and other runtimes, and keeps your unrelated
 credentials from reaching a program that does not need them.
 
-- Programs you run for yourself (unsandboxed shell commands and command tools, MCP servers) get
+- MCP servers and command tools you run unsandboxed get
   `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TZ` and `XDG_RUNTIME_DIR`,
   plus the names you list under `env` in `mcp.json` or `tools.json`.
-- An unsandboxed shell command gets that list but no `env` names, since the shell has no `env`
-  list: `SSH_AUTH_SOCK`, `KUBECONFIG`, `AWS_PROFILE`, `DISPLAY` and similar are not inherited. On
+- An unsandboxed shell command runs with your environment (`SSH_AUTH_SOCK`, `KUBECONFIG`,
+  `AWS_PROFILE`, `DISPLAY` and so on), minus Blackwall's own keys, loader and code-injection
+  variables, and the AppImage runtime's (`APPDIR`, `APPIMAGE`, `ARGV0`, `OWD` and similar). On
   Linux every shell command currently runs unsandboxed, so this applies to all of them.
 - A sandboxed shell command or command tool gets only `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`
   and `PATH`, and ignores `env`.
+- A bare program name in `mcp.json` or `tools.json` is looked up only in that cleaned `PATH`, and
+  never in a directory that resolves into the project. An absolute path is used as written.
 - `PATH` is your login shell's, with relative and empty entries, the project folder and the
   AppImage's own folders removed. On Windows, the variables programs need to start are kept too.
 - Blackwall's model key, relay token and signing keys are never passed, even if listed in `env`.
