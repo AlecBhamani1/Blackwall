@@ -132,16 +132,21 @@
   $: workspaceWrite = sandbox?.workspaceWrite ?? true;
   const SANDBOX_RECHECK_MS = 30_000;
   let sandboxRecheck: ReturnType<typeof setTimeout> | undefined;
+  let sandboxRequest = 0;
   /** Ask again; when the sandbox is unavailable (bubblewrap may have failed only for a moment,
-   * or been installed since), ask once more about 30 seconds later. */
+   * or been installed since), ask once more about 30 seconds later. Only the latest answer counts. */
   async function checkSandbox(recheck = false) {
     if (!isDesktop()) return;
+    const request = ++sandboxRequest;
     const status = await sandboxClient.status();
+    if (request !== sandboxRequest) return;
     sandbox = status;
     clearTimeout(sandboxRecheck);
     sandboxRecheck = undefined;
     if (!recheck && status && !status.available) {
-      sandboxRecheck = setTimeout(() => void checkSandbox(true), SANDBOX_RECHECK_MS);
+      sandboxRecheck = setTimeout(() => {
+        if ($agentMode) void checkSandbox(true);
+      }, SANDBOX_RECHECK_MS);
     }
   }
   $: if ($agentMode) void checkSandbox();
@@ -325,6 +330,12 @@
             onclick={() => void setupClient.openLink('sandbox-docs').catch(() => {})}
             >Learn more</button
           >
+        </p>
+      {/if}
+      {#if !setupOpen && isDesktop() && $agentMode && $commandNetwork && $executionProfile !== 'unsandboxed'}
+        <p class="sandbox-note" role="note">
+          With command network on, sandboxed commands share this computer's network, so they can
+          reach services on this computer (localhost) and your local network.
         </p>
       {/if}
       {#if $agentMode && $executionProfile === 'unsandboxed'}

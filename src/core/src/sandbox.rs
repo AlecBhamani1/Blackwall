@@ -33,40 +33,14 @@ pub struct SandboxStatus {
     pub workspace_write: bool,
 }
 
-/// Whether the owner's sandboxed profiles can run on this machine. On Linux this looks for a
-/// working bubblewrap the first time, so it can block for a few seconds: call it off the async
-/// workers (`spawn_blocking`).
-pub fn sandbox_status(data_directory: &Path) -> SandboxStatus {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = data_directory;
-        let available = Path::new(SANDBOX_EXEC).is_file();
-        SandboxStatus {
-            available,
-            note: (!available).then_some(MACOS_UNAVAILABLE),
-            workspace_write: available,
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux_status(linux::availability(data_directory))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = data_directory;
-        SandboxStatus {
-            available: false,
-            note: Some(UNSUPPORTED),
-            workspace_write: false,
-        }
-    }
-}
-/// [`sandbox_status`] where the owner's choice of profile depends on it: Linux only, since there
-/// whether bubblewrap works varies by computer. Elsewhere it is `None` and nothing is gated.
+/// Whether the owner's sandboxed profiles can run on this machine, where the owner's choice of
+/// profile depends on it: Linux only, since there whether bubblewrap works varies by computer.
+/// Elsewhere it is `None` and nothing is gated. On Linux the first call looks for a working
+/// bubblewrap, so it can block for a few seconds: call it off the async workers (`spawn_blocking`).
 pub fn selector_status(data_directory: &Path) -> Option<SandboxStatus> {
     #[cfg(target_os = "linux")]
     {
-        Some(sandbox_status(data_directory))
+        Some(linux_status(linux::availability(data_directory)))
     }
     #[cfg(not(target_os = "linux"))]
     {
