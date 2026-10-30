@@ -659,6 +659,9 @@ pub(crate) fn fill_mode_workspace(
 /// A session read from its rows, with the counters it stored and the ones its rows add up to.
 struct Loaded {
     chat: StoredChat,
+    /// The `contextState` exactly as `build_view` made it, when the context is `Valid`. This is
+    /// what the session JSON carries, so a `serverUsage` that was absent stays absent.
+    context_json: Option<Value>,
     stored: Counters,
     counted: Counters,
     /// Whether the stored counters could be read at all (negative ones cannot).
@@ -806,11 +809,15 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
         }
         Err(error) => return Err(view_error(id, &error)),
     };
+    let mut context_json = None;
     let context = match (invalid, view.context) {
         (Some(reason), _) => StoredContext::Invalid { reason },
         (None, None) => StoredContext::None,
-        (None, Some(value)) => match serde_json::from_value::<ContextState>(value) {
-            Ok(state) if state.validate().is_ok() => StoredContext::Valid(state),
+        (None, Some(value)) => match serde_json::from_value::<ContextState>(value.clone()) {
+            Ok(state) if state.validate().is_ok() => {
+                context_json = Some(value);
+                StoredContext::Valid(state)
+            }
             _ => StoredContext::Invalid {
                 reason: CONTEXT_BAD,
             },
@@ -843,6 +850,7 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
             context,
             open_run: view.open_run.is_some(),
         },
+        context_json,
         stored,
         counted,
         stored_ok,
@@ -850,8 +858,10 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
 }
 
 /// Today's session JSON for a chat: the typed columns, each `metadata` key at the top level, the
-/// messages, and a `contextState` only when the stored context is valid.
-fn chat_json(chat: &StoredChat) -> Result<Value, StorageError> {
+/// messages, and a `contextState` only when the stored context is valid. That value is
+/// `build_view`'s own, not a re-serialized `ContextState`.
+fn chat_json(loaded: &Loaded) -> Value {
+    let chat = &loaded.chat;
     let mut json = Map::new();
     for (key, value) in &chat.metadata {
         // A literal `contextState:null` is the only form of it metadata may carry.
@@ -868,17 +878,17 @@ fn chat_json(chat: &StoredChat) -> Result<Value, StorageError> {
         }
     }
     json.insert("messages".into(), Value::Array(chat.messages.clone()));
-    if let StoredContext::Valid(state) = &chat.context {
-        json.insert("contextState".into(), serde_json::to_value(state)?);
+    if let Some(context) = &loaded.context_json {
+        json.insert("contextState".into(), context.clone());
     }
-    Ok(Value::Object(json))
+    Value::Object(json)
 }
 
 /// The session JSON on any connection, inside the caller's transaction or out of one. It does not
 /// repair counters, since the upgrade reads a chat it has just written. `NotFound` when absent.
 pub(crate) fn load_json_v6_from(conn: &Connection, id: &str) -> Result<Value, StorageError> {
     let loaded = read_chat(conn, id)?.ok_or(StorageError::NotFound)?;
-    chat_json(&loaded.chat)
+    Ok(chat_json(&loaded))
 }
 
 impl LocalStore {
@@ -968,6 +978,10 @@ impl LocalStore {
     /// Rebuilds a chat from its log. A counter that disagrees with the rows is rewritten from them.
     /// A load never changes the log or the model context.
     pub fn load_chat(&self, id: &str) -> Result<Option<StoredChat>, StorageError> {
+        Ok(self.load_checked(id)?.map(|loaded| loaded.chat))
+    }
+
+    fn load_checked(&self, id: &str) -> Result<Option<Loaded>, StorageError> {
         validate_id(id)?;
         let read = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let loaded = read_chat(&read, id)?;
@@ -988,7 +1002,7 @@ impl LocalStore {
                 Err(error) => return Err(error),
             }
         }
-        Ok(Some(loaded.chat))
+        Ok(Some(loaded))
     }
 
     /// The session list as today's JSON, from typed columns only; no `chat_events` row is read.
@@ -1018,7 +1032,7 @@ impl LocalStore {
 
     /// Today's session JSON, or `None`. It repairs counters as [`Self::load_chat`] does.
     pub(crate) fn load_json_v6(&self, id: &str) -> Result<Option<Value>, StorageError> {
-        self.load_chat(id)?.map(|chat| chat_json(&chat)).transpose()
+        Ok(self.load_checked(id)?.map(|loaded| chat_json(&loaded)))
     }
 
     /// Deletes a chat and everything keyed to it. Deleted search terms stay in the index's
@@ -1968,7 +1982,12 @@ mod tests {
         assert_eq!(chat.context, StoredContext::Valid(state.clone()));
         assert!(!chat.open_run);
         let json = db.load_json_v6("s").unwrap().unwrap();
-        assert_eq!(json["contextState"], serde_json::to_value(&state).unwrap());
+        assert_eq!(
+            json["contextState"],
+            json!({"transcript": [user], "checkpoints": [], "coveredMessages": 1,
+                   "sourceHash": good.source_hash}),
+            "no serverUsage key when none is stored"
+        );
         // Each way a context can be wrong loads as Invalid, with the messages intact.
         let events = rows(&db, "s");
         let counted = counters(&db, "s");
@@ -2021,9 +2040,14 @@ mod tests {
         let json = db.load_json_v6("s").unwrap().unwrap();
         assert_eq!(json["contextState"], Value::Null);
         assert_eq!(json["pinned"], 1);
-        set(good);
+        set(good.clone());
         let json = db.load_json_v6("s").unwrap().unwrap();
-        assert_eq!(json["contextState"], serde_json::to_value(&state).unwrap());
+        assert_eq!(
+            json["contextState"],
+            json!({"transcript": [user], "checkpoints": [], "coveredMessages": 1,
+                   "sourceHash": good.source_hash}),
+            "no serverUsage key when none is stored"
+        );
     }
 
     #[test]
@@ -2065,6 +2089,62 @@ mod tests {
         make(&db, "bare");
         let bare = db.load_json_v6("bare").unwrap().unwrap();
         assert!(bare.get("mode").is_none() && bare.get("workspace").is_none());
+    }
+
+    #[test]
+    fn context_state_json_is_the_raw_view_value() {
+        // A1's `compacted` fixture has three checkpoints and a server usage. Store its context
+        // as the upgrade would, then read the session JSON back: the contextState must be
+        // identical, `serverUsage` included.
+        let source = crate::storage::fixtures::v5_sessions()
+            .into_iter()
+            .find(|s| s["id"] == "compacted")
+            .unwrap();
+        let context = source["contextState"].clone();
+        assert!(context["serverUsage"].is_object());
+        let db = v6_in_memory();
+        make(&db, "s");
+        let row = ContextRow {
+            model_from: 0,
+            model_len: context["transcript"].as_array().unwrap().len() as u64,
+            covered_messages: context["coveredMessages"].as_u64().unwrap(),
+            source_hash: context["sourceHash"].as_str().unwrap().to_owned(),
+            server_usage: Some(context["serverUsage"].to_string()),
+        };
+        write(&db, "s", |tx, c| {
+            for entry in context["transcript"].as_array().unwrap() {
+                append_model(tx, "s", c, entry)?;
+            }
+            write_context(
+                tx,
+                "s",
+                c,
+                &row,
+                context["checkpoints"].as_array().unwrap(),
+                false,
+            )
+        })
+        .unwrap();
+        let chat = db.load_chat("s").unwrap().unwrap();
+        assert!(
+            matches!(chat.context, StoredContext::Valid(_)),
+            "{:?}",
+            chat.context
+        );
+        let json = db.load_json_v6("s").unwrap().unwrap();
+        assert_eq!(json["contextState"], context);
+        // The same context with NULL server_usage has no serverUsage key at all.
+        db.connection()
+            .execute("UPDATE chat_context SET server_usage=NULL", [])
+            .unwrap();
+        let json = db.load_json_v6("s").unwrap().unwrap();
+        let mut without = context.clone();
+        without.as_object_mut().unwrap().remove("serverUsage");
+        assert_eq!(json["contextState"], without);
+        assert!(!json["contextState"]
+            .as_object()
+            .unwrap()
+            .contains_key("serverUsage"));
     }
 
     #[test]
