@@ -1287,6 +1287,8 @@ mod tests {
         assert!(loaded.is_empty());
         assert!(warnings[0].contains("Too large: 41 KiB (limit 32 KiB)"));
         store.remove("large-skill").unwrap();
+        // Close the store first; Windows cannot delete a folder with an open file in it.
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
