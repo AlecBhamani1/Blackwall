@@ -113,7 +113,11 @@ impl From<WalkError> for ToolError {
                 subtree.display()
             ),
             WalkError::RootTooLarge => "This project folder itself has too many files to sandbox safely. The command was not run.".to_string(),
-            WalkError::Unreadable { .. } => "A folder in this project could not be read, so Blackwall could not check it before sandboxing. The command was not run.".to_string(),
+            WalkError::Unreadable { path } if path.as_os_str().is_empty() => "Blackwall couldn't read this project folder, so it can't check it before sandboxing. The command was not run.".to_string(),
+            WalkError::Unreadable { path } => format!(
+                "Blackwall couldn't read {} in this project, so it can't check it before sandboxing. Fix its permissions or move it out of the project. The command was not run.",
+                path.display()
+            ),
         })
     }
 }
@@ -145,8 +149,13 @@ pub(crate) fn walk(root: &Path, limit: usize) -> Result<Walk, WalkError> {
                 let top = relative
                     .components()
                     .next()
-                    .map_or_else(|| name.clone(), |first| first.as_os_str().to_os_string());
-                *per_top.entry(top).or_insert(0) += 1;
+                    .map_or(name.as_os_str(), |first| first.as_os_str());
+                match per_top.get_mut(top) {
+                    Some(seen) => *seen += 1,
+                    None => {
+                        per_top.insert(top.to_os_string(), 1);
+                    }
+                }
                 if at_root && count > limit {
                     return Err(WalkError::RootTooLarge);
                 }
@@ -391,19 +400,23 @@ mod tests {
 
     #[test]
     fn walk_limit_names_the_largest_top_level_entry_not_the_one_that_tips_it() {
-        // Whichever order the directories are read in, the big one is named.
-        for small in ["a_small", "z_small"] {
+        // `big` fits under the limit by itself (13 entries of 20), but the total does not (25), so
+        // whichever entry tips the limit, only counting per top-level entry names `big`. The
+        // order the directories are read in is up to the filesystem, so try several names.
+        for big in ["a_big", "m_big", "z_big"] {
             let root = Root::new();
-            for n in 0..30 {
-                root.file(&format!("m_big/f{n}"));
+            for n in 0..12 {
+                root.file(&format!("{big}/f{n}"));
             }
-            for n in 0..2 {
-                root.file(&format!("{small}/f{n}"));
+            for small in ["b", "d", "n", "y"] {
+                for n in 0..2 {
+                    root.file(&format!("{small}/f{n}"));
+                }
             }
             assert_eq!(
                 walk(&root.0, 20).err(),
                 Some(WalkError::TooLarge {
-                    subtree: "m_big".into()
+                    subtree: big.into()
                 })
             );
         }
@@ -428,6 +441,26 @@ mod tests {
         assert_eq!(
             named,
             "This project is too large to sandbox safely: big has too many files. The command was not run."
+        );
+    }
+
+    #[test]
+    fn unreadable_messages_name_the_folder() {
+        let with_path = ToolError::from(WalkError::Unreadable {
+            path: "a/locked".into(),
+        })
+        .to_string();
+        assert_eq!(
+            with_path,
+            "Blackwall couldn't read a/locked in this project, so it can't check it before sandboxing. Fix its permissions or move it out of the project. The command was not run."
+        );
+        let root = ToolError::from(WalkError::Unreadable {
+            path: PathBuf::new(),
+        })
+        .to_string();
+        assert_eq!(
+            root,
+            "Blackwall couldn't read this project folder, so it can't check it before sandboxing. The command was not run."
         );
     }
 
