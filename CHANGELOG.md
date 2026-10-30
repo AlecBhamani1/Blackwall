@@ -234,6 +234,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that look like the prompt's `BEGIN GUIDANCE`, `END GUIDANCE`, `Source:` or `Scope:` markers are
   prefixed with `> `.
 
+- **Breaking:** command tools in `tools.json` now run outside the sandbox by default, with a new
+  owner-only setting **Command tools** (Memory → Advanced · Subagents, or
+  `bw config set command-tools-isolation outside|sandboxed`; a project file cannot set it).
+  - Owner allow rules for command tools no longer skip the prompt. An outside tool always asks,
+    "allow identical action this run" is not offered, and a deny rule still denies. The prompt says
+    it runs outside the sandbox and shows the resolved program, and the audit log records it as
+    `program`. Choose `sandboxed` to keep the old behavior, where allow rules and remembered
+    approvals still apply.
+  - Command tools run outside the sandbox by default on every system, including Windows, in the
+    project folder with your allow-listed environment plus the tool's `env` names, whatever the
+    Commands profile is. Shell commands still follow the profile. A sandboxed tool that fails
+    like a sandbox denial now adds a hint about the setting.
+  - `bw run --json` cannot run an outside command tool, even with an allow rule, because the
+    headless run denies every prompt. Use `sandboxed`, or run it without `--json`.
+
 ### Security
 
 - `bw run --json` now counts actions an owner or project deny rule blocks, and calls to tools the
