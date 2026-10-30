@@ -118,7 +118,7 @@ mod tests {
     use crate::protocol::{
         MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
     };
-    use crate::storage::configure;
+    use crate::storage::{configure, FOREIGN_KEYS_OFF};
     use crate::storage::{
         MAX_CHECKPOINTS, MAX_CHECKPOINT_BYTES, MAX_EVENT_BYTES, MAX_METADATA_BYTES,
         MAX_MODEL_ENTRIES, MAX_SESSION_BYTES, MAX_UI_MESSAGES,
@@ -305,8 +305,16 @@ mod tests {
             .unwrap();
         assert_eq!(on, 1);
         let inside = Connection::open_in_memory().unwrap();
-        inside.execute_batch("BEGIN;").unwrap();
-        assert!(configure(&inside, Duration::from_millis(1)).is_err());
+        // The bundled build defaults foreign_keys to ON, so turn it off first; inside the
+        // transaction `configure`'s `foreign_keys=ON` is then a silent no-op and only the readback sees it.
+        inside
+            .execute_batch("PRAGMA foreign_keys=OFF; BEGIN;")
+            .unwrap();
+        // The readback must be what refuses it, not a later pragma that errors inside a transaction.
+        assert!(matches!(
+            configure(&inside, Duration::from_millis(1)),
+            Err(StorageError::Invalid(FOREIGN_KEYS_OFF))
+        ));
     }
 
     #[test]

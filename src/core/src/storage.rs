@@ -474,19 +474,20 @@ fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), Storag
     Ok((id, title, updated as i64, body))
 }
 
+/// What `configure` reports when `foreign_keys` would not turn on.
+pub(crate) const FOREIGN_KEYS_OFF: &str = "Blackwall could not turn on its database safety checks. Your existing data has been left in place.";
+
 /// Every connection starts here: foreign keys, secure delete and full syncs, with `busy` as its
-/// lock wait. `foreign_keys` is a no-op inside a transaction, so it is read back and must be on.
+/// lock wait. `foreign_keys` is a silent no-op inside a transaction, so it is set and read back
+/// first, before `synchronous` (which errors inside one) can mask the failure.
 pub(crate) fn configure(connection: &Connection, busy: Duration) -> Result<(), StorageError> {
     connection.busy_timeout(busy)?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
-    )?;
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
     let on: i64 = connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if on != 1 {
-        return Err(StorageError::Invalid(
-            "Blackwall could not turn on its database safety checks. Your existing data has been left in place.",
-        ));
+        return Err(StorageError::Invalid(FOREIGN_KEYS_OFF));
     }
+    connection.execute_batch("PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;")?;
     Ok(())
 }
 
