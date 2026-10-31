@@ -207,6 +207,7 @@ pub(crate) mod tests {
         drop(store);
         let again = LocalStore::open_at(&directory, V6).unwrap();
         assert_eq!(again.list_chats().unwrap().len(), chats.len());
+        drop(again); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -271,6 +272,7 @@ pub(crate) mod tests {
             let id = chat["id"].as_str().unwrap();
             assert_eq!(store.load_session(id).unwrap().as_ref(), Some(chat));
         }
+        drop(store); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -289,6 +291,7 @@ pub(crate) mod tests {
         store.delete_chat(chats[0]["id"].as_str().unwrap()).unwrap();
         store.migrate_sessions(&chats[..3]).unwrap();
         assert_eq!(store.list_chats().unwrap().len(), 2, "runs once");
+        drop(store); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -299,6 +302,7 @@ pub(crate) mod tests {
         assert_eq!(version(&directory.join(DATABASE_FILE)), V6);
         assert!(!directory.join(BACKUPS_DIR).exists());
         assert!(store.list_chats().unwrap().is_empty());
+        drop(store); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -369,6 +373,7 @@ pub(crate) mod tests {
         let median = times[times.len() / 2];
         eprintln!("load of a 300-message chat: {median:?}");
         assert!(median <= Duration::from_millis(50), "{median:?}");
+        drop(store); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
     }
 }
