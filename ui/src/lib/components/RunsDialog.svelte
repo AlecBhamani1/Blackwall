@@ -249,6 +249,7 @@
     backdrop-filter: blur(3px);
   }
   dialog.embedded {
+    position: static;
     display: block;
     width: 100%;
     max-height: none;

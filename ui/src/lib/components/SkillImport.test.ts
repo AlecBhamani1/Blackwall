@@ -111,6 +111,18 @@ describe('skill import', () => {
     expect(save).toHaveBeenCalledExactlyOnceWith(found()[2].source, false, true);
   });
 
+  it('keeps Cancel available when no skills are selected', async () => {
+    const user = userEvent.setup();
+    const cancel = vi.fn();
+    render(SkillImport, { props: { onDone: vi.fn(), onCancel: cancel } });
+    await user.click(await screen.findByLabelText('Import pdf'));
+    expect(screen.getByRole('button', { name: 'Import 0 skills' })).toBeDisabled();
+    const button = screen.getByRole('button', { name: 'Cancel' });
+    expect(button).toBeEnabled();
+    await user.click(button);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it('blocks a flagged skill and replaces a saved one only when asked', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'importSkill').mockResolvedValue(skill('release'));

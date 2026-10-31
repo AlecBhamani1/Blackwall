@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { flushSync, onDestroy, onMount } from 'svelte';
   import {
     persistence,
     instructionFileValid,
@@ -13,6 +13,7 @@
   } from '../persistence';
   import { createId } from '../id';
   import Icon from './Icon.svelte';
+  import SettingsFooter from './SettingsFooter.svelte';
   import { platform } from '../platform';
   export let contextPreferences: Preferences = {};
   export let onPreferences: (preferences: {
@@ -38,6 +39,8 @@
   let query = '';
   let error = '';
   let busy = false;
+  let feedback = '';
+  let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let enabled = false;
   let contextWindow = 32000;
   let outputTokens = 4096;
@@ -50,6 +53,52 @@
   let subagentRunsOn: 'local' | 'tool' = 'local';
   let subagentTool = '';
   let commandToolsIsolation: CommandToolsIsolation = 'outside';
+  let savedLimits = '';
+  let savedSubagents = '';
+  let savedInstructions = '';
+  $: limitsState = JSON.stringify({
+    contextWindow: Number(contextWindow),
+    outputTokens: Number(outputTokens),
+    autoCompact,
+    maxIterations: Number(maxIterations),
+    commandTimeoutSeconds: Number(commandTimeoutSeconds),
+    maxOutputBytes: Number(maxOutputBytes),
+  });
+  $: limitsValid =
+    contextWindow >= 2048 &&
+    contextWindow <= 1000000 &&
+    outputTokens >= 1 &&
+    outputTokens <= 32768 &&
+    Number(outputTokens) + Math.floor(contextWindow / 20) < contextWindow &&
+    Number.isInteger(Number(maxIterations)) &&
+    maxIterations >= 1 &&
+    maxIterations <= 100 &&
+    Number.isInteger(Number(commandTimeoutSeconds)) &&
+    commandTimeoutSeconds >= 10 &&
+    commandTimeoutSeconds <= 3600 &&
+    Number.isInteger(Number(maxOutputBytes)) &&
+    maxOutputBytes >= 4096 &&
+    maxOutputBytes <= 1048576;
+  $: subagentsState = JSON.stringify({
+    subagentMaxSteps: Number(subagentMaxSteps),
+    subagentTools,
+    subagentRunsOn,
+    subagentTool,
+    commandToolsIsolation,
+  });
+  $: instructionsState = JSON.stringify({
+    instructionMaxFileKib: Number(instructionMaxFileKib),
+    instructionMaxTotalKib: Number(instructionMaxTotalKib),
+    instructionFiles,
+    maxSkillSizeMode,
+    maxSkillSizeKib: Number(maxSkillSizeKib),
+  });
+  function showSaved() {
+    feedback = 'Saved ✓';
+    clearTimeout(feedbackTimer);
+    feedbackTimer = setTimeout(() => (feedback = ''), 3000);
+  }
+  onDestroy(() => clearTimeout(feedbackTimer));
   const toolLabels: Record<SubagentTool, string> = {
     read_file: 'Read files',
     list_files: 'List folders',
@@ -80,6 +129,8 @@
         subagentRunsOn: subagentRunsOn === 'local' ? 'local' : { tool: subagentTool },
         commandToolsIsolation,
       });
+      savedSubagents = subagentsState;
+      showSaved();
     } catch (cause) {
       error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
     } finally {
@@ -119,6 +170,8 @@
         instructionExtraFiles: instructionFileList,
         maxSkillSizeKib: maxSkillSizeMode === 'auto' ? null : Number(maxSkillSizeKib),
       });
+      savedInstructions = instructionsState;
+      showSaved();
     } catch (cause) {
       error = typeof cause === 'string' ? cause : 'These settings could not be saved. Try again.';
     } finally {
@@ -144,8 +197,8 @@
       error = 'Your memories could not be loaded. Existing data has been left in place.';
     }
   }
-  async function save(event: SubmitEvent) {
-    event.preventDefault();
+  async function save(event?: SubmitEvent) {
+    event?.preventDefault();
     busy = true;
     error = '';
     try {
@@ -237,11 +290,37 @@
         commandTimeoutSeconds: Number(commandTimeoutSeconds),
         maxOutputBytes: Number(maxOutputBytes),
       });
+      savedLimits = limitsState;
+      showSaved();
     } catch {
       error = 'These settings could not be saved. Try again.';
     } finally {
       busy = false;
     }
+  }
+  async function saveMemoryEnabled() {
+    busy = true;
+    error = '';
+    try {
+      if (desktop) await persistence.savePreferences({ memoryEnabled: enabled });
+      showSaved();
+    } catch {
+      error = 'This setting could not be saved. Try again.';
+    } finally {
+      busy = false;
+    }
+  }
+  function restoreLimits() {
+    const saved = JSON.parse(savedLimits);
+    ({ contextWindow, outputTokens, autoCompact, maxIterations, commandTimeoutSeconds, maxOutputBytes } = saved);
+  }
+  function restoreSubagents() {
+    const saved = JSON.parse(savedSubagents);
+    ({ subagentMaxSteps, subagentTools, subagentRunsOn, subagentTool, commandToolsIsolation } = saved);
+  }
+  function restoreInstructions() {
+    const saved = JSON.parse(savedInstructions);
+    ({ instructionMaxFileKib, instructionMaxTotalKib, instructionFiles, maxSkillSizeMode, maxSkillSizeKib } = saved);
   }
   onMount(() => {
     if (embedded) dialog.setAttribute('open', '');
@@ -280,6 +359,9 @@
         maxSkillSizeKib = savedPreferences.maxSkillSizeKib ?? 32;
         instructionFiles = (savedPreferences.instructionExtraFiles ?? []).join('\n');
         await refresh();
+        savedLimits = limitsState;
+        savedSubagents = subagentsState;
+        savedInstructions = instructionsState;
         loaded = true;
       } catch {
         error = 'Your memory settings could not be opened.';
@@ -324,7 +406,7 @@
           type="checkbox"
           bind:checked={enabled}
           disabled={busy || !loaded}
-          onchange={saveSettings}
+          onchange={saveMemoryEnabled}
         />
       </div>
       {#if proposals.length}
@@ -386,20 +468,20 @@
           placeholder="For example: I prefer concise answers with practical examples."
           rows="3"
           disabled={busy || !loaded}></textarea>
-        <div class="editor-actions">
-            <span>Saved on this {platform.device}. Editable at any time.</span
-            >{#if editingId}<button
-              type="button"
-              class="secondary"
-              onclick={() => {
-                editingId = '';
-                editingEntry = undefined;
-                content = '';
-              }}>Cancel</button
-            >{/if}<button class="primary" disabled={busy || !loaded || !content.trim()}
-            >{busy ? 'Saving…' : editingId ? 'Save changes' : 'Save memory'}</button
-          >
-        </div>
+        <p class="hint">Saved on this {platform.device}. Editable at any time.</p>
+        <SettingsFooter
+          dirty={Boolean(content.trim())}
+          {busy}
+          saveLabel={editingId ? 'Save changes' : 'Save memory'}
+          feedback=""
+          error={content.trim() ? error : ''}
+          onSave={() => save()}
+          onCancel={() => {
+            editingId = '';
+            editingEntry = undefined;
+            content = '';
+          }}
+        />
       </form>
       <label for="memory-search" class="sr-only">Search memories</label><input
         id="memory-search"
@@ -517,26 +599,16 @@
       <p class="hint">
         Longer command output keeps its first 40% and last 60%. File reads stay limited to 64 KiB.
       </p>
-      <button
-        class="secondary"
-        disabled={busy ||
-          !loaded ||
-          contextWindow < 2048 ||
-          contextWindow > 1000000 ||
-          outputTokens < 1 ||
-          outputTokens > 32768 ||
-          Number(outputTokens) + Math.floor(contextWindow / 20) >= contextWindow ||
-          !Number.isInteger(Number(maxIterations)) ||
-          maxIterations < 1 ||
-          maxIterations > 100 ||
-          !Number.isInteger(Number(commandTimeoutSeconds)) ||
-          commandTimeoutSeconds < 10 ||
-          commandTimeoutSeconds > 3600 ||
-          !Number.isInteger(Number(maxOutputBytes)) ||
-          maxOutputBytes < 4096 ||
-          maxOutputBytes > 1048576}
-        onclick={saveSettings}>Save context limit</button
-      >
+      <SettingsFooter
+        dirty={loaded && limitsState !== savedLimits}
+        canSave={limitsValid}
+        {busy}
+        saveLabel="Save context limit"
+        {feedback}
+        {error}
+        onSave={saveSettings}
+        onCancel={restoreLimits}
+      />
       </details>{/if}
     {#if desktop && section === 'subagents'}
       <details open>
@@ -557,7 +629,7 @@
             below</label
           >
           <label
-            ><input type="radio" bind:group={subagentRunsOn} value="tool" /> A command tool</label
+            ><input type="radio" checked={subagentRunsOn === 'tool'} value="tool" onclick={() => flushSync(() => (subagentRunsOn = 'tool'))} /> A command tool</label
           >
         </fieldset>
         {#if subagentRunsOn === 'local'}
@@ -583,7 +655,8 @@
             autocomplete="off"
             disabled={busy || !loaded}
           />
-          <p class="off-device" role="note">
+          <p class="notice warning" role="note">
+            <span aria-hidden="true">⚠</span>
             Sends data off this device. The subagent's whole prompt goes to this tool as JSON on
             standard input, and you are asked every time. The tool needs "stdin": "json" and a
             "prompt" parameter in tools.json.
@@ -604,11 +677,16 @@
           <p class="hint">Command tools run with your account permissions and always ask first.</p>
         {/if}
         <p class="hint">Projects can lower these limits but never choose where subagents run.</p>
-        <button
-          class="secondary"
-          disabled={busy || !loaded || !subagentsValid}
-          onclick={saveSubagents}>Save subagent settings</button
-        >
+        <SettingsFooter
+          dirty={loaded && subagentsState !== savedSubagents}
+          canSave={subagentsValid}
+          {busy}
+          saveLabel="Save subagent settings"
+          {feedback}
+          {error}
+          onSave={saveSubagents}
+          onCancel={restoreSubagents}
+        />
       </details>
     {/if}
     {#if desktop && section === 'instructions'}
@@ -669,14 +747,19 @@
           Auto uses the same configured-window limit for importing and every chat path. Installed
           skills over the current limit stay available to remove but are skipped during chats.
         </p>
-        <button
-          class="secondary"
-          disabled={busy || !loaded || !instructionsValid}
-          onclick={saveInstructions}>Save instruction limits</button
-        >
+        <SettingsFooter
+          dirty={loaded && instructionsState !== savedInstructions}
+          canSave={instructionsValid}
+          {busy}
+          saveLabel="Save instruction limits"
+          {feedback}
+          {error}
+          onSave={saveInstructions}
+          onCancel={restoreInstructions}
+        />
       </details>
     {/if}
-    {#if error}<p role="alert" class="error">{error}</p>{/if}
+    {#if error && section === 'memory' && !content.trim()}<p role="alert" class="error">{error}</p>{/if}
   </div>
 </dialog>
 
@@ -690,9 +773,15 @@
     font-size: 12px;
     margin-bottom: 4px;
   }
-  .off-device {
-    font-weight: 600;
-    color: var(--warn);
+  .notice.warning {
+    display: flex;
+    gap: 8px;
+    border-left: 2px solid var(--warn);
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--warn) 7%, transparent);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 400;
   }
   .proposals {
     margin-bottom: 24px;
@@ -732,6 +821,7 @@
     backdrop-filter: blur(3px);
   }
   dialog.embedded {
+    position: static;
     display: block;
     width: 100%;
     max-height: none;
@@ -828,17 +918,6 @@
     resize: vertical;
     min-height: 85px;
     max-height: 220px;
-  }
-  .editor-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 10px 0 26px;
-  }
-  .editor-actions span {
-    flex: 1;
-    color: var(--text-muted);
-    font-size: 10.5px;
   }
   .primary,
   .secondary,

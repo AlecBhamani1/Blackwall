@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { instructionFileValid, persistence, type MemoryProposal } from '../persistence';
@@ -51,6 +51,19 @@ describe('memory management', () => {
       expect.objectContaining({ maxIterations: 40, commandTimeoutSeconds: 600 }),
     );
   });
+  it('cancels an invalid context limit edit', async () => {
+    const user = userEvent.setup();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'limits' } });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    await user.clear(context);
+    await user.type(context, '1000');
+    expect(screen.getByRole('button', { name: 'Save context limit' })).toBeDisabled();
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toBeEnabled();
+    await user.click(cancel);
+    expect(context).toHaveValue(32000);
+  });
   it('saves the command output cap only within its range', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
@@ -92,6 +105,7 @@ describe('memory management', () => {
       subagentRunsOn: 'local',
       commandToolsIsolation: 'outside',
     });
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
     await user.click(screen.getByLabelText('A command tool'));
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
     expect(button).toBeDisabled();
@@ -103,6 +117,34 @@ describe('memory management', () => {
       subagentRunsOn: { tool: 'review' },
       commandToolsIsolation: 'outside',
     });
+  });
+  it('shows command tool settings synchronously from local state', async () => {
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const option = await screen.findByLabelText('A command tool');
+    await vi.waitFor(() => expect(option).toBeEnabled());
+    fireEvent.click(option);
+    expect(screen.getByLabelText('Command tool name')).toBeInTheDocument();
+  });
+  it('saves the memory toggle without committing a draft context limit', async () => {
+    const user = userEvent.setup();
+    let stored = { memoryEnabled: false, contextWindow: 32000 };
+    vi.spyOn(persistence, 'preferences').mockImplementation(async () => ({ ...stored }));
+    vi.spyOn(persistence, 'savePreferences').mockImplementation(async (patch) => {
+      stored = { ...stored, ...patch };
+    });
+    const view = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'limits' },
+    });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    await user.clear(context);
+    await user.type(context, '64000');
+    view.unmount();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'memory' } });
+    const toggle = await screen.findByLabelText('Use saved memories in chat');
+    await vi.waitFor(() => expect(toggle).toBeEnabled());
+    await user.click(toggle);
+    expect(stored).toEqual({ memoryEnabled: true, contextWindow: 32000 });
   });
   it('loads saved subagent settings that run on a command tool', async () => {
     const user = userEvent.setup();
@@ -169,13 +211,17 @@ describe('memory management', () => {
     });
     const limit = await screen.findByLabelText('Model context limit (tokens)');
     await vi.waitFor(() => expect(limit).toBeEnabled());
+    await user.clear(limit);
+    await user.type(limit, '33000');
     await user.click(screen.getByRole('button', { name: 'Save context limit' }));
     expect(stored.commandToolsIsolation).toBe('sandboxed');
     limits.unmount();
     const instructions = render(MemoryDialog, {
       props: { onClose: vi.fn(), embedded: true, section: 'instructions' },
     });
-    await screen.findByLabelText('Instruction file limit (KiB)');
+    const instructionFile = await screen.findByLabelText('Instruction file limit (KiB)');
+    await vi.waitFor(() => expect(instructionFile).toBeEnabled());
+    await user.type(screen.getByLabelText('Extra instruction files, one per line'), 'CLAUDE.md');
     await user.click(screen.getByRole('button', { name: 'Save instruction limits' }));
     expect(stored.commandToolsIsolation).toBe('sandboxed');
     expect(stored.instructionMaxFileKib).toBe(8);

@@ -95,6 +95,21 @@ describe('SettingsDialog', () => {
     usage.mockRestore();
   });
 
+  it('keeps every embedded panel in the content pane flow', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({});
+    vi.spyOn(persistence, 'memories').mockResolvedValue([]);
+    vi.spyOn(persistence, 'memoryProposals').mockResolvedValue([]);
+    vi.spyOn(persistence, 'usage').mockReturnValue(new Promise(() => {}));
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
+    for (const name of ['Limits', 'Subagents', 'Instructions', 'Saved memories', 'MCP servers', 'Skills', 'Runs', 'Usage']) {
+      await fireEvent.click(screen.getByRole('button', { name: new RegExp(name) }));
+      const embedded = document.querySelector('dialog.embedded');
+      expect(embedded).not.toBeNull();
+      expect(getComputedStyle(embedded!).position).toBe('static');
+    }
+  });
+
   it('filters by related terms and category, and explains an empty result', async () => {
     const user = userEvent.setup();
     render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });

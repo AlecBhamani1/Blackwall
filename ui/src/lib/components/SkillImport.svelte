@@ -2,6 +2,7 @@
   import ScanBadge from './ScanBadge.svelte';
   import { onDestroy, onMount } from 'svelte';
   import { persistence, type SkillImportCandidate, type SuggestedSkill } from '../persistence';
+  import SettingsFooter from './SettingsFooter.svelte';
   export let onDone: (imported: number) => void;
   export let onCancel: () => void;
   let candidates: SkillImportCandidate[] = [];
@@ -224,7 +225,7 @@
           {/if}
         {/if}
         {#if candidate.error}<p class="problem">{candidate.error}</p>{/if}
-        {#each candidate.notes as note}<p class="note">{note}</p>{/each}
+        {#each candidate.notes as note}<p class="notice warning"><span aria-hidden="true">⚠</span>{note}</p>{/each}
         {#if candidate.exists}
           <label class="replace"
             ><input
@@ -237,16 +238,17 @@
       </div>
     </article>
   {/each}
-  {#each failures as failure}<p role="alert" class="problem">{failure}</p>{/each}
   {#if error}<p role="alert" class="problem">{error}</p>{/if}
-  <div class="actions">
-    <button class="secondary" disabled={busy} onclick={onCancel}>Cancel</button><span></span><button
-      class="primary"
-      disabled={busy || count === 0}
-      onclick={importSelected}
-      >{busy ? 'Importing…' : count === 1 ? 'Import 1 skill' : `Import ${count} skills`}</button
-    >
-  </div>
+  <SettingsFooter
+    dirty
+    canSave={count > 0}
+    {busy}
+    saveLabel={count === 1 ? 'Import 1 skill' : `Import ${count} skills`}
+    feedback=""
+    error={failures.join(' ')}
+    onSave={importSelected}
+    onCancel={onCancel}
+  />
 </section>
 
 <style>
@@ -261,17 +263,20 @@
     line-height: 1.6;
     margin: 0 0 14px;
   }
-  .choose,
-  .actions {
+  .choose {
     display: flex;
     gap: 8px;
     align-items: center;
   }
-  .actions {
-    margin-top: 16px;
-  }
-  .actions > span {
-    flex: 1;
+  .notice.warning {
+    display: flex;
+    gap: 8px;
+    border-left: 2px solid var(--warn);
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--warn) 7%, transparent);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 400;
   }
   article {
     display: flex;
@@ -331,16 +336,10 @@
     height: 16px;
     margin-top: 2px;
   }
-  .primary,
   .secondary {
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     font-size: 11.5px;
-  }
-  .primary {
-    background: var(--accent);
-    color: var(--text-on-accent);
-    font-weight: 600;
   }
   .secondary {
     background: var(--bg-elevated);
