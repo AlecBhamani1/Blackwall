@@ -53,6 +53,9 @@ windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
 credential-store = ["dep:security-framework", "dep:keyring"]
 
 [dev-dependencies]
+# Test-only: the progress handler counts SQLite VM work in the append-cost tests. Same crate and
+# version as above, so `Cargo.lock` does not change.
+rusqlite = { version = "0.41.0", features = ["bundled", "backup", "hooks"] }
 tower.workspace = true
 
 [lints]
