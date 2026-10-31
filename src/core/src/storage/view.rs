@@ -10,9 +10,11 @@ use crate::{
 use serde_json::{json, Map, Value};
 use std::{cell::Cell, collections::BTreeMap};
 
-/// Most bytes one load may build by following references (security L5): assistant content
-/// (inline or from turns), tool names, arguments and outputs, and the model forms behind `model`
-/// refs. Stored bytes are
+/// Most bytes one load may build by following references (security L5): everything an assistant
+/// message is rebuilt from (content inline or from turns, tools inline or by ref with their names,
+/// arguments and outputs, a fallback's `full` message, children, reasoning and other fields), and
+/// the model forms behind `model` refs. An assistant is counted each time it is rebuilt, because
+/// an echo ref in the transcript rebuilds it again. Stored bytes are
 /// capped at [`super::MAX_SESSION_BYTES`] when written, but a reference costs a few bytes and can
 /// name a large row any number of times, so a tampered `{"turns":[s,s,s,…]}` could otherwise ask
 /// for terabytes. A valid chat builds each stored byte at most twice (once for the screen, and
@@ -281,7 +283,10 @@ pub(crate) fn resolve_assistant(rows: &Index<'_>, seq: i64) -> Result<Value, Vie
                         .map(|tool| resolve_tool(rows, tool, seq))
                         .collect::<Result<_, _>>()?,
                 ),
-                _ => value.clone(),
+                _ => {
+                    rows.charge(weight(value))?;
+                    value.clone()
+                }
             };
             message.insert(key.clone(), value);
         }
@@ -294,10 +299,11 @@ pub(crate) fn resolve_assistant(rows: &Index<'_>, seq: i64) -> Result<Value, Vie
         .ok_or(ViewError::BadRef { seq })?;
     if let Some(full) = body.get("full") {
         only(&row.body, &["run", "full"], seq)?;
-        return full
-            .is_object()
-            .then(|| full.clone())
-            .ok_or(ViewError::BadBody { seq });
+        if !full.is_object() {
+            return Err(ViewError::BadBody { seq });
+        }
+        rows.charge(weight(full))?;
+        return Ok(full.clone());
     }
     // Content and status come only from the terminal; the start owns the rest.
     let complete = body.contains_key("content") && body.contains_key("status");
@@ -315,6 +321,7 @@ pub(crate) fn resolve_assistant(rows: &Index<'_>, seq: i64) -> Result<Value, Vie
             }
             "tools" => upsert(rows, &mut message, value, seq)?,
             _ => {
+                rows.charge(weight(value))?;
                 message.insert(key.clone(), value.clone());
             }
         }
@@ -340,6 +347,7 @@ fn progress(rows: &Index<'_>, run: &Run) -> Result<Map<String, Value>, ViewError
             upsert(rows, &mut message, tools, seq)?;
         }
         if let Some(children) = delta.get("children") {
+            rows.charge(weight(children))?;
             message.insert(
                 "children".into(),
                 Value::Array(list(children, seq)?.clone()),
@@ -350,6 +358,7 @@ fn progress(rows: &Index<'_>, run: &Run) -> Result<Map<String, Value>, ViewError
             if !reasoning.is_string() {
                 return Err(ViewError::BadBody { seq });
             }
+            rows.charge(weight(reasoning))?;
             message.insert("reasoning".into(), reasoning.clone());
         }
         match delta.get("reasoningMs") {
@@ -440,6 +449,8 @@ fn content(rows: &Index<'_>, form: &Value, seq: i64) -> Result<String, ViewError
 /// `name` and `arguments` from that call and `output` from the result row.
 fn resolve_tool(rows: &Index<'_>, residual: &Value, seq: i64) -> Result<Value, ViewError> {
     let object = residual.as_object().ok_or(ViewError::BadBody { seq })?;
+    // The residual's own fields, inline or around a ref.
+    rows.charge(weight(residual))?;
     let Some(call) = object.get("call") else {
         return Ok(residual.clone());
     };
@@ -1190,6 +1201,45 @@ mod tests {
         assert_eq!(error(&inline, Some(&ctx)), ViewError::TooLarge);
         ctx.model_len = 2;
         assert!(build_view(&inline, Some(&ctx), &[]).is_ok());
+        // Echo refs to a run terminal that is a fallback's `full` message.
+        let mut full = rows(json!("unused"));
+        full[3] = assistant(
+            3,
+            json!({"run": 1, "full": {"id": "a", "role": "assistant", "content": big, "status": "complete"}}),
+        );
+        full.extend((0..turns as i64).map(|n| reference(4 + n, 3)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = full.iter().filter(|r| r.kind == Kind::Model).count() as u64;
+        assert_eq!(error(&full, Some(&ctx)), ViewError::TooLarge);
+        ctx.model_len = 2;
+        assert!(build_view(&full, Some(&ctx), &[]).is_ok());
+        // Echo refs to an answer whose bulk is in inline tools, or in progress children.
+        let mut inline_tools = vec![
+            user(0, "u", "Hi"),
+            assistant(
+                1,
+                json!({"id": "s", "role": "assistant", "content": "done", "status": "complete",
+                       "tools": [{"id": "t", "name": "f", "arguments": "{}", "output": big}]}),
+            ),
+        ];
+        inline_tools.extend((0..turns as i64).map(|n| reference(2 + n, 1)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = turns as u64;
+        assert_eq!(error(&inline_tools, Some(&ctx)), ViewError::TooLarge);
+        let mut children = rows(json!("done"));
+        children.insert(
+            2,
+            progress(2, json!({"run": 1, "children": [{"text": big}]})),
+        );
+        children[3] = said(3, "x");
+        children[4] = assistant(
+            4,
+            json!({"run": 1, "content": "done", "status": "complete"}),
+        );
+        children.extend((0..turns as i64).map(|n| reference(5 + n, 4)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = children.iter().filter(|r| r.kind == Kind::Model).count() as u64;
+        assert_eq!(error(&children, Some(&ctx)), ViewError::TooLarge);
     }
 
     #[test]
