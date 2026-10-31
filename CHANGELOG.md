@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Chat now uses one slim header row, with model and access controls moved into the composer.
+
 ### Added
 
 - Settings → Privacy & security → Rules & sandbox now has Your rules: list your allow, ask and

@@ -7,9 +7,12 @@
     type AttachmentReference,
   } from '../attachmentReferences';
   import { persistence } from '../persistence';
-  import type { Attachment, PendingAttachment } from '../types';
+  import { modelLabel } from '../format';
+  import type { Attachment, ConnectionState, ModelInfo, PendingAttachment } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
   import Icon from './Icon.svelte';
+
+  type ExecutionProfile = 'read-only' | 'workspace-write' | 'unsandboxed';
 
   export let busy = false;
   export let disabled = false;
@@ -19,6 +22,21 @@
   export let onStop: () => void;
   export let chatAttachments: Attachment[] = [];
   export let sessionId: string | null = null;
+  export let models: ModelInfo[] = [];
+  export let selectedModel = '';
+  export let connectionState: ConnectionState = 'checking';
+  export let agentMode = false;
+  export let executionProfile: ExecutionProfile = 'read-only';
+  export let commandNetwork = false;
+  export let webEnabled = false;
+  export let workspaceWrite = true;
+  export let controlsDisabled = false;
+  export let onModelChange: (modelId: string) => void = () => undefined;
+  export let onExecutionProfileChange: (profile: ExecutionProfile) => void = () => undefined;
+  export let onCommandNetworkChange: (enabled: boolean) => void = () => undefined;
+  export let onWebEnabledChange: (enabled: boolean) => void = () => undefined;
+  export let onProfileFocusChange: (focused: boolean) => void = () => undefined;
+  export let onReconnect: () => void = () => undefined;
 
   let text = '';
   let attachments: PendingAttachment[] = [];
@@ -344,6 +362,67 @@
 
       <div class="composer-actions">
         <div class="left-actions">
+          <div class="model-control">
+            <span
+              class:ready={connectionState === 'ready'}
+              class:offline={connectionState === 'offline'}
+              class="state-dot"
+              aria-hidden="true"
+            ></span>
+            {#if models.length > 0}
+              <label class="sr-only" for="model-select">Model</label>
+              <select
+                id="model-select"
+                value={selectedModel}
+                onchange={(event) => onModelChange(event.currentTarget.value)}
+              >
+                {#each models as model (model.id)}<option value={model.id}
+                    >{modelLabel(model.name)}</option
+                  >{/each}
+              </select>
+            {:else}<span class="model-placeholder"
+                >{connectionState === 'checking'
+                  ? 'Finding your model…'
+                  : 'Model unavailable'}</span
+              >{/if}
+            {#if connectionState === 'offline'}<button class="reconnect" onclick={onReconnect}
+                ><Icon name="refresh" size={14} />Reconnect</button
+              >{/if}
+          </div>
+          {#if agentMode}
+            <label class="compact-control"
+              >Commands
+              <select
+                aria-label="Command execution profile"
+                value={executionProfile}
+                disabled={controlsDisabled}
+                onfocus={() => onProfileFocusChange(true)}
+                onblur={() => onProfileFocusChange(false)}
+                onchange={(event) =>
+                  onExecutionProfileChange(event.currentTarget.value as ExecutionProfile)}
+              >
+                <option value="read-only">Read-only</option>
+                <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
+                <option value="unsandboxed">Unsandboxed (full access)</option>
+              </select>
+            </label>
+            <label class="compact-control"
+              ><input
+                type="checkbox"
+                checked={commandNetwork || executionProfile === 'unsandboxed'}
+                onchange={(event) => onCommandNetworkChange(event.currentTarget.checked)}
+                disabled={controlsDisabled || executionProfile === 'unsandboxed'}
+              />Command network</label
+            >
+          {/if}
+          <label class="compact-control"
+            ><input
+              type="checkbox"
+              checked={webEnabled}
+              onchange={(event) => onWebEnabledChange(event.currentTarget.checked)}
+              disabled={controlsDisabled}
+            />Web access</label
+          >
           <button
             class="attach"
             aria-label="Add photos or files"
@@ -353,7 +432,6 @@
           >
             <Icon name="paperclip" size={18} />
           </button>
-          <span class="local-hint">Sent only to your model</span>
         </div>
 
         {#if busy}
@@ -491,7 +569,8 @@
 
   .composer-actions {
     display: flex;
-    height: 42px;
+    min-height: 42px;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     padding: 0 9px 8px 10px;
@@ -500,8 +579,62 @@
   .left-actions {
     display: flex;
     min-width: 0;
+    flex: 1;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+  }
+
+  .model-control,
+  .compact-control {
+    display: flex;
+    height: 28px;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-muted);
+    font-size: 10.5px;
+    white-space: nowrap;
+  }
+
+  .model-control select,
+  .compact-control select {
+    max-width: 220px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 5px;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font: inherit;
+  }
+
+  .compact-control input {
+    margin: 0;
+    accent-color: var(--accent);
+  }
+  .state-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+  .state-dot.ready {
+    background: var(--ok);
+  }
+  .state-dot.offline {
+    background: var(--err);
+  }
+  .model-placeholder {
+    font-size: 10.5px;
+  }
+  .reconnect {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
   }
 
   .attach,
@@ -542,14 +675,6 @@
 
   .send.active:hover {
     transform: translateY(-1px);
-  }
-
-  .local-hint {
-    overflow: hidden;
-    color: var(--text-faint);
-    font-size: 10.5px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .composer-caption {
@@ -638,7 +763,6 @@
       padding-top: 7px;
     }
 
-    .local-hint,
     .composer-caption {
       display: none;
     }
