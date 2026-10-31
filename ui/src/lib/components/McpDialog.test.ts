@@ -39,7 +39,7 @@ describe('MCP server management', () => {
     await user.type(screen.getByLabelText('Name'), 'files');
     await user.type(screen.getByLabelText('Command'), 'npx -y server-filesystem /tmp');
     await user.click(screen.getByRole('button', { name: 'Add server' }));
-    expect(add).toHaveBeenCalledWith('files', 'npx -y server-filesystem /tmp');
+    expect(add).toHaveBeenCalledWith('files', ['npx', '-y', 'server-filesystem', '/tmp']);
   });
   it('never carries a typed secret over to another server', async () => {
     const user = userEvent.setup();
@@ -49,10 +49,13 @@ describe('MCP server management', () => {
     ]);
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByText('jira'));
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
     await user.type(screen.getByLabelText('Environment variable'), 'TOKEN');
     await user.type(screen.getByLabelText('Value'), 'jira-only');
     await user.click(screen.getByRole('button', { name: 'Back' }));
     await user.click(screen.getByText('gitlab'));
+    expect(screen.queryByLabelText('Environment variable')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
     expect(screen.getByLabelText('Environment variable')).toHaveValue('');
     expect(screen.getByLabelText('Value')).toHaveValue('');
   });
@@ -83,6 +86,102 @@ describe('MCP server management', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Keychain is locked.');
     expect(screen.getByLabelText('Value')).toHaveValue('');
     expect(screen.getByLabelText('Environment variable')).toHaveValue('JIRA_API_TOKEN');
+  });
+  it('adds a command with a quoted argument and refuses an unclosed quote', async () => {
+    const user = userEvent.setup();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.type(screen.getByLabelText('Name'), 'files');
+    await user.type(screen.getByLabelText('Command'), 'server --root "my folder');
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('closing quote');
+    expect(add).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText('Command'), '"');
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).toHaveBeenCalledWith('files', ['server', '--root', 'my folder']);
+    expect(screen.queryByText(/bw mcp add/)).not.toBeInTheDocument();
+  });
+  it('shows a command as a command line and edits it', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      {
+        name: 'time',
+        command: ['/home/riz/.local/bin/uvx', 'mcp-server-time', '--root', 'my folder'],
+        enabled: true,
+        secrets: ['TZ_TOKEN'],
+      },
+    ]);
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    const line = '/home/riz/.local/bin/uvx mcp-server-time --root "my folder"';
+    expect(await screen.findByText(line)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Manage time' }));
+    expect(screen.getByText(line)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const field = screen.getByLabelText('Command');
+    expect(field).toHaveValue(line);
+    await user.clear(field);
+    await user.type(field, 'uvx mcp-server-time --root "other folder"');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(edit).toHaveBeenCalledWith(
+      'time',
+      ['uvx', 'mcp-server-time', '--root', 'other folder'],
+      null,
+    );
+    await vi.waitFor(() => expect(screen.queryByLabelText('Command')).not.toBeInTheDocument());
+  });
+  it('edits the address of a URL server', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      { name: 'docs', url: 'https://mcp.example.com/mcp', enabled: true },
+    ]);
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByText('docs'));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const field = screen.getByLabelText('URL');
+    expect(field).toHaveValue('https://mcp.example.com/mcp');
+    await user.clear(field);
+    await user.type(field, 'https://mcp.example.org/v2');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(edit).toHaveBeenCalledWith('docs', [], 'https://mcp.example.org/v2');
+  });
+  it('does not save a command whose quote is never closed', async () => {
+    const user = userEvent.setup();
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByText('jira'));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.type(screen.getByLabelText('Command'), ' "my folder');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('closing quote');
+    expect(edit).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('keeps the secret form closed until it is needed', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      { name: 'time', command: ['uvx', 'mcp-server-time'], enabled: true },
+      {
+        name: 'docs',
+        url: 'https://mcp.example.com/mcp',
+        headers: { Authorization: '{secret:DOCS_TOKEN}' },
+        enabled: true,
+      },
+    ]);
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Manage time' }));
+    expect(screen.queryByLabelText('Environment variable')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove server' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
+    expect(screen.getByLabelText('Environment variable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add secret' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    // A header that names a secret that is not saved yet needs the form.
+    await user.click(screen.getByRole('button', { name: 'Manage docs' }));
+    expect(screen.getByLabelText('Secret name')).toBeInTheDocument();
   });
   it('lists and removes the rules that allow a server without asking', async () => {
     const user = userEvent.setup();
@@ -127,7 +226,7 @@ describe('MCP server management', () => {
     expect(screen.getByLabelText('Command')).toHaveValue('npx -y @upstash/context7-mcp@4.4.1');
     expect(add).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: 'Add server' }));
-    expect(add).toHaveBeenCalledWith('context7', 'npx -y @upstash/context7-mcp@4.4.1');
+    expect(add).toHaveBeenCalledWith('context7', ['npx', '-y', '@upstash/context7-mcp@4.4.1']);
   });
   it.each([
     ['filesystem', 'Add the folder', '/tmp/notes', '@modelcontextprotocol/server-filesystem@1.0.0'],
@@ -144,7 +243,7 @@ describe('MCP server management', () => {
     expect(add).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText('Command'), value);
     await user.click(screen.getByRole('button', { name: 'Add server' }));
-    expect(add).toHaveBeenCalledWith(name, `npx -y ${pkg} ${value}`);
+    expect(add).toHaveBeenCalledWith(name, ['npx', '-y', pkg, value]);
   });
   it('does not offer suggestions that cannot run on Windows', async () => {
     const user = userEvent.setup();
@@ -179,7 +278,7 @@ describe('MCP server management', () => {
     await user.clear(command);
     await user.type(command, 'my-server --stdio');
     await user.click(screen.getByRole('button', { name: 'Add server' }));
-    expect(add).toHaveBeenCalledWith('filesystem', 'my-server --stdio');
+    expect(add).toHaveBeenCalledWith('filesystem', ['my-server', '--stdio']);
   });
   it('adds a server by URL with headers that name secrets', async () => {
     const user = userEvent.setup();

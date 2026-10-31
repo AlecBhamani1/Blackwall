@@ -186,6 +186,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- On the MCP servers screen, a server's command or URL can be edited (a changed command asks for
+  approval again), a command shows as a command line instead of a JSON list and accepts quoted
+  arguments with spaces, and the secret form stays closed behind Add secret until a server has
+  secrets or a header needs one.
+
 - First-run setup now keeps connection failures neutral until a server is chosen, excludes
   embedding models, and asks which chat model to use before starting a conversation.
 

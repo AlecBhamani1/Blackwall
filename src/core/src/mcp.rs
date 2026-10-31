@@ -130,14 +130,16 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
     let failed = "The MCP file could not be saved.";
-    // Approvals were given for a server at one address; one that moves starts asking again.
+    // Approvals were given for a server at one address or command; one that moves starts asking
+    // again.
     let moved: Vec<String> = read_config(directory)
         .unwrap_or_default()
         .into_iter()
         .filter(|old| {
-            servers
-                .iter()
-                .any(|new| new.name == old.name && new.endpoint() != old.endpoint())
+            servers.iter().any(|new| {
+                new.name == old.name
+                    && (new.endpoint() != old.endpoint() || new.command != old.command)
+            })
         })
         .map(|old| old.name)
         .collect();
@@ -269,6 +271,24 @@ pub fn set_enabled(directory: &Path, name: &str, enabled: bool) -> Result<(), St
     let name = &saved_name(name);
     edit(directory, name, |servers, index| {
         servers[index].enabled = enabled;
+        Ok(())
+    })
+}
+
+/// Change the command or URL of a server, which keeps its kind, secrets and other settings.
+pub fn set_endpoint(
+    directory: &Path,
+    name: &str,
+    command: Vec<String>,
+    url: Option<String>,
+) -> Result<(), String> {
+    let name = &saved_name(name);
+    edit(directory, name, |servers, index| {
+        if servers[index].url.is_some() != url.is_some() {
+            return Err("A server cannot change between a command and a URL.".into());
+        }
+        servers[index].command = command;
+        servers[index].url = url.map(|url| url.trim().to_owned());
         Ok(())
     })
 }
@@ -1586,6 +1606,85 @@ mod tests {
             }
         });
         assert_eq!(read_config(&directory).unwrap().len(), 8);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_an_endpoint_keeps_the_rest_of_the_server() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-edit-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        add_server(&directory, "time", vec!["uvx".into()]).unwrap();
+        add_http_server(&directory, "docs", "https://mcp.example.com/mcp", vec![]).unwrap();
+        let mut servers = read_config(&directory).unwrap();
+        servers[0].secrets = vec!["TOKEN".into()];
+        servers[0].enabled = false;
+        write_config(&directory, servers).unwrap();
+
+        let command = vec!["uvx".into(), "mcp-server-time".into(), "my folder".into()];
+        set_endpoint(&directory, "time", command.clone(), None).unwrap();
+        set_endpoint(
+            &directory,
+            "docs",
+            vec![],
+            Some(" https://mcp.example.org/v2 ".into()),
+        )
+        .unwrap();
+        let servers = read_config(&directory).unwrap();
+        assert_eq!(servers[0].command, command);
+        assert_eq!(servers[0].secrets, ["TOKEN"]);
+        assert!(!servers[0].enabled);
+        assert_eq!(
+            servers[1].url.as_deref(),
+            Some("https://mcp.example.org/v2")
+        );
+
+        // A server keeps its kind, and an invalid address leaves the file as it was.
+        assert!(set_endpoint(
+            &directory,
+            "time",
+            vec![],
+            Some("https://a.example.com".into())
+        )
+        .is_err());
+        assert!(set_endpoint(&directory, "docs", vec!["uvx".into()], None).is_err());
+        assert!(set_endpoint(
+            &directory,
+            "docs",
+            vec![],
+            Some("http://mcp.example.com".into())
+        )
+        .is_err());
+        assert!(set_endpoint(&directory, "missing", vec!["uvx".into()], None).is_err());
+        assert_eq!(read_config(&directory).unwrap()[1].url, servers[1].url);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_a_command_ends_its_approvals_but_other_edits_keep_them() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-rules-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        add_server(
+            &directory,
+            "time",
+            vec!["uvx".into(), "mcp-server-time".into()],
+        )
+        .unwrap();
+        crate::policy::allow_tool(&directory, "time", None).unwrap();
+
+        set_endpoint(
+            &directory,
+            "time",
+            vec!["uvx".into(), "mcp-server-time".into()],
+            None,
+        )
+        .unwrap();
+        set_enabled(&directory, "time", false).unwrap();
+        assert_eq!(crate::policy::tool_rules(&directory).unwrap().len(), 1);
+
+        set_endpoint(&directory, "time", vec!["other-server".into()], None).unwrap();
+        assert!(crate::policy::tool_rules(&directory).unwrap().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

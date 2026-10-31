@@ -104,6 +104,7 @@ fn run() -> Result<(), StartupError> {
             data::add_mcp_server,
             data::add_mcp_http_server,
             data::set_mcp_server_enabled,
+            data::set_mcp_endpoint,
             data::remove_mcp_server,
             data::save_mcp_secret,
             data::delete_mcp_secret,
