@@ -1683,7 +1683,7 @@ mod tests {
         set_enabled(&directory, "time", false).unwrap();
         assert_eq!(crate::policy::tool_rules(&directory).unwrap().len(), 1);
 
-        set_endpoint(&directory, "time", vec!["/tmp/other".into()], None).unwrap();
+        set_endpoint(&directory, "time", vec!["other-server".into()], None).unwrap();
         assert!(crate::policy::tool_rules(&directory).unwrap().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
