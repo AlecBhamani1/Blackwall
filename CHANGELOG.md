@@ -186,6 +186,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Before setup, `bw status` shows the model and endpoint as not set instead of printing defaults
+  such as `llama3.2` as if they were configured.
+
 - Unsandboxed shell commands keep variables such as `GTK_THEME` when you have `APPDIR` set
   yourself. Only a running AppImage, which sets both `APPDIR` and `APPIMAGE`, has its variables
   removed, including values that are not valid text.
@@ -233,6 +236,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Rule paths with `*` or `?` are now refused with an error naming the rule, instead of being
+  accepted and never matching. Paths are plain prefixes: use `src`, not `src/**`.
 - Chats are now stored with each message saved once. `bw` appends only what is new on each save;
   the desktop app appends when you send a message and rewrites the chat when a streaming answer
   finishes. The first open after updating backs up the database to `backups/blackwall-backup-1.sqlite3` (then `-2`,
@@ -308,6 +313,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- A deny `file` rule now blocks reading, listing, and searching its path, not just editing it, so
+  `deny file .env` keeps the agent out of `.env`. Listings, searches, and `/review` leave denied
+  files out, and the audit log names the rule as it does for a denied edit.
 - `bw run --json` now counts actions an owner or project deny rule blocks, and calls to tools the
   model was not offered, in `denied`, so those runs end with reason `denied` and exit 3 instead of
   reporting success. Each such `tool_result` event has `"denied": true`.
