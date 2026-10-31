@@ -580,13 +580,6 @@
     position: relative;
     margin: 0 0 8px;
   }
-  .search > span {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-  }
   .search :global(svg) {
     position: absolute;
     left: 10px;
