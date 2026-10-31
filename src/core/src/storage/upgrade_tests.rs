@@ -329,6 +329,144 @@ fn a_vacuum_skipped_for_disk_or_busy_is_owed_to_the_next_open() {
     assert_eq!(pages(&db), (after, 0));
 }
 
+/// The size of the database file, by `stat`.
+fn file_size(dir: &Scratch) -> u64 {
+    fs::metadata(dir.database()).unwrap().len()
+}
+
+#[test]
+fn the_vacuum_needs_twice_the_file_free_and_a_full_disk_leaves_it_owed() {
+    let dir = Scratch::new("vacuum-full");
+    let bodies = vacuum_chats();
+    build_v5_indexed(&dir, &bodies);
+    set_test_free_disk(&dir, Some(0));
+    let db = open6(&dir).unwrap();
+    let (before, free) = pages(&db);
+    assert!(free > 0 && vacuum_owed(&db));
+    drop(db);
+    // One and a half times the file is not enough: the copy and its journal need about two.
+    set_test_free_disk(&dir, Some(file_size(&dir) * 3 / 2));
+    let db = open6(&dir).unwrap();
+    assert!(vacuum_owed(&db));
+    assert_eq!(pages(&db), (before, free));
+    drop(db);
+    // Room enough, but the disk fills while it runs: it stays owed, here as on Windows, where
+    // free space is not read first.
+    set_test_free_disk(&dir, Some(file_size(&dir) * 2));
+    set_fault(&dir, Some(Fault::VacuumFull));
+    for _ in 0..2 {
+        let db = open6(&dir).unwrap();
+        assert!(vacuum_owed(&db), "a full disk is retried");
+        assert_eq!(pages(&db).0, before);
+        assert_bodies_load(&db, &bodies);
+    }
+    set_fault(&dir, None);
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db));
+    assert_eq!(pages(&db).1, 0);
+    assert!(pages(&db).0 < before);
+    assert_bodies_load(&db, &bodies);
+}
+
+#[test]
+fn an_integrity_failure_drops_the_owed_vacuum_and_leaves_the_file_as_it_is() {
+    let dir = Scratch::new("vacuum-damaged");
+    let bodies = vacuum_chats();
+    build_v5_indexed(&dir, &bodies);
+    // A first attempt leaves its verified backup, so the next one reuses it and never runs the
+    // backup's own integrity check: the fault then trips only the post-commit check.
+    set_fault(&dir, Some(Fault::BeforeCommit));
+    failed_backup(open6(&dir));
+    set_fault(&dir, Some(Fault::IntegrityCheck));
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db), "dropped with the notice");
+    drop(db);
+    set_fault(&dir, None);
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db));
+    assert!(pages(&db).1 > 0, "nothing rewrote the file");
+    assert!(db
+        .take_storage_notices()
+        .unwrap()
+        .iter()
+        .any(|notice| matches!(notice, StorageNotice::IntegrityFailed { .. })));
+}
+
+/// A data folder as a crash right after the upgrade's commit leaves it: v6, the VACUUM owed,
+/// and the state file still there, because the post-commit steps never ran.
+fn committed_then_crashed(name: &str) -> Scratch {
+    let dir = Scratch::new(name);
+    build_v5_indexed(&dir, &vacuum_chats());
+    set_fault(&dir, Some(Fault::BeforeCommit));
+    failed_backup(open6(&dir));
+    set_fault(&dir, None);
+    let state = fs::read(dir.backups().join("upgrade-state.json")).unwrap();
+    set_test_free_disk(&dir, Some(0));
+    drop(open6(&dir).unwrap());
+    set_test_free_disk(&dir, None);
+    fs::write(dir.backups().join("upgrade-state.json"), state).unwrap();
+    dir
+}
+
+#[test]
+fn a_crash_before_the_check_leaves_the_vacuum_to_the_cleanup_that_checks() {
+    let dir = committed_then_crashed("vacuum-crashed");
+    // While the state file is there, the VACUUM refuses, whoever asks.
+    {
+        let raw = Connection::open(dir.database()).unwrap();
+        vacuum_if_pending(&dir, &raw, BUSY_TIMEOUT);
+        let owed: bool = raw
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key='storage_vacuum_pending')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(owed, "skipped while the state file is there");
+    }
+    // The open checks the file and cleans up first, and only then vacuums.
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db));
+    assert_eq!(pages(&db).1, 0);
+    assert!(!dir.backups().join("upgrade-state.json").exists());
+    drop(db);
+    // The check fails at the open that finishes the cleanup: nothing is vacuumed, ever.
+    let dir = committed_then_crashed("vacuum-crashed-damaged");
+    set_fault(&dir, Some(Fault::IntegrityCheck));
+    let db = open6(&dir).unwrap();
+    set_fault(&dir, None);
+    assert!(!vacuum_owed(&db));
+    assert!(pages(&db).1 > 0, "a file that failed its check is not vacuumed");
+    assert!(!dir.backups().join("upgrade-state.json").exists());
+    assert!(db
+        .take_storage_notices()
+        .unwrap()
+        .iter()
+        .any(|notice| matches!(notice, StorageNotice::IntegrityFailed { backup: Some(_) })));
+}
+
+#[test]
+fn a_second_window_does_not_vacuum_again() {
+    let dir = Scratch::new("vacuum-twice");
+    build_v5_indexed(&dir, &vacuum_chats());
+    let db = open6(&dir).unwrap();
+    assert_eq!(pages(&db).1, 0);
+    // Another window read the flag before this one cleared it: under the lock it finds no free
+    // page and only clears the flag. Had it run the VACUUM, the armed fault would have kept it.
+    set_fault(&dir, Some(Fault::VacuumFull));
+    db.connection()
+        .execute(
+            "INSERT INTO settings(key,value) VALUES ('storage_vacuum_pending','1')",
+            [],
+        )
+        .unwrap();
+    vacuum_if_pending(&dir, db.connection(), BUSY_TIMEOUT);
+    assert!(!vacuum_owed(&db));
+    // Cleared by the time it holds the lock: nothing to do.
+    assert!(!vacuum(&dir, db.connection()).unwrap());
+    set_fault(&dir, None);
+}
+
 #[test]
 fn the_invalid_fixture_is_set_aside_and_noticed_once() {
     let dir = Scratch::new("notices");

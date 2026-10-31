@@ -9,9 +9,10 @@
 //!    `convert_session_in_tx` (one savepoint each; an invalid chat is set aside, not fatal).
 //! 4. `foreign_key_check`, `user_version=6`, commit. Any SQL or I/O error before the commit rolls
 //!    everything back: the database stays v5 and the error names the backup.
-//! 5. After the commit: `integrity_check`, for detection only (a failure is a notice), then prune,
-//!    then one `VACUUM`, best effort (R6-3). A VACUUM that cannot run now is left owed, in
-//!    `settings`, and the next open runs it before anything else.
+//! 5. After the commit: `integrity_check`, for detection only (a failure is a notice, and the file
+//!    is then never vacuumed), then prune, then one `VACUUM`, best effort (R6-3). A VACUUM that
+//!    cannot run now is left owed, in `settings`, and the next open runs it, after finishing any
+//!    post-commit step a crash cut short.
 //!
 //! A database with no data yet takes the same steps without a backup or a VACUUM. A v6 open only
 //! reads the version and whether a VACUUM is owed: it never takes the write lock otherwise.
@@ -22,7 +23,7 @@ use super::{
     configure, is_busy, LocalStore, StorageError, BUSY_TIMEOUT, DATABASE_FILE, NEWER_VERSION,
     UPGRADE_BUSY_TIMEOUT,
 };
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -184,8 +185,10 @@ pub(super) fn open_v6(
         return Err(StorageError::Invalid(NEWER_VERSION));
     }
     if version == V6 {
-        vacuum_if_pending(directory, &connection, busy);
+        // The cleanup a crash cut short runs first: it checks the file, so the VACUUM after it
+        // never rewrites one that was not checked.
         finish_interrupted_cleanup(directory, &connection);
+        vacuum_if_pending(directory, &connection, busy);
         prune_expired_once(directory, &connection);
     } else {
         connection.busy_timeout(upgrade_busy)?;
@@ -454,50 +457,76 @@ fn after_commit(
     backup: Option<&Backup>,
     now: SystemTime,
 ) {
-    let intact = integrity_ok(directory, connection);
-    if !intact {
-        eprintln!("warn: upgrade: the integrity check after the upgrade found a problem");
-        let notice = StorageNotice::IntegrityFailed {
-            backup: backup.map(|backup| backup.path().display().to_string()),
-        };
-        let recorded = write_tx(connection).and_then(|tx| {
-            record_notices(&tx, &[notice])?;
-            Ok(tx.commit()?)
-        });
-        if let Err(error) = recorded {
-            eprintln!("warn: upgrade: could not record the integrity notice: {error:?}");
-        }
-    }
+    check_committed(
+        directory,
+        connection,
+        backup.map(|backup| backup.path().display().to_string()),
+    );
     if let Err(error) = clean_up(directory, connection, backup, now) {
         eprintln!("warn: upgrade: could not prune the backups: {error:?}");
     }
-    // A database the check found damaged is left exactly as it is, for the owner to restore.
-    if intact {
-        vacuum_if_pending(directory, connection, UPGRADE_BUSY_TIMEOUT);
+    // A database the check found damaged no longer owes the VACUUM, so it is left exactly as it
+    // is, for the owner to restore.
+    vacuum_if_pending(directory, connection, UPGRADE_BUSY_TIMEOUT);
+}
+
+/// The check after a committed upgrade, for detection only. On a failure it records the notice
+/// and drops the owed VACUUM in one transaction, so a damaged file is never rewritten.
+fn check_committed(directory: &Path, connection: &Connection, backup: Option<String>) {
+    if integrity_ok(directory, connection) {
+        return;
     }
+    eprintln!("warn: upgrade: the integrity check after the upgrade found a problem");
+    let recorded = write_tx(connection).and_then(|tx| {
+        record_notices(&tx, &[StorageNotice::IntegrityFailed { backup }])?;
+        tx.execute("DELETE FROM settings WHERE key=?1", [VACUUM_PENDING_KEY])?;
+        Ok(tx.commit()?)
+    });
+    if let Err(error) = recorded {
+        eprintln!("warn: upgrade: could not record the integrity notice: {error:?}");
+    }
+}
+
+/// Whether the post-upgrade VACUUM is still owed.
+fn vacuum_owed(connection: &Connection) -> Result<bool, StorageError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
+        [VACUUM_PENDING_KEY],
+        |row| row.get(0),
+    )?)
 }
 
 /// Runs the VACUUM the upgrade left owed, once, best effort (R6-3). It rewrites the file without
 /// the pages the v5 bodies and the v5 search index freed. It never fails the open:
+/// - an upgrade whose post-commit cleanup has not run yet (`upgrade-state.json` is still there):
+///   left owed, because that cleanup checks the file first;
+/// - less free disk than twice the database (VACUUM writes a whole temporary copy, then journals
+///   the rewrite): left owed and logged;
 /// - busy (another window holds a lock): left owed, for the next open;
-/// - less free disk than the database's size (VACUUM writes a whole copy): left owed and logged;
+/// - the disk filled, or its temporary file could not be made, while it ran (`SQLITE_FULL`,
+///   `SQLITE_CANTOPEN`): left owed, so it runs again once there is room, on every OS. VACUUM is
+///   atomic, so the database is as it was;
 /// - any other error: logged and no longer owed, so a damaged file is not retried at every open.
+///
+/// Two windows can both find it owed. The second one re-reads the flag under the write lock,
+/// and skips when the first has cleared it or has already left no free page; the only overlap
+/// left is the instant between the first one's check and its VACUUM, where a second VACUUM costs
+/// time and nothing else.
 ///
 /// It never runs inside a transaction (SQLite refuses one there anyway). `restore` is the lock
 /// wait the connection goes back to.
 fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duration) {
-    let pending = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
-        [VACUUM_PENDING_KEY],
-        |row| row.get::<_, bool>(0),
-    );
-    match pending {
+    match vacuum_owed(connection) {
         Ok(true) => {}
         Ok(false) => return,
         Err(error) => {
-            eprintln!("warn: storage: could not read whether a VACUUM is owed: {error}");
+            eprintln!("warn: storage: could not read whether a VACUUM is owed: {error:?}");
             return;
         }
+    }
+    if backup::has_state(&directory.join(BACKUPS_DIR)) {
+        eprintln!("info: storage: the VACUUM waits for the upgrade's cleanup; left for later");
+        return;
     }
     if !connection.is_autocommit() {
         eprintln!("warn: storage: the VACUUM was not run inside a transaction; left for later");
@@ -511,9 +540,10 @@ fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duratio
         )
         .map_or(0, |size| u64::try_from(size).unwrap_or(0));
     if let Some(free) = free_disk(directory) {
-        if free < size {
+        let needed = size.saturating_mul(2);
+        if free < needed {
             eprintln!(
-                "info: storage: skipped the VACUUM: {free} bytes free, the database is {size} bytes; left for a later open"
+                "info: storage: skipped the VACUUM: {free} bytes free, it needs about {needed}; left for a later open"
             );
             return;
         }
@@ -522,18 +552,23 @@ fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duratio
     let started = std::time::Instant::now();
     let result = connection
         .busy_timeout(wait)
-        .and_then(|()| connection.execute_batch("VACUUM"))
-        .map_err(StorageError::from);
+        .map_err(StorageError::from)
+        .and_then(|()| vacuum(directory, connection));
     if let Err(error) = connection.busy_timeout(restore) {
         eprintln!("warn: storage: could not restore the lock wait after the VACUUM: {error}");
     }
     match result {
-        Ok(()) => eprintln!(
+        Ok(false) => return,
+        Ok(true) => eprintln!(
             "info: storage: VACUUM of {size} bytes took {} ms",
             started.elapsed().as_millis()
         ),
         Err(error) if is_busy(&error) => {
             eprintln!("info: storage: the VACUUM is busy (another window is open); left for the next open");
+            return;
+        }
+        Err(error) if out_of_room(&error) => {
+            eprintln!("warn: storage: the VACUUM ran out of disk space; left for a later open: {error:?}");
             return;
         }
         Err(error) => {
@@ -546,6 +581,50 @@ fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duratio
         // Still owed, so the next open runs it again: a second VACUUM only costs time.
         eprintln!("warn: storage: could not clear the owed VACUUM: {error}");
     }
+}
+
+/// The VACUUM pass itself; `false` when another window has done it. Under the write lock it
+/// re-reads the flag, then flushes the search index with FTS5 `optimize` before the rewrite.
+///
+/// `optimize` merges the index into one segment and drops what deleted rows left behind. Those
+/// include the deletes of a v5 process still running across the upgrade: its `DELETE FROM
+/// sessions` cascades through `chat_search_keys` to `chat_search` without the `optimize` a v6
+/// delete runs (security L1). The gap left: such a delete after this pass stays in the index
+/// until the next v6 delete of an indexed chat optimizes it.
+fn vacuum(directory: &Path, connection: &Connection) -> Result<bool, StorageError> {
+    let tx = write_tx(connection)?;
+    if !vacuum_owed(&tx)? {
+        return Ok(false);
+    }
+    let free: i64 = tx.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    if free == 0 {
+        // Another window's VACUUM ran and has not cleared the flag yet.
+        tx.execute("DELETE FROM settings WHERE key=?1", [VACUUM_PENDING_KEY])?;
+        tx.commit()?;
+        return Ok(false);
+    }
+    tx.execute_batch("INSERT INTO chat_search(chat_search) VALUES ('optimize');")?;
+    tx.commit()?;
+    #[cfg(test)]
+    if backup::fault(directory, backup::Fault::VacuumFull).is_err() {
+        return Err(StorageError::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        )));
+    }
+    #[cfg(not(test))]
+    let _ = directory;
+    connection.execute_batch("VACUUM")?;
+    Ok(true)
+}
+
+/// The disk filled, or SQLite could not make a temporary file: worth trying again later.
+fn out_of_room(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Database(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(error.code, ErrorCode::DiskFull | ErrorCode::CannotOpen)
+    )
 }
 
 /// Bytes free to this user on the data folder's volume, or `None` where it cannot be read.
@@ -629,14 +708,23 @@ fn clean_up(
 }
 
 /// A state file at v6 means an upgrade committed and then stopped (a crash) before its post-commit
-/// cleanup: finish it, under the write lock, keeping the backup the state names. Only a `stat`
-/// on the usual lock-free open; a failure is logged and the next open tries again.
+/// steps: finish them. The integrity check first, as `after_commit` runs it (a failure is a
+/// notice, and drops the owed VACUUM), then the pruning under the write lock, keeping the backup
+/// the state names. Only a `stat` on the usual lock-free open; a failure is logged and the next
+/// open tries again.
 fn finish_interrupted_cleanup(directory: &Path, connection: &Connection) {
     let dir = directory.join(BACKUPS_DIR);
     if !backup::has_state(&dir) {
         return;
     }
     let current = backup::read_state(&dir).map(|state| state.backup);
+    check_committed(
+        directory,
+        connection,
+        current
+            .as_ref()
+            .map(|name| dir.join(name).display().to_string()),
+    );
     let finished = backup::backups_dir(directory).and_then(|dir| {
         let _lock = write_tx(connection)?;
         backup::prune(&dir, current.as_deref(), SystemTime::now(), None, None)?;

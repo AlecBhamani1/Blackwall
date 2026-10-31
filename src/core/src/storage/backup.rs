@@ -841,6 +841,8 @@ pub(crate) enum Fault {
     Slow(Duration),
     /// The backup's integrity check reports damage.
     IntegrityCheck,
+    /// The post-upgrade VACUUM fails with `SQLITE_FULL`, as on a full disk.
+    VacuumFull,
     /// The process dies at this point.
     Abort(AbortAt),
     /// At the upgrade's slow point (the backup is made, the write lock held) the process creates
