@@ -1,11 +1,7 @@
 //! Versioned local SQLite persistence. All values are bounded and writes are transactional.
-use rusqlite::{config::DbConfig, params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, path::Path, time::Duration};
 use thiserror::Error;
 
 /// The local database file in the data folder.
@@ -14,30 +10,11 @@ pub const DATABASE_FILE: &str = "blackwall.sqlite3";
 pub const LOCK_MARKER: &str = "app-lock-enabled";
 /// Empty, non-secret file in the data folder: this data has no app lock.
 pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
-/// Most bytes any one `chat_events` body may hold, serialized.
-pub const MAX_EVENT_BYTES: usize = 32 << 20;
-/// Most bytes one context checkpoint may hold.
-pub const MAX_CHECKPOINT_BYTES: usize = 1 << 20;
-/// Most checkpoints one session may hold.
-pub const MAX_CHECKPOINTS: usize = 100;
-/// Most UI messages one session may hold; reserved assistant slots count.
-pub const MAX_UI_MESSAGES: u64 = 2000;
-/// Most `model` rows one session may hold.
-pub const MAX_MODEL_ENTRIES: u64 = 20_000;
-/// Most bytes one session may hold: event bodies, checkpoint bodies and metadata.
-pub const MAX_SESSION_BYTES: u64 = 48 << 20;
-/// Most bytes one session's metadata may hold.
-pub const MAX_METADATA_BYTES: usize = 64 << 10;
+const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
-/// How long the v5 to v6 upgrade waits for another window's writer lock.
-const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SCHEMA_VERSION: i64 = 5;
-/// The schema version `open` upgrades to. It stays at v5 until the v6 event log goes live.
-const OPEN_TARGET: i64 = 5;
-const NEWER_VERSION: &str =
-    "This data was created by a newer Blackwall version. Update the app to open it.";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -49,82 +26,38 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Invalid(&'static str),
-    #[error("This conversation changed elsewhere. Reload it and try again.")]
-    Conflict { current: i64 },
-    #[error("{}", .0.message())]
-    Limit(Cap),
     #[error("This conversation could not be found.")]
     NotFound,
-    #[error(
-        "This conversation is running in another window. Wait for it to finish, then try again."
-    )]
-    RunInProgress,
-    #[error("Blackwall is still upgrading your chats in another window. Try again in a moment.")]
-    UpgradeBusy,
-    #[error("Couldn't back up your chats before upgrading them, so nothing was changed. Check free disk space and folder permissions, then try again.")]
-    BackupFailed,
-    /// The backup is `None` when a fresh database failed to create its schema: nothing existed to
-    /// copy. `source` is the typed error that stopped the upgrade (P2-2).
-    #[error("{}", upgrade_text(.backup))]
-    UpgradeFailed {
-        backup: Option<PathBuf>,
-        source: Box<StorageError>,
-    },
-    #[error("{}", UPGRADE_FAILED_BACKED_UP)]
-    UpgradeStopped(PathBuf),
-}
-
-/// What the owner reads when an upgrade with a backup fails or stops. It never holds the backup's
-/// path, which would cross IPC as error text (security L6): the path is logged where the error is
-/// made, and the error and the notices carry it as data.
-const UPGRADE_FAILED_BACKED_UP: &str = "Couldn't upgrade your chats; your data is safe, and a \
-     backup of it is in the backups folder inside Blackwall's data folder.";
-
-fn upgrade_text(backup: &Option<PathBuf>) -> &'static str {
-    match backup {
-        Some(_) => UPGRADE_FAILED_BACKED_UP,
-        None => "Couldn't upgrade your chats; your existing data has been left in place.",
-    }
+    #[error("Blackwall backs up your chats before upgrading them, and its backups folder already holds 3 backups. Remove one, then open Blackwall again. Nothing was changed.")]
+    BackupsFull,
 }
 
 pub struct LocalStore {
     connection: Connection,
 }
-mod backup;
 mod chats;
 mod convert;
-#[cfg(test)]
-pub(crate) mod fixtures;
 mod memory;
-#[cfg(test)]
-mod perf_tests;
-#[cfg(test)]
-mod property_tests;
 mod recall;
 mod search;
 mod upgrade;
 mod view;
-pub use chats::{Cap, MetadataPatch, NewSession, StoredChat, StoredContext};
-/// Moved to `convert`; re-exported here for the v5 save path until B6.
-pub(crate) use convert::validate_session;
+pub use chats::NewSession;
 pub use memory::{MemoryEntry, MemoryProposal, MemoryScope, MemorySource, ProposalInput};
 pub use recall::{RecallHit, RecallQuery, RecallResults};
-pub use upgrade::{StorageNotice, UpgradeStatus};
+#[cfg(test)]
+pub(crate) use upgrade::tests::v5_chats;
 
 impl LocalStore {
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
-        Self::open_at(directory, OPEN_TARGET)
+        Self::open_at(directory, SCHEMA_VERSION)
     }
-    /// Opens the database at schema version `target`: 5, or 6, which upgrades an older database
-    /// first (see `upgrade`). `open` stays at v5 until the switch-over.
+    /// Opens the database at schema version `target`: 5, or 6, which first upgrades an older
+    /// database (see `upgrade`). `open` stays at v5 until the v6 chat store is switched on.
     pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
-        Self::open_with(directory, target, false)
-    }
-    /// [`Self::open_at`]; `retry` is the Retry button, which lets a stopped v6 upgrade try again.
-    fn open_with(directory: &Path, target: i64, retry: bool) -> Result<Self, StorageError> {
         if target != SCHEMA_VERSION && target != upgrade::V6 {
             return Err(StorageError::Invalid(
                 "This version of Blackwall cannot open that storage format yet.",
@@ -176,16 +109,21 @@ impl LocalStore {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         }
         let connection = Connection::open(path)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         if target == upgrade::V6 {
-            return upgrade::open_v6(directory, connection, retry);
+            return upgrade::open_v6(directory, connection);
         }
         Self::initialize(connection)
     }
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
-        configure(&connection, BUSY_TIMEOUT)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
+        )?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(NEWER_VERSION));
+            return Err(StorageError::Invalid(
+                "This data was created by a newer Blackwall version. Update the app to open it.",
+            ));
         }
         if version == SCHEMA_VERSION {
             let store = Self { connection };
@@ -203,10 +141,12 @@ impl LocalStore {
 
         // Only schema creation and upgrades wait for the writer lock. Re-read the version after
         // acquiring it because another opener may have completed the upgrade while this one waited.
-        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(NEWER_VERSION));
+            return Err(StorageError::Invalid(
+                "This data was created by a newer Blackwall version. Update the app to open it.",
+            ));
         }
         if version == SCHEMA_VERSION {
             connection.execute_batch("ROLLBACK;")?;
@@ -357,7 +297,7 @@ impl LocalStore {
             .connection
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         if !exists && count >= MAX_SESSIONS {
-            return Err(StorageError::Invalid(Cap::Sessions.message()));
+            return Err(StorageError::Invalid("Your history has reached 500 conversations. Export or delete an older conversation before starting another."));
         }
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute("INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at=excluded.updated_at,body=excluded.body", params![id, title, updated, body])?;
@@ -376,7 +316,7 @@ impl LocalStore {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version >= upgrade::V6 {
-            return upgrade::migrate(self, sessions);
+            return convert::migrate_v6(self, sessions);
         }
         if self.setting("legacy_sessions_migrated")?.is_some() {
             return Ok(());
@@ -469,28 +409,61 @@ pub(crate) fn validate_id(id: &str) -> Result<(), StorageError> {
     }
     Ok(())
 }
-/// What `configure` reports when `foreign_keys` would not turn on.
-pub(crate) const FOREIGN_KEYS_OFF: &str = "Blackwall could not turn on its database safety checks. Your existing data has been left in place.";
-
-/// Every connection starts here: foreign keys, secure delete and full syncs, with `busy` as its
-/// lock wait. `foreign_keys` is a silent no-op inside a transaction, so it is set and read back
-/// first, before `synchronous` (which errors inside one) can mask the failure.
-///
-/// It also hardens the connection against a tampered file (security L8):
-/// - `SQLITE_DBCONFIG_DEFENSIVE`: no `writable_schema`, no direct writes to the FTS5 shadow
-///   tables, nothing that can corrupt the file on purpose.
-/// - `trusted_schema=OFF`: a trigger or view in the file may only call functions and virtual
-///   tables marked innocuous. FTS5 is, so the search triggers and the cascade into `chat_search`
-///   still run.
-pub(crate) fn configure(connection: &Connection, busy: Duration) -> Result<(), StorageError> {
-    connection.busy_timeout(busy)?;
-    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
-    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")?;
-    let on: i64 = connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-    if on != 1 {
-        return Err(StorageError::Invalid(FOREIGN_KEYS_OFF));
+fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), StorageError> {
+    let id = session
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or(StorageError::Invalid("Missing conversation identifier."))?;
+    validate_id(id)?;
+    let title = session
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 1000)
+        .ok_or(StorageError::Invalid("Invalid conversation title."))?;
+    let updated = session
+        .get("updatedAt")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= i64::MAX as u64)
+        .ok_or(StorageError::Invalid("Invalid conversation date."))?;
+    let messages = session
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|m| m.len() <= 2000)
+        .ok_or(StorageError::Invalid(
+            "This conversation contains too many messages.",
+        ))?;
+    for message in messages {
+        validate_message(message)?;
     }
-    connection.execute_batch("PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;")?;
+    if let Some(context) = session.get("contextState").filter(|v| !v.is_null()) {
+        let state: crate::context::ContextState = serde_json::from_value(context.clone())?;
+        state
+            .validate()
+            .map_err(|_| StorageError::Invalid("Invalid saved model context."))?;
+    }
+    let body = serde_json::to_string(session)?;
+    if body.len() > MAX_SESSION_BYTES {
+        return Err(StorageError::Invalid(
+            "This conversation is too large to save. Export it before closing Blackwall.",
+        ));
+    }
+    Ok((id, title, updated as i64, body))
+}
+/// The v5 rule for one chat message: a user or assistant role, text content and an attachment list.
+fn validate_message(message: &Value) -> Result<(), StorageError> {
+    if !matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("user" | "assistant")
+    ) || message.get("content").and_then(Value::as_str).is_none()
+        || message
+            .get("attachments")
+            .and_then(Value::as_array)
+            .is_none()
+    {
+        return Err(StorageError::Invalid(
+            "This conversation contains an invalid message.",
+        ));
+    }
     Ok(())
 }
 
