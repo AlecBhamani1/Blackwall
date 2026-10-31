@@ -3,6 +3,7 @@ use crate::{
     approvals::Approvals,
     child_env::Scope,
     model::ToolCall,
+    policy::Decision,
     protocol::{AgentEvent, ApprovalKind},
     sandbox::ExecutionProfile,
 };
@@ -300,8 +301,14 @@ impl Workspace {
         }
         Ok(path)
     }
-    /// Literal, bounded project search. Symlinks and generated dependency folders are skipped.
-    pub fn search(&self, path: &str, query: &str) -> Result<String, ToolError> {
+    /// Literal, bounded project search. Symlinks, generated dependency folders, and `denied`
+    /// paths are skipped.
+    pub fn search(
+        &self,
+        path: &str,
+        query: &str,
+        denied: &dyn Fn(&Path) -> bool,
+    ) -> Result<String, ToolError> {
         let root = self.checked(path)?;
         if query.is_empty() || query.len() > 256 {
             return Err(ToolError::Arguments);
@@ -334,6 +341,9 @@ impl Workspace {
                 }
                 let kind = entry.file_type().map_err(|_| ToolError::File)?;
                 let path = directory.join(name);
+                if denied(&path) {
+                    continue;
+                }
                 if kind.is_dir() && path.components().count() < 20 {
                     directories.push(path);
                 } else if kind.is_file() {
@@ -538,12 +548,38 @@ pub async fn execute(
     let arguments: Value =
         serde_json::from_str(&call.function.arguments).map_err(|_| ToolError::Arguments)?;
     match call.function.name.as_str() {
-        "read_file" => workspace.read(argument(&arguments, "path")?),
-        "list_files" => workspace.list(argument(&arguments, "path")?),
-        "search_files" => workspace.search(
-            argument(&arguments, "path")?,
-            argument(&arguments, "query")?,
-        ),
+        name @ ("read_file" | "list_files" | "search_files") => {
+            let path = argument(&arguments, "path")?;
+            // Deny `file` rules cover reading too; allow and ask rules only gate edits.
+            let policy = approvals.policy(request_id);
+            let denied = |path: &Path| {
+                policy.as_ref().and_then(|policy| {
+                    let verdict = policy.evaluate(ApprovalKind::File, path.to_str()?);
+                    (verdict.decision == Decision::Deny).then_some(verdict)
+                })
+            };
+            let checked = workspace.checked(path)?;
+            if let (Some(policy), Some(verdict)) = (&policy, denied(&checked)) {
+                policy
+                    .record(
+                        ApprovalKind::File,
+                        &checked.to_string_lossy(),
+                        Decision::Deny,
+                        false,
+                        None,
+                        verdict.matched,
+                    )
+                    .await;
+                return Err(ToolError::Denied);
+            }
+            match name {
+                "read_file" => workspace.read(path),
+                "list_files" => workspace.list(path),
+                _ => workspace.search(path, argument(&arguments, "query")?, &|path| {
+                    denied(path).is_some()
+                }),
+            }
+        }
         "write_file" => {
             let path = workspace.checked(argument(&arguments, "path")?)?;
             let path = path.to_str().ok_or(ToolError::Path)?;
@@ -1502,10 +1538,10 @@ mod tests {
             "first line\nneedle here"
         );
         assert!(workspace
-            .search(".", "needle")
+            .search(".", "needle", &|_| false)
             .unwrap()
             .contains("search.txt:2: needle here"));
-        assert!(workspace.search("../", "needle").is_err());
+        assert!(workspace.search("../", "needle", &|_| false).is_err());
         assert!(workspace.read("/etc/passwd").is_err());
         assert_eq!(
             workspace
@@ -1608,6 +1644,106 @@ mod tests {
             Err(ToolError::Denied)
         ));
         assert!(!target.exists());
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deny_file_rules_block_reads_listing_and_search() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-tools-read-policy-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        let (data, project) = (root.join("data"), root.join("project"));
+        std::fs::create_dir_all(project.join(".blackwall")).unwrap();
+        std::fs::create_dir_all(project.join("secrets")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            project.join(".blackwall/project.json"),
+            r#"{"policy":{"rules":[
+                {"decision":"deny","kind":"file","path":".env"},
+                {"decision":"deny","kind":"file","path":"secrets"}
+            ]}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join(".env"), "TOKEN=needle").unwrap();
+        std::fs::write(project.join("secrets/key.txt"), "needle").unwrap();
+        std::fs::write(project.join("src/ok.txt"), "needle").unwrap();
+        let workspace = Workspace::open(&project).unwrap();
+        let approvals = Approvals::default();
+        approvals
+            .load_policy("run", &data, &workspace.path)
+            .await
+            .unwrap();
+        let run = |name: &str, arguments: Value| {
+            let call = ToolCall {
+                id: name.into(),
+                function: crate::model::ToolFunction {
+                    name: name.into(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let (workspace, approvals) = (workspace.clone(), approvals.clone());
+            async move {
+                let never = |_| panic!("a denied read must not prompt");
+                execute(
+                    &workspace,
+                    &call,
+                    "run",
+                    &approvals,
+                    &never,
+                    Duration::from_secs(1),
+                    &OutputCap::default(),
+                )
+                .await
+            }
+        };
+        let absolute = workspace.path.join(".env");
+        for path in [".env", "./.env", "src/../.env", absolute.to_str().unwrap()] {
+            assert!(matches!(
+                run("read_file", json!({"path":path})).await,
+                Err(ToolError::Denied)
+            ));
+        }
+        assert!(matches!(
+            run("read_file", json!({"path":"secrets/key.txt"})).await,
+            Err(ToolError::Denied)
+        ));
+        assert!(matches!(
+            run("list_files", json!({"path":"secrets"})).await,
+            Err(ToolError::Denied)
+        ));
+        assert!(matches!(
+            run("search_files", json!({"path":"secrets","query":"needle"})).await,
+            Err(ToolError::Denied)
+        ));
+        // A search above a denied path leaves the denied files out.
+        let found = run("search_files", json!({"path":".","query":"needle"}))
+            .await
+            .unwrap();
+        assert!(found.contains("ok.txt"), "{found}");
+        assert!(
+            !found.contains(".env") && !found.contains("secrets"),
+            "{found}"
+        );
+        // Other reads are unchanged.
+        assert_eq!(
+            run("read_file", json!({"path":"src/ok.txt"}))
+                .await
+                .unwrap(),
+            "needle"
+        );
+        // The audit names the rule that denied the read, as it does for a denied write.
+        let audit = std::fs::read_to_string(data.join("policy-audit.jsonl")).unwrap();
+        let record: Value = serde_json::from_str(audit.lines().next().unwrap()).unwrap();
+        assert_eq!(record["subject"], ".env");
+        assert_eq!(record["decision"], "deny");
+        assert_eq!(record["allowed"], false);
+        assert_eq!(
+            record["rule"],
+            json!({"source":"project","index":0,"mode":"strictest"})
+        );
         drop(workspace);
         std::fs::remove_dir_all(root).unwrap();
     }

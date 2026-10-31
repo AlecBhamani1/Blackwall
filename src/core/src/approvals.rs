@@ -113,6 +113,10 @@ impl Approvals {
             .insert(request_id.into(), policy);
         Ok(settings)
     }
+    /// The rules applied to this run, if any.
+    pub(crate) fn policy(&self, request_id: &str) -> Option<Arc<Policy>> {
+        self.0.lock().ok()?.policies.get(request_id).cloned()
+    }
     /// `subject` is the command, workspace-relative path, or host that rules match.
     pub async fn request(
         &self,
