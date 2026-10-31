@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { flushSync, onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import {
     persistence,
     instructionFileValid,
@@ -212,6 +212,7 @@
       editingId = '';
       editingEntry = undefined;
       await refresh();
+      showSaved();
     } catch (cause) {
       error =
         typeof cause === 'string'
@@ -273,7 +274,6 @@
     try {
       if (desktop)
         await persistence.savePreferences({
-          memoryEnabled: enabled,
           contextWindow: Number(contextWindow),
           outputTokens: Number(outputTokens),
           autoCompact,
@@ -333,7 +333,12 @@
       maxIterations = contextPreferences.maxIterations ?? 20;
       commandTimeoutSeconds = contextPreferences.commandTimeoutSeconds ?? 120;
       maxOutputBytes = contextPreferences.maxOutputBytes ?? 65536;
-      loaded = true;
+      void tick().then(() => {
+        savedLimits = limitsState;
+        savedSubagents = subagentsState;
+        savedInstructions = instructionsState;
+        loaded = true;
+      });
       return;
     }
     void (async () => {
@@ -359,6 +364,7 @@
         maxSkillSizeKib = savedPreferences.maxSkillSizeKib ?? 32;
         instructionFiles = (savedPreferences.instructionExtraFiles ?? []).join('\n');
         await refresh();
+        await tick();
         savedLimits = limitsState;
         savedSubagents = subagentsState;
         savedInstructions = instructionsState;
@@ -473,7 +479,7 @@
           dirty={Boolean(content.trim())}
           {busy}
           saveLabel={editingId ? 'Save changes' : 'Save memory'}
-          feedback=""
+          {feedback}
           error={content.trim() ? error : ''}
           onSave={() => save()}
           onCancel={() => {
@@ -629,7 +635,7 @@
             below</label
           >
           <label
-            ><input type="radio" checked={subagentRunsOn === 'tool'} value="tool" onclick={() => flushSync(() => (subagentRunsOn = 'tool'))} /> A command tool</label
+            ><input type="radio" bind:group={subagentRunsOn} value="tool" /> A command tool</label
           >
         </fieldset>
         {#if subagentRunsOn === 'local'}

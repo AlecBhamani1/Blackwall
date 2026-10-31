@@ -67,6 +67,13 @@ function client(saved: Partial<ExportSettings> = {}, extra: Partial<TelemetryVie
 }
 
 describe('telemetry settings', () => {
+  it('does not enable Save before settings load', () => {
+    const api = client();
+    api.load.mockReturnValue(new Promise(() => {}));
+    render(TelemetrySettings, { client: api });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
   it('starts off and saves an endpoint, protocol, signals, project names, and retention', async () => {
     const user = userEvent.setup();
     const api = client();

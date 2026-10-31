@@ -288,7 +288,7 @@
     </div>
     {#if !confirmingContent}
       <SettingsFooter
-        dirty={saved === null || dirty}
+        dirty={saved !== null && dirty}
         canSave={forever || (Number.isInteger(days) && days >= 30 && days <= 3650)}
         {busy}
         saveLabel="Save"

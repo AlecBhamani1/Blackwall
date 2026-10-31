@@ -43,7 +43,7 @@
     font-size: 12px;
   }
   span.error {
-    color: var(--danger);
+    color: var(--err);
   }
   button {
     padding: 8px 12px;
@@ -56,6 +56,6 @@
   }
   .primary {
     background: var(--accent);
-    color: var(--accent-contrast);
+    color: var(--text-on-accent);
   }
 </style>

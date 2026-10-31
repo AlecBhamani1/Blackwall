@@ -72,7 +72,6 @@
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let keysOpen = false;
-  let telemetryOpen = false;
   let trustedOpen = false;
   let selectedSetting: SettingsPage = 'connection';
   let settingsQuery = '';
@@ -89,19 +88,16 @@
       .every((word) => text.includes(word));
   });
   $: menuGroups = settingsGroups.map((title) => ({
-          title,
-          entries: matchingSettings.filter((entry) => entry.group === title),
-        }));
+    title,
+    entries: matchingSettings.filter((entry) => entry.group === title),
+  }));
 
-  async function openSetting(
-    entry: (typeof settingsEntries)[number],
-    _button: HTMLButtonElement,
-  ): Promise<void> {
-      selectedSetting = entry.id;
-      await tick();
-      dialogContent.scrollTop = 0;
-      dialogContent.focus();
-    }
+  async function openSetting(entry: (typeof settingsEntries)[number]): Promise<void> {
+    selectedSetting = entry.id;
+    await tick();
+    dialogContent.scrollTop = 0;
+    dialogContent.focus();
+  }
   let expiry: ShareExpiryMinutes = 60;
   let inviteName = '';
   let creatingLink = false;
@@ -468,7 +464,7 @@
                       data-setting-id={entry.id}
                       title={entry.description}
                       aria-current={selectedSetting === entry.id ? 'page' : undefined}
-                      onclick={(event) => openSetting(entry, event.currentTarget)}
+                      onclick={() => openSetting(entry)}
                     >
                       <Icon name={entry.icon} size={19} />
                       <span><strong>{entry.title}</strong></span>
@@ -1877,7 +1873,7 @@
     line-height: 1.5;
   }
 
-  @media (max-width: 560px) {
+  @media (max-width: 760px) {
     .modal-layer {
       inset: 0;
     }

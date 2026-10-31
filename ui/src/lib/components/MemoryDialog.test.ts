@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/svelte';
+import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { instructionFileValid, persistence, type MemoryProposal } from '../persistence';
@@ -64,6 +64,26 @@ describe('memory management', () => {
     await user.click(cancel);
     expect(context).toHaveValue(32000);
   });
+  it('starts web limits clean and restores their loaded values', async () => {
+    vi.spyOn(persistence, 'available').mockReturnValue(false);
+    const user = userEvent.setup();
+    render(MemoryDialog, {
+      props: {
+        onClose: vi.fn(),
+        embedded: true,
+        section: 'limits',
+        contextPreferences: { contextWindow: 64000 },
+      },
+    });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    expect(cancel).toBeDisabled();
+    await user.clear(context);
+    await user.type(context, '32000');
+    await user.click(cancel);
+    expect(context).toHaveValue(64000);
+  });
   it('saves the command output cap only within its range', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
@@ -118,11 +138,12 @@ describe('memory management', () => {
       commandToolsIsolation: 'outside',
     });
   });
-  it('shows command tool settings synchronously from local state', async () => {
+  it('shows command tool settings after choosing a command tool', async () => {
+    const user = userEvent.setup();
     render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
     const option = await screen.findByLabelText('A command tool');
     await vi.waitFor(() => expect(option).toBeEnabled());
-    fireEvent.click(option);
+    await user.click(option);
     expect(screen.getByLabelText('Command tool name')).toBeInTheDocument();
   });
   it('saves the memory toggle without committing a draft context limit', async () => {
@@ -145,6 +166,17 @@ describe('memory management', () => {
     await vi.waitFor(() => expect(toggle).toBeEnabled());
     await user.click(toggle);
     expect(stored).toEqual({ memoryEnabled: true, contextWindow: 32000 });
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
+  });
+  it('shows feedback after saving memory text', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'saveMemory').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'memory' } });
+    const input = await screen.findByLabelText('Remember something');
+    await vi.waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, 'Prefer concise answers.');
+    await user.click(screen.getByRole('button', { name: 'Save memory' }));
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
   });
   it('loads saved subagent settings that run on a command tool', async () => {
     const user = userEvent.setup();

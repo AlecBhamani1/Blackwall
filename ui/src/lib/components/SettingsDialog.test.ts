@@ -47,7 +47,9 @@ describe('SettingsDialog', () => {
       within(menu.getByRole('region', { name: 'Agent' }))
         .getAllByRole('button')
         .map((button) => button.textContent?.trim()),
-    ).toEqual(['Limits', 'Subagents', 'Instructions', 'MCP servers', 'Skills']);
+    ).toEqual(['Limits', 'MCP servers', 'Skills']);
+    expect(menu.queryByRole('button', { name: /Subagents/ })).not.toBeInTheDocument();
+    expect(menu.queryByRole('button', { name: /Instructions/ })).not.toBeInTheDocument();
     expect(
       within(menu.getByRole('region', { name: 'Workflows' }))
         .getAllByRole('button')
@@ -116,7 +118,7 @@ describe('SettingsDialog', () => {
     const search = screen.getByRole('searchbox', { name: 'Search settings' });
     const menu = within(screen.getByRole('navigation', { name: 'Settings menu' }));
     await user.type(search, '  TOOLS  ');
-    expect(menu.getAllByRole('button')).toHaveLength(2);
+    expect(menu.getAllByRole('button')).toHaveLength(1);
     expect(menu.getByRole('button', { name: /MCP servers/ })).toBeInTheDocument();
     await user.clear(search);
     await user.type(search, 'workflows');

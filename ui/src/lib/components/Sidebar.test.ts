@@ -53,11 +53,14 @@ it('manages settings sections on one page and returns focus after closing Settin
   }
 
   await user.click(within(settings).getByRole('button', { name: 'Limits' }));
-  expect(within(pane).getByLabelText('Model context limit (tokens)')).toHaveValue(8192);
+  const context = within(pane).getByLabelText('Model context limit (tokens)');
+  expect(context).toHaveValue(8192);
+  await user.clear(context);
+  await user.type(context, '8193');
   await user.click(within(pane).getByRole('button', { name: 'Save context limit' }));
-      expect(onPreferences).toHaveBeenCalledWith(
-        expect.objectContaining({ contextWindow: 8192, maxIterations: 30 }),
-      );
+  expect(onPreferences).toHaveBeenCalledWith(
+    expect.objectContaining({ contextWindow: 8193, maxIterations: 30 }),
+  );
 
   await user.keyboard('{Escape}');
   expect(screen.queryByRole('region', { name: 'Settings' })).not.toBeInTheDocument();
