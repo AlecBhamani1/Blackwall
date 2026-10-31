@@ -455,15 +455,20 @@ impl Workspace {
         }
         result
     }
-    pub fn list(&self, path: &str) -> Result<String, ToolError> {
+    /// Up to 500 entries of a directory, leaving out `.git` and `denied` paths.
+    pub fn list(&self, path: &str, denied: &dyn Fn(&Path) -> bool) -> Result<String, ToolError> {
+        let root = self.checked(path)?;
         let mut names = vec![];
         for entry in self
             .directory
-            .read_dir(self.checked(path)?)
+            .read_dir(&root)
             .map_err(|_| ToolError::File)?
             .take(500)
         {
             let entry = entry.map_err(|_| ToolError::File)?;
+            if denied(&root.join(entry.file_name())) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == ".git" {
                 continue;
@@ -574,7 +579,7 @@ pub async fn execute(
             }
             match name {
                 "read_file" => workspace.read(path),
-                "list_files" => workspace.list(path),
+                "list_files" => workspace.list(path, &|path| denied(path).is_some()),
                 _ => workspace.search(path, argument(&arguments, "query")?, &|path| {
                     denied(path).is_some()
                 }),
@@ -1726,6 +1731,13 @@ mod tests {
         assert!(
             !found.contains(".env") && !found.contains("secrets"),
             "{found}"
+        );
+        // A parent listing leaves the denied entries out.
+        let listed = run("list_files", json!({"path":"."})).await.unwrap();
+        assert!(listed.contains("src/"), "{listed}");
+        assert!(
+            !listed.contains(".env") && !listed.contains("secrets"),
+            "{listed}"
         );
         // Other reads are unchanged.
         assert_eq!(
