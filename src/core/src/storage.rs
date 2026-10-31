@@ -12,7 +12,7 @@ pub const LOCK_MARKER: &str = "app-lock-enabled";
 pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SCHEMA_VERSION: i64 = 5;
 

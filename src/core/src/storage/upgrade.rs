@@ -7,18 +7,21 @@
 
 use super::chats::{apply_v6_schema, write_tx};
 use super::convert::convert_session;
-use super::{LocalStore, StorageError, DATABASE_FILE};
+use super::{LocalStore, StorageError, BUSY_TIMEOUT, DATABASE_FILE};
 use rusqlite::{backup::NO_PROGRESS, Connection, OpenFlags, MAIN_DB};
 use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 /// The schema version of the v6 chat store.
 pub(crate) const V6: i64 = 6;
 const BACKUPS_DIR: &str = "backups";
 const MAX_BACKUPS: u32 = 3;
+/// How long an opener waits for another window's upgrade (800 large chats took 13 s).
+const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn user_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -33,6 +36,8 @@ pub(super) fn open_v6(
     )?;
     if user_version(&connection)? != V6 {
         // Re-read under the writer lock: another window may have upgraded while this one waited.
+        // An upgrade of a large history takes seconds, so a second opener waits it out.
+        connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
         let tx = write_tx(&connection)?;
         let version = user_version(&tx)?;
         if version > V6 {
@@ -70,6 +75,7 @@ pub(super) fn open_v6(
             // failure here (no room for the temporary copy) only leaves the file larger.
             let _ = connection.execute_batch("VACUUM");
         }
+        connection.busy_timeout(BUSY_TIMEOUT)?;
     }
     Ok(LocalStore { connection })
 }
@@ -91,7 +97,11 @@ fn back_up(directory: &Path) -> Result<PathBuf, StorageError> {
         directory.join(DATABASE_FILE),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    source.backup(MAIN_DB, &target, NO_PROGRESS)?;
+    if let Err(error) = source.backup(MAIN_DB, &target, NO_PROGRESS) {
+        // A partial copy must not take a slot.
+        let _ = fs::remove_file(&target);
+        return Err(error.into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -293,7 +303,8 @@ pub(crate) mod tests {
     }
 
     /// A v5 agent chat of `exchanges` user/assistant pairs, saved the way v5 saves one: every
-    /// third answer runs a tool, and the model transcript holds every turn.
+    /// third answer runs a tool, and the model transcript holds every turn. 150 exchanges come to
+    /// about 1.6 MB, the size of an average chat in a long real history.
     fn long_chat(exchanges: usize) -> Value {
         let (mut messages, mut transcript) = (vec![], vec![]);
         for i in 0..exchanges {
@@ -305,14 +316,14 @@ pub(crate) mod tests {
             transcript.push(json!({"role": "user", "content": question}));
             let answer = format!(
                 "Module {i} validates its inputs, then {}.",
-                "stores them ".repeat(20)
+                "stores them ".repeat(210)
             );
             let mut reply = json!({"id": format!("a{i}"), "role": "assistant", "content": answer,
                 "attachments": [], "status": "complete", "createdAt": i});
             if i % 3 == 0 {
                 let call = format!("call{i}");
                 let arguments = format!("{{\"path\":\"src/module_{i}.rs\"}}");
-                let output = format!("pub fn module_{i}() {{}}\n").repeat(30);
+                let output = format!("pub fn module_{i}() {{}}\n").repeat(320);
                 transcript.push(json!({"role": "assistant", "content": "Reading it.",
                     "tool_calls": [{"id": call, "type": "function",
                         "function": {"name": "read_file", "arguments": arguments}}]}));
