@@ -2,7 +2,7 @@
 use blackwall_core::storage::{LocalStore, MemoryEntry, StorageError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 pub async fn with_store<T: Send + 'static>(
     app: &AppHandle,
@@ -1084,9 +1084,35 @@ pub async fn owner_rules(app: AppHandle) -> Result<blackwall_core::policy::Rules
 #[tauri::command]
 pub async fn save_owner_rules(
     app: AppHandle,
-    shown: Vec<blackwall_core::policy::Rule>,
+    shown: blackwall_core::policy::RulesFile,
     rules: Vec<blackwall_core::policy::Rule>,
 ) -> Result<(), String> {
+    crate::auth::require_unlocked(&app).await?;
+    let mut after = shown.clone();
+    after.rules.clone_from(&rules);
+    let loosened = blackwall_core::policy::loosened(&shown, &after);
+    if !loosened.is_empty() {
+        let asker = app.clone();
+        let confirmed = tokio::task::spawn_blocking(move || {
+            asker
+                .dialog()
+                .message(format!(
+                    "This makes your rules weaker:\n\n- {}",
+                    loosened.join("\n- ")
+                ))
+                .title("Loosen your rules?")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Save".into(),
+                    "Cancel".into(),
+                ))
+                .blocking_show()
+        })
+        .await
+        .map_err(|_| "The confirmation could not open.")?;
+        if !confirmed {
+            return Err("Not saved.".into());
+        }
+    }
     with_mcp(&app, move |directory| {
         blackwall_core::policy::save_owner_rules(directory, &shown, rules)
     })
@@ -1097,7 +1123,7 @@ pub async fn test_owner_rule(
     app: AppHandle,
     kind: blackwall_core::protocol::ApprovalKind,
     subject: String,
-) -> Result<blackwall_core::policy::Verdict, String> {
+) -> Result<blackwall_core::policy::RuleTest, String> {
     crate::auth::require_unlocked(&app).await?;
     let directory = crate::identity::data_directory(&app)?;
     blackwall_core::policy::test_owner_rule(&directory, kind, &subject).await

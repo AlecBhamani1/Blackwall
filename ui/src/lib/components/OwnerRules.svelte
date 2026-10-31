@@ -72,12 +72,15 @@
     busy = true;
     error = '';
     try {
-      await persistence.saveOwnerRules(rules, next);
+      await persistence.saveOwnerRules(saved ?? { rules }, next);
       draft = null;
     } catch (cause) {
       error = message(cause, 'The rules could not be saved.');
     } finally {
+      const shown = JSON.stringify(saved);
       await loadRules();
+      // The editor's index would point at another rule.
+      if (JSON.stringify(saved) !== shown) draft = null;
       busy = false;
     }
   }
@@ -119,7 +122,7 @@
     const rule = result.matched ? rules[result.matched.index] : undefined;
     return result.matched
       ? `${result.decision} by rule ${result.matched.index + 1}${rule ? `: ${describe(rule)}` : ''}`
-      : `${result.decision}, no rule matched`;
+      : `${result.decision}, no rule matched${result.projectOnly ? ' outside a project: a rule limited to a project would match' : ''}`;
   }
   onMount(load);
 </script>
@@ -185,22 +188,24 @@
   {/if}
   <fieldset>
     <legend>Test a rule</legend>
-    <label
-      >Test kind
-      <select
-        bind:value={testKind}
-        onchange={() => ((testValue = ''), (verdict = null))}
-      >
-        <option value="exec">exec</option>
-        <option value="file">file</option>
-        <option value="network">network</option>
-      </select>
-    </label>
-    <label
-      >{LABELS[FIELDS[testKind]]}
-      <input bind:value={testValue} autocomplete="off" autocapitalize="none" />
-    </label>
-    <button onclick={test} disabled={!testValue}>Test</button>
+    <div class="row">
+      <label
+        >Test kind
+        <select
+          bind:value={testKind}
+          onchange={() => ((testValue = ''), (verdict = null))}
+        >
+          <option value="exec">exec</option>
+          <option value="file">file</option>
+          <option value="network">network</option>
+        </select>
+      </label>
+      <label
+        >{LABELS[FIELDS[testKind]]}
+        <input bind:value={testValue} autocomplete="off" autocapitalize="none" />
+      </label>
+      <button onclick={test} disabled={!testValue}>Test</button>
+    </div>
     {#if verdict}<p role="status">{verdictText(verdict)}</p>{/if}
   </fieldset>
 {/if}
@@ -262,25 +267,48 @@
     background: var(--bg-elevated);
   }
   form,
-  fieldset {
+  .row {
     display: flex;
     flex-wrap: wrap;
     align-items: end;
     gap: 10px;
+  }
+  form {
     margin: 12px 0;
+    font-size: 12px;
+  }
+  fieldset {
+    margin: 20px 0 0;
     padding: 0;
     border: 0;
     font-size: 12px;
   }
   label {
-    display: grid;
-    gap: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    color: var(--text-muted);
+  }
+  input,
+  select {
+    min-width: 0;
+    padding: 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+  input {
+    min-width: 200px;
   }
   legend {
+    padding: 0;
+    margin-bottom: 10px;
+    font-size: 12px;
     font-weight: 600;
   }
   h4 {
-    margin: 16px 0 6px;
+    margin: 20px 0 10px;
     font-size: 12px;
   }
   .error {

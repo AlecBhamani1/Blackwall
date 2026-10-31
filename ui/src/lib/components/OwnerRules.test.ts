@@ -56,7 +56,7 @@ describe('Owner rules in Settings', () => {
     await user.selectOptions(screen.getByLabelText('Kind'), 'file');
     await user.type(screen.getByLabelText('Path'), 'src');
     await user.click(screen.getByRole('button', { name: 'Save rule' }));
-    expect(save).toHaveBeenCalledWith(rules, [...rules, added]);
+    expect(save).toHaveBeenCalledWith({ rules }, [...rules, added]);
     expect(await screen.findByText('allow file src')).toBeInTheDocument();
     expect(screen.queryByLabelText('Path')).not.toBeInTheDocument();
   });
@@ -71,7 +71,7 @@ describe('Owner rules in Settings', () => {
     await user.clear(screen.getByLabelText('Tool'));
     await user.type(screen.getByLabelText('Tool'), 'docs__fetch');
     await user.click(screen.getByRole('button', { name: 'Save rule' }));
-    expect(save).toHaveBeenCalledWith(rules, [
+    expect(save).toHaveBeenCalledWith({ rules }, [
       rules[0],
       { decision: 'deny', kind: 'exec', tool: 'docs__fetch', project: '/work/app' },
       rules[2],
@@ -83,7 +83,7 @@ describe('Owner rules in Settings', () => {
     const save = vi.spyOn(persistence, 'saveOwnerRules').mockResolvedValue();
     render(OwnerRules);
     await user.click(await screen.findByRole('button', { name: 'Delete rule 1: .git' }));
-    expect(save).toHaveBeenCalledWith(rules, [rules[1], rules[2]]);
+    expect(save).toHaveBeenCalledWith({ rules }, [rules[1], rules[2]]);
   });
 
   it("shows the backend's refusal and keeps the form open", async () => {
@@ -108,6 +108,36 @@ describe('Owner rules in Settings', () => {
     expect(screen.queryByRole('button', { name: 'Add rule' })).not.toBeInTheDocument();
   });
 
+  it('says a test ran outside a project when only a project rule would match', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'testOwnerRule').mockResolvedValue({
+      decision: 'ask',
+      matched: null,
+      projectOnly: true,
+    });
+    render(OwnerRules);
+    await screen.findAllByRole('listitem');
+    const tester = within(screen.getByRole('group', { name: 'Test a rule' }));
+    await user.type(tester.getByLabelText('Command'), 'docs');
+    await user.click(tester.getByRole('button', { name: 'Test' }));
+    expect(await tester.findByRole('status')).toHaveTextContent('outside a project');
+  });
+
+  it('closes the editor when a failed save finds the rules changed underneath it', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'saveOwnerRules').mockRejectedValue('The rules changed since they were shown.');
+    vi.spyOn(persistence, 'ownerRules')
+      .mockResolvedValueOnce({ rules })
+      .mockResolvedValue({ rules: [rules[2]] });
+    render(OwnerRules);
+    await user.click(await screen.findByRole('button', { name: 'Edit rule 1: .git' }));
+    await user.type(screen.getByLabelText('Path'), 'x');
+    await user.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('changed');
+    expect(screen.queryByLabelText('Path')).not.toBeInTheDocument();
+    expect(screen.getByText('ask exec git push')).toBeInTheDocument();
+  });
+
   it('tests a command, a path and a host without saving anything', async () => {
     const user = userEvent.setup();
     const test = vi
@@ -115,8 +145,9 @@ describe('Owner rules in Settings', () => {
       .mockResolvedValueOnce({
         decision: 'ask',
         matched: { source: 'user', index: 2, mode: 'strictest' },
+        projectOnly: false,
       })
-      .mockResolvedValueOnce({ decision: 'ask', matched: null });
+      .mockResolvedValueOnce({ decision: 'ask', matched: null, projectOnly: false });
     const save = vi.spyOn(persistence, 'saveOwnerRules');
     render(OwnerRules);
     await screen.findAllByRole('listitem');

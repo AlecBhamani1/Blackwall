@@ -310,6 +310,8 @@ export interface MatchedOwnerRule {
 export interface RuleVerdict {
   decision: OwnerRule['decision'];
   matched: MatchedOwnerRule | null;
+  /** Nothing matched, but a rule limited to a project would in that project. */
+  projectOnly: boolean;
 }
 export interface PolicyAuditEntry {
   /** Seconds since the Unix epoch. */
@@ -411,8 +413,9 @@ export const persistence = {
   mcpToolRules: () => command<McpToolRule[]>('list_mcp_tool_rules'),
   removeMcpToolRule: (rule: McpToolRule) => command<void>('remove_mcp_tool_rule', { rule }),
   ownerRules: () => command<OwnerRules>('owner_rules'),
-  /** Replaces the owner's rules if the file still holds `shown`; the backend validates. */
-  saveOwnerRules: (shown: OwnerRule[], rules: OwnerRule[]) =>
+  /** Replaces the owner's rules if the file still holds `shown`; the backend validates and asks
+   * the owner to confirm anything that loosens them. */
+  saveOwnerRules: (shown: OwnerRules, rules: OwnerRule[]) =>
     command<void>('save_owner_rules', { shown, rules }),
   testOwnerRule: (kind: OwnerRule['kind'], subject: string) =>
     command<RuleVerdict>('test_owner_rule', { kind, subject }),

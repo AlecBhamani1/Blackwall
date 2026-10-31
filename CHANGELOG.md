@@ -11,8 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Settings → Privacy & security → Rules & sandbox now has Your rules: list your allow, ask and
   deny rules in order, add, edit or delete one (saved with the same checks as `policy.json`, other
-  rules kept), test a command, path or host to see which rule decides, and read the latest 100
-  audit log entries.
+  rules kept, and a confirmation first when a change loosens them), test a command, path or host
+  to see which rule decides, and read the latest 100 audit log entries.
 - A Max skill size preference (Memory → Advanced · Instructions, or
   `bw config set max-skill-kib`) defaults to 10% of the configured context window at about four bytes
   per token, clamped to 32–256 KiB, and accepts a manual 32–256 KiB override. Skill import and
