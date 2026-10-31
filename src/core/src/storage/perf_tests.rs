@@ -41,8 +41,17 @@ use std::{
 
 /// Every timing is the median of this many runs.
 const RUNS: usize = 20;
-/// R4-6 budgeted 50 ms to open a 300-message chat and 5 ms to append; R5-9 allows 10x.
+/// R4-6 budgeted 50 ms to open a 300-message chat and 5 ms to append; R5-9 allows 10x. An open
+/// only reads, so its ceiling is the same on every OS (Windows CI measured about 12 ms in debug).
 const OPEN_CEILING: Duration = Duration::from_millis(500);
+/// An append commits under `synchronous=FULL`. On Windows that commit is dominated by
+/// `FlushFileBuffers` on the journal and the database (CI measured 109 ms in debug while the
+/// statement, change, page and VM-op counts stayed the same as elsewhere), so the ceiling there
+/// is 500 ms. The counts above decide whether an append's work grew; this only catches a
+/// pathology.
+#[cfg(windows)]
+const APPEND_CEILING: Duration = Duration::from_millis(500);
+#[cfg(not(windows))]
 const APPEND_CEILING: Duration = Duration::from_millis(50);
 
 // ---- helpers ----

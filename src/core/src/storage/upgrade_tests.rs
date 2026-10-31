@@ -1629,13 +1629,16 @@ fn another_process_cannot_take_the_write_lock_from_an_upgrade_in_progress() {
     assert_eq!(version_of(&dir.database()), V6);
 }
 
-/// The production code of `file`: everything before its test module.
-fn production(file: &str) -> &str {
+/// The production code of `file`: everything before its test module. Line ends are made `\n`
+/// first: a Windows checkout (git's `core.autocrlf`) gives `include_str!` CRLF text, and the
+/// markers searched for here and below span a line end.
+fn production(file: &str) -> String {
+    let file = file.replace("\r\n", "\n");
     let end = file
         .find("#[cfg(test)]\n#[allow(clippy::unwrap_used)]")
         .or_else(|| file.find("#[cfg(test)]\nmod tests"))
-        .unwrap();
-    &file[..end]
+        .expect("the file has a test module");
+    file[..end].to_owned()
 }
 
 /// The rule behind the POSIX lock fix: the database file is never opened outside SQLite, because
@@ -1646,6 +1649,11 @@ fn the_database_file_is_never_opened_outside_sqlite() {
     let upgrade = production(include_str!("upgrade.rs"));
     let backup = production(include_str!("backup.rs"));
     let storage = production(include_str!("../storage.rs"));
+    // The same scan of a CRLF checkout, as Windows CI has it.
+    let crlf = include_str!("upgrade.rs")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_eq!(production(&crlf), upgrade);
     let opens = [
         "File::open(",
         "File::options(",
@@ -1666,7 +1674,7 @@ fn the_database_file_is_never_opened_outside_sqlite() {
             .collect()
     };
     assert_eq!(
-        calls(upgrade),
+        calls(&upgrade),
         Vec::<String>::new(),
         "upgrade.rs opens a file"
     );
@@ -1674,7 +1682,7 @@ fn the_database_file_is_never_opened_outside_sqlite() {
     // file, which no connection can hold a lock on yet, and opens nothing when it exists. The
     // other write is the no-lock marker, not the database.
     assert_eq!(
-        calls(storage),
+        calls(&storage),
         [
             "match fs::OpenOptions::new()",
             "let _ = fs::write(directory.join(NO_LOCK_MARKER), b\"\");",
@@ -1682,7 +1690,7 @@ fn the_database_file_is_never_opened_outside_sqlite() {
         "a new std open in storage.rs: it must never be the database file"
     );
     assert_eq!(
-        calls(backup),
+        calls(&backup),
         [
             "fn create_private(path: &Path) -> io::Result<File> {",
             "let mut options = OpenOptions::new();",
