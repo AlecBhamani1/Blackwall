@@ -575,7 +575,7 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, String> {
     }
     for (index, rule) in rules.iter().enumerate() {
         // Paths match as prefixes, so a wildcard would never match anything.
-        if let Some(path) = rule.path.as_deref().filter(|p| p.contains(['*', '?', '['])) {
+        if let Some(path) = rule.path.as_deref().filter(|p| p.contains(['*', '?'])) {
             return Err(format!(
                 "Rule rules[{index}] path {path:?} uses a wildcard. Paths are plain prefixes: use \"src\", not \"src/**\"."
             ));
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn wildcard_rule_paths_are_refused_with_the_rule_named() {
-        for path in ["src/**", "*.env", "file?.txt", "app/[id]"] {
+        for path in ["src/**", "*.env", "file?.txt"] {
             let rules = json!({"rules":[
                 {"decision":"allow","kind":"exec","command":"ls"},
                 {"decision":"deny","kind":"file","path":path}
@@ -1257,6 +1257,12 @@ mod tests {
                 "{error}"
             );
         }
+        // Brackets are literal, as in a Next.js route folder.
+        let literal = json!({"rules":[{"decision":"deny","kind":"file","path":"app/[id]"}]});
+        assert!(serde_json::from_value::<RulesFile>(literal)
+            .unwrap()
+            .validate()
+            .is_ok());
     }
 
     #[tokio::test]
