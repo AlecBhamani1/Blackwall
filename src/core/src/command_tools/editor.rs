@@ -55,7 +55,8 @@ pub fn summaries(directory: &Path) -> Result<Vec<ToolSummary>, String> {
 }
 
 /// Change the file's `tools` array as plain JSON, so entries and fields the screen does not know
-/// stay exactly as written, then save only what the loader accepts. Nothing is saved otherwise.
+/// keep their values (keys may be re-ordered and re-indented), then save only what the loader
+/// accepts. Nothing is saved otherwise.
 fn edit(
     directory: &Path,
     change: impl FnOnce(&mut Vec<Value>) -> Result<(), String>,
@@ -98,10 +99,9 @@ fn command_tool_only(tool: &Value) -> Result<(), String> {
     }
 }
 
-/// Add a command tool, or change the description and command of the one with this name and keep
-/// everything else it has. `prompt_on_stdin` makes a new tool take a `prompt` as JSON on standard
-/// input, which is what a subagent needs.
-pub fn save_tool(
+/// Add a command tool under a name no tool has. `prompt_on_stdin` makes it take a `prompt` as
+/// JSON on standard input, which is what a subagent needs.
+pub fn add_tool(
     directory: &Path,
     name: &str,
     description: &str,
@@ -112,22 +112,34 @@ pub fn save_tool(
         return Err("A tool name uses lowercase letters, digits and underscores.".into());
     }
     edit(directory, |tools| {
-        match position(tools, name) {
-            Some(index) => {
-                command_tool_only(&tools[index])?;
-                tools[index]["description"] = json!(description.trim());
-                tools[index]["command"] = json!(command);
-            }
-            None => {
-                let mut tool =
-                    json!({"name":name,"description":description.trim(),"command":command});
-                if prompt_on_stdin {
-                    tool["stdin"] = json!("json");
-                    tool["parameters"] = json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]});
-                }
-                tools.push(tool);
-            }
+        if position(tools, name).is_some() {
+            return Err(format!(
+                "A tool named {name} already exists. Edit it instead."
+            ));
         }
+        let mut tool = json!({"name":name,"description":description.trim(),"command":command});
+        if prompt_on_stdin {
+            tool["stdin"] = json!("json");
+            tool["parameters"] = json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"]});
+        }
+        tools.push(tool);
+        Ok(())
+    })
+}
+
+/// Change the description and command of a command tool and keep everything else it has.
+pub fn update_tool(
+    directory: &Path,
+    name: &str,
+    description: &str,
+    command: Vec<String>,
+) -> Result<(), String> {
+    edit(directory, |tools| {
+        let index = position(tools, name)
+            .ok_or_else(|| format!("There is no command tool named {name}."))?;
+        command_tool_only(&tools[index])?;
+        tools[index]["description"] = json!(description.trim());
+        tools[index]["command"] = json!(command);
         Ok(())
     })
 }
@@ -220,7 +232,7 @@ mod tests {
     fn a_missing_file_has_no_tools_and_a_save_creates_it() {
         let directory = folder();
         assert!(summaries(&directory).unwrap().is_empty());
-        save_tool(
+        add_tool(
             &directory,
             "claude",
             "Ask Claude",
@@ -245,7 +257,7 @@ mod tests {
     #[test]
     fn a_tool_without_a_prompt_on_stdin_is_not_a_subagent_candidate() {
         let directory = folder();
-        save_tool(
+        add_tool(
             &directory,
             "copilot",
             "Copilot",
@@ -267,17 +279,16 @@ mod tests {
         let body = format!(r#"{{"tools":[{HTTP},{LOCAL}]}}"#);
         std::fs::write(directory.join(COMMAND_TOOLS_FILE), &body).unwrap();
         let before = read(&directory);
-        save_tool(&directory, "claude", "Ask", vec!["claude".into()], true).unwrap();
+        add_tool(&directory, "claude", "Ask", vec!["claude".into()], true).unwrap();
         let after = read(&directory);
         assert_eq!(after["tools"][0], before["tools"][0]);
         assert_eq!(after["tools"][1], before["tools"][1]);
         // Editing an existing tool changes only its description and command.
-        save_tool(
+        update_tool(
             &directory,
             "lint",
             "Lint files",
             vec!["biome".into(), "{file}".into()],
-            true,
         )
         .unwrap();
         let edited = read(&directory)["tools"][1].clone();
@@ -294,6 +305,31 @@ mod tests {
     }
 
     #[test]
+    fn add_refuses_an_existing_name_and_update_needs_one() {
+        let directory = folder();
+        add_tool(&directory, "claude", "Ask", vec!["claude".into()], true).unwrap();
+        let before = std::fs::read(directory.join(COMMAND_TOOLS_FILE)).unwrap();
+        // A stale list must not overwrite a tool, nor drop what it takes on standard input.
+        let error =
+            add_tool(&directory, "claude", "Other", vec!["other".into()], false).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(update_tool(&directory, "absent", "d", vec!["ls".into()]).is_err());
+        assert_eq!(
+            std::fs::read(directory.join(COMMAND_TOOLS_FILE)).unwrap(),
+            before
+        );
+        update_tool(
+            &directory,
+            "claude",
+            "Ask again",
+            vec!["claude".into(), "-p".into()],
+        )
+        .unwrap();
+        assert_eq!(read(&directory)["tools"][0]["stdin"], "json");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn http_tools_are_listed_but_not_changed_or_removed() {
         let directory = folder();
         std::fs::write(
@@ -305,7 +341,8 @@ mod tests {
         assert_eq!(tools[0].kind, "http");
         assert!(tools[0].subagent_problem.is_some());
         let before = std::fs::read(directory.join(COMMAND_TOOLS_FILE)).unwrap();
-        assert!(save_tool(&directory, "issues", "x", vec!["ls".into()], false).is_err());
+        assert!(update_tool(&directory, "issues", "x", vec!["ls".into()]).is_err());
+        assert!(add_tool(&directory, "issues", "x", vec!["ls".into()], false).is_err());
         assert!(remove_tool(&directory, "issues").is_err());
         assert_eq!(
             std::fs::read(directory.join(COMMAND_TOOLS_FILE)).unwrap(),
@@ -327,11 +364,11 @@ mod tests {
             ("local", vec!["./run".into()]),
         ] {
             assert!(
-                save_tool(&directory, name, "d", command, true).is_err(),
+                add_tool(&directory, name, "d", command, true).is_err(),
                 "{name}"
             );
         }
-        assert!(save_tool(&directory, "ok", "  ", vec!["ls".into()], true).is_err());
+        assert!(add_tool(&directory, "ok", "  ", vec!["ls".into()], true).is_err());
         assert!(remove_tool(&directory, "absent").is_err());
         assert_eq!(
             std::fs::read_to_string(directory.join(COMMAND_TOOLS_FILE)).unwrap(),
@@ -340,7 +377,7 @@ mod tests {
         // An unreadable file is reported, not replaced.
         std::fs::write(directory.join(COMMAND_TOOLS_FILE), "not json").unwrap();
         assert!(summaries(&directory).is_err());
-        assert!(save_tool(&directory, "ok", "d", vec!["ls".into()], true).is_err());
+        assert!(add_tool(&directory, "ok", "d", vec!["ls".into()], true).is_err());
         assert_eq!(
             std::fs::read_to_string(directory.join(COMMAND_TOOLS_FILE)).unwrap(),
             "not json"
@@ -355,7 +392,7 @@ mod tests {
         let target = directory.join("elsewhere.json");
         std::fs::write(&target, r#"{"tools":[]}"#).unwrap();
         std::os::unix::fs::symlink(&target, directory.join(COMMAND_TOOLS_FILE)).unwrap();
-        let error = save_tool(&directory, "ok", "d", vec!["ls".into()], true).unwrap_err();
+        let error = add_tool(&directory, "ok", "d", vec!["ls".into()], true).unwrap_err();
         assert!(error.contains("symbolic link"), "{error}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"tools":[]}"#);
         assert!(

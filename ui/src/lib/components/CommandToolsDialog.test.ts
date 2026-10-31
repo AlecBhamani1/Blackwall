@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { persistence, type CommandToolSummary } from '../persistence';
+import { COMMAND_TOOL_SUGGESTIONS } from '../commandToolSuggestions';
 import CommandToolsDialog from './CommandToolsDialog.svelte';
 
 const review: CommandToolSummary = {
@@ -74,7 +75,7 @@ describe('command tools screen', () => {
   it('adds claude so a subagent can run on it', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'commandTools').mockResolvedValue([]);
-    const save = vi.spyOn(persistence, 'saveCommandTool').mockResolvedValue();
+    const save = vi.spyOn(persistence, 'addCommandTool').mockResolvedValue();
     render(CommandToolsDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add tool' }));
     await user.click(screen.getByRole('button', { name: /claude/ }));
@@ -89,6 +90,9 @@ describe('command tools screen', () => {
         '-p',
         '--permission-mode',
         'plan',
+        '--setting-sources',
+        'user',
+        '--strict-mcp-config',
         '--append-system-prompt',
         'Standard input is JSON; do the task in arguments.prompt.',
       ],
@@ -96,10 +100,17 @@ describe('command tools screen', () => {
     );
     await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Add tool' })).toBeEnabled());
   });
+  it('keeps the project from configuring the suggested claude', () => {
+    const claude = COMMAND_TOOL_SUGGESTIONS.find((item) => item.name === 'claude');
+    // A cloned repository's .claude/settings.json and .mcp.json are never loaded.
+    expect(claude?.command).toContain('--strict-mcp-config');
+    const sources = claude?.command.indexOf('--setting-sources') ?? -1;
+    expect(claude?.command.slice(sources, sources + 2)).toEqual(['--setting-sources', 'user']);
+  });
   it('suggests codex and copilot with the prompt as an argument, not for subagents', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'commandTools').mockResolvedValue([]);
-    const save = vi.spyOn(persistence, 'saveCommandTool').mockResolvedValue();
+    const save = vi.spyOn(persistence, 'addCommandTool').mockResolvedValue();
     render(CommandToolsDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add tool' }));
     await user.click(screen.getByRole('button', { name: /codex/ }));
@@ -112,9 +123,11 @@ describe('command tools screen', () => {
       false,
     );
   });
-  it('adds a tool of its own and refuses an unclosed quote or a name in use', async () => {
+  it('adds a tool of its own, refuses an unclosed quote, and shows a refused name', async () => {
     const user = userEvent.setup();
-    const save = vi.spyOn(persistence, 'saveCommandTool').mockResolvedValue();
+    const save = vi
+      .spyOn(persistence, 'addCommandTool')
+      .mockRejectedValue('A tool named lint already exists. Edit it instead.');
     render(CommandToolsDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add tool' }));
     await user.type(screen.getByLabelText('Name'), 'lint');
@@ -122,14 +135,15 @@ describe('command tools screen', () => {
     await user.type(screen.getByLabelText('Command'), 'eslint "a b');
     await user.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('closing quote');
+    expect(save).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText('Command'), '"');
     await user.click(screen.getByRole('button', { name: 'Save' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('A tool named lint already exists');
-    expect(save).not.toHaveBeenCalled();
+    expect(await screen.findByText(/A tool named lint already exists/)).toBeInTheDocument();
+    expect(save).toHaveBeenCalledWith('lint', 'Lint', ['eslint', 'a b'], false);
   });
   it('edits only the description and command of a tool', async () => {
     const user = userEvent.setup();
-    const save = vi.spyOn(persistence, 'saveCommandTool').mockResolvedValue();
+    const save = vi.spyOn(persistence, 'updateCommandTool').mockResolvedValue();
     render(CommandToolsDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Edit review' }));
     expect(screen.getByLabelText('Name')).toBeDisabled();
@@ -139,11 +153,11 @@ describe('command tools screen', () => {
     await user.clear(command);
     await user.type(command, 'review --strict');
     await user.click(screen.getByRole('button', { name: 'Save' }));
-    expect(save).toHaveBeenCalledWith('review', 'Ask for a review', ['review', '--strict'], false);
+    expect(save).toHaveBeenCalledWith('review', 'Ask for a review', ['review', '--strict']);
   });
   it('shows the message from a refused save', async () => {
     const user = userEvent.setup();
-    vi.spyOn(persistence, 'saveCommandTool').mockRejectedValue('The tools file is not valid.');
+    vi.spyOn(persistence, 'updateCommandTool').mockRejectedValue('The tools file is not valid.');
     render(CommandToolsDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Edit review' }));
     await user.click(screen.getByRole('button', { name: 'Save' }));

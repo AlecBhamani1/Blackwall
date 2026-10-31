@@ -16,7 +16,9 @@ use std::{
 
 mod editor;
 mod http;
-pub use editor::{detect_clis, remove_tool, save_tool, summaries, CliStatus, ToolSummary};
+pub use editor::{
+    add_tool, detect_clis, remove_tool, summaries, update_tool, CliStatus, ToolSummary,
+};
 pub use http::{delete_secret, save_secret, save_secret_with, SECRET_SERVICE};
 
 pub const COMMAND_TOOLS_FILE: &str = "tools.json";

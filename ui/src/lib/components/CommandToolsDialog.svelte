@@ -86,13 +86,12 @@
       error = UNCLOSED_QUOTE;
       return;
     }
-    if (!editing && tools.some((tool) => tool.name === name)) {
-      error = `A tool named ${name} already exists. Edit it instead.`;
-      return;
-    }
     if (
       await run(
-        () => persistence.saveCommandTool(name, description, words, promptOnStdin),
+        () =>
+          editing
+            ? persistence.updateCommandTool(name, description, words)
+            : persistence.addCommandTool(name, description, words, promptOnStdin),
         'This tool could not be saved.',
       )
     )

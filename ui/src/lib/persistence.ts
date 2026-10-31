@@ -435,18 +435,21 @@ export const persistence = {
     command<RuleVerdict>('test_owner_rule', { kind, subject }),
   policyAudit: () => command<PolicyAuditEntry[]>('policy_audit'),
   commandTools: () => command<CommandToolSummary[]>('list_command_tools'),
-  saveCommandTool: (
+  /** Refused when a tool already has the name. */
+  addCommandTool: (
     name: string,
     description: string,
     commandArgs: string[],
     promptOnStdin: boolean,
   ) =>
-    command<void>('save_command_tool', {
+    command<void>('add_command_tool', {
       name,
       description,
       command: commandArgs,
       promptOnStdin,
     }),
+  updateCommandTool: (name: string, description: string, commandArgs: string[]) =>
+    command<void>('update_command_tool', { name, description, command: commandArgs }),
   removeCommandTool: (name: string) => command<void>('remove_command_tool', { name }),
   commandClis: () => command<CommandCli[]>('detect_command_clis'),
   memories: (query = '') => command<MemoryEntry[]>('list_memories', { query }),

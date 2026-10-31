@@ -13,8 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deny rules in order, add, edit or delete one (saved with the same checks as `policy.json`, other
   rules kept, and a confirmation first when a change loosens them), test a command, path or host
   to see which rule decides, and read the latest 100 audit log entries.
-- Settings → Agent → Command tools adds, edits and removes command tools in `tools.json` without
-  touching other entries, and suggests `claude` (usable by subagents, with no wrapper script),
+- Settings → Agent → Command tools adds, edits and removes command tools in `tools.json`, keeping
+  the other entries' values, and suggests `claude` (usable by subagents, with no wrapper script),
   `codex` and `copilot`, showing whether each is installed and has a sign-in file (never run or
   read). Subagents → A command tool is now a dropdown of the tools that qualify, with the reason
   for each one that does not.

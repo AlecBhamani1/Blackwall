@@ -1152,7 +1152,7 @@ pub async fn list_command_tools(
     with_tools(&app, blackwall_core::command_tools::summaries).await
 }
 #[tauri::command]
-pub async fn save_command_tool(
+pub async fn add_command_tool(
     app: AppHandle,
     name: String,
     description: String,
@@ -1160,13 +1160,25 @@ pub async fn save_command_tool(
     prompt_on_stdin: bool,
 ) -> Result<(), String> {
     with_tools(&app, move |directory| {
-        blackwall_core::command_tools::save_tool(
+        blackwall_core::command_tools::add_tool(
             directory,
             &name,
             &description,
             command,
             prompt_on_stdin,
         )
+    })
+    .await
+}
+#[tauri::command]
+pub async fn update_command_tool(
+    app: AppHandle,
+    name: String,
+    description: String,
+    command: Vec<String>,
+) -> Result<(), String> {
+    with_tools(&app, move |directory| {
+        blackwall_core::command_tools::update_tool(directory, &name, &description, command)
     })
     .await
 }

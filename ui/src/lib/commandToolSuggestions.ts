@@ -1,7 +1,9 @@
 /**
  * Coding assistants offered in the Add form of Settings → Command tools. Each runs a program
- * without a shell, so a read-only flag is part of the command. Only the first takes its prompt on
- * standard input, which is what a subagent needs; the others take it as an argument.
+ * without a shell, so a read-only flag is part of the command. The tool runs in the project
+ * folder, so claude is told to load only the owner's settings and MCP servers, never the
+ * project's. Only the first takes its prompt on standard input, which is what a subagent needs;
+ * the others take it as an argument.
  */
 export interface CommandToolSuggestion {
   name: string;
@@ -20,6 +22,9 @@ export const COMMAND_TOOL_SUGGESTIONS: CommandToolSuggestion[] = [
       '-p',
       '--permission-mode',
       'plan',
+      '--setting-sources',
+      'user',
+      '--strict-mcp-config',
       '--append-system-prompt',
       'Standard input is JSON; do the task in arguments.prompt.',
     ],

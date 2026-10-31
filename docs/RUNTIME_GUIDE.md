@@ -335,12 +335,14 @@ program's standard input and then closes it, so long text such as a prompt is no
 8,000-byte argument cap or the option check (up to 256 KiB of JSON). The approval prompt shows the
 input's size, its SHA-256, and its first 2,000 characters. For example, `claude -p` reads standard
 input as its prompt, so a fixed instruction that says the input is JSON is all it needs, with no
-wrapper:
+wrapper. The tool runs in the project folder, so `--setting-sources user` and `--strict-mcp-config`
+keep Claude from loading the project's `.claude/settings.json` (hooks, environment, permissions)
+or `.mcp.json`, which a cloned repository could plant:
 
 ```json
 {"tools":[
   {"name":"ask_claude","description":"Ask Claude a question",
-   "command":["claude","-p","--permission-mode","plan","--append-system-prompt","Standard input is JSON; do the task in arguments.prompt."],
+   "command":["claude","-p","--permission-mode","plan","--setting-sources","user","--strict-mcp-config","--append-system-prompt","Standard input is JSON; do the task in arguments.prompt."],
    "stdin":"json",
    "parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The question"}},"required":["prompt"]}}
 ]}
