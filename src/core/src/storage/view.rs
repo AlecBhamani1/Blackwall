@@ -10,8 +10,9 @@ use crate::{
 use serde_json::{json, Map, Value};
 use std::{cell::Cell, collections::BTreeMap};
 
-/// Most bytes one load may build by following references (security L5): resolved content turns,
-/// tool names, arguments and outputs, and the model forms behind `model` refs. Stored bytes are
+/// Most bytes one load may build by following references (security L5): assistant content
+/// (inline or from turns), tool names, arguments and outputs, and the model forms behind `model`
+/// refs. Stored bytes are
 /// capped at [`super::MAX_SESSION_BYTES`] when written, but a reference costs a few bytes and can
 /// name a large row any number of times, so a tampered `{"turns":[s,s,s,…]}` could otherwise ask
 /// for terabytes. A valid chat builds each stored byte at most twice (once for the screen, and
@@ -408,6 +409,8 @@ fn is_instructions(tool: &Value) -> bool {
 /// A `content` field: a string, or `{turns, tail?}` rebuilt with the agent's accumulator.
 fn content(rows: &Index<'_>, form: &Value, seq: i64) -> Result<String, ViewError> {
     if let Some(text) = form.as_str() {
+        // Counted too: an echo ref in the transcript builds this text again each time.
+        rows.charge(text.len() as u64)?;
         return Ok(text.to_owned());
     }
     let form = only(form, &["turns", "tail"], seq)?;
@@ -1173,6 +1176,20 @@ mod tests {
         let mut ctx = context(0, 0);
         ctx.model_len = echoes.iter().filter(|r| r.kind == Kind::Model).count() as u64;
         assert_eq!(error(&echoes, Some(&ctx)), ViewError::TooLarge);
+        // Echo refs to a standalone answer whose content is inline text, not turns.
+        let mut inline = vec![
+            user(0, "u", "Hi"),
+            assistant(
+                1,
+                json!({"id": "s", "role": "assistant", "content": big, "status": "complete"}),
+            ),
+        ];
+        inline.extend((0..turns as i64).map(|n| reference(2 + n, 1)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = turns as u64;
+        assert_eq!(error(&inline, Some(&ctx)), ViewError::TooLarge);
+        ctx.model_len = 2;
+        assert!(build_view(&inline, Some(&ctx), &[]).is_ok());
     }
 
     #[test]

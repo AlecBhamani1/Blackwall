@@ -449,6 +449,28 @@ fn a_crash_before_the_check_leaves_the_vacuum_to_the_cleanup_that_checks() {
 }
 
 #[test]
+fn a_failed_check_skips_the_vacuum_even_when_dropping_the_flag_fails() {
+    // At the upgrade's own post-commit check.
+    let dir = Scratch::new("vacuum-unrecorded");
+    build_v5_indexed(&dir, &vacuum_chats());
+    set_fault(&dir, Some(Fault::BeforeCommit));
+    failed_backup(open6(&dir));
+    set_fault(&dir, Some(Fault::IntegrityUnrecorded));
+    let db = open6(&dir).unwrap();
+    set_fault(&dir, None);
+    assert!(vacuum_owed(&db), "the flag could not be dropped");
+    assert!(pages(&db).1 > 0, "but the file was not vacuumed");
+    drop(db);
+    // At the check an interrupted cleanup runs.
+    let dir = committed_then_crashed("vacuum-unrecorded-crashed");
+    set_fault(&dir, Some(Fault::IntegrityUnrecorded));
+    let db = open6(&dir).unwrap();
+    set_fault(&dir, None);
+    assert!(vacuum_owed(&db), "the flag could not be dropped");
+    assert!(pages(&db).1 > 0, "but the file was not vacuumed");
+}
+
+#[test]
 fn a_second_window_does_not_vacuum_again() {
     let dir = Scratch::new("vacuum-twice");
     build_v5_indexed(&dir, &vacuum_chats());

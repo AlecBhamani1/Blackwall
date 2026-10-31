@@ -187,8 +187,9 @@ pub(super) fn open_v6(
     if version == V6 {
         // The cleanup a crash cut short runs first: it checks the file, so the VACUUM after it
         // never rewrites one that was not checked.
-        finish_interrupted_cleanup(directory, &connection);
-        vacuum_if_pending(directory, &connection, busy);
+        if finish_interrupted_cleanup(directory, &connection) {
+            vacuum_if_pending(directory, &connection, busy);
+        }
         prune_expired_once(directory, &connection);
     } else {
         connection.busy_timeout(upgrade_busy)?;
@@ -475,7 +476,7 @@ fn after_commit(
     backup: Option<&Backup>,
     now: SystemTime,
 ) {
-    check_committed(
+    let intact = check_committed(
         directory,
         connection,
         backup.map(|backup| backup.path().display().to_string()),
@@ -484,18 +485,23 @@ fn after_commit(
         eprintln!("warn: upgrade: could not prune the backups: {error:?}");
     }
     // A database the check found damaged no longer owes the VACUUM, so it is left exactly as it
-    // is, for the owner to restore.
-    vacuum_if_pending(directory, connection, UPGRADE_BUSY_TIMEOUT);
+    // is, for the owner to restore. Checked here too, in case dropping the flag failed.
+    if intact {
+        vacuum_if_pending(directory, connection, UPGRADE_BUSY_TIMEOUT);
+    }
 }
 
-/// The check after a committed upgrade, for detection only. On a failure it records the notice
-/// and drops the owed VACUUM in one transaction, so a damaged file is never rewritten.
-fn check_committed(directory: &Path, connection: &Connection, backup: Option<String>) {
+/// The check after a committed upgrade, for detection only; whether the file passed. On a failure
+/// it records the notice and drops the owed VACUUM in one transaction, so a damaged file is never
+/// rewritten. The callers also skip the VACUUM on `false`, in case that transaction failed.
+fn check_committed(directory: &Path, connection: &Connection, backup: Option<String>) -> bool {
     if integrity_ok(directory, connection) {
-        return;
+        return true;
     }
     eprintln!("warn: upgrade: the integrity check after the upgrade found a problem");
     let recorded = write_tx(connection).and_then(|tx| {
+        #[cfg(test)]
+        backup::fault(directory, backup::Fault::IntegrityUnrecorded)?;
         record_notices(&tx, &[StorageNotice::IntegrityFailed { backup }])?;
         tx.execute("DELETE FROM settings WHERE key=?1", [VACUUM_PENDING_KEY])?;
         Ok(tx.commit()?)
@@ -503,6 +509,7 @@ fn check_committed(directory: &Path, connection: &Connection, backup: Option<Str
     if let Err(error) = recorded {
         eprintln!("warn: upgrade: could not record the integrity notice: {error:?}");
     }
+    false
 }
 
 /// Whether the post-upgrade VACUUM is still owed.
@@ -693,7 +700,9 @@ fn test_free_disk(directory: &Path) -> Option<u64> {
 #[cfg_attr(not(test), allow(unused_variables))] // `directory` keys the test faults
 fn integrity_ok(directory: &Path, connection: &Connection) -> bool {
     #[cfg(test)]
-    if backup::fault(directory, backup::Fault::IntegrityCheck).is_err() {
+    if backup::fault(directory, backup::Fault::IntegrityCheck).is_err()
+        || backup::fault(directory, backup::Fault::IntegrityUnrecorded).is_err()
+    {
         return false;
     }
     connection
@@ -731,14 +740,14 @@ fn clean_up(
 /// steps: finish them. The integrity check first, as `after_commit` runs it (a failure is a
 /// notice, and drops the owed VACUUM), then the pruning under the write lock, keeping the backup
 /// the state names. Only a `stat` on the usual lock-free open; a failure is logged and the next
-/// open tries again.
-fn finish_interrupted_cleanup(directory: &Path, connection: &Connection) {
+/// open tries again. Returns `false` only when the check failed: no VACUUM may follow.
+fn finish_interrupted_cleanup(directory: &Path, connection: &Connection) -> bool {
     let dir = directory.join(BACKUPS_DIR);
     if !backup::has_state(&dir) {
-        return;
+        return true;
     }
     let current = backup::read_state(&dir).map(|state| state.backup);
-    check_committed(
+    let intact = check_committed(
         directory,
         connection,
         current
@@ -753,6 +762,7 @@ fn finish_interrupted_cleanup(directory: &Path, connection: &Connection) {
     if let Err(error) = finished {
         eprintln!("warn: upgrade: could not finish an interrupted cleanup: {error:?}");
     }
+    intact
 }
 
 /// With [`DELETE_BACKUPS_AFTER`] set, a v6 open deletes expired backups, once per process.

@@ -874,6 +874,9 @@ pub(crate) enum Fault {
     IntegrityCheck,
     /// The post-upgrade VACUUM fails with `SQLITE_FULL`, as on a full disk.
     VacuumFull,
+    /// The post-commit integrity check reports damage, and recording its notice (which drops
+    /// the owed VACUUM) fails too.
+    IntegrityUnrecorded,
     /// The process dies at this point.
     Abort(AbortAt),
     /// At the upgrade's slow point (the backup is made, the write lock held) the process creates
