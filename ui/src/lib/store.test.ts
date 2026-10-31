@@ -576,6 +576,27 @@ describe('chat controller', () => {
     expect(get(controller.selectedModel)).toBe('small');
   });
 
+  it('clears the previous model when a deferred server has no matching model', async () => {
+    const client = mockClient();
+    const controller = createChatController(client);
+    await controller.configureEndpoint('http://first:11434');
+    client.discoverModels = vi.fn().mockResolvedValue([{ id: 'other', name: 'Other' }]);
+    expect(await controller.configureEndpoint('http://second:11434', undefined, true)).toBe(true);
+    expect(get(controller.selectedModel)).toBe('');
+  });
+
+  it('accepts an empty catalog only when model selection is deferred', async () => {
+    const client = mockClient();
+    client.discoverModels = vi.fn().mockResolvedValue([]);
+    const controller = createChatController(client);
+    expect(await controller.configureEndpoint('http://empty:11434', undefined, true)).toBe(true);
+    expect(get(controller.models)).toEqual([]);
+    expect(get(controller.connectionState)).toBe('ready');
+    const strict = createChatController(client);
+    expect(await strict.configureEndpoint('http://empty:11434')).toBe(false);
+    expect(get(strict.connectionError)).toContain('no models are installed');
+  });
+
   it('keeps the working connection when a replacement fails', async () => {
     const client = mockClient();
     const controller = createChatController(client);

@@ -598,7 +598,7 @@ export function createChatController(
 
       const catalog = await client.discoverModels(configuredEndpoint || undefined);
       if (destroyed || attempt !== connectionAttempt) return false;
-      if (catalog.length === 0) {
+      if (catalog.length === 0 && !deferModel) {
         throw new Error('The service did not report any models.');
       }
 
@@ -613,8 +613,8 @@ export function createChatController(
         ? preferred
         : deferModel
           ? ''
-          : catalog[0].id;
-      if (choice) selectedModel.set(choice);
+          : catalog[0]?.id ?? '';
+      selectedModel.set(choice);
       if (configuredEndpoint) {
         const normalized = normalizeEndpoint(configuredEndpoint);
         const settings = get(preferences);

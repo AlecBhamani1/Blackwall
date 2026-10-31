@@ -64,6 +64,7 @@ describe('guided model setup', () => {
       props: {
         onConnect: vi.fn(),
         currentEndpoint: 'https://model.example/v1',
+        connections: [{ endpoint: 'https://model.example/v1', name: 'Saved' }],
         connectionError: 'Check the macOS Keychain prompt, then reconnect.',
       },
     });
@@ -80,10 +81,27 @@ describe('guided model setup', () => {
     render(ConnectionSetup, {
       props: {
         onConnect: vi.fn(),
+        currentEndpoint: 'http://localhost:11434/v1',
         connectionError: 'Blackwall could not reach your model.',
+        found: [],
       },
     });
     expect(screen.getByText('No model server found on this computer.')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('waits for the local scan before showing the neutral first-run message', () => {
+    const mock = client();
+    mock.discover = vi.fn().mockReturnValue(new Promise(() => {}));
+    render(ConnectionSetup, {
+      props: {
+        client: mock,
+        desktop: true,
+        onConnect: vi.fn(),
+        currentEndpoint: 'http://localhost:11434/v1',
+        connectionError: 'Blackwall could not reach your model.',
+      },
+    });
+    expect(screen.queryByText('No model server found on this computer.')).not.toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
   it('starts a new server address empty with the localhost example as its placeholder', async () => {
@@ -97,6 +115,18 @@ describe('guided model setup', () => {
       'placeholder',
       'http://localhost:11434/v1',
     );
+  });
+  it('prefills an equivalent normalized saved connection', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn(),
+        currentEndpoint: 'http://host:11434',
+        connections: [{ endpoint: 'http://host:11434/v1', name: 'Saved' }],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    expect(screen.getByLabelText('Model service address')).toHaveValue('http://host:11434');
   });
   it('accepts a paired connection that advances to model selection', async () => {
     const user = userEvent.setup();
@@ -174,6 +204,20 @@ describe('guided model setup', () => {
     await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
     expect(await screen.findByRole('radio', { name: 'qwen3.6' })).toBeChecked();
     expect(screen.getByRole('button', { name: 'Use this model' })).toBeEnabled();
+  });
+  it('preselects the saved model when reconnecting to a multi-model server', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn().mockResolvedValue(true),
+        models: ['qwen3.6', 'llama3.2'],
+        currentModel: 'llama3.2',
+        connections: [{ endpoint: 'https://model.example/v1', name: 'Saved' }],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Connect to Saved' }));
+    expect(await screen.findByRole('radio', { name: 'llama3.2' })).toBeChecked();
+    expect(screen.getByRole('heading', { name: 'Choose a model.' })).toBeVisible();
   });
   it('focuses Keychain recovery guidance and allows an explicit connection retry', async () => {
     const user = userEvent.setup();

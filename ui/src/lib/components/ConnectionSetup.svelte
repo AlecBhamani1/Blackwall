@@ -8,6 +8,7 @@
     isDesktop,
     serviceAddress,
     serviceName,
+    normalizeEndpoint,
     type SetupClient,
     type LocalService,
     type DownloadProgress,
@@ -28,6 +29,7 @@
   export let onDone: () => void = () => {};
   export let onChooseModel: (model: string) => void = () => {};
   export let models: string[] = [];
+  export let currentModel = '';
   export let client: SetupClient = setupClient;
   export let desktop = isDesktop();
   export let currentEndpoint = '';
@@ -44,9 +46,15 @@
   let scanned = false;
   // Setup can first appear because the automatic saved-connection check failed.
   let error = connectionError;
-  let address = connections.some((profile) => profile.endpoint === currentEndpoint)
-    ? currentEndpoint
-    : '';
+  let savedConnection = false;
+  try {
+    savedConnection = connections.some(
+      (profile) => normalizeEndpoint(profile.endpoint) === normalizeEndpoint(currentEndpoint),
+    );
+  } catch {
+    // Invalid drafts are not saved connections.
+  }
+  let address = savedConnection ? currentEndpoint : '';
   let accessKey = '';
   let connectionName = '';
   let invitation = '';
@@ -129,7 +137,11 @@
         connectedName = name || profileName(endpoint);
         await tick();
         offeredModels = serviceModels ?? models;
-        selectedModel = offeredModels.length === 1 ? offeredModels[0] : '';
+        selectedModel = offeredModels.includes(currentModel)
+          ? currentModel
+          : offeredModels.length === 1
+            ? offeredModels[0]
+            : '';
         modelReturnStep = step;
         step = 'model';
         await tick();
@@ -253,8 +265,10 @@
       {:else}
         <p class="intro">Choose where your model runs.<br />We’ll help you get connected.</p>
       {/if}
-      {#if !connections.length && !currentEndpoint && !foundAvailable.length}
-        <p class="no-server">No model server found on this computer.</p>
+      {#if !savedConnection}
+        {#if !foundScanning && !foundAvailable.length}
+          <p class="no-server">No model server found on this computer.</p>
+        {/if}
       {:else if error}
         <div class="error" role="alert" tabindex="-1" bind:this={errorMessage}>{error}</div>
       {/if}
