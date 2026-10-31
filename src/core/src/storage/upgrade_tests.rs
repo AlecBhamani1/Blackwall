@@ -831,10 +831,10 @@ fn a_reused_backup_that_no_longer_verifies_is_replaced_by_a_fresh_one() {
             LocalStore::upgrade_status(&dir).unwrap(),
             UpgradeStatus::Failed {
                 backup: second.display().to_string(),
-                attempts: 1,
+                attempts: 2,
                 stopped: false,
             },
-            "{damage}: the passed-over state's attempts do not carry over"
+            "{damage}: the passed-over state's attempts carry over"
         );
         // A sound backup is reused as before.
         set_fault(&dir, None);
@@ -842,6 +842,36 @@ fn a_reused_backup_that_no_longer_verifies_is_replaced_by_a_fresh_one() {
         assert_eq!(baks(&dir).len(), 2, "{damage}");
         assert_eq!(version_of(&dir.database()), V6);
     }
+}
+
+#[test]
+fn a_backup_damaged_every_time_still_reaches_the_attempt_limit() {
+    let dir = Scratch::new("damaged-limit");
+    build_v5(&dir, &v5_sessions(), 5);
+    set_fault(&dir, Some(Fault::BeforeCommit));
+    let (mut path, _) = failed_backup(open6(&dir));
+    for attempt in 2..=3u32 {
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=4")
+            .unwrap();
+        let (next, _) = failed_backup(open6(&dir));
+        assert_ne!(next, path);
+        assert_eq!(
+            LocalStore::upgrade_status(&dir).unwrap(),
+            UpgradeStatus::Failed {
+                backup: next.display().to_string(),
+                attempts: attempt,
+                stopped: attempt == 3,
+            }
+        );
+        path = next;
+    }
+    assert!(matches!(
+        open6(&dir),
+        Err(StorageError::UpgradeStopped(stopped)) if stopped == path
+    ));
+    assert_eq!(baks(&dir).len(), 3);
 }
 
 /// Copies a file, or a folder of files, from one data folder to another.

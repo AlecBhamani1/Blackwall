@@ -332,6 +332,8 @@ pub(crate) fn resolve_assistant(rows: &Index<'_>, seq: i64) -> Result<Value, Vie
 /// A run's message from its start and deltas, before any terminal: `RunFold`'s opening message,
 /// then each delta in seq order.
 fn progress(rows: &Index<'_>, run: &Run) -> Result<Map<String, Value>, ViewError> {
+    // The id is copied into every rebuilt message.
+    rows.charge(run.id.len() as u64)?;
     let mut message = RunFold::new(&run.id, run.created_at, AssistantShape::Desktop)
         .message()
         .as_object()
@@ -441,7 +443,7 @@ fn content(rows: &Index<'_>, form: &Value, seq: i64) -> Result<String, ViewError
         Some(tail) => tail.as_str().ok_or(ViewError::BadBody { seq })?,
     };
     // Counted before the text is joined: each turn plus the separator before it.
-    rows.charge(texts.iter().map(|text| text.len() as u64 + 2).sum())?;
+    rows.charge(texts.iter().map(|text| text.len() as u64 + 2).sum::<u64>() + tail.len() as u64)?;
     Ok(accumulate(texts) + tail)
 }
 
@@ -1240,6 +1242,19 @@ mod tests {
         let mut ctx = context(0, 0);
         ctx.model_len = children.iter().filter(|r| r.kind == Kind::Model).count() as u64;
         assert_eq!(error(&children, Some(&ctx)), ViewError::TooLarge);
+        // Echo refs to an answer whose bulk is the `tail` of its `{turns, tail}` content.
+        let mut tail = rows(json!({"turns": [], "tail": big}));
+        tail.extend((0..turns as i64).map(|n| reference(4 + n, 3)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = tail.iter().filter(|r| r.kind == Kind::Model).count() as u64;
+        assert_eq!(error(&tail, Some(&ctx)), ViewError::TooLarge);
+        // Echo refs to a run whose bulk is the id on its start row, copied into every rebuild.
+        let mut long_id = rows(json!("done"));
+        long_id[1] = start(1, &big, 5, 0);
+        long_id.extend((0..turns as i64).map(|n| reference(4 + n, 3)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = long_id.iter().filter(|r| r.kind == Kind::Model).count() as u64;
+        assert_eq!(error(&long_id, Some(&ctx)), ViewError::TooLarge);
     }
 
     #[test]

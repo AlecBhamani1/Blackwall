@@ -349,7 +349,8 @@ fn back_up(
         }
         // The backup an earlier attempt made is checked again before it is trusted: something may
         // have changed it since (security L3). One that fails is passed over, as if no state
-        // were saved, and a fresh backup is made.
+        // were saved, and a fresh backup is made. Its attempts carry over, so a backup damaged
+        // every time still reaches `MAX_ATTEMPTS`.
         Some(state) if backup::still_verified(&dir.join(&state.backup), version) => (
             Backup {
                 dir,
@@ -367,7 +368,10 @@ fn back_up(
             configure(&reader, BUSY_TIMEOUT)?;
             let name = backup::create_backup(&reader, &dir, version)?;
             drop(reader);
-            (Backup { dir, name }, 0)
+            (
+                Backup { dir, name },
+                saved.map_or(0, |state| state.attempts),
+            )
         }
     };
     // From here the backup exists, so every error names it.
