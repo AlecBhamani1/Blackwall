@@ -231,26 +231,8 @@ impl ReviewSnapshot {
             .filter(|p| !p.is_empty())
             .map(|p| String::from_utf8(p.to_vec()).map_err(|_| ReviewError::Git))
             .collect::<Result<BTreeSet<_>, _>>()?;
-        arguments.extend(["--patch", "--"]);
-        let mut diff = String::from_utf8(git(&workspace.path, &arguments).await?)
-            .map_err(|_| ReviewError::Git)?;
-        if matches!(target, ReviewTarget::Uncommitted) && revisions.is_empty() {
-            let staged = git(
-                &workspace.path,
-                &[
-                    "diff",
-                    "--cached",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    "--no-renames",
-                    "--submodule=short",
-                    "--patch",
-                    "--",
-                ],
-            )
-            .await?;
-            diff.push_str(std::str::from_utf8(&staged).map_err(|_| ReviewError::Git)?);
+        let unborn = matches!(target, ReviewTarget::Uncommitted) && revisions.is_empty();
+        if unborn {
             let staged_names = git(
                 &workspace.path,
                 &["diff", "--cached", "--name-only", "-z", "--"],
@@ -259,6 +241,46 @@ impl ReviewSnapshot {
             for name in staged_names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
                 paths.insert(String::from_utf8(name.to_vec()).map_err(|_| ReviewError::Git)?);
             }
+        }
+        // A deny `file` rule keeps a file out of the review entirely, even through a symlink.
+        let denied = |name: &str| {
+            let path = workspace.checked(name).map_or_else(
+                |_| workspace.path.join(name),
+                |path| workspace.path.join(path),
+            );
+            policy.is_some_and(|policy| {
+                path.strip_prefix(policy.scope().1)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .is_some_and(|path| policy.decide(ApprovalKind::File, path) == Decision::Deny)
+            })
+        };
+        let excluded = paths
+            .iter()
+            .filter(|name| denied(name))
+            .map(|name| format!(":(exclude,literal){name}"))
+            .collect::<Vec<_>>();
+        let mut left_out = excluded.len();
+        paths.retain(|name| !denied(name));
+        arguments.extend(["--patch", "--"]);
+        arguments.extend(excluded.iter().map(String::as_str));
+        let mut diff = String::from_utf8(git(&workspace.path, &arguments).await?)
+            .map_err(|_| ReviewError::Git)?;
+        if unborn {
+            let mut staged = vec![
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--submodule=short",
+                "--patch",
+                "--",
+            ];
+            staged.extend(excluded.iter().map(String::as_str));
+            let staged = git(&workspace.path, &staged).await?;
+            diff.push_str(std::str::from_utf8(&staged).map_err(|_| ReviewError::Git)?);
         }
         let mut omitted = Vec::new();
         if matches!(target, ReviewTarget::Uncommitted) {
@@ -276,21 +298,9 @@ impl ReviewSnapshot {
             }
             for file in files {
                 let name = std::str::from_utf8(file).map_err(|_| ReviewError::Git)?;
-                // A deny `file` rule keeps the file out entirely, even through a symlink.
-                let resolved = workspace
-                    .checked(name)
-                    .map(|path| workspace.path.join(path));
-                if let (Some(policy), Ok(resolved)) = (policy, &resolved) {
-                    if resolved
-                        .strip_prefix(policy.scope().1)
-                        .ok()
-                        .and_then(Path::to_str)
-                        .is_some_and(|path| {
-                            policy.decide(ApprovalKind::File, path) == Decision::Deny
-                        })
-                    {
-                        continue;
-                    }
+                if denied(name) {
+                    left_out += 1;
+                    continue;
                 }
                 let supported = workspace
                     .checked(name)
@@ -323,6 +333,11 @@ impl ReviewSnapshot {
         if diff.len() > MAX_DIFF {
             return Err(ReviewError::Limit);
         }
+        // The model learns how many files the rules left out, never which.
+        let description = match left_out {
+            0 => description,
+            count => format!("{description}\nFiles left out by deny rules: {count}."),
+        };
         Ok(Self {
             description,
             diff,
@@ -512,25 +527,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_untracked_files_stay_out_of_the_review() {
+    async fn denied_files_stay_out_of_the_review() {
         let repo = Repo::new();
+        fs::create_dir(repo.0.join("secrets")).unwrap();
         repo.write("file", "original\n");
+        repo.write("secrets/key", "tracked private\n");
         repo.commit();
+        repo.write("file", "changed\n");
+        repo.write("secrets/key", "changed private\n");
         repo.write(".env", "TOKEN=private\n");
         repo.write("notes.txt", "visible\n");
         #[cfg(unix)]
         std::os::unix::fs::symlink(".env", repo.0.join("alias")).unwrap();
         let data = repo.0.join("owner");
         fs::create_dir(&data).unwrap();
-        let rules = json!({"rules":[{"decision":"deny","kind":"file","path":".env"}]});
+        let rules = json!({"rules":[
+            {"decision":"deny","kind":"file","path":".env"},
+            {"decision":"deny","kind":"file","path":"secrets"}
+        ]});
         fs::write(data.join(crate::policy::POLICY_FILE), rules.to_string()).unwrap();
         let workspace = Workspace::open(&repo.0).unwrap().path;
         let policy = crate::policy::Policy::load(&data, &workspace).await;
         let snapshot = ReviewSnapshot::collect(&repo.0, &ReviewTarget::Uncommitted, Some(&policy))
             .await
             .unwrap();
-        assert!(snapshot.diff.contains("1: visible"));
-        assert!(!snapshot.diff.contains("TOKEN=private"));
+        assert!(snapshot.diff.contains("1: visible") && snapshot.diff.contains("+changed"));
+        assert!(!snapshot.diff.contains("private"), "{}", snapshot.diff);
+        // Tracked and untracked files alike; the count names no paths.
+        let left_out = if cfg!(unix) { 3 } else { 2 };
+        assert!(
+            snapshot
+                .description
+                .ends_with(&format!("\nFiles left out by deny rules: {left_out}.")),
+            "{}",
+            snapshot.description
+        );
+        // A committed change to a denied path is left out too.
+        repo.commit();
+        let target = ReviewTarget::Commit("HEAD".into());
+        let snapshot = ReviewSnapshot::collect(&repo.0, &target, Some(&policy))
+            .await
+            .unwrap();
+        assert!(snapshot.diff.contains("+changed"));
+        assert!(!snapshot.diff.contains("private"), "{}", snapshot.diff);
     }
 
     #[tokio::test]
