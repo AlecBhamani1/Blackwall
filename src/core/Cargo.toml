@@ -23,7 +23,7 @@ prost.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-rusqlite = { version = "0.41.0", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled", "backup"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng = "0.10.0"
@@ -37,8 +37,10 @@ tokio-tungstenite.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7.0", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -51,6 +53,9 @@ windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
 credential-store = ["dep:security-framework", "dep:keyring"]
 
 [dev-dependencies]
+# Test-only: the progress handler counts SQLite VM work in the append-cost tests. Same crate and
+# version as above, so `Cargo.lock` does not change.
+rusqlite = { version = "0.41.0", features = ["bundled", "backup", "hooks"] }
 tower.workspace = true
 
 [lints]

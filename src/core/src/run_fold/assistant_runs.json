@@ -1,0 +1,401 @@
+{
+  "about": "Shared fixture for run_fold::fold_run. Each case is a run's AgentEvents in wire form, how it ended (null: still open) and the assistant message it must fold to: what ui/src/lib/store.ts keeps (persistedMessages shape) for shape Desktop, and what src/bw/src/session.rs saves for shape Cli.",
+  "cases": [
+    {
+      "name": "text_only",
+      "id": "message_a",
+      "createdAt": 1700000000000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Hello"},
+        {"type": "memory_updated", "requestId": "r", "store": "user", "entryId": "e1"},
+        {"type": "model_usage", "requestId": "r", "usage": {"promptTokens": 10, "completionTokens": 2, "totalTokens": 12}},
+        {"type": "assistant_delta", "requestId": "r", "delta": " world"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Hello world"}, "finishReason": "stop", "usage": {"promptTokens": 10, "completionTokens": 2, "totalTokens": 12}}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_a", "role": "assistant", "content": "Hello world", "attachments": [], "status": "complete", "createdAt": 1700000000000}
+    },
+    {
+      "name": "tools_with_emoji_offsets",
+      "id": "message_b",
+      "createdAt": 1700000001000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Hi 🦀"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_c1", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_1_c2", "name": "shell", "arguments": "{\"command\":\"ls\"}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_c1", "output": "alpha", "success": true, "truncated": true},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_1_c2", "output": "The action was denied.", "success": false, "denied": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Done ✅"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_c3", "name": "write_file", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "1_0_c3", "output": "ok", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Finished."},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Hi 🦀\n\nDone ✅\n\nFinished."}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {
+        "id": "message_b", "role": "assistant", "content": "Hi 🦀\n\nDone ✅\n\nFinished.", "attachments": [], "status": "complete", "createdAt": 1700000001000,
+        "tools": [
+          {"id": "0_0_c1", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}", "contentOffset": 5, "status": "complete", "output": "alpha", "truncated": true},
+          {"id": "0_1_c2", "name": "shell", "arguments": "{\"command\":\"ls\"}", "contentOffset": 5, "status": "error", "output": "The action was denied."},
+          {"id": "1_0_c3", "name": "write_file", "arguments": "{}", "contentOffset": 13, "status": "complete", "output": "ok"}
+        ]
+      }
+    },
+    {
+      "name": "instructions_replaced",
+      "id": "message_c",
+      "createdAt": 1700000002000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "instructions_loaded", "requestId": "r", "sources": ["AGENTS.md"], "warnings": [], "diagnostics": [{"server": "x", "stderr": "boom"}]},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Reading 🦀"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_r", "name": "read_file", "arguments": "{\"path\":\"sub/x.rs\"}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_r", "output": "fn x() {}", "success": true},
+        {"type": "instructions_loaded", "requestId": "r", "sources": ["AGENTS.md", "sub/AGENTS.md"], "warnings": ["MCP server \"x\" did not start:\n  exit 1\n\n  see log", "two  spaces kept\n"]},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "instructions_loaded", "requestId": "r", "agentId": "child-1", "sources": [], "warnings": []},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Done."},
+        {"type": "instructions_loaded", "requestId": "r", "agentId": "", "sources": ["AGENTS.md"], "warnings": []},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Reading 🦀\n\nDone."}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {
+        "id": "message_c", "role": "assistant", "content": "Reading 🦀\n\nDone.", "attachments": [], "status": "complete", "createdAt": 1700000002000,
+        "tools": [
+          {"id": "0_0_r", "name": "read_file", "arguments": "{\"path\":\"sub/x.rs\"}", "contentOffset": 10, "status": "complete", "output": "fn x() {}"},
+          {"id": "instructions_child-1", "name": "project_instructions", "contentOffset": 12, "arguments": "{\"path\":\"None\"}", "output": "Loaded instructions: None", "status": "complete"},
+          {"id": "instructions", "name": "project_instructions", "contentOffset": 0, "arguments": "{\"path\":\"AGENTS.md\"}", "output": "Loaded instructions: AGENTS.md", "status": "complete"}
+        ]
+      }
+    },
+    {
+      "name": "instruction_warnings",
+      "id": "message_c2",
+      "createdAt": 1700000002500,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Hi 🦀"},
+        {"type": "instructions_loaded", "requestId": "r", "sources": ["AGENTS.md"], "warnings": []},
+        {"type": "assistant_delta", "requestId": "r", "delta": "!"},
+        {"type": "instructions_loaded", "requestId": "r", "sources": ["AGENTS.md", "sub/AGENTS.md"], "warnings": ["MCP server \"x\" did not start:\n  exit 1\n\n  see log", "two  spaces kept\n", "tab\t\r\nand \nnbsp"]}
+      ],
+      "end": {"type": "complete"},
+      "expected": {
+        "id": "message_c2", "role": "assistant", "content": "Hi 🦀!", "attachments": [], "status": "complete", "createdAt": 1700000002500,
+        "tools": [
+          {"id": "instructions", "name": "project_instructions", "contentOffset": 5, "arguments": "{\"path\":\"AGENTS.md, sub/AGENTS.md\"}", "output": "Loaded instructions: AGENTS.md, sub/AGENTS.md\nWarning: MCP server \"x\" did not start: exit 1 see log\nWarning: two  spaces kept \nWarning: tab and nbsp", "status": "error"}
+        ]
+      }
+    },
+    {
+      "name": "children_upserted_in_order",
+      "id": "message_d",
+      "createdAt": 1700000003000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "subagent_status", "requestId": "r", "agentId": "a", "state": "queued"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "b", "parentId": "root", "state": "running", "summary": "Looking"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "a", "state": "running", "summary": "Started"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "c", "state": "queued"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "b", "state": "completed", "summary": "Found it"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Both done."},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Both done."}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {
+        "id": "message_d", "role": "assistant", "content": "Both done.", "attachments": [], "status": "complete", "createdAt": 1700000003000,
+        "children": [
+          {"id": "a", "state": "running", "summary": "Started"},
+          {"id": "c", "state": "queued", "summary": ""},
+          {"id": "b", "state": "completed", "summary": "Found it"}
+        ]
+      }
+    },
+    {
+      "name": "reasoning",
+      "id": "message_e",
+      "createdAt": 1700000004000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Answer"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Answer"}, "finishReason": "stop", "reasoning": "Thinking hard", "reasoningMs": 1234}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_e", "role": "assistant", "content": "Answer", "attachments": [], "status": "complete", "createdAt": 1700000004000, "reasoning": "Thinking hard", "reasoningMs": 1234}
+    },
+    {
+      "name": "reasoning_replaced",
+      "id": "message_e2",
+      "createdAt": 1700000004500,
+      "shape": "Desktop",
+      "events": [
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": ""}, "reasoning": "First", "reasoningMs": 5},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Answer"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Answer"}, "reasoning": "Second"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Answer"}, "reasoning": ""}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_e2", "role": "assistant", "content": "Answer", "attachments": [], "status": "complete", "createdAt": 1700000004500, "reasoning": "Second"}
+    },
+    {
+      "name": "empty_middle_turn",
+      "id": "message_f",
+      "createdAt": 1700000005000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Let me look."},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "read_file", "arguments": "{\"path\":\"a\"}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "A", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_b", "name": "read_file", "arguments": "{\"path\":\"b\"}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "1_0_b", "output": "B", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "All set."},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Let me look.\n\n\n\nAll set."}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {
+        "id": "message_f", "role": "assistant", "content": "Let me look.\n\n\n\nAll set.", "attachments": [], "status": "complete", "createdAt": 1700000005000,
+        "tools": [
+          {"id": "0_0_a", "name": "read_file", "arguments": "{\"path\":\"a\"}", "contentOffset": 12, "status": "complete", "output": "A"},
+          {"id": "1_0_b", "name": "read_file", "arguments": "{\"path\":\"b\"}", "contentOffset": 14, "status": "complete", "output": "B"}
+        ]
+      }
+    },
+    {
+      "name": "stopped_mid_tool",
+      "id": "message_g",
+      "createdAt": 1700000006000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Working"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "read_file", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "done", "success": true},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_1_b", "name": "shell", "arguments": "{\"command\":\"sleep 9\"}"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running", "summary": "Busy"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k2", "state": "queued"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k3", "state": "completed", "summary": "Ok"}
+      ],
+      "end": {"type": "stopped"},
+      "expected": {
+        "id": "message_g", "role": "assistant", "content": "Working", "attachments": [], "status": "stopped", "createdAt": 1700000006000,
+        "tools": [
+          {"id": "0_0_a", "name": "read_file", "arguments": "{}", "contentOffset": 7, "status": "complete", "output": "done"},
+          {"id": "0_1_b", "name": "shell", "arguments": "{\"command\":\"sleep 9\"}", "contentOffset": 7, "status": "stopped"}
+        ],
+        "children": [
+          {"id": "k1", "state": "interrupted", "summary": "Stopped with the parent task."},
+          {"id": "k2", "state": "queued", "summary": ""},
+          {"id": "k3", "state": "completed", "summary": "Ok"}
+        ]
+      }
+    },
+    {
+      "name": "stopped_before_text",
+      "id": "message_g2",
+      "createdAt": 1700000006500,
+      "shape": "Desktop",
+      "events": [
+        {"type": "instructions_loaded", "requestId": "r", "sources": [], "warnings": []}
+      ],
+      "end": {"type": "stopped"},
+      "expected": {
+        "id": "message_g2", "role": "assistant", "content": "Response stopped.", "attachments": [], "status": "stopped", "createdAt": 1700000006500,
+        "tools": [
+          {"id": "instructions", "name": "project_instructions", "contentOffset": 0, "arguments": "{\"path\":\"None\"}", "output": "Loaded instructions: None", "status": "complete"}
+        ]
+      }
+    },
+    {
+      "name": "failed_with_detail",
+      "id": "message_h",
+      "createdAt": 1700000007000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Partial"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "shell", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_b", "name": "shell", "arguments": "{}"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"}
+      ],
+      "end": {"type": "failed", "code": "model_unavailable", "message": "The model server is unavailable.", "detail": "llama.cpp:\n\t Loading   model\u0000"},
+      "expected": {
+        "id": "message_h", "role": "assistant", "content": "Partial\n\n", "attachments": [], "status": "error", "createdAt": 1700000007000,
+        "error": "The model computer is unavailable. Open and unlock Blackwall on that computer, keep its model running, and reconnect. (llama.cpp: Loading model)",
+        "tools": [
+          {"id": "0_0_a", "name": "shell", "arguments": "{}", "contentOffset": 7, "status": "complete", "output": "x"},
+          {"id": "1_0_b", "name": "shell", "arguments": "{}", "contentOffset": 9, "status": "error"}
+        ],
+        "children": [
+          {"id": "k1", "state": "interrupted", "summary": "The parent task ended."}
+        ]
+      }
+    },
+    {
+      "name": "failed_after_error_event",
+      "id": "message_h4",
+      "createdAt": 1700000007800,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Partial"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "shell", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "1_0_b", "name": "shell", "arguments": "{}"},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"},
+        {"type": "error", "requestId": "r", "code": "model_busy", "message": "busy", "retryable": true},
+        {"type": "error", "requestId": "r", "code": "model_unavailable", "message": "The model server is unavailable.", "retryable": true, "detail": "llama.cpp:\n\t Loading   model\u0000"}
+      ],
+      "end": {"type": "failed", "code": "storage_error", "message": "The model server is unavailable.", "detail": "a different detail"},
+      "expected": {
+        "id": "message_h4", "role": "assistant", "content": "Partial\n\n", "attachments": [], "status": "error", "createdAt": 1700000007800,
+        "error": "The model computer is unavailable. Open and unlock Blackwall on that computer, keep its model running, and reconnect.",
+        "tools": [
+          {"id": "0_0_a", "name": "shell", "arguments": "{}", "contentOffset": 7, "status": "complete", "output": "x"},
+          {"id": "1_0_b", "name": "shell", "arguments": "{}", "contentOffset": 9, "status": "error"}
+        ],
+        "children": [
+          {"id": "k1", "state": "interrupted", "summary": "The parent task ended."}
+        ]
+      }
+    },
+    {
+      "name": "complete_after_error_event",
+      "id": "message_h5",
+      "createdAt": 1700000007900,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Answer"},
+        {"type": "error", "requestId": "r", "code": "model_timeout", "message": "slow", "retryable": true, "detail": "upstream timeout"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "Answer"}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_h5", "role": "assistant", "content": "Answer", "attachments": [], "status": "error", "createdAt": 1700000007900, "error": "The model took too long to respond. Check that its computer is awake and connected, then try again."}
+    },
+    {
+      "name": "failed_unknown_code",
+      "id": "message_h2",
+      "createdAt": 1700000007500,
+      "shape": "Desktop",
+      "events": [],
+      "end": {"type": "failed", "code": "model_http_error", "message": "generic", "detail": "Ollama: out of memory"},
+      "expected": {"id": "message_h2", "role": "assistant", "content": "", "attachments": [], "status": "error", "createdAt": 1700000007500, "error": "Ollama: out of memory"}
+    },
+    {
+      "name": "failed_without_detail",
+      "id": "message_h3",
+      "createdAt": 1700000007700,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Step"}
+      ],
+      "end": {"type": "failed", "code": "agent_iteration_limit", "message": "The agent reached its iteration limit."},
+      "expected": {"id": "message_h3", "role": "assistant", "content": "Step", "attachments": [], "status": "error", "createdAt": 1700000007700, "error": "The agent reached its iteration limit. Review its progress before continuing."}
+    },
+    {
+      "name": "empty_answer",
+      "id": "message_i",
+      "createdAt": 1700000008000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "  \n"},
+        {"type": "assistant_delta", "requestId": "r", "delta": " ﻿"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "  \n ﻿"}, "finishReason": "stop"}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_i", "role": "assistant", "content": "  \n ﻿", "attachments": [], "status": "error", "createdAt": 1700000008000, "error": "The model returned no answer. Try a shorter prompt or choose another model."}
+    },
+    {
+      "name": "next_line_is_an_answer",
+      "id": "message_i2",
+      "createdAt": 1700000008500,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": " \u0085 "}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "message_i2", "role": "assistant", "content": " \u0085 ", "attachments": [], "status": "complete", "createdAt": 1700000008500}
+    },
+    {
+      "name": "open_run",
+      "id": "message_j",
+      "createdAt": 1700000009000,
+      "shape": "Desktop",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "Still going"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "shell", "arguments": "{}"}
+      ],
+      "end": null,
+      "expected": {
+        "id": "message_j", "role": "assistant", "content": "Still going", "attachments": [], "status": "streaming", "createdAt": 1700000009000,
+        "tools": [
+          {"id": "0_0_a", "name": "shell", "arguments": "{}", "contentOffset": 11, "status": "running"}
+        ]
+      }
+    },
+    {
+      "name": "cli_error",
+      "id": "assistant_1700000010000_1",
+      "createdAt": 1700000010000,
+      "shape": "Cli",
+      "events": [
+        {"type": "instructions_loaded", "requestId": "r", "sources": ["AGENTS.md"], "warnings": []},
+        {"type": "assistant_delta", "requestId": "r", "delta": "Part"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "shell", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
+        {"type": "subagent_status", "requestId": "r", "agentId": "k1", "state": "running"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"}
+      ],
+      "end": {"type": "failed", "code": "model_unavailable", "message": "The model server could not be reached.", "detail": "connection refused"},
+      "expected": {"id": "assistant_1700000010000_1", "role": "assistant", "content": "Part\n\n", "attachments": [], "status": "error", "createdAt": 1700000010000}
+    },
+    {
+      "name": "cli_error_before_text",
+      "id": "assistant_1700000011000_1",
+      "createdAt": 1700000011000,
+      "shape": "Cli",
+      "events": [],
+      "end": {"type": "failed", "code": "timeout", "message": "The run reached its 60-second time limit and was stopped. You can continue this conversation."},
+      "expected": {"id": "assistant_1700000011000_1", "role": "assistant", "content": "The run reached its 60-second time limit and was stopped. You can continue this conversation.", "attachments": [], "status": "error", "createdAt": 1700000011000}
+    },
+    {
+      "name": "cli_stopped",
+      "id": "assistant_1700000012000_1",
+      "createdAt": 1700000012000,
+      "shape": "Cli",
+      "events": [],
+      "end": {"type": "stopped"},
+      "expected": {"id": "assistant_1700000012000_1", "role": "assistant", "content": "Task stopped. You can continue this conversation.", "attachments": [], "status": "error", "createdAt": 1700000012000}
+    },
+    {
+      "name": "cli_complete",
+      "id": "assistant_1700000013000_1",
+      "createdAt": 1700000013000,
+      "shape": "Cli",
+      "events": [
+        {"type": "assistant_delta", "requestId": "r", "delta": "A"},
+        {"type": "tool_call", "requestId": "r", "toolCallId": "0_0_a", "name": "read_file", "arguments": "{}"},
+        {"type": "tool_result", "requestId": "r", "toolCallId": "0_0_a", "output": "x", "success": true},
+        {"type": "assistant_delta", "requestId": "r", "delta": "\n\n"},
+        {"type": "assistant_delta", "requestId": "r", "delta": "B"},
+        {"type": "turn_complete", "requestId": "r", "message": {"role": "assistant", "content": "A\n\nB"}, "finishReason": "stop", "reasoning": "r", "reasoningMs": 5}
+      ],
+      "end": {"type": "complete"},
+      "expected": {"id": "assistant_1700000013000_1", "role": "assistant", "content": "A\n\nB", "attachments": [], "status": "complete", "createdAt": 1700000013000}
+    },
+    {
+      "name": "cli_complete_empty",
+      "id": "assistant_1700000014000_1",
+      "createdAt": 1700000014000,
+      "shape": "Cli",
+      "events": [],
+      "end": {"type": "complete"},
+      "expected": {"id": "assistant_1700000014000_1", "role": "assistant", "content": "", "attachments": [], "status": "complete", "createdAt": 1700000014000}
+    }
+  ]
+}

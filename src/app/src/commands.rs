@@ -1159,6 +1159,9 @@ fn build_api_messages(request: &ChatRequest) -> Result<Vec<ApiOutgoingMessage>, 
         .collect())
 }
 
+/// The request format of the non-streaming `chat` command only. Its output is sent once and never
+/// stored, so it is not a saved model form; the one canonical form of a chat message, which the
+/// streaming path sends and stored chats reference, is `blackwall_core::model::message_form`.
 fn multimodal_content(message: &ChatMessage, attachments: &[&Attachment]) -> ApiContent {
     let mut parts = Vec::new();
     let mut text = message.content.clone();

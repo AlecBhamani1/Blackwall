@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MIGRATION_BATCH: i64 = 5;
-const SESSION_TEXT_BYTES: usize = 512 * 1024;
-const MESSAGE_TEXT_BYTES: usize = 64 * 1024;
+pub(super) const SESSION_TEXT_BYTES: usize = 512 * 1024;
+pub(super) const MESSAGE_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -104,6 +104,61 @@ pub(super) fn index(db: &Connection, session: &Value) -> Result<(), StorageError
     Ok(())
 }
 
+/// The `recall` rules both stores share: guests are refused, the query is checked, and its words
+/// become a quoted `AND` expression. The FTS query language is never exposed to callers or
+/// transcripts.
+pub(super) fn match_expression(
+    client: MemoryClient,
+    query: &RecallQuery,
+) -> Result<String, StorageError> {
+    if matches!(client, MemoryClient::Guest) {
+        return Err(StorageError::Invalid(
+            "Conversation recall is unavailable to guests.",
+        ));
+    }
+    if query.query.trim().is_empty()
+        || query.query.len() > 512
+        || query.project.as_ref().is_some_and(|p| p.len() > 2048)
+        || query.after.is_some_and(|n| n < 0)
+        || query.before.is_some_and(|n| n < 0)
+        || matches!((query.after, query.before), (Some(a),Some(b)) if a > b)
+        || query.limit.is_some_and(|n| !(1..=10).contains(&n))
+    {
+        return Err(StorageError::Invalid(
+            "Use a search of 1–512 bytes, valid date range, and a limit of 1–10.",
+        ));
+    }
+    // Literal words, joined with AND.
+    let words: Vec<_> = query
+        .query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .take(32)
+        .map(|s| format!("\"{s}\""))
+        .collect();
+    if words.is_empty() {
+        return Err(StorageError::Invalid("Enter at least one word to search."));
+    }
+    Ok(words.join(" AND "))
+}
+
+/// Keeps hits, in order, until their JSON would pass 14,000 bytes.
+pub(super) fn cap_results(
+    hits: impl IntoIterator<Item = rusqlite::Result<RecallHit>>,
+) -> Result<Vec<RecallHit>, StorageError> {
+    let mut results = Vec::new();
+    let mut bytes = 0;
+    for hit in hits {
+        let hit = hit?;
+        bytes += serde_json::to_vec(&hit)?.len();
+        if bytes > 14_000 {
+            break;
+        }
+        results.push(hit);
+    }
+    Ok(results)
+}
+
 impl LocalStore {
     pub(super) fn message_index_is_current(&self) -> Result<bool, StorageError> {
         Ok(self.connection.query_row(
@@ -128,7 +183,7 @@ impl LocalStore {
             let mut sessions = Vec::new();
             for row in rows {
                 let (id, body) = row?;
-                if body.len() > super::MAX_SESSION_BYTES {
+                if body.len() as u64 > super::MAX_SESSION_BYTES {
                     return Err(StorageError::Invalid(
                         "A saved conversation exceeds the migration limit.",
                     ));
@@ -176,34 +231,7 @@ impl LocalStore {
         client: MemoryClient,
         query: &RecallQuery,
     ) -> Result<RecallResults, StorageError> {
-        if matches!(client, MemoryClient::Guest) {
-            return Err(StorageError::Invalid(
-                "Conversation recall is unavailable to guests.",
-            ));
-        }
-        if query.query.trim().is_empty()
-            || query.query.len() > 512
-            || query.project.as_ref().is_some_and(|p| p.len() > 2048)
-            || query.after.is_some_and(|n| n < 0)
-            || query.before.is_some_and(|n| n < 0)
-            || matches!((query.after, query.before), (Some(a),Some(b)) if a > b)
-            || query.limit.is_some_and(|n| !(1..=10).contains(&n))
-        {
-            return Err(StorageError::Invalid(
-                "Use a search of 1–512 bytes, valid date range, and a limit of 1–10.",
-            ));
-        }
-        // Literal words, joined with AND. Never expose the FTS query language to transcripts or callers.
-        let words: Vec<_> = query
-            .query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| !s.is_empty())
-            .take(32)
-            .map(|s| format!("\"{s}\""))
-            .collect();
-        if words.is_empty() {
-            return Err(StorageError::Invalid("Enter at least one word to search."));
-        }
+        let expression = match_expression(client, query)?;
         let mut statement = self.connection.prepare("SELECT s.id,m.message_id,m.message_index,s.title,
             i.mode,i.project,s.updated_at,m.role,snippet(message_search,0,'','',' … ',32)
             FROM message_search JOIN session_messages m ON m.id=message_search.rowid JOIN sessions s ON s.id=m.session_id JOIN indexed_sessions i ON i.session_id=s.id
@@ -212,7 +240,7 @@ impl LocalStore {
             ORDER BY bm25(message_search),s.updated_at DESC,m.message_index LIMIT ?5")?;
         let rows = statement.query_map(
             params![
-                words.join(" AND "),
+                expression,
                 query.project,
                 query.after,
                 query.before,
@@ -234,16 +262,7 @@ impl LocalStore {
                 })
             },
         )?;
-        let mut results = Vec::new();
-        let mut bytes = 0;
-        for row in rows {
-            let hit = row?;
-            bytes += serde_json::to_vec(&hit)?.len();
-            if bytes > 14_000 {
-                break;
-            }
-            results.push(hit);
-        }
+        let results = cap_results(rows)?;
         let remaining_sessions = self.connection.query_row("SELECT COUNT(*) FROM sessions WHERE id NOT IN (SELECT session_id FROM indexed_sessions)", [], |row| row.get(0))?;
         Ok(RecallResults {
             results,
