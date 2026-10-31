@@ -328,6 +328,11 @@ fn an_append_costs_the_same_at_any_history_length() {
 
 /// A12 review: the same, with the search entry an append also writes, which `stmt` cannot see
 /// into (FTS5 runs its own statements). `total_changes` and the VM count do see it.
+///
+/// Not covered: FTS5's segment merges. `chat_with_history` writes the whole history in one
+/// transaction, so the index holds one segment here, and no append in this test triggers an
+/// automerge. A merge's cost depends on the index, not on the chat's length, and lands on the
+/// append that triggers it.
 #[test]
 fn an_append_with_its_search_entry_costs_the_same_at_any_history_length() {
     let costs = append_costs(true);
@@ -654,6 +659,24 @@ fn large_history_v6_timings_are_reported_and_bounded() {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
 
+    // Delete: a chat, its rows by the cascade, its search entries, and the FTS5 `optimize` that
+    // `delete_v6` runs after removing them. Reported only. Every timed chat but the first, which
+    // the check below still reads.
+    let mut delete_times = vec![];
+    for id in &ids[1..] {
+        let indexed = count(
+            db,
+            &format!(
+                "SELECT count(*) FROM chat_search_keys WHERE sid=(SELECT key FROM sessions WHERE id='{id}')"
+            ),
+        );
+        assert!(indexed > 0, "{id} has search entries to delete");
+        let started = Instant::now();
+        db.delete_v6(id).unwrap();
+        delete_times.push(started.elapsed());
+    }
+    let delete = median(delete_times);
+
     // Lists never read a body: break every one and the list is the same.
     let list_before = db.list_v6().unwrap();
     db.connection()
@@ -677,7 +700,8 @@ fn large_history_v6_timings_are_reported_and_bounded() {
              | open a live-run chat of {} runs | {:.2} ms |\n\
              | append: user + model ref + start + search entry | {:.2} ms, {} statements |\n\
              | list, {listed} rows | {:.2} ms |\n\
-             | search, limit 10 | {:.2} ms, {search_statements} statements, {} hits in {hit_chats} chats |\n\n\
+             | search, limit 10 | {:.2} ms, {search_statements} statements, {} hits in {hit_chats} chats |\n\
+             | delete a chat with its search entries, then `optimize` (median of {}) | {:.2} ms |\n\n\
              {SIZE_HEADER}\n{}\n\n\
              message text {}, v5 bodies {}, v6 event bodies {}; vacuumed v6 / text {:.2}",
             ms(upgraded.upgrade),
@@ -693,6 +717,8 @@ fn large_history_v6_timings_are_reported_and_bounded() {
             ms(list_time),
             ms(search),
             found.results.len(),
+            ids.len() - 1,
+            ms(delete),
             size_rows("synthetic", v5_file, &upgraded),
             mib(text_bytes as u64),
             mib(v5_body_bytes as u64),

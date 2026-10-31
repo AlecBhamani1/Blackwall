@@ -436,7 +436,10 @@ fn a_crash_before_the_check_leaves_the_vacuum_to_the_cleanup_that_checks() {
     let db = open6(&dir).unwrap();
     set_fault(&dir, None);
     assert!(!vacuum_owed(&db));
-    assert!(pages(&db).1 > 0, "a file that failed its check is not vacuumed");
+    assert!(
+        pages(&db).1 > 0,
+        "a file that failed its check is not vacuumed"
+    );
     assert!(!dir.backups().join("upgrade-state.json").exists());
     assert!(db
         .take_storage_notices()

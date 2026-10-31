@@ -909,9 +909,6 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
     }))
 }
 
-/// Today's session JSON for a chat: the typed columns, each `metadata` key at the top level, the
-/// messages, and a `contextState` only when the stored context is valid. That value is
-/// `build_view`'s own, not a re-serialized `ContextState`.
 /// Top-level session JSON keys that metadata may not carry. `contextState` is reserved only for
 /// a non-null value: a literal `contextState:null` is how v5 saved "no context", and metadata may
 /// keep it (see [`reserved_in_metadata`]).
@@ -929,6 +926,9 @@ fn reserved_in_metadata(key: &str, value: &Value) -> bool {
     RESERVED_KEYS.contains(&key) && !(key == "contextState" && value.is_null())
 }
 
+/// Today's session JSON for a chat: the typed columns, each `metadata` key at the top level, the
+/// messages, and a `contextState` only when the stored context is valid. That value is
+/// `build_view`'s own, not a re-serialized `ContextState`.
 fn chat_json(loaded: &Loaded) -> Value {
     let chat = &loaded.chat;
     let mut json = Map::new();
@@ -957,7 +957,7 @@ fn chat_json(loaded: &Loaded) -> Value {
     Value::Object(json)
 }
 
-/// The session JSON on any connection, inside the caller's transaction or out of one. It does not
+/// The session JSON on any connection, inside the caller's transaction. It does not
 /// repair counters, since the upgrade reads a chat it has just written. `NotFound` when absent.
 pub(crate) fn load_json_v6_from(conn: &Connection, id: &str) -> Result<Value, StorageError> {
     let loaded = read_chat(conn, id)?.ok_or(StorageError::NotFound)?;
@@ -1351,12 +1351,24 @@ mod tests {
             )
             .unwrap();
         let big = "x".repeat(1 << 20);
-        let turns = vec![2; (2 * crate::storage::MAX_SESSION_BYTES >> 20) as usize + 1];
+        let turns = vec![2; ((2 * crate::storage::MAX_SESSION_BYTES) >> 20) as usize + 1];
         for (seq, kind, body) in [
-            (0, "ui_user", json!({"id": "u", "role": "user", "content": "Hi", "attachments": [], "createdAt": 1, "status": "complete"})),
-            (1, "ui_progress", json!({"start": {"id": "a", "createdAt": 2, "user": 0}})),
+            (
+                0,
+                "ui_user",
+                json!({"id": "u", "role": "user", "content": "Hi", "attachments": [], "createdAt": 1, "status": "complete"}),
+            ),
+            (
+                1,
+                "ui_progress",
+                json!({"start": {"id": "a", "createdAt": 2, "user": 0}}),
+            ),
             (2, "model", json!({"role": "assistant", "content": big})),
-            (3, "ui_assistant", json!({"run": 1, "content": {"turns": turns}, "status": "complete"})),
+            (
+                3,
+                "ui_assistant",
+                json!({"run": 1, "content": {"turns": turns}, "status": "complete"}),
+            ),
         ] {
             db.connection()
                 .execute(
@@ -2717,14 +2729,23 @@ mod tests {
             .filter(|t| !t.is_empty())
             .map(str::to_ascii_uppercase)
             .collect();
+        let writes = |t: &String| {
+            matches!(
+                t.as_str(),
+                "UPDATE" | "DELETE" | "REPLACE" | "CONFLICT" | "DROP" | "ALTER"
+            )
+        };
         match tokens.first().map(String::as_str) {
-            Some("CREATE") => true,
-            Some("INSERT" | "SELECT") => !tokens.iter().any(|t| {
-                matches!(
-                    t.as_str(),
-                    "UPDATE" | "DELETE" | "REPLACE" | "CONFLICT" | "DROP" | "ALTER"
-                )
-            }),
+            // A table's or index's own `CREATE`, `ON DELETE CASCADE` included. A trigger is
+            // checked by its body, which runs later as a write: it may not change `chat_events`.
+            Some("CREATE") => match tokens.iter().position(|t| t == "BEGIN") {
+                Some(begin) if tokens[..begin].iter().any(|t| t == "TRIGGER") => {
+                    let body = &tokens[begin + 1..];
+                    !(body.iter().any(|t| t == "CHAT_EVENTS") && body.iter().any(writes))
+                }
+                _ => true,
+            },
+            Some("INSERT" | "SELECT") => !tokens.iter().any(writes),
             _ => false,
         }
     }
@@ -2738,6 +2759,20 @@ mod tests {
         assert_eq!(
             found.iter().map(|s| is_add_only(s)).collect::<Vec<_>>(),
             [false, true, false, false]
+        );
+        // A trigger whose body updates or deletes `chat_events` fails, wherever it fires. The
+        // table's own cascade, and a guard trigger on `chat_events` that only refuses, pass. The
+        // `sessions` key guard does not name `chat_events`, so the scan never sees it.
+        let triggers = "a(\"CREATE TRIGGER t AFTER INSERT ON sessions BEGIN UPDATE chat_events SET body=''; END;\");\n\
+             b(\"CREATE TEMP TRIGGER t AFTER UPDATE ON sessions BEGIN DELETE FROM chat_events WHERE sid=old.key; END;\");\n\
+             c(\"CREATE TABLE chat_events (id INTEGER PRIMARY KEY, sid INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE);\");\n\
+             d(\"CREATE TRIGGER g BEFORE DELETE ON chat_events BEGIN SELECT RAISE(ABORT, 'no'); END;\");\n\
+             e(\"CREATE TRIGGER sessions_key_bu BEFORE UPDATE OF key ON sessions BEGIN SELECT RAISE(ABORT, 'x'); END;\")";
+        let found = chat_events_statements(triggers);
+        assert_eq!(
+            found.iter().map(|s| is_add_only(s)).collect::<Vec<_>>(),
+            [false, false, true, true],
+            "{found:?}"
         );
         // The real sources, test modules and test-only files excluded.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

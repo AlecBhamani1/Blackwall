@@ -586,7 +586,9 @@ fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duratio
             return;
         }
         Err(error) if out_of_room(&error) => {
-            eprintln!("warn: storage: the VACUUM ran out of disk space; left for a later open: {error:?}");
+            eprintln!(
+                "warn: storage: the VACUUM ran out of disk space; left for a later open: {error:?}"
+            );
             return;
         }
         Err(error) => {

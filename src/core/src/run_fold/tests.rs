@@ -51,6 +51,7 @@ fn fold_run_matches_the_shared_fixture() {
         "stopped_mid_tool",
         "failed_with_detail",
         "failed_after_error_event",
+        "complete_after_error_event",
         "empty_answer",
         "cli_error",
         "cli_complete",

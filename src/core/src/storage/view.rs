@@ -1134,7 +1134,10 @@ mod tests {
                 user(0, "u", "Hi"),
                 start(1, "a", 5, 0),
                 said(2, &big),
-                assistant(3, json!({"run": 1, "content": content, "status": "complete"})),
+                assistant(
+                    3,
+                    json!({"run": 1, "content": content, "status": "complete"}),
+                ),
             ]
         };
         // One honest reference to the turn is fine.
