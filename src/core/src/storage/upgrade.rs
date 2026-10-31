@@ -65,6 +65,11 @@ pub(super) fn open_v6(
             tx.pragma_update(None, "user_version", V6)?;
         }
         tx.commit()?;
+        if version < V6 {
+            // Hand back the space the old copies used (1.3 GB of v5 history becomes 0.56 GB). A
+            // failure here (no room for the temporary copy) only leaves the file larger.
+            let _ = connection.execute_batch("VACUUM");
+        }
     }
     Ok(LocalStore { connection })
 }
