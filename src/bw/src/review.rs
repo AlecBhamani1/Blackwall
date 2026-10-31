@@ -1,11 +1,17 @@
 use crate::{session::environment_key, settings::Settings};
 use blackwall_core::{
     model::HttpModel,
+    policy::Policy,
     review::{ReviewSnapshot, ReviewTarget},
 };
 use std::path::Path;
 
-pub async fn run(path: &Path, settings: &Settings, arguments: &[String]) -> Result<(), String> {
+pub async fn run(
+    directory: &Path,
+    path: &Path,
+    settings: &Settings,
+    arguments: &[String],
+) -> Result<(), String> {
     let mut arguments = arguments.to_vec();
     let json = if let Some(index) = arguments.iter().position(|arg| arg == "--json") {
         arguments.remove(index);
@@ -15,18 +21,24 @@ pub async fn run(path: &Path, settings: &Settings, arguments: &[String]) -> Resu
     };
     let target = ReviewTarget::parse(&arguments).map_err(|e| e.to_string())?;
     tokio::select! {
-        result = execute(path, settings, &target, json) => result,
+        result = execute(directory, path, settings, &target, json) => result,
         _ = tokio::signal::ctrl_c() => Err("Review cancelled; no changes were made.".into()),
     }
 }
 
 async fn execute(
+    directory: &Path,
     path: &Path,
     settings: &Settings,
     target: &ReviewTarget,
     json: bool,
 ) -> Result<(), String> {
-    let snapshot = ReviewSnapshot::collect(path, target)
+    // The owner's and the project's deny `file` rules keep files out of the review.
+    let policy = Policy::load(directory, path).await;
+    if let Some(error) = policy.error.as_ref() {
+        return Err(error.clone());
+    }
+    let snapshot = ReviewSnapshot::collect(path, target, Some(&policy))
         .await
         .map_err(|e| e.to_string())?;
     let backend = HttpModel::new(

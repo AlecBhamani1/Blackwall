@@ -331,6 +331,32 @@ impl Settings {
             self.retention,
         )
     }
+
+    /// [`Self::describe`] for `bw status`. Until setup or `bw config` saves settings, the model
+    /// and endpoint are only defaults, so they show as not set.
+    pub fn describe_status(&self, store: &LocalStore) -> Result<String, String> {
+        let description = self.describe();
+        if store
+            .setting(SETTINGS_KEY)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(description);
+        }
+        Ok(description
+            .lines()
+            .map(|line| {
+                if line.starts_with("model: ") {
+                    "model: not set"
+                } else if line.starts_with("endpoint: ") {
+                    "endpoint: not set"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
 }
 
 /// One line for the instruction settings.

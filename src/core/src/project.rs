@@ -1489,6 +1489,22 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_rule_paths_are_refused_with_the_rule_named() {
+        let folders = Folders::new();
+        folders.write(json!({"policy":{"rules":[
+            {"decision":"deny","kind":"exec","command":"rm"},
+            {"decision":"deny","kind":"file","path":"src/**"}
+        ]}}));
+        let shown = status(&folders.workspace, &folders.data);
+        assert!(shown.rules.is_empty());
+        let error = shown.error.unwrap();
+        assert!(
+            error.contains("rules[1]") && error.contains("src/**") && error.contains("plain"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn invisible_characters_escaped_and_blank_runs_collapsed() {
         for hidden in [
             '\u{200B}',

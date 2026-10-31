@@ -103,7 +103,7 @@ fn is_strictest(mode: &RuleMode) -> bool {
 }
 
 impl RulesFile {
-    pub(crate) fn validate(self) -> Result<Self, &'static str> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         let mode = self.mode;
         validate(self.rules).map(|rules| Self {
             mode,
@@ -259,10 +259,12 @@ impl Policy {
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RulesFile::default()),
-            Err(_) => Err("The policy file could not be read."),
-            Ok(body) if body.len() > MAX_POLICY_BYTES => Err("The policy file is too large."),
+            Err(_) => Err("The policy file could not be read.".into()),
+            Ok(body) if body.len() > MAX_POLICY_BYTES => {
+                Err("The policy file is too large.".into())
+            }
             Ok(body) => serde_json::from_slice::<RulesFile>(&body)
-                .map_err(|_| "The policy file is not valid.")
+                .map_err(|_| "The policy file is not valid.".into())
                 .and_then(RulesFile::validate),
         };
         let (file, mut error) = match parsed {
@@ -295,7 +297,7 @@ impl Policy {
         }
         user.rules = kept;
         let mut layers = vec![user];
-        let mut warnings = vec![];
+        let mut warnings: Vec<String> = error.iter().cloned().collect();
         let mut ask_all = false;
         let mut project_limits = None;
         let mut project_instructions = None;
@@ -315,7 +317,7 @@ impl Policy {
                             error.get_or_insert(message.clone());
                         }
                     }
-                    warnings = loaded.warnings;
+                    warnings.extend(loaded.warnings);
                     if loaded.trust == crate::project::Trust::Trusted {
                         project_limits = loaded.config.limits;
                         project_instructions = loaded.config.instructions;
@@ -567,11 +569,17 @@ pub(crate) async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<V
     Ok(body)
 }
 
-fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
+fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, String> {
     if rules.len() > MAX_RULES {
-        return Err("The policy file has too many rules.");
+        return Err("The policy file has too many rules.".into());
     }
-    for rule in &rules {
+    for (index, rule) in rules.iter().enumerate() {
+        // Paths match as prefixes, so a wildcard would never match anything.
+        if let Some(path) = rule.path.as_deref().filter(|p| p.contains(['*', '?'])) {
+            return Err(format!(
+                "Rule rules[{index}] path {path:?} uses a wildcard. Paths are plain prefixes: use \"src\", not \"src/**\"."
+            ));
+        }
         let field = match rule.kind {
             ApprovalKind::Exec => rule
                 .command
@@ -604,7 +612,7 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
                 .as_deref()
                 .is_some_and(|project| !Path::new(project).is_absolute())
         {
-            return Err("A policy rule has missing or mismatched fields.");
+            return Err("A policy rule has missing or mismatched fields.".into());
         }
     }
     Ok(rules)
@@ -1233,6 +1241,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wildcard_rule_paths_are_refused_with_the_rule_named() {
+        for path in ["src/**", "*.env", "file?.txt"] {
+            let rules = json!({"rules":[
+                {"decision":"allow","kind":"exec","command":"ls"},
+                {"decision":"deny","kind":"file","path":path}
+            ]});
+            let error = serde_json::from_value::<RulesFile>(rules)
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(
+                error.contains("rules[1]") && error.contains(path) && error.contains("plain"),
+                "{error}"
+            );
+        }
+        // Brackets are literal, as in a Next.js route folder.
+        let literal = json!({"rules":[{"decision":"deny","kind":"file","path":"app/[id]"}]});
+        assert!(serde_json::from_value::<RulesFile>(literal)
+            .unwrap()
+            .validate()
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn invalid_or_missing_files_ask_and_audit_is_redacted() {
         let directory =
@@ -1254,6 +1286,10 @@ mod tests {
                 .unwrap();
             let invalid = Policy::load(&directory, Path::new("/workspace")).await;
             assert!(invalid.error.is_some(), "{body}");
+            assert_eq!(
+                invalid.warnings,
+                invalid.error.iter().cloned().collect::<Vec<_>>()
+            );
             assert_eq!(invalid.decide(ApprovalKind::Exec, "ls"), Decision::Ask);
         }
         record_secret(&missing).await;

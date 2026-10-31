@@ -249,9 +249,22 @@ impl Agent<'_> {
                     let target = crate::review::ReviewTarget::parse(
                         &arguments.map(str::to_owned).collect::<Vec<_>>(),
                     )?;
-                    let snapshot =
-                        crate::review::ReviewSnapshot::collect(&self.workspace.path, &target)
-                            .await?;
+                    // Only rules are read here: deny `file` rules keep files out of the review.
+                    let policy = match user_directory {
+                        Some(directory) => {
+                            Some(crate::policy::Policy::load(directory, &self.workspace.path).await)
+                        }
+                        None => None,
+                    };
+                    if let Some(error) = policy.as_ref().and_then(|policy| policy.error.clone()) {
+                        return Err(tools::ToolError::Execution(error).into());
+                    }
+                    let snapshot = crate::review::ReviewSnapshot::collect(
+                        &self.workspace.path,
+                        &target,
+                        policy.as_ref(),
+                    )
+                    .await?;
                     let result = snapshot.review(self.backend).await?;
                     let answer = snapshot.render(&result);
                     (self.emit)(AgentEvent::AssistantDelta {
