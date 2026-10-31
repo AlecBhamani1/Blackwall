@@ -181,10 +181,10 @@
     gap: 8px;
   }
   select {
-    padding: 6px 8px;
+    padding: 6px 30px 6px 8px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border-strong);
-    background: var(--bg-base);
+    background-color: var(--bg-base);
     font: inherit;
   }
   .note {
