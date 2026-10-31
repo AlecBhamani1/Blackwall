@@ -119,7 +119,8 @@ and manage `.blackwall/project.json` trust. See
 review settings; changes apply to the next turn and future CLI launches.
 
 Use `bw mcp` or **Settings → AI capabilities → MCP servers** to manage local-command and HTTP
-servers and their saved secrets. Edit command and HTTP tools in `tools.json`;
+servers and their saved secrets, and **Settings → Agent → Command tools** to manage command tools
+(`claude`, `codex` and `copilot` are suggested). Edit HTTP tools in `tools.json`;
 `bw tools secret <tool> <NAME>` saves an HTTP header value from standard input. The Runtime guide
 covers MCP commands, headers, and secret handling. Settings supports purpose search and
 **Sort by → Name (A–Z)**.

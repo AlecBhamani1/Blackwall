@@ -1134,6 +1134,68 @@ pub async fn delete_mcp_secret(app: AppHandle, name: String, key: String) -> Res
     .await
 }
 
+/// Command tool edits share the CLI's loader validation, like MCP edits.
+async fn with_tools<T: Send + 'static>(
+    app: &AppHandle,
+    operation: impl FnOnce(&std::path::Path) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    crate::auth::require_unlocked(app).await?;
+    let directory = crate::identity::data_directory(app)?;
+    tokio::task::spawn_blocking(move || operation(&directory))
+        .await
+        .map_err(|_| "The tools task could not finish.")?
+}
+#[tauri::command]
+pub async fn list_command_tools(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::command_tools::ToolSummary>, String> {
+    with_tools(&app, blackwall_core::command_tools::summaries).await
+}
+#[tauri::command]
+pub async fn add_command_tool(
+    app: AppHandle,
+    name: String,
+    description: String,
+    command: Vec<String>,
+    prompt_on_stdin: bool,
+) -> Result<(), String> {
+    with_tools(&app, move |directory| {
+        blackwall_core::command_tools::add_tool(
+            directory,
+            &name,
+            &description,
+            command,
+            prompt_on_stdin,
+        )
+    })
+    .await
+}
+#[tauri::command]
+pub async fn update_command_tool(
+    app: AppHandle,
+    name: String,
+    description: String,
+    command: Vec<String>,
+) -> Result<(), String> {
+    with_tools(&app, move |directory| {
+        blackwall_core::command_tools::update_tool(directory, &name, &description, command)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn remove_command_tool(app: AppHandle, name: String) -> Result<(), String> {
+    with_tools(&app, move |directory| {
+        blackwall_core::command_tools::remove_tool(directory, &name)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn detect_command_clis(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::command_tools::CliStatus>, String> {
+    with_tools(&app, |_| Ok(blackwall_core::command_tools::detect_clis())).await
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod pairing_commit_tests {

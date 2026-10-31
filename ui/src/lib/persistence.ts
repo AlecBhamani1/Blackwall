@@ -282,6 +282,20 @@ export interface McpServer {
   denyTools?: string[];
   secrets?: string[];
 }
+export interface CommandToolSummary {
+  name: string;
+  description: string;
+  kind: 'command' | 'http';
+  command: string[];
+  /** Why a subagent cannot run on this tool; null when it can. */
+  subagentProblem: string | null;
+}
+export interface CommandCli {
+  name: string;
+  installed: boolean;
+  /** A sign-in file exists. Its contents are never read. */
+  signedIn: boolean;
+}
 export interface McpToolRule {
   tool: string;
   project: string | null;
@@ -420,6 +434,24 @@ export const persistence = {
   testOwnerRule: (kind: OwnerRule['kind'], subject: string) =>
     command<RuleVerdict>('test_owner_rule', { kind, subject }),
   policyAudit: () => command<PolicyAuditEntry[]>('policy_audit'),
+  commandTools: () => command<CommandToolSummary[]>('list_command_tools'),
+  /** Refused when a tool already has the name. */
+  addCommandTool: (
+    name: string,
+    description: string,
+    commandArgs: string[],
+    promptOnStdin: boolean,
+  ) =>
+    command<void>('add_command_tool', {
+      name,
+      description,
+      command: commandArgs,
+      promptOnStdin,
+    }),
+  updateCommandTool: (name: string, description: string, commandArgs: string[]) =>
+    command<void>('update_command_tool', { name, description, command: commandArgs }),
+  removeCommandTool: (name: string) => command<void>('remove_command_tool', { name }),
+  commandClis: () => command<CommandCli[]>('detect_command_clis'),
   memories: (query = '') => command<MemoryEntry[]>('list_memories', { query }),
   memoryProposals: () => command<MemoryProposal[]>('list_memory_proposals'),
   approveMemory: (id: string, content: string | null = null) =>

@@ -31,6 +31,7 @@
   import MemoryDialog from './MemoryDialog.svelte';
   import SkillsDialog from './SkillsDialog.svelte';
   import McpDialog from './McpDialog.svelte';
+  import CommandToolsDialog from './CommandToolsDialog.svelte';
   import RunsDialog from './RunsDialog.svelte';
   import UsageDialog from './UsageDialog.svelte';
   import { settingsEntries, settingsGroups, type SettingsPage } from '../settingsNavigation';
@@ -893,6 +894,7 @@
             />{/if}
           {#if selectedSetting === 'skills'}<SkillsDialog embedded onClose={() => {}} />{/if}
           {#if selectedSetting === 'mcp'}<McpDialog embedded onClose={() => {}} />{/if}
+          {#if selectedSetting === 'commandtools'}<CommandToolsDialog embedded onClose={() => {}} />{/if}
           {#if selectedSetting === 'runs'}<RunsDialog embedded onClose={() => {}} />{/if}
           {#if selectedSetting === 'usage'}<UsageDialog embedded onClose={() => {}} />{/if}
         {#if selectedSetting === 'updates'}

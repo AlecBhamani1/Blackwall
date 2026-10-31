@@ -323,25 +323,26 @@ still denies). With `bw config set command-tools-isolation sandboxed`, that rule
 a prompt. Calls use the command time limit and output bounds. If the file is invalid, no
 owner tools are offered and the run shows a warning.
 
-There is no `bw` or desktop editor for `tools.json`; edit the file, and changes apply from the next
-run. Tools without the fields below load and behave exactly as before.
+**Settings → Agent → Command tools** adds, edits and removes command tools, and suggests `claude`,
+`codex` and `copilot`. It shows whether each program is on your `PATH` and whether its sign-in file
+exists (it never runs the program or reads the file; a program that keeps its sign-in in the system
+keychain shows as not detected). It lists HTTP tools but does not change them. You can also edit
+`tools.json` by hand, and changes apply from the next run. Tools without the fields below load and
+behave exactly as before.
 
 **Standard input.** `"stdin":"json"` writes `{"arguments":{…}}`, the call's arguments, to the
 program's standard input and then closes it, so long text such as a prompt is not limited by the
 8,000-byte argument cap or the option check (up to 256 KiB of JSON). The approval prompt shows the
-input's size, its SHA-256, and its first 2,000 characters. For example, a small wrapper lets
-`claude -p` read its prompt from stdin JSON:
-
-```sh
-#!/bin/sh
-# ~/bin/ask-claude: read {"arguments":{"prompt":…}} and pass the prompt to Claude on stdin.
-python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"]["prompt"])' \
-  | exec claude -p --permission-mode plan
-```
+input's size, its SHA-256, and its first 2,000 characters. For example, `claude -p` reads standard
+input as its prompt, so a fixed instruction that says the input is JSON is all it needs, with no
+wrapper. The tool runs in the project folder, so `--setting-sources user` and `--strict-mcp-config`
+keep Claude from loading the project's `.claude/settings.json` (hooks, environment, permissions)
+or `.mcp.json`, which a cloned repository could plant:
 
 ```json
 {"tools":[
-  {"name":"ask_claude","description":"Ask Claude a question","command":["/Users/me/bin/ask-claude"],
+  {"name":"ask_claude","description":"Ask Claude a question",
+   "command":["claude","-p","--permission-mode","plan","--setting-sources","user","--strict-mcp-config","--append-system-prompt","Standard input is JSON; do the task in arguments.prompt."],
    "stdin":"json",
    "parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The question"}},"required":["prompt"]}}
 ]}
@@ -759,8 +760,8 @@ the `Exit: 0` line) is the child's answer. The tool must:
   `{"arguments":{"prompt":"Task: …\n\nContext:\n…"}}` and never on the command line;
 - declare a string `prompt` in `parameters`, need no other argument, and use no `{placeholders}`.
 
-`bw config set subagent-runs-on` and the desktop check this when you choose the tool, and every
-run checks again. Each delegation **always asks**, whether the tool runs outside the sandbox or
+`bw config set subagent-runs-on` checks this when you choose the tool, the desktop lists only the
+tools that qualify and says why it leaves out each of the others, and every run checks again. Each delegation **always asks**, whether the tool runs outside the sandbox or
 sandboxed: an allow rule never skips the prompt (a deny rule still denies), "allow identical action
 this run" is not offered, and the prompt shows the whole text being sent, marked **Sends data off
 this device**. The model is not offered that tool
@@ -787,7 +788,7 @@ python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["arguments"][
 
 | CLI | Last line of the wrapper |
 | --- | --- |
-| Claude Code | `\| exec claude -p --permission-mode plan` |
+| Claude Code | No wrapper: use the `claude` command in [Work in a project](#work-in-a-project) |
 | Codex | `\| exec codex exec --sandbox read-only -` (`-` reads the prompt from stdin) |
 | GitHub Copilot CLI | `\| xargs -0 copilot -p` with no `--allow-tool` or `--allow-all-tools`, so it cannot use tools that need permission (Copilot takes the prompt as an argument; check `copilot --help` for your version) |
 

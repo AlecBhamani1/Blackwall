@@ -5,6 +5,7 @@
     instructionFileValid,
     MAX_INSTRUCTION_FILES,
     SUBAGENT_TOOLS,
+    type CommandToolSummary,
     type CommandToolsIsolation,
     type SubagentTool,
     type MemoryEntry,
@@ -52,6 +53,8 @@
   let subagentTools: SubagentTool[] = ['read_file', 'list_files'];
   let subagentRunsOn: 'local' | 'tool' = 'local';
   let subagentTool = '';
+  let commandTools: CommandToolSummary[] = [];
+  let commandToolsError = '';
   let commandToolsIsolation: CommandToolsIsolation = 'outside';
   let savedLimits = '';
   let savedSubagents = '';
@@ -108,7 +111,9 @@
     web_fetch: 'Read web pages (asks)',
     web_search: 'Search the web (asks)',
   };
-  $: subagentToolValid = /^[a-z0-9_]{1,64}$/.test(subagentTool);
+  // A subagent can only run on a tool that takes its prompt on standard input.
+  $: subagentChoices = commandTools.filter((tool) => tool.subagentProblem === null);
+  $: subagentToolValid = subagentChoices.some((tool) => tool.name === subagentTool);
   $: subagentsValid =
     Number.isInteger(Number(subagentMaxSteps)) &&
     subagentMaxSteps >= 1 &&
@@ -342,6 +347,12 @@
       return;
     }
     void (async () => {
+      try {
+        commandTools = await persistence.commandTools();
+      } catch (cause) {
+        commandToolsError =
+          typeof cause === 'string' ? cause : 'Your command tools could not be read.';
+      }
       try {
         savedPreferences = await persistence.preferences();
         enabled = savedPreferences.memoryEnabled ?? false;
@@ -653,19 +664,36 @@
             {/each}
           </fieldset>
         {:else}
-          <label for="subagent-tool">Command tool name</label>
-          <input
+          <label for="subagent-tool">Command tool</label>
+          <select
             id="subagent-tool"
             bind:value={subagentTool}
-            placeholder="review"
-            autocomplete="off"
-            disabled={busy || !loaded}
-          />
+            disabled={busy || !loaded || (subagentChoices.length === 0 && !subagentTool)}
+          >
+            <option value="">Choose a tool</option>
+            {#each subagentChoices as tool (tool.name)}
+              <option value={tool.name}>{tool.name}</option>
+            {/each}
+            {#if subagentTool && !subagentToolValid}
+              <option value={subagentTool}>{subagentTool} (not available)</option>
+            {/if}
+          </select>
+          {#if commandToolsError}<p role="alert" class="error">{commandToolsError}</p>{/if}
+          {#if subagentChoices.length === 0}
+            <p class="hint">
+              No command tool can take a subagent's prompt yet. Add one under Command tools; claude
+              is suggested there.
+            </p>
+          {/if}
+          {#each commandTools.filter((tool) => tool.subagentProblem !== null) as tool (tool.name)}
+            <p class="hint">
+              <code>{tool.name}</code> cannot be used: {tool.subagentProblem}
+            </p>
+          {/each}
           <p class="notice warning" role="note">
             <span aria-hidden="true">⚠</span>
             Sends data off this device. The subagent's whole prompt goes to this tool as JSON on
-            standard input, and you are asked every time. The tool needs "stdin": "json" and a
-            "prompt" parameter in tools.json.
+            standard input, and you are asked every time. Only tools that take it that way are listed.
           </p>
         {/if}
         <fieldset disabled={busy || !loaded}>
