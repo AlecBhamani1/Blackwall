@@ -1,5 +1,5 @@
 //! Versioned local SQLite persistence. All values are bounded and writes are transactional.
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{config::DbConfig, params, Connection, ErrorCode, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -70,17 +70,20 @@ pub enum StorageError {
         backup: Option<PathBuf>,
         source: Box<StorageError>,
     },
-    #[error("{}", upgrade_text(&Some(.0.clone())))]
+    #[error("{}", UPGRADE_FAILED_BACKED_UP)]
     UpgradeStopped(PathBuf),
 }
 
-fn upgrade_text(backup: &Option<PathBuf>) -> String {
+/// What the owner reads when an upgrade with a backup fails or stops. It never holds the backup's
+/// path, which would cross IPC as error text (security L6): the path is logged where the error is
+/// made, and the error and the notices carry it as data.
+const UPGRADE_FAILED_BACKED_UP: &str = "Couldn't upgrade your chats; your data is safe, and a \
+     backup of it is in the backups folder inside Blackwall's data folder.";
+
+fn upgrade_text(backup: &Option<PathBuf>) -> &'static str {
     match backup {
-        Some(path) => format!(
-            "Couldn't upgrade your chats; your data and a backup are safe at {}.",
-            path.display()
-        ),
-        None => "Couldn't upgrade your chats; your existing data has been left in place.".into(),
+        Some(_) => UPGRADE_FAILED_BACKED_UP,
+        None => "Couldn't upgrade your chats; your existing data has been left in place.",
     }
 }
 
@@ -472,9 +475,17 @@ pub(crate) const FOREIGN_KEYS_OFF: &str = "Blackwall could not turn on its datab
 /// Every connection starts here: foreign keys, secure delete and full syncs, with `busy` as its
 /// lock wait. `foreign_keys` is a silent no-op inside a transaction, so it is set and read back
 /// first, before `synchronous` (which errors inside one) can mask the failure.
+///
+/// It also hardens the connection against a tampered file (security L8):
+/// - `SQLITE_DBCONFIG_DEFENSIVE`: no `writable_schema`, no direct writes to the FTS5 shadow
+///   tables, nothing that can corrupt the file on purpose.
+/// - `trusted_schema=OFF`: a trigger or view in the file may only call functions and virtual
+///   tables marked innocuous. FTS5 is, so the search triggers and the cascade into `chat_search`
+///   still run.
 pub(crate) fn configure(connection: &Connection, busy: Duration) -> Result<(), StorageError> {
     connection.busy_timeout(busy)?;
-    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")?;
     let on: i64 = connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if on != 1 {
         return Err(StorageError::Invalid(FOREIGN_KEYS_OFF));

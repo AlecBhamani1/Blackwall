@@ -974,7 +974,8 @@ fn session_columns(session: &Value) -> (&str, i64) {
     )
 }
 
-/// Imports the browser's legacy sessions once, in one transaction. Ids already kept or set aside
+/// Imports the browser's legacy sessions once, in one transaction. Each one's `contextState` is
+/// removed first, as a compatibility save removes it (security M1). Ids already kept or set aside
 /// are skipped, so a chat deleted since is never brought back. A bad session is set aside, not
 /// fatal (one with no usable id under `import_{position}`), and the number set aside is returned
 /// (F24). An SQL or I/O error rolls the whole import back.
@@ -991,6 +992,8 @@ pub(crate) fn migrate_v6(store: &mut LocalStore, sessions: &[Value]) -> Result<u
     let tx = write_tx(&store.connection)?;
     let mut set_aside_count = 0;
     for (position, session) in sessions.iter().enumerate() {
+        // Webview-supplied, like a compatibility save: its transcript never becomes model rows.
+        let session = &without_context(session);
         let raw = serde_json::to_string(session)?;
         let (title, updated_at) = session_columns(session);
         let id = match session
@@ -1029,6 +1032,16 @@ pub(crate) fn migrate_v6(store: &mut LocalStore, sessions: &[Value]) -> Result<u
     Ok(set_aside_count)
 }
 
+/// A session the webview supplied, with any `contextState` removed (security H4, M1). Only the
+/// backend writes model rows; a transcript from the webview is never stored as one.
+fn without_context(session: &Value) -> Value {
+    let mut session = session.clone();
+    if let Some(object) = session.as_object_mut() {
+        object.remove("contextState");
+    }
+    session
+}
+
 /// The compatibility save of a chat the backend has not seen: a new id only, converted like a
 /// legacy chat with any supplied `contextState` removed first (security H4). An existing id is a
 /// `Conflict` at its current revision, and is counted. A session that cannot be converted is set
@@ -1039,10 +1052,7 @@ pub(crate) fn import_session(store: &LocalStore, session: &Value) -> Result<(), 
         .and_then(Value::as_str)
         .ok_or(StorageError::Invalid("Missing conversation identifier."))?;
     validate_id(id)?;
-    let mut session = session.clone();
-    if let Some(object) = session.as_object_mut() {
-        object.remove("contextState");
-    }
+    let session = without_context(session);
     let raw = serde_json::to_string(&session)?;
     let (title, updated_at) = session_columns(&session);
     let tx = write_tx(&store.connection)?;
@@ -1838,11 +1848,15 @@ mod tests {
             assert_eq!(rows, 0, "{table}");
         }
         assert_eq!(db.setting("legacy_sessions_migrated").unwrap(), None);
-        // The same import without the fault succeeds whole.
+        // The same import without the fault succeeds whole, each chat without its webview
+        // `contextState` (security M1).
         assert_eq!(migrate_v6(&mut db, &sessions).unwrap(), 0);
         for session in &sessions {
             let id = session["id"].as_str().unwrap();
-            assert_eq!(db.load_json_v6(id).unwrap().unwrap(), *session);
+            assert_eq!(
+                db.load_json_v6(id).unwrap().unwrap(),
+                without_context(session)
+            );
         }
     }
 
@@ -1877,7 +1891,10 @@ mod tests {
             migrate_v6(&mut db, &[good.clone(), bad.clone(), nameless.clone()]).unwrap(),
             2
         );
-        assert_eq!(db.load_json_v6("desktop_plain").unwrap().unwrap(), good);
+        assert_eq!(
+            db.load_json_v6("desktop_plain").unwrap().unwrap(),
+            without_context(&good)
+        );
         assert_eq!(
             quarantined(&db, "bad_role").unwrap().2,
             "This conversation contains an invalid message."
@@ -1928,25 +1945,32 @@ mod tests {
         assert!(db.load_json_v6("broken").unwrap().is_none());
     }
 
+    /// R4-7: the webview cannot append model rows. Both of its ways to hand the backend a whole
+    /// chat, the compatibility save and the browser import, drop the `contextState` it supplied,
+    /// so its transcript never becomes model rows (security H4, M1).
     #[test]
     fn import_session_ignores_a_supplied_context_state() {
+        let mut imported = v6_in_memory();
+        migrate_v6(&mut imported, &[fixture("agent_tools")]).unwrap();
         let db = v6_in_memory();
         let session = fixture("agent_tools");
         import_session(&db, &session).unwrap();
         let mut without = session.clone();
         without.as_object_mut().unwrap().remove("contextState");
-        assert_eq!(db.load_json_v6("agent_tools").unwrap().unwrap(), without);
-        assert_eq!(
-            count(
-                &db,
-                "SELECT count(*) FROM chat_context WHERE session_id=?1",
-                "agent_tools"
-            ),
-            0
-        );
-        assert!(event_bodies(&db, "agent_tools")
-            .iter()
-            .all(|(kind, _)| kind != "model"));
+        for db in [&db, &imported] {
+            assert_eq!(db.load_json_v6("agent_tools").unwrap().unwrap(), without);
+            assert_eq!(
+                count(
+                    db,
+                    "SELECT count(*) FROM chat_context WHERE session_id=?1",
+                    "agent_tools"
+                ),
+                0
+            );
+            assert!(event_bodies(db, "agent_tools")
+                .iter()
+                .all(|(kind, _)| kind != "model"));
+        }
         // An id that exists is a conflict at its current revision, and is counted.
         let saves = compat_saves();
         db.update_session_metadata("agent_tools", &MetadataPatch::default(), 1)

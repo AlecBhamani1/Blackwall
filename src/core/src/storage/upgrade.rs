@@ -264,7 +264,10 @@ fn upgrade(directory: &Path, connection: &Connection, retry: bool) -> Result<(),
         None
     };
     let failed = |source: StorageError| {
-        eprintln!("warn: upgrade: rolled back to the previous version: {source:?}");
+        eprintln!(
+            "warn: upgrade: rolled back to the previous version (backup: {:?}): {source:?}",
+            backup.as_ref().map(Backup::path)
+        );
         StorageError::UpgradeFailed {
             backup: backup.as_ref().map(Backup::path),
             source: Box::new(source),
@@ -335,7 +338,13 @@ fn back_up(
         });
     let (made, attempts) = match saved {
         Some(state) if state.attempts >= MAX_ATTEMPTS => {
-            return Err(StorageError::UpgradeStopped(dir.join(state.backup)));
+            let path = dir.join(state.backup);
+            eprintln!(
+                "warn: upgrade: stopped after {} attempts; the backup is {}",
+                state.attempts,
+                path.display()
+            );
+            return Err(StorageError::UpgradeStopped(path));
         }
         // The backup an earlier attempt made is checked again before it is trusted: something may
         // have changed it since (security L3). One that fails is passed over, as if no state
@@ -361,9 +370,15 @@ fn back_up(
         }
     };
     // From here the backup exists, so every error names it.
-    let named = |source: StorageError| StorageError::UpgradeFailed {
-        backup: Some(made.path()),
-        source: Box::new(source),
+    let named = |source: StorageError| {
+        eprintln!(
+            "warn: upgrade: failed after its backup {}: {source:?}",
+            made.path().display()
+        );
+        StorageError::UpgradeFailed {
+            backup: Some(made.path()),
+            source: Box::new(source),
+        }
     };
     // Older backups are pruned only after the commit: a failed attempt never deletes one.
     let state = UpgradeState {

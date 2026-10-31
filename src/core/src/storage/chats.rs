@@ -242,6 +242,9 @@ const BAD_MESSAGE: &str = "This conversation contains an invalid message.";
 const UNREADABLE: &str =
     "This conversation's saved history can't be read. Your existing data has been left in place.";
 const CONTEXT_BAD: &str = "The saved model context is not valid.";
+/// A chat whose references would build more than one load may hold (security L5).
+const TOO_LARGE: &str =
+    "This conversation refers to more data than Blackwall can open. Your existing data has been left in place.";
 const CONTEXT_TOO_SHORT: &str = "The saved model history is shorter than its context says.";
 const CONTEXT_REF: &str = "The saved model context refers to an entry that cannot be read.";
 
@@ -718,7 +721,10 @@ impl Loaded {
 fn view_error(id: &str, error: &ViewError) -> StorageError {
     // The entry number is for the log only.
     eprintln!("warn: chat {id} could not be rebuilt: {error}");
-    StorageError::Invalid(UNREADABLE)
+    match error {
+        ViewError::TooLarge => StorageError::Invalid(TOO_LARGE),
+        _ => StorageError::Invalid(UNREADABLE),
+    }
 }
 
 fn context_reason(error: &ViewError) -> &'static str {
@@ -726,6 +732,7 @@ fn context_reason(error: &ViewError) -> &'static str {
         ViewError::ContextLength => CONTEXT_TOO_SHORT,
         ViewError::BadRef { .. } | ViewError::BadBody { .. } => CONTEXT_REF,
         ViewError::BadContext => CONTEXT_BAD,
+        ViewError::TooLarge => TOO_LARGE,
     }
 }
 
@@ -1333,6 +1340,38 @@ mod tests {
             .is_err());
     }
 
+    /// Security L5: a tampered terminal naming one 1 MiB turn 97 times is a typed error at load.
+    #[test]
+    fn a_load_that_would_build_past_the_cap_is_a_typed_error() {
+        let db = v6_in_memory();
+        db.connection()
+            .execute(
+                "INSERT INTO sessions(id,title,updated_at,body) VALUES ('s','t',1,'')",
+                [],
+            )
+            .unwrap();
+        let big = "x".repeat(1 << 20);
+        let turns = vec![2; (2 * crate::storage::MAX_SESSION_BYTES >> 20) as usize + 1];
+        for (seq, kind, body) in [
+            (0, "ui_user", json!({"id": "u", "role": "user", "content": "Hi", "attachments": [], "createdAt": 1, "status": "complete"})),
+            (1, "ui_progress", json!({"start": {"id": "a", "createdAt": 2, "user": 0}})),
+            (2, "model", json!({"role": "assistant", "content": big})),
+            (3, "ui_assistant", json!({"run": 1, "content": {"turns": turns}, "status": "complete"})),
+        ] {
+            db.connection()
+                .execute(
+                    "INSERT INTO chat_events(sid,seq,kind,body) VALUES (1,?1,?2,?3)",
+                    params![seq, kind, body.to_string()],
+                )
+                .unwrap();
+        }
+        let error = load_json_v6_from(db.connection(), "s").unwrap_err();
+        assert!(
+            matches!(error, StorageError::Invalid(text) if text == TOO_LARGE),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn bundled_sqlite_supports_contentless_delete_and_secure_delete() {
         let db = v6_in_memory();
@@ -1424,6 +1463,53 @@ mod tests {
             configure(&inside, Duration::from_millis(1)),
             Err(StorageError::Invalid(FOREIGN_KEYS_OFF))
         ));
+    }
+
+    /// Security L8: defensive mode and an untrusted schema, with the search index, its trigger,
+    /// the cascade into it and `foreign_key_check` all still working.
+    #[test]
+    fn configure_hardens_the_connection_and_the_search_index_still_works() {
+        let db = v6_in_memory();
+        let connection = db.connection();
+        assert!(connection
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+            .unwrap());
+        let trusted: i64 = connection
+            .pragma_query_value(None, "trusted_schema", |r| r.get(0))
+            .unwrap();
+        assert_eq!(trusted, 0);
+        // A write straight into an FTS5 shadow table, or to the schema, is refused.
+        assert!(connection
+            .execute("DELETE FROM chat_search_data", [])
+            .is_err());
+        assert!(connection
+            .execute_batch("PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=''")
+            .is_err());
+        // An index entry, then the chat's delete: the cascade and `chat_search_keys_ad` run.
+        make(&db, "s");
+        let message = json!({"id": "m", "role": "user", "content": "zqxjhardened", "attachments": [], "createdAt": 1, "status": "complete"});
+        write(&db, "s", |tx, c| {
+            let seq = append_ui_user(tx, "s", c, &message)?;
+            search::index_message(tx, "s", c, seq, 0, &message).map(drop)
+        })
+        .unwrap();
+        let hits = |db: &LocalStore| {
+            count(
+                db,
+                "SELECT count(*) FROM chat_search WHERE chat_search MATCH 'zqxjhardened'",
+            )
+        };
+        assert_eq!(hits(&db), 1);
+        db.delete_v6("s").unwrap();
+        assert_eq!(hits(&db), 0);
+        assert!(connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
     }
 
     #[test]

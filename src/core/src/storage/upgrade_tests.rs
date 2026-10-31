@@ -540,10 +540,10 @@ fn the_import_records_its_set_asides_as_a_notice() {
         db.take_storage_notices().unwrap(),
         [StorageNotice::SetAside { chats: 1 }]
     );
-    assert_eq!(
-        db.load_json_v6("desktop_plain").unwrap().unwrap(),
-        fixture("desktop_plain")
-    );
+    // Imported from the webview, so without its `contextState` (security M1).
+    let mut imported = fixture("desktop_plain");
+    imported.as_object_mut().unwrap().remove("contextState");
+    assert_eq!(db.load_json_v6("desktop_plain").unwrap().unwrap(), imported);
 }
 
 #[test]
@@ -636,7 +636,10 @@ fn an_injected_sql_error_rolls_back_to_whole_v5_and_names_the_backup() {
     let rows = session_rows(&dir.database());
     set_fault(&dir, Some(Fault::ConvertError(3)));
     let (path, text) = failed_backup(open6(&dir));
-    assert!(text.contains(&path.display().to_string()), "{text}");
+    // The error carries the path as data; its text, which crosses IPC, never shows it (L6).
+    assert!(!text.contains(&path.display().to_string()), "{text}");
+    assert!(!text.contains(&*dir.to_string_lossy()), "{text}");
+    assert!(text.contains("backups folder"), "{text}");
     assert_eq!(path.parent(), Some(dir.backups().as_path()));
     // The database is exactly the v5 file it was.
     assert_eq!(fs::read(dir.database()).unwrap(), bytes);
@@ -712,7 +715,14 @@ fn three_failures_on_one_source_make_one_backup_then_stop() {
     }
     let path = first.unwrap();
     match open6(&dir) {
-        Err(StorageError::UpgradeStopped(stopped)) => assert_eq!(stopped, path),
+        Err(error @ StorageError::UpgradeStopped(_)) => {
+            let text = error.to_string();
+            assert!(!text.contains(&*dir.to_string_lossy()), "{text}");
+            let StorageError::UpgradeStopped(stopped) = error else {
+                unreachable!()
+            };
+            assert_eq!(stopped, path);
+        }
         other => panic!("expected UpgradeStopped, got {:?}", other.err()),
     }
     assert_eq!(baks(&dir).len(), 1);

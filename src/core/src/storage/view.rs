@@ -8,7 +8,16 @@ use crate::{
     run_fold::{accumulate, AssistantShape, RunFold},
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap};
+
+/// Most bytes one load may build by following references (security L5): resolved content turns,
+/// tool names, arguments and outputs, and the model forms behind `model` refs. Stored bytes are
+/// capped at [`super::MAX_SESSION_BYTES`] when written, but a reference costs a few bytes and can
+/// name a large row any number of times, so a tampered `{"turns":[s,s,s,…]}` could otherwise ask
+/// for terabytes. A valid chat builds each stored byte at most twice (once for the screen, and
+/// once more for an assistant echo ref in the transcript, or for a tool's arguments as its call
+/// and then its result arrive), so twice the session cap never refuses one.
+const MAX_RESOLVED_BYTES: u64 = 2 * super::MAX_SESSION_BYTES;
 
 /// A `chat_events.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +75,9 @@ pub(crate) enum ViewError {
     ContextLength,
     #[error("The saved context usage is not in a form Blackwall can read.")]
     BadContext,
+    /// Its references would build more than [`MAX_RESOLVED_BYTES`].
+    #[error("A saved chat refers to more data than one conversation can hold.")]
+    TooLarge,
 }
 
 /// One run: its `ui_progress` start, deltas and terminal, and the verbatim assistant turns
@@ -83,6 +95,8 @@ struct Run {
 pub(crate) struct Index<'a> {
     rows: BTreeMap<i64, &'a EventRow>,
     runs: BTreeMap<i64, Run>,
+    /// The bytes built from references so far, against [`MAX_RESOLVED_BYTES`].
+    resolved: Cell<u64>,
 }
 
 impl<'a> Index<'a> {
@@ -142,7 +156,21 @@ impl<'a> Index<'a> {
                 Kind::UiUser | Kind::UiAssistant | Kind::Model => {}
             }
         }
-        Ok(Self { rows: by_seq, runs })
+        Ok(Self {
+            rows: by_seq,
+            runs,
+            resolved: Cell::new(0),
+        })
+    }
+
+    /// Counts `bytes` about to be built from a reference, before they are: `TooLarge` past the cap.
+    fn charge(&self, bytes: u64) -> Result<(), ViewError> {
+        let total = self.resolved.get().saturating_add(bytes);
+        if total > MAX_RESOLVED_BYTES {
+            return Err(ViewError::TooLarge);
+        }
+        self.resolved.set(total);
+        Ok(())
     }
 
     fn row(&self, seq: i64, kind: Kind) -> Option<&'a EventRow> {
@@ -192,6 +220,20 @@ fn only<'v>(body: &'v Value, keys: &[&str], seq: i64) -> Result<&'v Map<String, 
         .ok_or(ViewError::BadBody { seq })
 }
 
+/// About how many bytes a copy of `value` holds: its strings and keys, and 8 for anything else.
+/// It walks the value without allocating.
+fn weight(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => text.len() as u64,
+        Value::Array(items) => items.iter().map(weight).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| key.len() as u64 + weight(value))
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+    }
+}
+
 /// A `model` row as a transcript entry: verbatim, or the canonical form of what its ref names.
 pub(crate) fn resolve_model(rows: &Index<'_>, seq: i64) -> Result<Value, ViewError> {
     let row = rows
@@ -207,13 +249,14 @@ pub(crate) fn resolve_model(rows: &Index<'_>, seq: i64) -> Result<Value, ViewErr
     match rows.rows.get(&target).map(|row| row.kind) {
         Some(Kind::UiUser) => {
             let user = &rows.rows[&target].body;
+            rows.charge(weight(user))?;
             let message = serde_json::from_value::<ChatMessage>(user.clone())
                 .map_err(|_| ViewError::BadBody { seq: target })?;
             Ok(message_form(&message, &[]))
         }
         Some(Kind::UiAssistant) => {
-            let message = resolve_assistant(rows, target)?;
-            Ok(json!({"role": "assistant", "content": message["content"]}))
+            let mut message = resolve_assistant(rows, target)?;
+            Ok(json!({"role": "assistant", "content": message["content"].take()}))
         }
         _ => Err(ViewError::BadRef { seq }),
     }
@@ -385,6 +428,8 @@ fn content(rows: &Index<'_>, form: &Value, seq: i64) -> Result<String, ViewError
         None => "",
         Some(tail) => tail.as_str().ok_or(ViewError::BadBody { seq })?,
     };
+    // Counted before the text is joined: each turn plus the separator before it.
+    rows.charge(texts.iter().map(|text| text.len() as u64 + 2).sum())?;
     Ok(accumulate(texts) + tail)
 }
 
@@ -425,6 +470,7 @@ fn resolve_tool(rows: &Index<'_>, residual: &Value, seq: i64) -> Result<Value, V
     ) else {
         return Err(ViewError::BadRef { seq });
     };
+    rows.charge(weight(name) + weight(arguments))?;
     let mut tool = object.clone();
     tool.remove("call");
     tool.remove("result");
@@ -438,6 +484,7 @@ fn resolve_tool(rows: &Index<'_>, residual: &Value, seq: i64) -> Result<Value, V
         if output.get("tool_call_id") != Some(id) {
             return Err(ViewError::BadRef { seq });
         }
+        rows.charge(weight(&output["content"]))?;
         tool.insert("output".into(), output["content"].clone());
     }
     Ok(Value::Object(tool))
@@ -456,6 +503,7 @@ fn crash_fold(rows: &Index<'_>, run: &Run) -> Result<Value, ViewError> {
                 .ok_or(ViewError::BadBody { seq: turn })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    rows.charge(texts.iter().map(|text| text.len() as u64 + 2).sum())?;
     message.insert("content".into(), json!(accumulate(texts)));
     Ok(Value::Object(message))
 }
@@ -1074,6 +1122,54 @@ mod tests {
             error(&rows, Some(&context(5, 3))),
             ViewError::BadRef { seq: 7 }
         );
+    }
+
+    /// Security L5: a few bytes of references cannot make a load build without bound.
+    #[test]
+    fn references_that_would_build_past_the_cap_are_refused_before_they_are_built() {
+        let big = "x".repeat(1 << 20);
+        let turns = (MAX_RESOLVED_BYTES >> 20) as usize + 1;
+        let rows = |content: Value| {
+            vec![
+                user(0, "u", "Hi"),
+                start(1, "a", 5, 0),
+                said(2, &big),
+                assistant(3, json!({"run": 1, "content": content, "status": "complete"})),
+            ]
+        };
+        // One honest reference to the turn is fine.
+        let honest = view(&rows(json!({"turns": [2]})));
+        assert_eq!(honest.messages[1]["content"], big);
+        // The same turn named over and over is refused, typed, before any text is joined.
+        let tampered = rows(json!({"turns": vec![2; turns]}));
+        assert_eq!(error(&tampered, None), ViewError::TooLarge);
+        // The same through repeated tool refs, and through repeated model refs to that answer.
+        let mut tools = rows(json!("done"));
+        tools[2] = model(
+            2,
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f", "arguments": big}},
+            ]}),
+        );
+        tools[3] = assistant(
+            3,
+            json!({"run": 1, "content": "done", "status": "complete",
+                   "tools": [{"id": "t", "call": [2, 0], "result": null}]}),
+        );
+        assert!(build_view(&tools, None, &[]).is_ok());
+        let mut many = vec![user(0, "u", "Hi")];
+        many.push(model(1, tools[2].body.clone()));
+        many.push(assistant(
+            2,
+            json!({"id": "s", "role": "assistant", "content": "done",
+                   "tools": vec![json!({"id": "t", "call": [1, 0], "result": null}); turns]}),
+        ));
+        assert_eq!(error(&many, None), ViewError::TooLarge);
+        let mut echoes = rows(json!({"turns": [2]}));
+        echoes.extend((0..turns as i64).map(|n| reference(4 + n, 3)));
+        let mut ctx = context(0, 0);
+        ctx.model_len = echoes.iter().filter(|r| r.kind == Kind::Model).count() as u64;
+        assert_eq!(error(&echoes, Some(&ctx)), ViewError::TooLarge);
     }
 
     #[test]
