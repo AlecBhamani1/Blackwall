@@ -130,14 +130,16 @@ pub fn read_config(directory: &Path) -> Result<Vec<ServerConfig>, &'static str> 
 /// Validate and replace the owner's servers, so a failed write leaves the old file in place.
 pub fn write_config(directory: &Path, servers: Vec<ServerConfig>) -> Result<(), &'static str> {
     let failed = "The MCP file could not be saved.";
-    // Approvals were given for a server at one address; one that moves starts asking again.
+    // Approvals were given for a server at one address or command; one that moves starts asking
+    // again.
     let moved: Vec<String> = read_config(directory)
         .unwrap_or_default()
         .into_iter()
         .filter(|old| {
-            servers
-                .iter()
-                .any(|new| new.name == old.name && new.endpoint() != old.endpoint())
+            servers.iter().any(|new| {
+                new.name == old.name
+                    && (new.endpoint() != old.endpoint() || new.command != old.command)
+            })
         })
         .map(|old| old.name)
         .collect();
@@ -1655,6 +1657,34 @@ mod tests {
         .is_err());
         assert!(set_endpoint(&directory, "missing", vec!["uvx".into()], None).is_err());
         assert_eq!(read_config(&directory).unwrap()[1].url, servers[1].url);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_a_command_ends_its_approvals_but_other_edits_keep_them() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-rules-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        add_server(
+            &directory,
+            "time",
+            vec!["uvx".into(), "mcp-server-time".into()],
+        )
+        .unwrap();
+        crate::policy::allow_tool(&directory, "time", None).unwrap();
+
+        set_endpoint(
+            &directory,
+            "time",
+            vec!["uvx".into(), "mcp-server-time".into()],
+            None,
+        )
+        .unwrap();
+        set_enabled(&directory, "time", false).unwrap();
+        assert_eq!(crate::policy::tool_rules(&directory).unwrap().len(), 1);
+
+        set_endpoint(&directory, "time", vec!["/tmp/other".into()], None).unwrap();
+        assert!(crate::policy::tool_rules(&directory).unwrap().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

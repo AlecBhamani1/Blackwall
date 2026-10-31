@@ -32,6 +32,7 @@
   let busy = false;
   let error = '';
   const desktop = persistence.available();
+  const UNCLOSED_QUOTE = 'The command has a quote without a closing quote.';
   // Secret fields belong to one server and are cleared whenever the view changes.
   function open(server: McpServer | null) {
     selected = server;
@@ -144,7 +145,11 @@
   async function add(event: SubmitEvent) {
     event.preventDefault();
     if (mode === 'url') return addUrl();
-    const words = commandLine.trim().split(/\s+/);
+    const words = parseCommand(commandLine);
+    if (!words) {
+      error = UNCLOSED_QUOTE;
+      return;
+    }
     if (suggestion?.needs && words.length <= suggestion.command.length) {
       error =
         suggestion.needs === 'folder'
@@ -154,7 +159,7 @@
     }
     if (
       await run(
-        () => persistence.addMcpServer(name, commandLine),
+        () => persistence.addMcpServer(name, words),
         'This server could not be added.',
       )
     ) {
@@ -189,12 +194,12 @@
     const server = selected;
     const command = server.url ? [] : parseCommand(endpoint);
     if (!command) {
-      error = 'The command has a quote without a closing quote.';
+      error = UNCLOSED_QUOTE;
       return;
     }
     const saved = await run(
       () =>
-        persistence.setMcpEndpoint(server.name, command, server.url ? endpoint.trim() : null),
+        persistence.setMcpEndpoint(server.name, command, server.url ? endpoint : null),
       'This server could not be changed.',
     );
     if (saved) editing = false;
@@ -373,8 +378,8 @@
               : 'Add the web address of the server at the end, such as https://mcp.example.com/mcp.'}
           </p>{/if}
         <p class="hint">
-          Words are separated by spaces; use <code>bw mcp add</code> or edit mcp.json for an argument
-            that contains a space. Servers start without a shell in the Blackwall data folder, so pass
+          Words are separated by spaces; put an argument that contains a space in quotes. Servers
+            start without a shell in the Blackwall data folder, so pass
             a project path as an argument when a server needs one.
         </p>
         {/if}
@@ -408,7 +413,10 @@
             disabled={busy}
           />
           <div class="actions">
-            <button type="button" class="secondary" disabled={busy} onclick={() => (editing = false)}
+            <button type="button" class="secondary" disabled={busy} onclick={() => {
+                editing = false;
+                error = '';
+              }}
               >Cancel</button
             ><span></span><button class="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
           </div>

@@ -988,8 +988,11 @@ pub async fn list_mcp_servers(app: AppHandle) -> Result<serde_json::Value, Strin
     .await
 }
 #[tauri::command]
-pub async fn add_mcp_server(app: AppHandle, name: String, command: String) -> Result<(), String> {
-    let command = command.split_whitespace().map(str::to_owned).collect();
+pub async fn add_mcp_server(
+    app: AppHandle,
+    name: String,
+    command: Vec<String>,
+) -> Result<(), String> {
     with_mcp(&app, move |directory| {
         blackwall_core::mcp::add_server(directory, &name, command).map(|_| ())
     })
