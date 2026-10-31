@@ -770,6 +770,45 @@ fn a_post_commit_integrity_failure_is_a_notice_not_an_error() {
     assert!(path.is_file(), "the backup to restore from stays");
 }
 
+#[test]
+fn a_reused_backup_that_no_longer_verifies_is_replaced_by_a_fresh_one() {
+    for damage in ["version", "pages"] {
+        let dir = Scratch::new("reuse-damaged");
+        build_v5(&dir, &v5_sessions(), 5);
+        set_fault(&dir, Some(Fault::BeforeCommit));
+        let (first, _) = failed_backup(open6(&dir));
+        if damage == "version" {
+            Connection::open(&first)
+                .unwrap()
+                .execute_batch("PRAGMA user_version=4")
+                .unwrap();
+        } else {
+            // Every page after the header page overwritten, the size kept.
+            let mut bytes = fs::read(&first).unwrap();
+            bytes[4096..].fill(0x55);
+            fs::write(&first, bytes).unwrap();
+        }
+        // The same source, so the state still matches it: only the check stops the reuse.
+        let (second, _) = failed_backup(open6(&dir));
+        assert_ne!(second, first, "{damage}");
+        assert_eq!(baks(&dir).len(), 2, "{damage}");
+        assert_eq!(
+            LocalStore::upgrade_status(&dir).unwrap(),
+            UpgradeStatus::Failed {
+                backup: second.display().to_string(),
+                attempts: 1,
+                stopped: false,
+            },
+            "{damage}: the passed-over state's attempts do not carry over"
+        );
+        // A sound backup is reused as before.
+        set_fault(&dir, None);
+        drop(open6(&dir).unwrap());
+        assert_eq!(baks(&dir).len(), 2, "{damage}");
+        assert_eq!(version_of(&dir.database()), V6);
+    }
+}
+
 /// Copies a file, or a folder of files, from one data folder to another.
 fn copy_into(from: &Path, to: &Path, name: &str) {
     let (from, to) = (from.join(name), to.join(name));

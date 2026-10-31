@@ -63,7 +63,12 @@ impl Cap {
 /// VACUUM may renumber. `ADD COLUMN` cannot declare it `NOT NULL` (that needs a constant default,
 /// which the unique index would refuse twice), so it is never null by construction instead: the
 /// upgrade gives each v5 row its key as it converts it, in conversion order, and checks that none
-/// is left; a row inserted afterwards gets `MAX(key)+1` from `sessions_key_ai`.
+/// is left; a row inserted afterwards gets `MAX(key)+1` from `sessions_key_ai`. `sessions_key_bu`
+/// refuses any `UPDATE` that changes a key once given, or sets one NULL.
+///
+/// A key is unique among the chats that exist, not for all time: when the chat with the highest
+/// key is deleted, the next new chat takes that key again. That is safe, because the delete
+/// cascades every row that hung off it (`chat_events`, `chat_search_keys`).
 #[cfg_attr(not(test), allow(dead_code))] // the upgrade that calls it lands later
 pub(crate) fn apply_v6_schema(tx: &Connection) -> Result<(), StorageError> {
     tx.execute_batch(
@@ -86,6 +91,9 @@ pub(crate) fn apply_v6_schema(tx: &Connection) -> Result<(), StorageError> {
         CREATE TRIGGER sessions_key_ai AFTER INSERT ON sessions WHEN new.key IS NULL BEGIN
             UPDATE sessions SET key = (SELECT COALESCE(MAX(key), 0) + 1 FROM sessions)
             WHERE rowid = new.rowid; END;
+        CREATE TRIGGER sessions_key_bu BEFORE UPDATE OF key ON sessions
+            WHEN new.key IS NULL OR (old.key IS NOT NULL AND new.key IS NOT old.key) BEGIN
+            SELECT RAISE(ABORT, 'a chat key never changes'); END;
         CREATE TABLE chat_events (
             id INTEGER PRIMARY KEY,
             sid INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
@@ -1196,6 +1204,8 @@ mod tests {
             "chat_search_keys",
             "chat_search",
             "chat_search_keys_ad",
+            "sessions_key_ai",
+            "sessions_key_bu",
             "quarantined_sessions",
             "sessions",
         ] {
@@ -1269,6 +1279,24 @@ mod tests {
                 [],
             )
             .is_err());
+        // A key never changes once given, and is never set back to NULL.
+        for change in [
+            "UPDATE sessions SET key=NULL WHERE id='a'",
+            "UPDATE sessions SET key=7 WHERE id='a'",
+            "UPDATE sessions SET key=key+1",
+        ] {
+            let refused = db.connection().execute(change, []).unwrap_err();
+            assert!(
+                refused.to_string().contains("a chat key never changes"),
+                "{change}: {refused}"
+            );
+        }
+        assert_eq!((key("a"), key("b")), (1, 2));
+        // Setting a key to itself, as a conversion does for a row that already has one, is fine.
+        db.connection()
+            .execute("UPDATE sessions SET key=COALESCE(key,99), title='u'", [])
+            .unwrap();
+        assert_eq!((key("a"), key("b")), (1, 2));
         // chat_events is an ordinary rowid table (R6-1): rows stay on their leaf pages.
         let without_rowid: i64 = db
             .connection()

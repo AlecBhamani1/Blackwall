@@ -337,14 +337,17 @@ fn back_up(
         Some(state) if state.attempts >= MAX_ATTEMPTS => {
             return Err(StorageError::UpgradeStopped(dir.join(state.backup)));
         }
-        Some(state) => (
+        // The backup an earlier attempt made is checked again before it is trusted: something may
+        // have changed it since (security L3). One that fails is passed over, as if no state
+        // were saved, and a fresh backup is made.
+        Some(state) if backup::still_verified(&dir.join(&state.backup), version) => (
             Backup {
                 dir,
                 name: state.backup,
             },
             state.attempts,
         ),
-        None => {
+        _ => {
             // SQLite's backup refuses (SQLITE_BUSY) a source connection that is inside a write
             // transaction, so a second, read-only connection reads the file the lock holds still.
             let reader = Connection::open_with_flags(
@@ -917,7 +920,8 @@ impl LocalStore {
             return Ok(UpgradeStatus::Pending);
         };
         // The identity the upgrade compares, read the same way: through SQLite, in one read
-        // transaction, never by opening the file (see `backup::source_id`).
+        // transaction, never by opening the file (see `backup::source_id`). It reads every chat,
+        // so it is computed only here, with a state file to compare it with.
         let identity = reader
             .unchecked_transaction()
             .map_err(StorageError::from)

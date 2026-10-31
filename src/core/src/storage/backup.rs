@@ -333,11 +333,12 @@ pub(crate) fn source_id(
 }
 
 /// Adds the content of every table in `main` to `hash`:
-/// - `sessions`: each row's id, `updated_at` and body length, ordered by id. Every v5 chat write
-///   (save, delete, import) changes an `updated_at` or the set of ids. Saves stamp `updatedAt` in
-///   milliseconds, so two saves in one millisecond can share one; the body length tells those
-///   apart for free, because `octet_length` reads it from the row header without loading the
-///   body.
+/// - `sessions`: each row's id, `updated_at` and whole body, ordered by id. Every v5 chat write
+///   (save, delete, import) changes one of them. `updatedAt` alone is not enough: saves stamp it
+///   in milliseconds, so two saves in one millisecond can share one, and two such bodies can have
+///   the same length. The bodies are read one row at a time, through SQLite, and never held
+///   together. It costs a read of every chat, so only the upgrade (under its write lock) and
+///   `upgrade_status` (only when a state file is there to compare with) compute it.
 /// - every other ordinary or shadow table (settings, memory, proposals, paired devices, FTS
 ///   shadow tables): every row in full, in rowid order, or primary-key order for a WITHOUT ROWID
 ///   table. Not the `sqlite_%` internals, not virtual tables (`pragma_table_list` type
@@ -358,7 +359,7 @@ fn hash_tables(connection: &Connection, hash: &mut Sha256) -> Result<(), Storage
             continue;
         }
         let query = if table == "sessions" {
-            "SELECT id, updated_at, octet_length(body) FROM main.sessions ORDER BY id".to_owned()
+            "SELECT id, updated_at, body FROM main.sessions ORDER BY id".to_owned()
         } else {
             format!(
                 "SELECT * FROM main.{} ORDER BY {}",
@@ -676,6 +677,36 @@ fn copy_and_verify(
     open_plain(partial, true)?.sync_all()?;
     publish(dir, partial, finished)?;
     Ok(())
+}
+
+/// Whether the backup at `path` still holds `expected_version` and passes `quick_check`, read
+/// through SQLite, read-only. Checked before an upgrade reuses the backup an earlier attempt made
+/// (security L3). Any failure to read it counts as a failed check.
+pub(crate) fn still_verified(path: &Path, expected_version: i64) -> bool {
+    let checked = (|| -> Result<bool, StorageError> {
+        if !plain_file_at(path) {
+            return Ok(false);
+        }
+        let reader = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        super::configure(&reader, Duration::ZERO)?;
+        let version: i64 = reader.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let check: String = reader.pragma_query_value(None, "quick_check", |row| row.get(0))?;
+        reader.close().map_err(|(_, error)| error)?;
+        Ok(version == expected_version && check == "ok")
+    })();
+    match checked {
+        Ok(true) => true,
+        outcome => {
+            eprintln!(
+                "warn: backup: the backup {} from an earlier attempt no longer verifies; making a new one: {outcome:?}",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 /// Copies every page, retrying a busy or locked step until [`BACKUP_DEADLINE`]. A source that
@@ -1242,9 +1273,11 @@ mod tests {
             assert!(!seen.contains(&now), "{sql} kept an earlier identity");
             seen.push(now);
         };
-        // A save that bumps the date, one in the same millisecond, an import and a delete.
+        // A save that bumps the date, one in the same millisecond, one in the same millisecond
+        // with a body of the same length, an import and a delete.
         changes("UPDATE sessions SET updated_at=3, body='{\"x\":2}' WHERE id='a'");
         changes("UPDATE sessions SET body='{\"x\":22}' WHERE id='a'");
+        changes("UPDATE sessions SET body='{\"x\":23}' WHERE id='a'");
         changes("INSERT INTO sessions VALUES ('c','C',3,'{}')");
         changes("DELETE FROM sessions WHERE id='b'");
         changes("PRAGMA user_version=4");
