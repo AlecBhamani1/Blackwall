@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import Sidebar from './Sidebar.svelte';
 
-it('manages Memory, Skills, MCP servers, and Runs through Settings and returns focus after closing each panel', async () => {
+it('manages settings sections on one page and returns focus after closing Settings', async () => {
   const user = userEvent.setup();
   Object.defineProperties(HTMLDialogElement.prototype, {
     showModal: {
@@ -40,37 +40,26 @@ it('manages Memory, Skills, MCP servers, and Runs through Settings and returns f
     expect(sidebar.queryByRole('button', { name: new RegExp(name) })).not.toBeInTheDocument();
   }
   await user.click(sidebar.getByRole('button', { name: 'Open settings' }));
-  const settings = screen.getByRole('dialog', { name: 'Settings' });
+  const settings = screen.getByRole('region', { name: 'Settings' });
+  const pane = within(settings).getByTestId('settings-content-pane');
 
-  for (const panel of ['Memory', 'Skills', 'MCP servers', 'Runs']) {
+  for (const panel of ['Saved memories', 'Skills', 'MCP servers', 'Runs']) {
     const button = within(settings).getByRole('button', { name: new RegExp(panel) });
     await user.click(button);
-    const dialog = screen.getByRole('dialog', { name: panel });
-    expect(settings.parentElement).toHaveProperty('inert', true);
+    expect(within(settings).getByTestId('settings-content-pane')).toBe(pane);
+    expect(
+      within(pane).getByRole('heading', { name: panel === 'Saved memories' ? 'Memory' : panel }),
+    ).toBeInTheDocument();
+  }
 
-    if (panel === 'Memory') {
-      expect(within(dialog).getByLabelText('Model context limit (tokens)')).toHaveValue(8192);
-      await user.click(within(dialog).getByText('Advanced · Context window'));
-      await user.click(within(dialog).getByRole('button', { name: 'Save context limit' }));
+  await user.click(within(settings).getByRole('button', { name: 'Limits' }));
+  expect(within(pane).getByLabelText('Model context limit (tokens)')).toHaveValue(8192);
+  await user.click(within(pane).getByRole('button', { name: 'Save context limit' }));
       expect(onPreferences).toHaveBeenCalledWith(
         expect.objectContaining({ contextWindow: 8192, maxIterations: 30 }),
       );
-    }
-
-    // Native dialogs handle Escape themselves; it must not also close Settings.
-    await fireEvent.keyDown(dialog, { key: 'Escape' });
-    expect(settings).toBeInTheDocument();
-    await user.click(
-      within(dialog).getByRole('button', {
-        name: `Close ${panel === 'MCP servers' ? panel : panel.toLowerCase()}`,
-      }),
-    );
-    await waitFor(() => expect(button).toHaveFocus());
-    expect(screen.queryByRole('dialog', { name: panel })).not.toBeInTheDocument();
-    expect(settings.parentElement).toHaveProperty('inert', false);
-  }
 
   await user.keyboard('{Escape}');
-  expect(screen.queryByRole('dialog', { name: 'Settings' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('region', { name: 'Settings' })).not.toBeInTheDocument();
   expect(sidebar.getByRole('button', { name: 'Open settings' })).toHaveFocus();
 });

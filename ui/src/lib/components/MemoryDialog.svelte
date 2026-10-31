@@ -25,6 +25,8 @@
     maxOutputBytes: number;
   }) => void = () => {};
   export let onClose: () => void;
+  export let embedded = false;
+  export let section: 'memory' | 'limits' | 'subagents' | 'instructions' = 'memory';
   let dialog: HTMLDialogElement;
   let entries: MemoryEntry[] = [];
   let content = '';
@@ -242,7 +244,8 @@
     }
   }
   onMount(() => {
-    dialog.showModal();
+    if (embedded) dialog.setAttribute('open', '');
+    else dialog.showModal();
     if (!desktop) {
       contextWindow = contextPreferences.contextWindow ?? 32000;
       outputTokens =
@@ -285,8 +288,8 @@
   });
 </script>
 
-<dialog bind:this={dialog} onclose={onClose} aria-labelledby="memory-title">
-  <header>
+<dialog class:embedded bind:this={dialog} onclose={onClose} aria-labelledby="memory-title">
+  {#if !embedded}<header>
     <div>
       <h2 id="memory-title">Memory</h2>
       <p>A little context, carried into your next conversation.</p>
@@ -294,8 +297,18 @@
     <button class="icon-button" aria-label="Close memory" onclick={() => dialog.close()}
       ><Icon name="x" /></button
     >
-  </header>
+    </header>{/if}
   <div class="content">
+    {#if embedded}<h2 id="memory-title">
+        {section === 'memory'
+          ? 'Memory'
+          : section === 'limits'
+            ? 'Limits'
+            : section === 'subagents'
+              ? 'Subagents'
+              : 'Instructions'}
+      </h2>{/if}
+    {#if section === 'memory'}
     {#if !desktop}<p>Memory is available in the installed Blackwall desktop app.</p>
     {:else}
       <div class="preference">
@@ -333,7 +346,8 @@
               <button
                 class="secondary"
                 disabled={busy}
-                onclick={() => showSource(proposal.id, proposal.source)}>View source message</button
+                  onclick={() => showSource(proposal.id, proposal.source)}
+                  >View source message</button
               >
               {#if sourceMessages[proposal.id]}<pre>{sourceMessages[proposal.id]}</pre>{/if}
               <label for={`before-${proposal.id}`}>Saved text (−)</label>
@@ -373,7 +387,8 @@
           rows="3"
           disabled={busy || !loaded}></textarea>
         <div class="editor-actions">
-          <span>Saved on this {platform.device}. Editable at any time.</span>{#if editingId}<button
+            <span>Saved on this {platform.device}. Editable at any time.</span
+            >{#if editingId}<button
               type="button"
               class="secondary"
               onclick={() => {
@@ -437,7 +452,8 @@
         </div>
       {/if}
     {/if}
-    <details>
+    {/if}
+    {#if section === 'limits'}<details open>
       <summary>Advanced · Context window</summary><label for="context-window"
         >Model context limit (tokens)</label
       ><input
@@ -450,8 +466,8 @@
         disabled={busy || !loaded}
       />
       <p class="hint">
-        Use the limit configured in your model service. Requests reserve room for tools, output, and
-        a 5% safety margin. Token counts are estimates.
+          Use the limit configured in your model service. Requests reserve room for tools, output,
+          and a 5% safety margin. Token counts are estimates.
       </p>
       <label for="output-tokens">Output reserve (tokens)</label>
       <input
@@ -521,9 +537,9 @@
           maxOutputBytes > 1048576}
         onclick={saveSettings}>Save context limit</button
       >
-    </details>
-    {#if desktop}
-      <details>
+      </details>{/if}
+    {#if desktop && section === 'subagents'}
+      <details open>
         <summary>Advanced · Subagents</summary>
         <label for="subagent-steps">Subagent step limit</label>
         <input
@@ -594,7 +610,9 @@
           onclick={saveSubagents}>Save subagent settings</button
         >
       </details>
-      <details>
+    {/if}
+    {#if desktop && section === 'instructions'}
+      <details open>
         <summary>Advanced · Instructions</summary>
         <label for="instruction-file-kib">Instruction file limit (KiB)</label>
         <input
@@ -631,12 +649,10 @@
         <fieldset disabled={busy || !loaded}>
           <legend>Max skill size</legend>
           <label
-            ><input type="radio" bind:group={maxSkillSizeMode} value="auto" /> Auto (10% of the
-            configured context window, 32–256 KiB)</label
+            ><input type="radio" bind:group={maxSkillSizeMode} value="auto" /> Auto (10% of the configured
+            context window, 32–256 KiB)</label
           >
-          <label
-            ><input type="radio" bind:group={maxSkillSizeMode} value="manual" /> Manual</label
-          >
+          <label><input type="radio" bind:group={maxSkillSizeMode} value="manual" /> Manual</label>
         </fieldset>
         {#if maxSkillSizeMode === 'manual'}
           <label for="max-skill-size-kib">Max skill size (KiB)</label>
@@ -714,6 +730,29 @@
   dialog::backdrop {
     background: var(--bg-scrim);
     backdrop-filter: blur(3px);
+  }
+  dialog.embedded {
+    display: block;
+    width: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  dialog.embedded .content {
+    padding: 0;
+  }
+  dialog.embedded h2 {
+    margin-bottom: 20px;
+  }
+  dialog.embedded details {
+    border-top: 0;
+    padding-top: 0;
+  }
+  dialog.embedded summary {
+    display: none;
   }
   header {
     display: flex;

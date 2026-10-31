@@ -6,6 +6,7 @@
   import { detectPlatform } from '../platform';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
+  export let embedded = false;
   let dialog: HTMLDialogElement;
   let servers: McpServer[] = [];
   let rules: McpToolRule[] = [];
@@ -189,7 +190,8 @@
     if (saved) secretName = '';
   }
   onMount(() => {
-    dialog.showModal();
+    if (embedded) dialog.setAttribute('open', '');
+    else dialog.showModal();
     if (desktop)
       void load().catch(
         () => (error = 'Your MCP servers could not be opened. The file has been left in place.'),
@@ -197,7 +199,7 @@
   });
 </script>
 
-<dialog bind:this={dialog} onclose={onClose} aria-labelledby="mcp-title">
+<dialog class:embedded bind:this={dialog} onclose={onClose} aria-labelledby="mcp-title">
   <header>
     <div>
       <h2 id="mcp-title">MCP servers</h2>
@@ -213,8 +215,8 @@
       <form onsubmit={add}>
         <h3 class="first">Suggested</h3>
         {#if windows}<p class="hint">
-            Suggested servers start with <code>npx</code>, which Blackwall cannot run on Windows yet.
-            Add a server whose program is an <code>.exe</code> instead.
+            Suggested servers start with <code>npx</code>, which Blackwall cannot run on Windows
+            yet. Add a server whose program is an <code>.exe</code> instead.
           </p>
         {:else}<div class="suggestions">
             {#each MCP_SUGGESTIONS as item (item.name)}{@const added = servers.some(
@@ -233,7 +235,8 @@
           </div>
           <p class="hint">
             Pick one to fill in the form, then review it and choose Add server. The first agent run
-            after adding one downloads that exact version from npm, so it needs a network connection.
+            after adding one downloads that exact version from npm, so it needs a network
+            connection.
           </p>
         {/if}
         <div class="modes" role="radiogroup" aria-label="Server type">
@@ -323,8 +326,8 @@
             >Add header</button
           >
           <p class="hint">
-            Each header is sent with the value of a secret saved for this server, never a value typed
-            here. After adding the server, save each secret's full header value, such as
+            Each header is sent with the value of a secret saved for this server, never a value
+            typed here. After adding the server, save each secret's full header value, such as
             <code>Bearer &lt;token&gt;</code> for Authorization. Servers that need OAuth sign-in are not
             supported yet.
           </p>
@@ -349,13 +352,12 @@
           </p>{/if}
         <p class="hint">
           Words are separated by spaces; use <code>bw mcp add</code> or edit mcp.json for an argument
-          that contains a space. Servers start without a shell in the Blackwall data folder, so pass a
-          project path as an argument when a server needs one.
+            that contains a space. Servers start without a shell in the Blackwall data folder, so pass
+            a project path as an argument when a server needs one.
         </p>
         {/if}
         <div class="actions">
-          <button type="button" class="secondary" disabled={busy} onclick={cancelAdd}
-            >Cancel</button
+          <button type="button" class="secondary" disabled={busy} onclick={cancelAdd}>Cancel</button
           ><span></span><button class="primary" disabled={busy}
             >{busy ? 'Saving…' : 'Add server'}</button
           >
@@ -372,7 +374,8 @@
       </div>
       {#if server.url}<code>{server.url}</code>
         {#each Object.entries(server.headers ?? {}) as [header, reference] (header)}{@const problem =
-            secretProblem(server, secretOf(reference))}<p class="header-line">
+            secretProblem(server, secretOf(reference))}
+          <p class="header-line">
             <code>{header}</code> from secret <code>{secretOf(reference)}</code>{#if problem}<span
                 class="missing">{` · ${problem}`}</span
               >{/if}
@@ -392,13 +395,12 @@
             aria-label={`Stop allowing ${rule.tool}${rule.project ? ` in ${rule.project}` : ''}`}
             disabled={busy}
             onclick={() =>
-              run(
-                () => persistence.removeMcpToolRule(rule),
-                'This rule could not be removed.',
-              )}>Remove</button
+              run(() => persistence.removeMcpToolRule(rule), 'This rule could not be removed.')}
+            >Remove</button
           >
         </article>{:else}<p class="empty">
-          {rulesError || 'Every call asks for approval. Choose Always allow on an approval to skip it.'}
+          {rulesError ||
+            'Every call asks for approval. Choose Always allow on an approval to skip it.'}
         </p>{/each}
       <h3>Secrets</h3>
       {#each server.secrets ?? [] as secret (secret)}<article>
@@ -416,7 +418,8 @@
           No secrets. Add one if this server needs a token.
         </p>{/each}
       <form onsubmit={saveSecret}>
-        <label for="mcp-secret-name">{server.url ? 'Secret name' : 'Environment variable'}</label><input
+        <label for="mcp-secret-name">{server.url ? 'Secret name' : 'Environment variable'}</label
+        ><input
           id="mcp-secret-name"
           autocapitalize="none"
           autocorrect="off"
@@ -516,6 +519,25 @@
   dialog::backdrop {
     background: var(--bg-scrim);
     backdrop-filter: blur(3px);
+  }
+  dialog.embedded {
+    display: block;
+    width: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  dialog.embedded header {
+    padding: 0 0 20px;
+  }
+  dialog.embedded header .icon-button {
+    display: none;
+  }
+  dialog.embedded .content {
+    padding: 0;
   }
   header {
     display: flex;
