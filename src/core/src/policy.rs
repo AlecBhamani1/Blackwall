@@ -103,7 +103,7 @@ fn is_strictest(mode: &RuleMode) -> bool {
 }
 
 impl RulesFile {
-    pub(crate) fn validate(self) -> Result<Self, &'static str> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         let mode = self.mode;
         validate(self.rules).map(|rules| Self {
             mode,
@@ -259,10 +259,12 @@ impl Policy {
             .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
         {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(RulesFile::default()),
-            Err(_) => Err("The policy file could not be read."),
-            Ok(body) if body.len() > MAX_POLICY_BYTES => Err("The policy file is too large."),
+            Err(_) => Err("The policy file could not be read.".into()),
+            Ok(body) if body.len() > MAX_POLICY_BYTES => {
+                Err("The policy file is too large.".into())
+            }
             Ok(body) => serde_json::from_slice::<RulesFile>(&body)
-                .map_err(|_| "The policy file is not valid.")
+                .map_err(|_| "The policy file is not valid.".into())
                 .and_then(RulesFile::validate),
         };
         let (file, mut error) = match parsed {
@@ -567,11 +569,17 @@ pub(crate) async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<V
     Ok(body)
 }
 
-fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
+fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, String> {
     if rules.len() > MAX_RULES {
-        return Err("The policy file has too many rules.");
+        return Err("The policy file has too many rules.".into());
     }
-    for rule in &rules {
+    for (index, rule) in rules.iter().enumerate() {
+        // Paths match as prefixes, so a wildcard would never match anything.
+        if let Some(path) = rule.path.as_deref().filter(|p| p.contains(['*', '?', '['])) {
+            return Err(format!(
+                "Rule rules[{index}] path {path:?} uses a wildcard. Paths are plain prefixes: use \"src\", not \"src/**\"."
+            ));
+        }
         let field = match rule.kind {
             ApprovalKind::Exec => rule
                 .command
@@ -604,7 +612,7 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, &'static str> {
                 .as_deref()
                 .is_some_and(|project| !Path::new(project).is_absolute())
         {
-            return Err("A policy rule has missing or mismatched fields.");
+            return Err("A policy rule has missing or mismatched fields.".into());
         }
     }
     Ok(rules)
@@ -1231,6 +1239,24 @@ mod tests {
             rules.decide(ApprovalKind::File, "/etc/passwd"),
             Decision::Ask
         );
+    }
+
+    #[test]
+    fn wildcard_rule_paths_are_refused_with_the_rule_named() {
+        for path in ["src/**", "*.env", "file?.txt", "app/[id]"] {
+            let rules = json!({"rules":[
+                {"decision":"allow","kind":"exec","command":"ls"},
+                {"decision":"deny","kind":"file","path":path}
+            ]});
+            let error = serde_json::from_value::<RulesFile>(rules)
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(
+                error.contains("rules[1]") && error.contains(path) && error.contains("plain"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
