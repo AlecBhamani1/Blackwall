@@ -16,6 +16,22 @@ describe('memory management', () => {
     vi.spyOn(persistence, 'preferences').mockResolvedValue({ memoryEnabled: false });
     vi.spyOn(persistence, 'memories').mockResolvedValue([]);
     vi.spyOn(persistence, 'memoryProposals').mockResolvedValue([]);
+    vi.spyOn(persistence, 'commandTools').mockResolvedValue([
+      {
+        name: 'review',
+        description: 'Ask for a review',
+        kind: 'command',
+        command: ['review'],
+        subagentProblem: null,
+      },
+      {
+        name: 'lint',
+        description: 'Lint',
+        kind: 'command',
+        command: ['eslint', '{file}'],
+        subagentProblem: 'A subagent tool must set "stdin": "json", so the prompt is sent on standard input.',
+      },
+    ]);
   });
   it('saves only the user-entered fact and refreshes the list', async () => {
     const user = userEvent.setup();
@@ -129,7 +145,7 @@ describe('memory management', () => {
     await user.click(screen.getByLabelText('A command tool'));
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
     expect(button).toBeDisabled();
-    await user.type(screen.getByLabelText('Command tool name'), 'review');
+    await user.selectOptions(screen.getByLabelText('Command tool'), 'review');
     await user.click(button);
     expect(save).toHaveBeenLastCalledWith({
       subagentMaxSteps: 12,
@@ -144,7 +160,40 @@ describe('memory management', () => {
     const option = await screen.findByLabelText('A command tool');
     await vi.waitFor(() => expect(option).toBeEnabled());
     await user.click(option);
-    expect(screen.getByLabelText('Command tool name')).toBeInTheDocument();
+    expect(screen.getByLabelText('Command tool')).toBeInTheDocument();
+  });
+  it('lists only tools a subagent can run on, and says why the others cannot', async () => {
+    const user = userEvent.setup();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const option = await screen.findByLabelText('A command tool');
+    await vi.waitFor(() => expect(option).toBeEnabled());
+    await user.click(option);
+    const choices = await screen.findByLabelText('Command tool');
+    expect(
+      Array.from((choices as HTMLSelectElement).options).map((choice) => choice.value),
+    ).toEqual(['', 'review']);
+    expect(screen.getByText(/lint/)).toBeInTheDocument();
+    expect(screen.getByText(/A subagent tool must set "stdin": "json"/)).toBeInTheDocument();
+  });
+  it('points to Command tools when no tool can take a subagent prompt', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'commandTools').mockResolvedValue([]);
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const option = await screen.findByLabelText('A command tool');
+    await vi.waitFor(() => expect(option).toBeEnabled());
+    await user.click(option);
+    expect(await screen.findByText(/Add one under Command tools/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Command tool')).toBeDisabled();
+  });
+  it('keeps a saved tool that no longer qualifies visible and blocks saving it', async () => {
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({
+      subagentRunsOn: { tool: 'gone' },
+    });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const choices = await screen.findByLabelText('Command tool');
+    await vi.waitFor(() => expect(choices).toHaveValue('gone'));
+    expect(screen.getByRole('option', { name: 'gone (not available)' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save subagent settings' })).toBeDisabled();
   });
   it('saves the memory toggle without committing a draft context limit', async () => {
     const user = userEvent.setup();
@@ -185,7 +234,7 @@ describe('memory management', () => {
       subagentRunsOn: { tool: 'review' },
     });
     render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
-    const name = await screen.findByLabelText('Command tool name');
+    const name = await screen.findByLabelText('Command tool');
     await vi.waitFor(() => expect(name).toBeEnabled());
     expect(name).toHaveValue('review');
     expect(screen.getByLabelText('Subagent step limit')).toHaveValue(3);

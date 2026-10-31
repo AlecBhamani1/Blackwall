@@ -124,7 +124,7 @@ describe('SettingsDialog', () => {
     vi.spyOn(persistence, 'memoryProposals').mockResolvedValue([]);
     vi.spyOn(persistence, 'usage').mockReturnValue(new Promise(() => {}));
     render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
-    for (const name of ['Limits', 'Subagents', 'Instructions', 'Saved memories', 'MCP servers', 'Skills', 'Runs', 'Usage']) {
+    for (const name of ['Limits', 'Subagents', 'Instructions', 'Saved memories', 'MCP servers', 'Command tools', 'Skills', 'Runs', 'Usage']) {
       await fireEvent.click(screen.getByRole('button', { name: new RegExp(name) }));
       const embedded = document.querySelector('dialog.embedded');
       expect(embedded).not.toBeNull();

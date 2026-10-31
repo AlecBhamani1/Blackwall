@@ -8,6 +8,7 @@ export type SettingsPage =
   | 'subagents'
   | 'instructions'
   | 'mcp'
+  | 'commandtools'
   | 'skills'
   | 'rules'
   | 'telemetry'
@@ -83,6 +84,15 @@ export const settingsEntries: readonly SettingsEntry[] = [
     title: 'MCP servers',
     description: 'Tools from local servers',
     keywords: 'integrations permissions approvals tools',
+  },
+  {
+    id: 'commandtools',
+    group: 'Agent',
+    icon: 'server',
+    desktopOnly: true,
+    title: 'Command tools',
+    description: 'Run Claude, Codex, or Copilot from agent tasks',
+    keywords: 'tools.json claude codex copilot cli subagent program',
   },
   {
     id: 'skills',
