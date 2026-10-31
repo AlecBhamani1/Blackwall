@@ -248,7 +248,7 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .path;
     if command == "review" {
-        return review::run(&workspace, &settings, &arguments).await;
+        return review::run(&directory, &workspace, &settings, &arguments).await;
     }
     let mut conversation = if command == "resume" {
         Conversation::load(
@@ -634,7 +634,7 @@ async fn chat(
                             .split_whitespace()
                             .map(str::to_owned)
                             .collect::<Vec<_>>();
-                        review::run(&conversation.workspace, settings, &arguments).await
+                        review::run(directory, &conversation.workspace, settings, &arguments).await
                     }
                     "init" | "learn" if value.is_empty() => {
                         let command = format!("/{name}");
