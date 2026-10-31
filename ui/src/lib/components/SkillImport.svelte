@@ -75,9 +75,13 @@
       getting[skill.name] = false;
     }
   }
+  let removing = '';
   function removeInstalled(name: string) {
-    if (window.confirm(`Remove ${name}?`)) onRemove(name);
+    if (removing || !window.confirm(`Remove ${name}?`)) return;
+    removing = name;
+    onRemove(name);
   }
+  $: if (removing && !installedSkills.some((installed) => installed.name === removing)) removing = '';
   function allow(candidate: SkillImportCandidate) {
     allowed[candidate.source] = true;
     selected[candidate.source] = true;
@@ -169,10 +173,10 @@
           </div>
           {#if installedSkills.some((installed) => installed.name === skill.name)}<div
               class="installed-actions"
-              ><button class="installed" disabled>Installed ✓</button><button
+              ><span class="installed">Installed ✓</span><button
                 class="remove-suggestion"
                 aria-label={`Remove ${skill.name}`}
-                disabled={busy}
+                disabled={busy || removing === skill.name}
                 onclick={() => removeInstalled(skill.name)}>Remove</button
               ></div
             >{:else}<button

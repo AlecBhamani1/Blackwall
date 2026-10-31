@@ -270,6 +270,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Settings skills are easier to manage with compact searchable rows, accessible enable switches,
+  visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
+  and a tighter segmented range control.
+
 - Settings now use a full-page layout with embedded content panes, sticky action footers, save
   feedback, and quieter warning callouts.
 - Rule paths with `*` or `?` are now refused with an error naming the rule, instead of being

@@ -302,7 +302,6 @@
         </section>
       {/if}
       {#if skills.length}<label class="search">
-          <span>Search skills</span>
           <Icon name="search" size={14} />
           <input
             type="search"
