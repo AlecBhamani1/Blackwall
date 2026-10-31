@@ -294,8 +294,6 @@
     accent-color: var(--accent);
     width: 17px;
     height: 17px;
-    margin: 0;
-    flex: 0 0 auto;
   }
   .intro {
     display: flex;

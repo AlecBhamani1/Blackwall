@@ -134,9 +134,6 @@
     align-items: center;
     margin-top: 12px;
   }
-  .toggle input {
-    margin: 0;
-  }
   .hint,
   small {
     font-size: 11px;

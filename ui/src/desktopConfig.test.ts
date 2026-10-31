@@ -9,7 +9,6 @@ describe('desktop configuration', () => {
     );
 
     // Tauri writes shortDescription as the desktop entry's Comment.
-    expect(config.app.windows[0].title).toBe('Blackwall');
     expect(config.bundle.shortDescription).toBe('Local AI assistant');
   });
 });

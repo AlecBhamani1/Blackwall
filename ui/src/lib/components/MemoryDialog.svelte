@@ -765,12 +765,9 @@
     accent-color: var(--accent);
     width: 17px;
     height: 17px;
-    margin: 0;
-    flex: 0 0 auto;
     vertical-align: middle;
   }
   input[type='radio'] {
-    margin: 0 5px 0 0;
     vertical-align: middle;
   }
   label {

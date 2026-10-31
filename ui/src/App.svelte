@@ -466,10 +466,10 @@
   }
   .web-toggle select {
     max-width: 190px;
-    padding: 4px 6px;
+    padding: 4px 30px 4px 6px;
     border: 1px solid var(--border);
     border-radius: 5px;
-    background: var(--bg-base);
+    background-color: var(--bg-base);
     color: var(--text-primary);
     font: inherit;
   }

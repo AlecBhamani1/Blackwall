@@ -28,10 +28,10 @@ describe('Blackwall theme contract', () => {
   it('styles native selects for the active color theme', () => {
     const theme = readFileSync(resolve(process.cwd(), 'src/theme.css'), 'utf8');
 
-    expect(theme).toMatch(/select\s*\{[^}]*background:\s*var\(--bg-elevated\)/s);
+    expect(theme).toMatch(/select\s*\{[^}]*appearance:\s*none/s);
+    expect(theme).toMatch(/select\s*\{[^}]*background-image:\s*url\("data:image\/svg\+xml,/s);
     expect(theme).toMatch(/select\s*\{[^}]*color:\s*var\(--text-primary\)/s);
     expect(theme).toMatch(/select\s*\{[^}]*border:\s*1px solid var\(--border-strong\)/s);
-    expect(theme).toMatch(/option\s*\{[^}]*background:\s*var\(--bg-elevated\)/s);
   });
 
   it('keeps Memory radio controls out of full-width text input styling', () => {

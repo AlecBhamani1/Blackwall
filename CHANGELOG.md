@@ -187,7 +187,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Radio buttons sit inline with their labels again, and checkbox rows line up (Memory → Advanced,
-  Runs, Recall). Native dropdowns use the app's colors, so they are readable on Linux. The lock
+  Runs, Recall). Dropdowns use the app's own style with a chevron instead of the grey Linux system button. The lock
   screen's Try again button has space above it. Linux menus and switchers show "Local AI
   assistant" as Blackwall's description.
 

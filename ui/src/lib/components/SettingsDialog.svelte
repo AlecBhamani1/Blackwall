@@ -1048,10 +1048,10 @@
   .key-connection {
     width: 100%;
     margin: 8px 0;
-    padding: 8px;
+    padding: 8px 30px 8px 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-base);
+    background-color: var(--bg-base);
     color: var(--text-primary);
     font: inherit;
   }
@@ -1094,7 +1094,7 @@
   .settings-order select {
     width: auto;
     margin: 0;
-    padding: 6px 10px;
+    padding: 6px 30px 6px 10px;
   }
   .settings-group + .settings-group {
     margin-top: 22px;
@@ -1331,10 +1331,10 @@
 
   #update-channel {
     width: 100%;
-    padding: 10px 12px;
+    padding: 10px 30px 10px 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-elevated);
+    background-color: var(--bg-elevated);
     color: var(--text-primary);
     font-size: 13px;
   }
