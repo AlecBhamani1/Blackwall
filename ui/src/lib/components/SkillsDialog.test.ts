@@ -119,13 +119,39 @@ describe('skill proposal review', () => {
     await screen.findByText('Pending review · 2');
     const body = screen.getByLabelText('Proposed instructions for todo-audit');
     await user.type(body, ' Then report.');
-    await user.click(screen.getByRole('button', { name: 'Disable release' }));
+    const enabled = screen.getByRole('switch', { name: 'release' });
+    expect(enabled).toHaveAttribute('aria-checked', 'true');
+    await user.click(enabled);
+    expect(persistence.saveSkill).toHaveBeenCalledWith({ ...release, enabled: false });
     expect(screen.getByLabelText('Proposed instructions for todo-audit')).toHaveValue(
       'Search. Then report.',
     );
     vi.spyOn(persistence, 'skillProposals').mockResolvedValue({ proposals: [], warnings: [] });
     await user.click(screen.getByRole('button', { name: 'Approve todo-audit' }));
     await vi.waitFor(() => expect(screen.queryByText(/Pending review/)).not.toBeInTheDocument());
+  });
+  it('filters installed skills by name or description', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'skills').mockResolvedValue({
+      skills: [release, { ...release, name: 'audit', description: 'Check dependencies.' }],
+      warnings: [],
+    });
+    render(SkillsDialog, { props: { onClose: vi.fn() } });
+    await user.type(await screen.findByRole('searchbox', { name: 'Search skills' }), 'depend');
+    expect(screen.getByRole('button', { name: /^audit/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^release/ })).not.toBeInTheDocument();
+  });
+  it('confirms before removing a skill from its row', async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const remove = vi.spyOn(persistence, 'removeSkill').mockResolvedValue();
+    render(SkillsDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Remove release' }));
+    expect(confirm).toHaveBeenCalledWith('Remove release?');
+    expect(remove).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole('button', { name: 'Remove release' }));
+    expect(remove).toHaveBeenCalledWith('release');
   });
   it('opens the importer and reports what was imported', async () => {
     const user = userEvent.setup();

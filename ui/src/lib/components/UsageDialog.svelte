@@ -13,10 +13,11 @@
   /** The page re-reads the metrics files this often while it is visible. */
   const REFRESH_MS = 120_000;
   const ranges = [
-    [1, 'Today'],
-    [7, '7 days'],
-    [30, '30 days'],
-    [90, '90 days'],
+    [1, 'Today', 'Today'],
+    [7, '7', '7 days'],
+    [30, '30', '30 days'],
+    [90, '90', '90 days'],
+    [0, 'YTD', 'Year to date'],
   ] as const;
   const desktop = persistence.available();
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -33,6 +34,16 @@
   let request = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
 
+  function rangeDays(value: number) {
+    if (value !== 0) return value;
+    const now = new Date();
+    return Math.floor(
+      (Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) -
+        Date.UTC(now.getFullYear(), 0, 1)) /
+        86_400_000,
+    ) + 1;
+  }
+
   const keyOf = (row: UsageGroupRow) => row.name ?? '';
   const nameOf = (row: UsageGroupRow) =>
     row.name ?? (view === 'projects' ? 'No project' : 'Unknown model');
@@ -42,7 +53,7 @@
     loading = true;
     error = '';
     try {
-      const next = await persistence.usage(days);
+      const next = await persistence.usage(rangeDays(days));
       if (current !== request) return;
       summary = next;
       lastRead = new Date();
@@ -63,7 +74,7 @@
     exported = '';
     error = '';
     try {
-      const report = await persistence.exportTelemetry(days);
+      const report = await persistence.exportTelemetry(rangeDays(days));
       if (report)
         exported = `Exported ${plural(report.metricsFiles, 'metrics file')} and ${plural(
           report.traceFiles,
@@ -185,11 +196,12 @@
   <header>
     <h2 id="usage-title">Usage</h2>
     <fieldset class="segmented" aria-label="Range">
-      {#each ranges as [value, label] (value)}
+      {#each ranges as [value, label, name] (value)}
         <label class:on={days === value}
           ><input
             type="radio"
             name="usage-range"
+            aria-label={name}
             {value}
             checked={days === value}
             onchange={() => pick(value)}
@@ -445,21 +457,28 @@
   .segmented {
     display: flex;
     margin: 0;
-    padding: 0;
+    padding: 2px;
     border: 1px solid var(--border);
     border-radius: var(--radius-pill);
-    overflow: hidden;
+    gap: 2px;
+    background: var(--bg-elevated);
   }
   .segmented label {
-    padding: 4px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 28px;
+    padding: 0 10px;
+    border-radius: var(--radius-pill);
     color: var(--text-muted);
     font-size: 12.5px;
     cursor: pointer;
     white-space: nowrap;
   }
   .segmented label.on {
-    background: var(--accent-muted);
-    color: var(--accent);
+    background: var(--bg-panel);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
   }
   .segmented label:has(input:focus-visible) {
     outline: 2px solid var(--focus-ring);
@@ -472,7 +491,8 @@
     height: 1px;
   }
   .segmented.small label {
-    padding: 3px 11px;
+    min-height: 24px;
+    padding: 0 9px;
   }
   .secondary {
     display: inline-flex;
