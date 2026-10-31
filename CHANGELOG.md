@@ -186,6 +186,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- First-run setup now keeps connection failures neutral until a server is chosen, excludes
+  embedding models, and asks which chat model to use before starting a conversation.
+
 - Radio buttons sit inline with their labels again, and checkbox rows line up (Memory → Advanced,
   Runs, Recall). Dropdowns use the app's own style with a chevron instead of the grey Linux system button. The lock
   screen's Try again button has space above it. Linux menus and switchers show "Local AI

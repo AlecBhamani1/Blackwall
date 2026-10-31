@@ -400,7 +400,11 @@ fn catalog_models(models: Vec<ApiModel>) -> Vec<ModelInfo> {
     let mut seen = std::collections::HashSet::new();
     models
         .into_iter()
-        .filter(|model| !model.id.trim().is_empty() && seen.insert(model.id.clone()))
+        .filter(|model| {
+            !model.id.trim().is_empty()
+                && blackwall_core::connection::is_chat_model(&model.id)
+                && seen.insert(model.id.clone())
+        })
         .map(|model| ModelInfo {
             id: model.id,
             name: model.name,
@@ -1407,6 +1411,7 @@ mod tests {
         let catalog: ApiModelCatalog = serde_json::from_value(serde_json::json!({"data": [
             {"id": "qwen3.6:latest"},
             {"id": "qwen3.6:latest", "name": "duplicate"},
+            {"id": "nomic-embed-text"},
             {"id": ""},
             {"id": "llama3.2:1b"}
         ]}))

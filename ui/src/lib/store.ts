@@ -569,7 +569,11 @@ export function createChatController(
     });
   }
 
-  async function initialize(candidate?: string, name?: string): Promise<boolean> {
+  async function initialize(
+    candidate?: string,
+    name?: string,
+    deferModel = false,
+  ): Promise<boolean> {
     await initializeStorage();
     const previousModels = get(models);
     // A cached catalog survives disconnects. Only preserve a currently working,
@@ -605,8 +609,12 @@ export function createChatController(
           )?.model
         : undefined;
       const preferred = profileModel ?? get(selectedModel);
-      const choice = catalog.some((model) => model.id === preferred) ? preferred : catalog[0].id;
-      selectedModel.set(choice);
+      const choice = catalog.some((model) => model.id === preferred)
+        ? preferred
+        : deferModel
+          ? ''
+          : catalog[0].id;
+      if (choice) selectedModel.set(choice);
       if (configuredEndpoint) {
         const normalized = normalizeEndpoint(configuredEndpoint);
         const settings = get(preferences);
@@ -617,7 +625,7 @@ export function createChatController(
         endpoint.set(configuredEndpoint);
         savePreferences({
           endpoint: configuredEndpoint,
-          model: choice,
+          ...(choice ? { model: choice } : {}),
           connectionName: label,
           ...(remember
             ? {
@@ -625,7 +633,7 @@ export function createChatController(
                   {
                     endpoint: normalized,
                     name: label,
-                    model: choice,
+                    ...(choice ? { model: choice } : {}),
                     ...(existing?.textToolCalls ? { textToolCalls: true } : {}),
                   },
                   ...(settings.connections ?? []).filter(
@@ -637,11 +645,11 @@ export function createChatController(
         });
       } else {
         // Browser development may discover models through its implicit proxy.
-        savePreferences({ model: choice });
+        if (choice) savePreferences({ model: choice });
       }
       try {
         if (canUseStorage()) {
-          window.localStorage.setItem(MODEL_STORAGE_KEY, choice);
+          if (choice) window.localStorage.setItem(MODEL_STORAGE_KEY, choice);
           if (configuredEndpoint)
             window.localStorage.setItem(ENDPOINT_STORAGE_KEY, configuredEndpoint);
         }
@@ -677,7 +685,11 @@ export function createChatController(
     connectionState.set('offline');
   }
 
-  async function configureEndpoint(value: string, name?: string): Promise<boolean> {
+  async function configureEndpoint(
+    value: string,
+    name?: string,
+    deferModel = false,
+  ): Promise<boolean> {
     const next = value.trim();
     if (!next) {
       const message = 'Enter the URL of an OpenAI-compatible model endpoint.';
@@ -707,7 +719,7 @@ export function createChatController(
       connectionError.set(connectionHelp(cause));
       return false;
     }
-    return initialize(next, name);
+    return initialize(next, name, deferModel);
   }
 
   /** The saved profile for the connection in use, if there is one. */

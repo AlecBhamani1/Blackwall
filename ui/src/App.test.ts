@@ -398,6 +398,11 @@ it('asks which server to use on a first launch instead of connecting on its own'
   ).toBeVisible();
   expect(discoverModels).not.toHaveBeenCalled();
   await user.click(list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }));
+  expect(await screen.findByRole('heading', { name: 'Choose a model.' })).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Return to your conversation' }),
+  ).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Use this model' }));
   expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
   expect(discoverModels).toHaveBeenCalledWith('http://127.0.0.1:18040/v1');
 });

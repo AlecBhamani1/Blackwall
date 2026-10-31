@@ -341,10 +341,11 @@ describe('browser model discovery', () => {
               models: [
                 { name: 'qwen3.6:latest', size: 2 },
                 { name: 'qwen3.6:latest', size: 2 },
+                { name: 'nomic-embed-text', size: 1 },
                 { name: 'llama3.2:1b', size: 1 },
               ],
             })
-          : Response.json({ data: [{ id: 'a' }, { id: 'a' }, { id: 'b' }] }),
+          : Response.json({ data: [{ id: 'a' }, { id: 'a' }, { id: 'text-embedding-3' }, { id: 'b' }] }),
       ),
     );
     expect((await localModelClient.discoverModels()).map(({ id }) => id)).toEqual([

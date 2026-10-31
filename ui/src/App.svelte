@@ -370,14 +370,15 @@
           <ConnectionSetup
             connections={$preferences.connections ?? []}
             onForget={controller.forgetConnection}
-            onConnect={controller.configureEndpoint}
+            onConnect={(endpoint, name) => controller.configureEndpoint(endpoint, name, true)}
             onChooseModel={controller.chooseModel}
             onDone={() => (setupOpen = false)}
+            models={$models.map((model) => model.id)}
             currentEndpoint={$endpoint}
             connectionError={$connectionError}
             found={startupServers}
           />
-          {#if $connectionState === 'ready'}<button
+          {#if $connectionState === 'ready' && $messages.length}<button
               class="return-chat"
               onclick={() => (setupOpen = false)}>Return to your conversation</button
             >{/if}

@@ -406,10 +406,20 @@ fn model_names(items: &[serde_json::Value], ollama: bool) -> Vec<String> {
             item.get(if ollama { "name" } else { "id" })
                 .and_then(|v| v.as_str())
         })
-        .filter(|name| !name.trim().is_empty() && name.len() <= 256 && seen.insert(*name))
+        .filter(|name| {
+            !name.trim().is_empty()
+                && name.len() <= 256
+                && is_chat_model(name)
+                && seen.insert(*name)
+        })
         .take(200)
         .map(str::to_owned)
         .collect()
+}
+
+/// Whether a listed model is suitable for chat when the server reports no capabilities.
+pub fn is_chat_model(name: &str) -> bool {
+    !name.to_ascii_lowercase().contains("embed")
 }
 
 /// Ports model servers commonly use: Ollama, LM Studio, llama.cpp, vLLM, text-generation-webui
@@ -709,6 +719,15 @@ fn valid_secret(value: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedding_models_are_not_offered_for_chat() {
+        let items = serde_json::json!([
+            {"name": "qwen3.6"},
+            {"name": "nomic-embed-text"},
+            {"name": "Snowflake-ARCTIC-EMBED"}
+        ]);
+        assert_eq!(model_names(items.as_array().unwrap(), true), ["qwen3.6"]);
+    }
     #[test]
     fn endpoint_validation_and_credential_scoping() {
         assert_eq!(

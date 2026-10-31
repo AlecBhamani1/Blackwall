@@ -140,6 +140,7 @@ function browserModelRoutes(endpoint?: string): { models: string; tags?: string;
 function uniqueModels(models: ModelInfo[]): ModelInfo[] {
   const seen = new Set<string>();
   return models.filter(({ id }) => {
+    if (id.toLowerCase().includes('embed')) return false;
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
