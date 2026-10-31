@@ -286,6 +286,40 @@ export interface McpToolRule {
   tool: string;
   project: string | null;
 }
+/** One allow, ask or deny rule in the owner's policy.json; one of the four subject fields is set. */
+export interface OwnerRule {
+  decision: 'allow' | 'ask' | 'deny';
+  kind: 'exec' | 'file' | 'network' | 'subagent';
+  command?: string;
+  path?: string;
+  host?: string;
+  tool?: string;
+  project?: string;
+}
+export interface OwnerRules {
+  /** Absent means strictest: deny beats ask, ask beats allow. Ordered: the first match decides. */
+  mode?: 'strictest' | 'ordered';
+  rules: OwnerRule[];
+}
+/** The rule that decided, by its position in the owner's `rules`, from 0. */
+export interface MatchedOwnerRule {
+  source: 'user' | 'project';
+  index: number;
+  mode: 'strictest' | 'ordered';
+}
+export interface RuleVerdict {
+  decision: OwnerRule['decision'];
+  matched: MatchedOwnerRule | null;
+}
+export interface PolicyAuditEntry {
+  /** Seconds since the Unix epoch. */
+  time: number;
+  kind: OwnerRule['kind'];
+  subject: string;
+  decision: OwnerRule['decision'];
+  allowed: boolean;
+  rule: MatchedOwnerRule | null;
+}
 export interface MemoryEntry {
   id: string;
   content: string;
@@ -376,6 +410,13 @@ export const persistence = {
   removeMcpSecret: (name: string, key: string) => command<void>('delete_mcp_secret', { name, key }),
   mcpToolRules: () => command<McpToolRule[]>('list_mcp_tool_rules'),
   removeMcpToolRule: (rule: McpToolRule) => command<void>('remove_mcp_tool_rule', { rule }),
+  ownerRules: () => command<OwnerRules>('owner_rules'),
+  /** Replaces the owner's rules if the file still holds `shown`; the backend validates. */
+  saveOwnerRules: (shown: OwnerRule[], rules: OwnerRule[]) =>
+    command<void>('save_owner_rules', { shown, rules }),
+  testOwnerRule: (kind: OwnerRule['kind'], subject: string) =>
+    command<RuleVerdict>('test_owner_rule', { kind, subject }),
+  policyAudit: () => command<PolicyAuditEntry[]>('policy_audit'),
   memories: (query = '') => command<MemoryEntry[]>('list_memories', { query }),
   memoryProposals: () => command<MemoryProposal[]>('list_memory_proposals'),
   approveMemory: (id: string, content: string | null = null) =>

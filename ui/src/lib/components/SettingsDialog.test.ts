@@ -75,6 +75,26 @@ describe('SettingsDialog', () => {
     expect(screen.getByRole('heading', { name: 'App lock' })).toBeInTheDocument();
   });
 
+  it('opens the owner rules under Rules & sandbox, showing where command tools run', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    vi.spyOn(persistence, 'ownerRules').mockResolvedValue({ rules: [] });
+    vi.spyOn(persistence, 'policyAudit').mockResolvedValue([]);
+    render(SettingsDialog, {
+      props: {
+        open: true,
+        onClose: vi.fn(),
+        client: mockClient(),
+        contextPreferences: { commandToolsIsolation: 'sandboxed' },
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Rules & sandbox' }));
+    expect(persistence.ownerRules).not.toHaveBeenCalled();
+    await user.click(screen.getByText('Your rules', { selector: 'summary' }));
+    expect(await screen.findByText('No rules.')).toBeInTheDocument();
+    expect(screen.getByText(/inside the Commands profile/)).toBeInTheDocument();
+  });
+
   it('lists Usage next to Runs on desktop and opens it', async () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});

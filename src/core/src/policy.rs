@@ -13,6 +13,8 @@ const AUDIT_FILE: &str = "policy-audit.jsonl";
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 const MAX_RULES: usize = 200;
 const MAX_AUDIT_BYTES: u64 = 1024 * 1024;
+/// How many of the newest audit records the Rules screen shows.
+const AUDIT_VIEW: usize = 100;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How much of each owner command tool argument the audit keeps.
 const MAX_AUDIT_ARG: usize = 1000;
@@ -80,7 +82,7 @@ pub struct MatchedRule {
 }
 
 /// A decision and the rule that made it; `matched` is `None` for the default Ask.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct Verdict {
     pub decision: Decision,
     pub matched: Option<MatchedRule>,
@@ -682,6 +684,83 @@ pub fn remove_tool_rule(directory: &Path, rule: &ToolRule) -> Result<(), String>
     })
 }
 
+/// The owner's rules and mode as saved, for the Rules screen. Blocking.
+pub fn owner_rules(directory: &Path) -> Result<RulesFile, String> {
+    read_file(directory)
+}
+
+/// Replace the owner's rules with `rules`, keeping the mode, if the file still holds `shown`, the
+/// rules the owner was looking at. Refused like any other save: same lock, same validation.
+/// Blocking.
+pub fn save_owner_rules(directory: &Path, shown: &[Rule], rules: Vec<Rule>) -> Result<(), String> {
+    try_edit_rules(directory, |file| {
+        if file.rules != shown {
+            return Err("The rules changed since they were shown. Reload and try again.".into());
+        }
+        file.rules = rules;
+        Ok(())
+    })
+}
+
+/// What the owner's rules decide for a command, path or host, with no project and no audit record.
+pub async fn test_owner_rule(
+    directory: &Path,
+    kind: ApprovalKind,
+    subject: &str,
+) -> Result<Verdict, String> {
+    // The workspace is never a parent of the data folder, so the data folder's own floor at Ask
+    // does not hide what the rules say.
+    let policy = Policy::read(directory, &directory.join(POLICY_FILE), false).await;
+    match &policy.error {
+        Some(error) => Err(error.clone()),
+        None => Ok(policy.evaluate(kind, subject)),
+    }
+}
+
+/// One audit record, as the Rules screen shows it.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AuditEntry {
+    pub time: u64,
+    pub kind: ApprovalKind,
+    pub subject: String,
+    pub decision: Decision,
+    pub allowed: bool,
+    pub rule: Option<MatchedRule>,
+}
+
+/// The newest audit records, newest first, from the end of the log. Damaged lines are skipped.
+/// Blocking.
+pub fn audit_entries(directory: &Path) -> Result<Vec<AuditEntry>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let unreadable = "The audit log could not be read.";
+    let mut file = match std::fs::File::open(directory.join(AUDIT_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(_) => return Err(unreadable.into()),
+        Ok(file) => file,
+    };
+    let start = file
+        .metadata()
+        .map_err(|_| unreadable)?
+        .len()
+        .saturating_sub(MAX_AUDIT_BYTES);
+    file.seek(SeekFrom::Start(start)).map_err(|_| unreadable)?;
+    let mut body = vec![];
+    file.take(MAX_AUDIT_BYTES)
+        .read_to_end(&mut body)
+        .map_err(|_| unreadable)?;
+    let text = String::from_utf8_lossy(&body);
+    let mut lines = text.lines();
+    if start > 0 {
+        // The cut may have landed inside a record.
+        lines.next();
+    }
+    Ok(lines
+        .rev()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .take(AUDIT_VIEW)
+        .collect())
+}
+
 fn read_rules(directory: &Path) -> Result<Vec<Rule>, String> {
     read_file(directory).map(|file| file.rules)
 }
@@ -713,12 +792,22 @@ fn read_file(directory: &Path) -> Result<RulesFile, String> {
 static EDITS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn edit_rules(directory: &Path, change: impl FnOnce(&mut RulesFile)) -> Result<(), String> {
+    try_edit_rules(directory, |file| {
+        change(file);
+        Ok(())
+    })
+}
+
+fn try_edit_rules(
+    directory: &Path,
+    change: impl FnOnce(&mut RulesFile) -> Result<(), String>,
+) -> Result<(), String> {
     let _edit = EDITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut file = read_file(directory)?;
     let before = file.rules.len();
-    change(&mut file);
+    change(&mut file)?;
     if file.rules.len() == before && !directory.join(POLICY_FILE).exists() {
         // Nothing to save, so a missing file stays missing.
         return Ok(());
@@ -1446,6 +1535,206 @@ mod tests {
             }
         });
         assert_eq!(tool_rules(&directory).unwrap().len(), 8);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    fn owner_directory() -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-owner-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn rule(body: serde_json::Value) -> Rule {
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn saving_owner_rules_keeps_the_mode_and_tool_rules_and_refuses_bad_rules() {
+        let directory = owner_directory();
+        let path = directory.join(POLICY_FILE);
+        std::fs::write(
+            &path,
+            r#"{"mode":"ordered","rules":[{"decision":"allow","kind":"exec","tool":"docs"}]}"#,
+        )
+        .unwrap();
+        let shown = owner_rules(&directory).unwrap();
+        assert_eq!(shown.mode, RuleMode::Ordered);
+        let mut rules = shown.rules.clone();
+        rules.push(rule(json!({"decision":"deny","kind":"file","path":".git"})));
+        save_owner_rules(&directory, &shown.rules, rules.clone()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            json!({"mode":"ordered","rules":[
+                {"decision":"allow","kind":"exec","tool":"docs"},
+                {"decision":"deny","kind":"file","path":".git"}
+            ]})
+        );
+        // The loader's own refusals, with its text, leave the file as it was.
+        let before = std::fs::read(&path).unwrap();
+        let mut wildcard = rules.clone();
+        wildcard.push(rule(
+            json!({"decision":"allow","kind":"file","path":"src/**"}),
+        ));
+        let error = save_owner_rules(&directory, &rules, wildcard).unwrap_err();
+        assert!(
+            error.contains("rules[2]") && error.contains("wildcard"),
+            "{error}"
+        );
+        let mut mismatched = rules.clone();
+        mismatched.push(rule(
+            json!({"decision":"allow","kind":"file","host":"example.com"}),
+        ));
+        assert_eq!(
+            save_owner_rules(&directory, &rules, mismatched).unwrap_err(),
+            "A policy rule has missing or mismatched fields."
+        );
+        // A file that changed since it was shown is not overwritten.
+        let error = save_owner_rules(&directory, &shown.rules, vec![]).unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn saving_owner_rules_creates_a_missing_file_and_leaves_a_broken_one() {
+        let directory = owner_directory();
+        let path = directory.join(POLICY_FILE);
+        assert!(owner_rules(&directory).unwrap().rules.is_empty());
+        save_owner_rules(&directory, &[], vec![]).unwrap();
+        assert!(!path.exists());
+        let added = rule(json!({"decision":"ask","kind":"network","host":"example.com"}));
+        save_owner_rules(&directory, &[], vec![added.clone()]).unwrap();
+        assert_eq!(owner_rules(&directory).unwrap().rules, vec![added.clone()]);
+        std::fs::write(&path, "not json").unwrap();
+        let error = owner_rules(&directory).unwrap_err();
+        assert!(error.contains("left unchanged"), "{error}");
+        assert!(save_owner_rules(&directory, &[], vec![added]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_owner_rules_refuses_a_symbolic_link() {
+        let directory = owner_directory();
+        let target = directory.join("elsewhere.json");
+        std::fs::write(&target, r#"{"rules":[]}"#).unwrap();
+        std::os::unix::fs::symlink(&target, directory.join(POLICY_FILE)).unwrap();
+        let added = rule(json!({"decision":"deny","kind":"exec","command":"rm"}));
+        let error = save_owner_rules(&directory, &[], vec![added]).unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"rules":[]}"#);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_owner_rule_saves_never_lose_a_rule() {
+        let directory = owner_directory();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let directory = &directory;
+                scope.spawn(move || loop {
+                    let mut rules = owner_rules(directory).unwrap().rules;
+                    let shown = rules.clone();
+                    rules.push(rule(
+                        json!({"decision":"ask","kind":"exec","command":format!("tool-{index}")}),
+                    ));
+                    if save_owner_rules(directory, &shown, rules).is_ok() {
+                        break;
+                    }
+                });
+            }
+        });
+        assert_eq!(owner_rules(&directory).unwrap().rules.len(), 8);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn testing_an_owner_rule_names_the_deciding_rule_and_records_nothing() {
+        let directory = owner_directory();
+        std::fs::write(
+            directory.join(POLICY_FILE),
+            json!({"rules":[
+                {"decision":"ask","kind":"exec","command":"git"},
+                {"decision":"allow","kind":"exec","command":"git status"},
+                {"decision":"allow","kind":"file","path":"src"},
+                {"decision":"allow","kind":"network","host":"example.com"},
+                {"decision":"deny","kind":"exec","command":"rm","project":directory.to_string_lossy()}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let matched = |index| {
+            Some(MatchedRule {
+                source: Source::User,
+                index,
+                mode: RuleMode::Strictest,
+            })
+        };
+        let cases = [
+            (ApprovalKind::Exec, "git status", Decision::Ask, matched(0)),
+            (
+                ApprovalKind::File,
+                "src/main.rs",
+                Decision::Allow,
+                matched(2),
+            ),
+            (
+                ApprovalKind::Network,
+                "example.com",
+                Decision::Allow,
+                matched(3),
+            ),
+            (ApprovalKind::Exec, "make", Decision::Ask, None),
+            // A rule limited to a project does not apply outside one.
+            (ApprovalKind::Exec, "rm -rf x", Decision::Ask, None),
+        ];
+        for (kind, subject, decision, rule) in cases {
+            let verdict = test_owner_rule(&directory, kind, subject).await.unwrap();
+            assert_eq!(
+                (verdict.decision, verdict.matched),
+                (decision, rule),
+                "{subject}"
+            );
+        }
+        assert!(!directory.join(AUDIT_FILE).exists());
+        std::fs::write(directory.join(POLICY_FILE), "not json").unwrap();
+        assert!(test_owner_rule(&directory, ApprovalKind::Exec, "ls")
+            .await
+            .is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_audit_view_is_newest_first_bounded_and_skips_damaged_lines() {
+        let directory = owner_directory();
+        assert!(audit_entries(&directory).unwrap().is_empty());
+        let mut log = String::new();
+        for time in 0..150 {
+            log += &json!({"time":time,"kind":"exec","subject":format!("cmd {time}"),"decision":"deny","allowed":false,"rule":{"source":"user","index":3,"mode":"strictest"},"args":["secret"]}).to_string();
+            log += "\n";
+            if time == 100 {
+                log += "not json\n";
+            }
+        }
+        std::fs::write(directory.join(AUDIT_FILE), log).unwrap();
+        let entries = audit_entries(&directory).unwrap();
+        assert_eq!(entries.len(), AUDIT_VIEW);
+        assert_eq!(entries[0].time, 149);
+        assert_eq!(entries[0].subject, "cmd 149");
+        assert_eq!(entries[99].time, 50);
+        assert_eq!(
+            entries[0].rule,
+            Some(MatchedRule {
+                source: Source::User,
+                index: 3,
+                mode: RuleMode::Strictest
+            })
+        );
+        assert!(!serde_json::to_string(&entries).unwrap().contains("secret"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

@@ -1075,6 +1075,43 @@ pub async fn remove_mcp_tool_rule(
     .await
 }
 #[tauri::command]
+pub async fn owner_rules(app: AppHandle) -> Result<blackwall_core::policy::RulesFile, String> {
+    with_mcp(&app, |directory| {
+        blackwall_core::policy::owner_rules(directory)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn save_owner_rules(
+    app: AppHandle,
+    shown: Vec<blackwall_core::policy::Rule>,
+    rules: Vec<blackwall_core::policy::Rule>,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::policy::save_owner_rules(directory, &shown, rules)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn test_owner_rule(
+    app: AppHandle,
+    kind: blackwall_core::protocol::ApprovalKind,
+    subject: String,
+) -> Result<blackwall_core::policy::Verdict, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    blackwall_core::policy::test_owner_rule(&directory, kind, &subject).await
+}
+#[tauri::command]
+pub async fn policy_audit(
+    app: AppHandle,
+) -> Result<Vec<blackwall_core::policy::AuditEntry>, String> {
+    with_mcp(&app, |directory| {
+        blackwall_core::policy::audit_entries(directory)
+    })
+    .await
+}
+#[tauri::command]
 pub async fn delete_mcp_secret(app: AppHandle, name: String, key: String) -> Result<(), String> {
     with_mcp(&app, move |directory| {
         blackwall_core::mcp::delete_secret(directory, &name, &key)
