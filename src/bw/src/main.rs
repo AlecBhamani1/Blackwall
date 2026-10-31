@@ -214,7 +214,7 @@ async fn run(reason: &mut Option<RunReason>) -> Result<(), String> {
         println!(
             "{}\n{}",
             session::server_status(&settings, true).await,
-            settings.describe()
+            settings.describe_status(&store)?
         );
         return Ok(());
     }

@@ -493,6 +493,28 @@ fn config_set_prints_only_the_changed_line() {
 }
 
 #[test]
+fn status_shows_model_and_endpoint_not_set_until_saved() {
+    let fixture = Fixture::new();
+    // An Ollama server address in the environment is not a configured endpoint. Nothing listens
+    // on port 9, so the server probe stays offline.
+    let environment = [("OLLAMA_HOST", "127.0.0.1:9")];
+    let run = |arguments: &[&str]| {
+        let output = fixture.run_from(arguments, "", &fixture.project, &environment);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let before = run(&["status"]);
+    assert!(
+        before.contains("\nmodel: not set\nendpoint: not set\n"),
+        "{before}"
+    );
+    run(&["config", "set", "model", "fixture-model"]);
+    let after = run(&["status"]);
+    assert!(after.contains("\nmodel: fixture-model\n"), "{after}");
+    assert!(!after.contains("not set"), "{after}");
+}
+
+#[test]
 fn interactive_chat_streams_multiple_turns_and_retains_history() {
     let fixture = Fixture::new();
     fixture.configure_model();
