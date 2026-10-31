@@ -15,7 +15,6 @@
   import ProjectTrust from './lib/components/ProjectTrust.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
-  import Icon from './lib/components/Icon.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
   import { sandboxClient, type SandboxStatus } from './lib/ipc';
@@ -165,6 +164,8 @@
   let filesVisible = true;
   let folderPulse = false;
   $: if ($folderRequests) folderPulse = true;
+  $: conversationTitle =
+    $visibleSessions.find((session) => session.id === $activeSessionId)?.title ?? 'New chat';
   let sidebarVisible = typeof window === 'undefined' ? true : window.innerWidth > 760;
   const showHarnessDemo =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo');
@@ -274,64 +275,20 @@
       <AppHeader
         setupMode={setupOpen}
         {sidebarVisible}
-        models={$models}
-        selectedModel={$selectedModel}
-        connectionState={$connectionState}
+        {conversationTitle}
+        agentMode={$agentMode}
+        workspace={$workspace}
+        {folderPulse}
+        projectDisabled={$sessionLocked || $runState !== 'idle'}
+        {filesVisible}
+        canExport={Boolean($messages.length)}
         onToggleSidebar={() => (sidebarVisible = !sidebarVisible)}
-        onModelChange={controller.chooseModel}
-        onReconnect={() => (setupOpen = true)}
+        onChooseWorkspace={controller.chooseWorkspace}
+        onFolderPulseEnd={() => (folderPulse = false)}
+        onToggleFiles={() => (filesVisible = !filesVisible)}
+        onExport={controller.exportConversation}
+        onSearch={() => controller.showRecall()}
       />
-
-      {#if !setupOpen && isDesktop()}
-        <div class="project-bar">
-          {#if $agentMode}<button
-              class="project-choice"
-              class:needs-folder={!$workspace}
-              class:pulse={folderPulse}
-              onanimationend={() => (folderPulse = false)}
-              disabled={$sessionLocked || $runState !== 'idle'}
-              title={$workspace || 'Choose the folder Blackwall can work in'}
-              onclick={controller.chooseWorkspace}
-              >{$workspace
-                ? $workspace.split('/').filter(Boolean).at(-1)
-                : 'Choose project folder'}</button
-            >{/if}<span></span>{#if $agentMode}<label class="web-toggle">
-              Commands
-              <select
-                aria-label="Command execution profile"
-                bind:value={$executionProfile}
-                disabled={$runState !== 'idle'}
-                onfocus={() => (choosingProfile = true)}
-                onblur={() => (choosingProfile = false)}
-              >
-                <option value="read-only">Read-only</option>
-                <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
-                <option value="unsandboxed">Unsandboxed (full access)</option>
-              </select>
-            </label><label class="web-toggle">
-              <input
-                type="checkbox"
-                checked={$commandNetwork || $executionProfile === 'unsandboxed'}
-                onchange={(event) => commandNetwork.set(event.currentTarget.checked)}
-                disabled={$runState !== 'idle' || $executionProfile === 'unsandboxed'}
-              />Command network
-            </label>{/if}<label class="web-toggle"
-            ><input type="checkbox" bind:checked={$webEnabled} disabled={$runState !== 'idle'} />Web
-            access</label
-          >{#if $agentMode}<button
-              class="export"
-              aria-label={filesVisible ? 'Hide files' : 'Show files'}
-              title={filesVisible ? 'Hide files' : 'Show files'}
-              aria-pressed={filesVisible}
-              onclick={() => (filesVisible = !filesVisible)}
-              ><Icon name={filesVisible ? 'panel-right-open' : 'panel-right'} size={16} /></button
-            >{/if}{#if $messages.length}<button
-              class="export"
-              onclick={controller.exportConversation}>Export chat</button
-            >{/if}
-          <button class="export" onclick={() => controller.showRecall()}>Search history</button>
-        </div>
-      {/if}
       {#if !setupOpen && isDesktop() && $agentMode && $workspace}
         <ProjectTrust workspace={$workspace} refresh={$runState} />
       {/if}
@@ -417,7 +374,22 @@
                 busy={$runState === 'streaming' || $runState === 'preparing'}
                 disabled={$connectionState !== 'ready'}
                 notice={$notice}
+                models={$models}
+                selectedModel={$selectedModel}
+                connectionState={$connectionState}
+                agentMode={$agentMode}
+                executionProfile={$executionProfile}
+                commandNetwork={$commandNetwork}
+                webEnabled={$webEnabled}
+                workspaceWrite={workspaceWrite}
+                controlsDisabled={$runState !== 'idle'}
                 onDismissNotice={controller.dismissNotice}
+                onModelChange={controller.chooseModel}
+                onExecutionProfileChange={(profile) => executionProfile.set(profile)}
+                onCommandNetworkChange={(enabled) => commandNetwork.set(enabled)}
+                onWebEnabledChange={(enabled) => webEnabled.set(enabled)}
+                onProfileFocusChange={(focused) => (choosingProfile = focused)}
+                onReconnect={() => (setupOpen = true)}
                 onSend={controller.send}
                 onStop={controller.stop}
               />
@@ -469,69 +441,6 @@
     min-width: 0;
   }
 
-  .web-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-muted);
-    font-size: 11px;
-    white-space: nowrap;
-  }
-  .web-toggle select {
-    max-width: 190px;
-    padding: 4px 30px 4px 6px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background-color: var(--bg-base);
-    color: var(--text-primary);
-    font: inherit;
-  }
-  .web-toggle input {
-    accent-color: var(--accent);
-  }
-  .project-bar {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 12px;
-    min-height: 45px;
-    padding: 7px 20px;
-    border-bottom: 1px solid var(--border);
-  }
-  .project-bar > span {
-    flex: 1;
-  }
-  .project-choice,
-  .export {
-    font-size: 11px;
-    background: transparent;
-    color: var(--text-muted);
-    padding: 4px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 250px;
-  }
-  .project-choice.needs-folder {
-    border-radius: 6px;
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-    color: var(--text-primary);
-  }
-  .project-choice.pulse {
-    animation: folder-pulse 700ms ease-out 2;
-  }
-  @keyframes folder-pulse {
-    50% {
-      outline-offset: 5px;
-      outline-color: transparent;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .project-choice.pulse {
-      animation: none;
-    }
-  }
   .storage-error button {
     flex: 0 0 auto;
     padding: 6px 10px;

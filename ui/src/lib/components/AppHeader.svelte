@@ -1,105 +1,65 @@
 <script lang="ts">
-  import { modelLabel } from '../format';
-  import type { ConnectionState, ModelInfo } from '../types';
   import Icon from './Icon.svelte';
-  import LogoMark from './LogoMark.svelte';
 
   export let setupMode = false;
   export let sidebarVisible = true;
-  export let models: ModelInfo[] = [];
-  export let selectedModel = '';
-  export let connectionState: ConnectionState = 'checking';
+  export let conversationTitle = 'New chat';
+  export let agentMode = false;
+  export let workspace = '';
+  export let folderPulse = false;
+  export let projectDisabled = false;
+  export let filesVisible = true;
+  export let canExport = false;
   export let onToggleSidebar: () => void;
-  export let onModelChange: (modelId: string) => void;
-  export let onReconnect: () => void;
-
-  function changeModel(event: Event) {
-    onModelChange((event.currentTarget as HTMLSelectElement).value);
-  }
+  export let onChooseWorkspace: () => void;
+  export let onFolderPulseEnd: () => void;
+  export let onToggleFiles: () => void;
+  export let onExport: () => void;
+  export let onSearch: () => void;
 </script>
 
-<header>
-  <div class="header-side">
+<header aria-label="Conversation header">
+  <button class="icon-button" aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'} onclick={onToggleSidebar}>
+    <Icon name={sidebarVisible ? 'panel-left-open' : 'panel-left'} size={18} />
+  </button>
+  <strong class="conversation-title">{setupMode ? 'Setup' : conversationTitle}</strong>
+  {#if !setupMode && agentMode}
     <button
-      class="icon-button"
-      aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
-      onclick={onToggleSidebar}
+      class="project-choice"
+      class:needs-folder={!workspace}
+      class:pulse={folderPulse}
+      onanimationend={onFolderPulseEnd}
+      disabled={projectDisabled}
+      title={workspace || 'Choose the folder Blackwall can work in'}
+      onclick={onChooseWorkspace}
+      >{workspace ? workspace.split('/').filter(Boolean).at(-1) : 'Choose project folder'}</button
     >
-      <Icon name={sidebarVisible ? 'panel-left-open' : 'panel-left'} size={18} />
-    </button>
-    {#if !sidebarVisible}
-      <div class="compact-brand"><LogoMark size={25} /><span>Blackwall</span></div>
-    {/if}
-  </div>
-
-  <div class="model-control">
-    <span
-      class:ready={connectionState === 'ready'}
-      class:offline={connectionState === 'offline' && !setupMode}
-      class="state-dot"
-      aria-hidden="true"
-    ></span>
-    {#if models.length > 0}
-      <label class="sr-only" for="model-select">Model</label>
-      <select id="model-select" value={selectedModel} onchange={changeModel}>
-        {#each models as model (model.id)}
-          <option value={model.id}>{modelLabel(model.name)}</option>
-        {/each}
-      </select>
-      <span class="select-chevron"><Icon name="chevron-down" size={14} /></span>
-    {:else}
-      <span class="model-placeholder">
-        {setupMode
-          ? 'Let’s get connected'
-          : connectionState === 'checking'
-            ? 'Finding your model…'
-            : 'Model unavailable'}
-      </span>
-    {/if}
-  </div>
-
-  <div class="header-side right">
-    {#if setupMode}
-      <span class="privacy">Setup</span>
-    {:else if connectionState === 'offline'}
-      <button class="reconnect" onclick={onReconnect}>
-        <Icon name="refresh" size={14} />
-        <span>Reconnect</span>
+  {/if}
+  <span class="spacer"></span>
+  {#if !setupMode}
+    {#if canExport}<button class="header-action" onclick={onExport}>Export chat</button>{/if}
+    <button class="header-action" onclick={onSearch}>Search history</button>
+    {#if agentMode}
+      <button class="icon-button" aria-label={filesVisible ? 'Hide files' : 'Show files'} title={filesVisible ? 'Hide files' : 'Show files'} aria-pressed={filesVisible} onclick={onToggleFiles}>
+        <Icon name={filesVisible ? 'panel-right-open' : 'panel-right'} size={16} />
       </button>
-    {:else}
-      <div class="privacy" title="Messages go to your selected model service">
-        <Icon name="link" size={13} />
-        <span>Your model</span>
-      </div>
     {/if}
-  </div>
+  {/if}
 </header>
 
 <style>
   header {
     position: relative;
     z-index: 5;
-    display: grid;
+    display: flex;
     height: var(--topbar-height);
     min-height: var(--topbar-height);
-    grid-template-columns: 1fr auto 1fr;
     align-items: center;
+    gap: 10px;
     border-bottom: 1px solid var(--border);
     padding: 0 14px;
     background: var(--bg-base);
   }
-
-  .header-side {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 9px;
-  }
-
-  .header-side.right {
-    justify-content: flex-end;
-  }
-
   .icon-button {
     display: grid;
     width: 32px;
@@ -110,126 +70,34 @@
     background: transparent;
     color: var(--text-muted);
   }
-
-  .icon-button:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .compact-brand {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    font-weight: 650;
-  }
-
-  .model-control {
-    position: relative;
-    display: flex;
-    max-width: min(42vw, 380px);
-    align-items: center;
-    gap: 8px;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    padding: 4px 7px 4px 8px;
-    color: var(--text-muted);
-    transition:
-      border-color var(--transition-fast),
-      background var(--transition-fast);
-  }
-
-  .model-control:hover,
-  .model-control:focus-within {
-    border-color: var(--border);
-    background: var(--bg-panel);
-  }
-
-  .state-dot {
-    width: 6px;
-    height: 6px;
-    flex: 0 0 auto;
-    border-radius: 50%;
-    background: var(--warn);
-  }
-
-  .state-dot.ready {
-    background: var(--ok);
-  }
-
-  .state-dot.offline {
-    background: var(--err);
-  }
-
-  select {
-    max-width: 330px;
+  .icon-button:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .conversation-title {
+    max-width: 240px;
     overflow: hidden;
-    appearance: none;
-    border: 0;
-    padding: 0 18px 0 0;
-    background: transparent;
     color: var(--text-primary);
-    font-size: 12.5px;
-    font-weight: 550;
-    outline: none;
-    text-overflow: ellipsis;
-  }
-
-  .select-chevron {
-    position: absolute;
-    right: 6px;
-    pointer-events: none;
-    color: var(--text-faint);
-  }
-
-  .model-placeholder {
-    overflow: hidden;
-    font-size: 12.5px;
+    font-size: 12px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
-  .privacy,
-  .reconnect {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    border-radius: var(--radius-sm);
-    color: var(--text-faint);
-    font-size: 11.5px;
-  }
-
-  .reconnect {
-    min-height: 30px;
-    padding: 0 9px;
-    background: var(--bg-elevated);
+  .spacer { flex: 1; }
+  .project-choice,
+  .header-action {
+    max-width: 250px;
+    overflow: hidden;
+    padding: 4px;
+    background: transparent;
     color: var(--text-muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-
-  .reconnect:hover {
+  .project-choice.needs-folder {
+    border-radius: 6px;
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
     color: var(--text-primary);
   }
-
-  @media (max-width: 620px) {
-    header {
-      grid-template-columns: auto 1fr auto;
-      gap: 7px;
-      padding: 0 9px;
-    }
-
-    .compact-brand span,
-    .privacy span,
-    .reconnect span {
-      display: none;
-    }
-
-    .model-control {
-      min-width: 0;
-      justify-self: center;
-    }
-
-    select {
-      max-width: 48vw;
-    }
-  }
+  .project-choice.pulse { animation: folder-pulse 700ms ease-out 2; }
+  @keyframes folder-pulse { 50% { outline-offset: 5px; outline-color: transparent; } }
+  @media (prefers-reduced-motion: reduce) { .project-choice.pulse { animation: none; } }
 </style>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { persistence } from '../persistence';
@@ -17,6 +17,32 @@ function renderComposer(onSend = vi.fn().mockResolvedValue(true)) {
 }
 
 describe('Composer', () => {
+  it('holds the model and Chat controls in its footer without the old filler', () => {
+    render(Composer, {
+      props: {
+        onSend: vi.fn(),
+        onStop: vi.fn(),
+        models: [{ id: 'model', name: 'Test model' }],
+      },
+    });
+    const composer = screen.getByRole('group', { name: 'Message composer' });
+    expect(within(composer).getByRole('combobox', { name: 'Model' })).toBeInTheDocument();
+    expect(within(composer).getByRole('checkbox', { name: 'Web access' })).toBeInTheDocument();
+    expect(within(composer).getByRole('button', { name: 'Add photos or files' })).toBeInTheDocument();
+    expect(within(composer).getByRole('button', { name: 'Send message' })).toBeInTheDocument();
+    expect(within(composer).queryByText('Sent only to your model')).not.toBeInTheDocument();
+    expect(within(composer).queryByRole('combobox', { name: 'Command execution profile' })).not.toBeInTheDocument();
+  });
+
+  it('adds Agent command controls to the composer footer', () => {
+    render(Composer, { props: { onSend: vi.fn(), onStop: vi.fn(), agentMode: true } });
+    const composer = screen.getByRole('group', { name: 'Message composer' });
+    expect(
+      within(composer).getByRole('combobox', { name: 'Command execution profile' }),
+    ).toBeInTheDocument();
+    expect(within(composer).getByRole('checkbox', { name: 'Command network' })).toBeInTheDocument();
+  });
+
   it('sends with Enter and clears only after the message is accepted', async () => {
     const user = userEvent.setup();
     const { onSend } = renderComposer();
