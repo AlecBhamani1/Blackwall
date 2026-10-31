@@ -676,7 +676,7 @@ mod tests {
             text_content: Some("E".into()),
         }];
         let mut seen = 0;
-        for session in crate::storage::fixtures::v5_sessions() {
+        for session in crate::storage::v5_chats() {
             for row in session["messages"].as_array().unwrap() {
                 let message: ChatMessage = serde_json::from_value(row.clone()).unwrap();
                 let mut request = ChatRequest::new("r", "m", vec![message.clone()]);

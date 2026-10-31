@@ -1,2 +1,0 @@
-# Fixtures embed multi-line SQL whose whitespace sqlite_master records; never convert it.
-src/core/src/storage/fixtures/* text eol=lf
