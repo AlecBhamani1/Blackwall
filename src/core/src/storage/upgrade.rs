@@ -33,12 +33,12 @@ pub(super) fn open_v6(
     directory: Option<&Path>,
     connection: Connection,
 ) -> Result<LocalStore, StorageError> {
+    // An upgrade of a large history, and its VACUUM, take seconds and lock out readers too, so a
+    // second opener waits it out, even to read the schema and the version.
+    connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
     connection.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
     )?;
-    // An upgrade of a large history, and its VACUUM, take seconds and lock out readers too, so a
-    // second opener waits it out, even to read the version.
-    connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
     if user_version(&connection)? != V6 {
         // Re-read under the writer lock: another window may have upgraded while this one waited.
         let tx = write_tx(&connection)?;
@@ -186,7 +186,7 @@ pub(crate) mod tests {
     fn every_v5_chat_loads_back_unchanged_and_is_stored_once() {
         let chats = v5_chats();
         let directory = v5_folder("convert", &chats);
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         for chat in &chats {
             let id = chat["id"].as_str().unwrap();
             assert_eq!(store.load_chat(id).unwrap().as_ref(), Some(chat), "{id}");
@@ -239,7 +239,7 @@ pub(crate) mod tests {
         assert!(!hits.results.is_empty());
         // A second open finds v6 and changes nothing.
         drop(store);
-        let again = LocalStore::open_at(&directory, V6).unwrap();
+        let again = LocalStore::open(&directory).unwrap();
         assert_eq!(again.list_chats().unwrap().len(), chats.len());
         drop(again); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
@@ -256,7 +256,7 @@ pub(crate) mod tests {
                 .join(format!("blackwall-backup-{n}.sqlite3"))
         };
         for n in 1..=3 {
-            LocalStore::open_at(&directory, V6).unwrap();
+            LocalStore::open(&directory).unwrap();
             assert_eq!(version(&database), V6);
             // Each backup is the whole v5 database.
             assert_eq!(v5_rows(&backup(n)), as_v5(std::slice::from_ref(chat)));
@@ -266,7 +266,7 @@ pub(crate) mod tests {
             assert_eq!(v5_rows(&database), as_v5(std::slice::from_ref(chat)));
         }
         assert!(matches!(
-            LocalStore::open_at(&directory, V6),
+            LocalStore::open(&directory),
             Err(StorageError::BackupsFull)
         ));
         assert_eq!(
@@ -277,7 +277,7 @@ pub(crate) mod tests {
         assert!(!backup(4).exists());
         // Once the owner removes one, its slot is used again.
         fs::remove_file(backup(2)).unwrap();
-        LocalStore::open_at(&directory, V6).unwrap();
+        LocalStore::open(&directory).unwrap();
         assert_eq!(version(&database), V6);
         assert_eq!(v5_rows(&backup(2)), as_v5(std::slice::from_ref(chat)));
         fs::remove_dir_all(&directory).unwrap();
@@ -292,7 +292,7 @@ pub(crate) mod tests {
         let chats = [v5_chats()[1].clone(), bad];
         let directory = v5_folder("rollback", &chats);
         assert!(matches!(
-            LocalStore::open_at(&directory, V6),
+            LocalStore::open(&directory),
             Err(StorageError::Invalid(message)) if message == super::super::convert::NOT_CONVERTED
         ));
         assert_eq!(v5_rows(&directory.join(DATABASE_FILE)), as_v5(&chats));
@@ -302,7 +302,7 @@ pub(crate) mod tests {
     #[test]
     fn the_browser_import_on_v6_converts_once_without_the_webview_context() {
         let directory = folder("import");
-        let mut store = LocalStore::open_at(&directory, V6).unwrap();
+        let mut store = LocalStore::open(&directory).unwrap();
         let chats = v5_chats();
         store.migrate_sessions(&chats[..3]).unwrap();
         for chat in &chats[..3] {
@@ -321,7 +321,7 @@ pub(crate) mod tests {
     #[test]
     fn a_new_database_opens_at_v6_without_a_backup() {
         let directory = folder("fresh");
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         assert_eq!(version(&directory.join(DATABASE_FILE)), V6);
         assert!(!directory.join(BACKUPS_DIR).exists());
         assert!(store.list_chats().unwrap().is_empty());
@@ -331,6 +331,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_second_opener_waits_for_the_upgrade_and_does_not_fail() {
+        // Longer than the usual busy timeout, so only the upgrade timeout waits it out.
+        const HOLD: Duration = Duration::from_secs(BUSY_TIMEOUT.as_secs() + 2);
         let chats = v5_chats();
         let directory = v5_folder("together", &chats);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -354,6 +356,17 @@ pub(crate) mod tests {
             !backups.join("blackwall-backup-2.sqlite3").exists(),
             "one upgrade"
         );
+        // A large upgrade's commit and VACUUM lock out readers too, for longer than the usual
+        // busy timeout. An opener still waits it out, even to read the version.
+        let holder = Connection::open(directory.join(DATABASE_FILE)).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let opened = LocalStore::open(&directory).and_then(|store| store.list_sessions());
+        release.join().unwrap();
+        assert_eq!(opened.unwrap().len(), chats.len());
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -402,7 +415,7 @@ pub(crate) mod tests {
     fn a_300_message_chat_loads_within_50_ms() {
         let chat = long_chat(150);
         let directory = v5_folder("speed", std::slice::from_ref(&chat));
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         assert_eq!(store.load_chat("long").unwrap().as_ref(), Some(&chat));
         let references: i64 = store
             .connection()

@@ -18,7 +18,16 @@ pub(crate) const NOT_CONVERTED: &str =
 /// Converts the chat whose `sessions` row has id `session["id"]` and no rows yet. Its v5 body is
 /// emptied.
 pub(crate) fn convert_session(tx: &Connection, session: &Value) -> Result<(), StorageError> {
-    if !write_chat(tx, session, vec![], vec![])? {
+    rewrite(tx, session, validate_session(session)?)
+}
+
+/// `convert_session` for a session already validated into `columns`.
+fn rewrite(
+    tx: &Connection,
+    session: &Value,
+    columns: (&str, &str, i64),
+) -> Result<(), StorageError> {
+    if !write_chat(tx, session, columns, vec![], vec![])? {
         eprintln!(
             "warn: chat {} did not rebuild to its saved copy",
             session["id"].as_str().unwrap_or_default()
@@ -31,7 +40,8 @@ pub(crate) fn convert_session(tx: &Connection, session: &Value) -> Result<(), St
 /// Saves a whole session JSON over its chat. When the stored messages and transcript begin the new
 /// ones, only the rest is appended and the context replaced; otherwise the chat is rewritten.
 pub(crate) fn save(tx: &Connection, session: &Value) -> Result<(), StorageError> {
-    let (id, title, updated_at, _) = validate_session(session)?;
+    let columns = validate_session(session)?;
+    let (id, title, updated_at) = columns;
     let Some((stored, ui)) = read_chat(tx, id)? else {
         let count: i64 = tx.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
         if count >= MAX_SESSIONS {
@@ -41,7 +51,7 @@ pub(crate) fn save(tx: &Connection, session: &Value) -> Result<(), StorageError>
             "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,'')",
             params![id, title, updated_at],
         )?;
-        return convert_session(tx, session);
+        return rewrite(tx, session, columns);
     };
     let old = transcript(&stored);
     if messages(session).starts_with(messages(&stored)) && transcript(session).starts_with(old) {
@@ -53,13 +63,13 @@ pub(crate) fn save(tx: &Connection, session: &Value) -> Result<(), StorageError>
             )?
             .query_map(params![id, old.len() as i64], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        if write_chat(tx, session, ui, model)? {
+        if write_chat(tx, session, columns, ui, model)? {
             return Ok(());
         }
     }
     tx.execute("DELETE FROM chat_events WHERE session_id=?1", [id])?;
     tx.execute("DELETE FROM chat_context WHERE session_id=?1", [id])?;
-    convert_session(tx, session)
+    rewrite(tx, session, columns)
 }
 
 fn messages(session: &Value) -> &[Value] {
@@ -81,10 +91,10 @@ fn transcript(session: &Value) -> &[Value] {
 fn write_chat(
     tx: &Connection,
     session: &Value,
+    (id, title, updated_at): (&str, &str, i64),
     mut ui: Vec<i64>,
     mut model: Vec<i64>,
 ) -> Result<bool, StorageError> {
-    let (id, title, updated_at, _) = validate_session(session)?;
     let text = |key: &str| session.get(key).and_then(Value::as_str);
     // Every key no column or row holds stays in `metadata`, a literal `contextState: null` too.
     let metadata: Map<String, Value> = session
@@ -183,13 +193,14 @@ pub(crate) fn migrate_v6(store: &LocalStore, sessions: &[Value]) -> Result<(), S
         if let Some(object) = session.as_object_mut() {
             object.remove("contextState");
         }
-        let (id, title, updated_at, _) = validate_session(&session)?;
+        let columns = validate_session(&session)?;
+        let (id, title, updated_at) = columns;
         let added = tx.execute(
             "INSERT OR IGNORE INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,'')",
             params![id, title, updated_at],
         )?;
         if added == 1 {
-            convert_session(&tx, &session)?;
+            rewrite(&tx, &session, columns)?;
         }
     }
     tx.execute(

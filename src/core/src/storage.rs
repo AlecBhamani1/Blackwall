@@ -13,7 +13,6 @@ pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SCHEMA_VERSION: i64 = upgrade::V6;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -51,17 +50,9 @@ impl LocalStore {
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
+    /// Opens the database at schema version 6. An older database is upgraded first (see
+    /// `upgrade`).
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
-        Self::open_at(directory, SCHEMA_VERSION)
-    }
-    /// Opens the database at schema version `target`, which must be 6. An older database is
-    /// upgraded first (see `upgrade`).
-    pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
-        if target != SCHEMA_VERSION {
-            return Err(StorageError::Invalid(
-                "This version of Blackwall cannot open that storage format yet.",
-            ));
-        }
         if fs::symlink_metadata(directory).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(StorageError::Invalid(
                 "The local data folder must not be a symbolic link.",
@@ -291,7 +282,7 @@ pub(crate) fn validate_id(id: &str) -> Result<(), StorageError> {
     }
     Ok(())
 }
-fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), StorageError> {
+fn validate_session(session: &Value) -> Result<(&str, &str, i64), StorageError> {
     let id = session
         .get("id")
         .and_then(Value::as_str)
@@ -323,13 +314,12 @@ fn validate_session(session: &Value) -> Result<(&str, &str, i64, String), Storag
             .validate()
             .map_err(|_| StorageError::Invalid("Invalid saved model context."))?;
     }
-    let body = serde_json::to_string(session)?;
-    if body.len() > MAX_SESSION_BYTES {
+    if serde_json::to_string(session)?.len() > MAX_SESSION_BYTES {
         return Err(StorageError::Invalid(
             "This conversation is too large to save. Export it before closing Blackwall.",
         ));
     }
-    Ok((id, title, updated as i64, body))
+    Ok((id, title, updated as i64))
 }
 /// The v5 rule for one chat message: a user or assistant role, text content and an attachment list.
 fn validate_message(message: &Value) -> Result<(), StorageError> {
@@ -455,11 +445,11 @@ mod tests {
         let transaction = store.connection.unchecked_transaction().unwrap();
         for session_index in public_session_count..session_count {
             let value = synthetic_session(session_index, message_count);
-            let (id, title, updated_at, body) = validate_session(&value).unwrap();
+            let (id, title, updated_at) = validate_session(&value).unwrap();
             transaction
                 .execute(
                     "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4)",
-                    params![id, title, updated_at, body],
+                    params![id, title, updated_at, value.to_string()],
                 )
                 .unwrap();
         }
@@ -560,7 +550,7 @@ mod tests {
             .map(|session| session["id"].as_str().unwrap().to_owned())
             .collect();
 
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, upgrade::V6);
         assert!(has_index);
         assert_eq!(
             ids,
@@ -683,10 +673,10 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, upgrade::V6);
         upgraded
             .connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .pragma_update(None, "user_version", upgrade::V6 + 1)
             .unwrap();
         drop(upgraded);
         assert!(LocalStore::open(&fixture.directory).is_err());
