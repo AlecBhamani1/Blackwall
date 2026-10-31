@@ -464,7 +464,7 @@ export const persistence = {
 };
 export type Persistence = typeof persistence;
 
-/** Settings → Security → Telemetry and the Usage page's export card. */
+/** Settings → Privacy & security → Telemetry and the Usage page's export card. */
 export const telemetryClient = {
   available: isDesktop,
   load: () => command<TelemetryView>('load_telemetry'),

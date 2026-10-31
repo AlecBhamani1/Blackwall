@@ -66,8 +66,8 @@
     <p class="sub">Reading…</p>
   {:else if !status.endpoint}
     <p class="sub">
-      Off. Send these traces and metrics to an OpenTelemetry collector from Settings → Security →
-      Telemetry.
+      Off. Send these traces and metrics to an OpenTelemetry collector from Settings → Privacy &amp;
+      security → Telemetry.
     </p>
   {:else}
     <p class="endpoint"><code>{status.endpoint}</code></p>

@@ -59,7 +59,7 @@ describe('export card', () => {
 
   it('points to Settings when export is off', async () => {
     render(ExportCard, { client: client(status({ endpoint: null })) });
-    expect(await screen.findByText(/Settings → Security → Telemetry/)).toBeInTheDocument();
+    expect(await screen.findByText(/Settings → Privacy & security → Telemetry/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Send test span' })).not.toBeInTheDocument();
   });
 

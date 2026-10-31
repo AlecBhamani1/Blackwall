@@ -37,11 +37,13 @@
   function rangeDays(value: number) {
     if (value !== 0) return value;
     const now = new Date();
-    return Math.floor(
-      (Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) -
-        Date.UTC(now.getFullYear(), 0, 1)) /
-        86_400_000,
-    ) + 1;
+    return (
+      Math.floor(
+        (Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) -
+          Date.UTC(now.getFullYear(), 0, 1)) /
+          86_400_000,
+      ) + 1
+    );
   }
 
   const keyOf = (row: UsageGroupRow) => row.name ?? '';
