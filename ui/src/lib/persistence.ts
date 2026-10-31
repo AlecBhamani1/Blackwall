@@ -411,9 +411,9 @@ export const persistence = {
       offsetMinutes: utcOffsetMinutes(),
     }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
-  mcpRuntimeStatus: (programs: string[]) => command<boolean[]>('mcp_runtime_status', { programs }),
+  mcpRuntimeStatus: () => command<[boolean, boolean]>('mcp_runtime_status'),
   addMcpServer: (name: string, commandArgs: string[]) =>
-    command<{ tools: number; error: string | null }>('add_mcp_server', {
+    command<{ tools: number; error: string | null; warning?: string | null }>('add_mcp_server', {
       name,
       command: commandArgs,
     }),

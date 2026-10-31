@@ -19,15 +19,16 @@ for line in sys.stdin:
             "serverInfo": {"name": "echo", "version": "0"},
         }
     elif method == "tools/list":
-        result = {
-            "tools": [
-                {
-                    "name": "echo",
-                    "description": "Echo",
-                    "inputSchema": {"type": "object", "properties": {}},
-                }
-            ]
-        }
+        tools = [
+            {
+                "name": "echo",
+                "description": "Echo",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ]
+        if len(sys.argv) > 1 and sys.argv[1] == "warn":
+            tools.append({"name": "bad name!", "inputSchema": {"type": "object"}})
+        result = {"tools": tools}
     else:
         result = {}
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": identifier, "result": result}) + "\n")

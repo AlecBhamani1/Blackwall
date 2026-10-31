@@ -36,11 +36,13 @@ const EDIT_LOCK: &str = ".mcp.lock";
 const RESERVED_PREFIX: &str =
     "MCP server names starting with p- are reserved for project servers; rename it.";
 
-fn timeout_failure(timeout: Duration) -> String {
-    format!(
-        "didn't answer within {} seconds — the first start may still be downloading the package; try again.",
-        timeout.as_secs()
-    )
+fn timeout_failure(timeout: Duration, first_start: bool) -> String {
+    let hint = if first_start {
+        " — the first start may still be downloading the package; try again."
+    } else {
+        "."
+    };
+    format!("didn't answer within {} seconds{hint}", timeout.as_secs())
 }
 
 /// One server entry in `mcp.json`.
@@ -220,7 +222,12 @@ pub fn program_found(program: &str) -> bool {
 }
 
 pub fn missing_program(program: &str) -> String {
+    missing_program_for(program, cfg!(windows))
+}
+
+fn missing_program_for(program: &str, windows: bool) -> String {
     match program {
+        "npx" if windows => "npx is a batch file; Blackwall can't run it on Windows yet.".into(),
         "npx" => "Needs Node.js (npx), which isn't on this computer.".into(),
         "uvx" => "Needs uv (uvx), which isn't on this computer.".into(),
         _ => format!("{program} was not found on this computer."),
@@ -467,7 +474,7 @@ impl McpServers {
                 directory,
                 &project,
                 &mut names,
-                STARTUP_TIMEOUT,
+                None,
             )
             .await;
         if let Some(workspace) = workspace {
@@ -480,7 +487,7 @@ impl McpServers {
                         directory,
                         &project,
                         &mut names,
-                        STARTUP_TIMEOUT,
+                        None,
                     )
                     .await;
             }
@@ -496,8 +503,13 @@ impl McpServers {
         directory: &Path,
         project: &Path,
         names: &mut Vec<String>,
-        startup_timeout: Duration,
+        first_start: Option<Duration>,
     ) {
+        // A server's first start after Add may download its package, so it gets longer.
+        let (startup_timeout, first_start) = match first_start {
+            Some(timeout) => (timeout, true),
+            None => (STARTUP_TIMEOUT, false),
+        };
         let configs = match validate_for(configs, source) {
             Ok(configs) => configs,
             Err(error) => {
@@ -592,7 +604,7 @@ impl McpServers {
                     continue;
                 }
                 Ok(Err(error)) => format!("did not start: {error}"),
-                Err(_) => timeout_failure(startup_timeout),
+                Err(_) => timeout_failure(startup_timeout, first_start),
             };
             self.warnings
                 .push(format!("MCP server {} {failure}{hint}", config.name));
@@ -615,8 +627,19 @@ impl McpServers {
     }
 
     /// Start only the server just added, allowing package runners time for their first download.
-    pub async fn first_start(directory: &Path, name: &str) -> Result<usize, String> {
-        let config = read_config(directory)?
+    pub async fn first_start(directory: &Path, name: &str) -> Result<(usize, Vec<String>), String> {
+        Self::first_start_with_timeout(directory, name, FIRST_START_TIMEOUT).await
+    }
+
+    async fn first_start_with_timeout(
+        directory: &Path,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<(usize, Vec<String>), String> {
+        let owned = directory.to_owned();
+        let config = tokio::task::spawn_blocking(move || read_config(&owned))
+            .await
+            .map_err(|_| "The MCP task could not finish.")??
             .into_iter()
             .find(|config| config.name == name)
             .ok_or_else(|| format!("No MCP server is named {name:?}."))?;
@@ -629,13 +652,17 @@ impl McpServers {
                 directory,
                 Path::new(""),
                 &mut names,
-                FIRST_START_TIMEOUT,
+                Some(timeout),
             )
             .await;
-        if let Some(warning) = started.warnings.first() {
-            Err(warning.clone())
+        if started.servers.is_empty() {
+            Err(started
+                .warnings
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "The MCP server did not start.".into()))
         } else {
-            Ok(started.definitions().len())
+            Ok((started.definitions().len(), started.warnings))
         }
     }
 
@@ -1837,7 +1864,7 @@ mod tests {
     async fn a_server_that_never_answers_still_shows_its_stderr() {
         let servers = start_failing_fixture("echo 'bad token abc' >&2; sleep 30").await;
         assert!(servers.warnings[0].contains("within 15 seconds"));
-        assert!(servers.warnings[0].contains("first start may still be downloading"));
+        assert!(!servers.warnings[0].contains("downloading"));
         assert!(servers.diagnostics[0].stderr.contains("bad token abc"));
     }
 
@@ -1845,7 +1872,59 @@ mod tests {
     fn only_the_immediate_first_start_uses_the_long_timeout() {
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(15));
         assert_eq!(FIRST_START_TIMEOUT, Duration::from_secs(120));
-        assert!(timeout_failure(STARTUP_TIMEOUT).contains("try again"));
+        assert!(!timeout_failure(STARTUP_TIMEOUT, false).contains("downloading"));
+        assert!(timeout_failure(FIRST_START_TIMEOUT, true).contains("first start"));
+    }
+
+    #[test]
+    fn missing_program_messages_account_for_windows_batch_files() {
+        assert_eq!(
+            missing_program_for("npx", true),
+            "npx is a batch file; Blackwall can't run it on Windows yet."
+        );
+        assert_eq!(
+            missing_program_for("npx", false),
+            "Needs Node.js (npx), which isn't on this computer."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_start_reports_tools_and_warnings_but_only_fails_if_startup_fails() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-mcp-first-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_echo.py");
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .unwrap();
+        add_server(
+            &directory,
+            "echo",
+            vec![python.into(), script.into(), "warn".into()],
+        )
+        .unwrap();
+        let (tools, warnings) = McpServers::first_start(&directory, "echo").await.unwrap();
+        assert_eq!(tools, 1);
+        assert!(warnings.iter().any(|warning| warning.contains("bad name!")));
+
+        set_endpoint(
+            &directory,
+            "echo",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            None,
+        )
+        .unwrap();
+        let error =
+            McpServers::first_start_with_timeout(&directory, "echo", Duration::from_millis(20))
+                .await
+                .unwrap_err();
+        assert!(
+            error.contains("first start may still be downloading"),
+            "{error}"
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[cfg(unix)]

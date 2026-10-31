@@ -176,13 +176,18 @@
     try {
       const result = await persistence.addMcpServer(name, words);
       await load();
-      if (result.error) error = result.error;
-      else startStatus = `Ready: ${result.tools} tools`;
+      if (result.error) {
+        startStatus = '';
+        error = result.error;
+      } else {
+        startStatus = `Ready: ${result.tools} tools${result.warning ? `. ${result.warning}` : ''}`;
+      }
       adding = false;
       suggestion = null;
       name = '';
       commandLine = '';
     } catch (cause) {
+      startStatus = '';
       error = typeof cause === 'string' ? cause : 'This server could not be added.';
     }
     busy = false;
@@ -238,7 +243,7 @@
     if (embedded) dialog.setAttribute('open', '');
     else dialog.showModal();
     if (desktop) {
-      void persistence.mcpRuntimeStatus(['npx', 'uvx']).then(
+      void persistence.mcpRuntimeStatus().then(
         (found) => (runtimes = { npx: found[0] ?? false, uvx: found[1] ?? false }),
         () => (runtimes = { npx: false, uvx: false }),
       );
@@ -266,7 +271,8 @@
         <h3 class="first">Suggested</h3>
         {#if windows}<p class="hint">
             Suggested servers that start with <code>npx</code> cannot run on Windows yet. Add a
-            server whose program is an <code>.exe</code> instead.
+            server whose program Blackwall can launch directly, such as <code>uvx.exe</code>,
+            instead.
           </p>
         {/if}
         <div class="suggestions">
@@ -291,7 +297,7 @@
           </div>
           <p class="hint">
             Pick one to fill in the form, then review it and choose Add server. The first agent run
-            after adding one downloads that exact version from npm, so it needs a network
+            after adding one downloads that exact version from npm or PyPI, so it needs a network
             connection.
           </p>
         <div class="modes" role="radiogroup" aria-label="Server type">

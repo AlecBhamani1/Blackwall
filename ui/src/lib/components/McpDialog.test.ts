@@ -230,7 +230,7 @@ describe('MCP server management', () => {
     expect(add).toHaveBeenCalledWith('context7', ['npx', '-y', '@upstash/context7-mcp@4.4.1']);
   });
   it('shows first-start progress and then the ready tool count', async () => {
-    let finish: (result: { tools: number; error: string | null }) => void = () => {};
+    let finish: (result: { tools: number; error: string | null; warning?: string }) => void = () => {};
     vi.spyOn(persistence, 'addMcpServer').mockReturnValue(
       new Promise((resolve) => (finish = resolve)),
     );
@@ -241,8 +241,32 @@ describe('MCP server management', () => {
     await user.type(screen.getByLabelText('Command'), 'local-server');
     await user.click(screen.getByRole('button', { name: 'Add server' }));
     expect(screen.getByText(/Starting… first start can take a minute/)).toBeVisible();
-    finish({ tools: 3, error: null });
-    expect(await screen.findByText('Ready: 3 tools')).toBeVisible();
+    finish({ tools: 3, error: null, warning: 'One tool was skipped.' });
+    expect(await screen.findByText('Ready: 3 tools. One tool was skipped.')).toBeVisible();
+  });
+  it('clears first-start progress when starting fails', async () => {
+    vi.spyOn(persistence, 'addMcpServer').mockRejectedValue('The server failed.');
+    const user = userEvent.setup();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.type(screen.getByLabelText('Name'), 'local');
+    await user.type(screen.getByLabelText('Command'), 'local-server');
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('The server failed.');
+    expect(screen.queryByText(/Starting… first start/)).not.toBeInTheDocument();
+  });
+  it('blocks a suggestion whose runtime is missing', async () => {
+    vi.mocked(persistence.mcpRuntimeStatus).mockResolvedValue([false, true]);
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
+    const user = userEvent.setup();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.click(screen.getByRole('button', { name: /^context7/ }));
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      "Needs Node.js (npx), which isn't on this computer.",
+    );
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(add).not.toHaveBeenCalled();
   });
   it.each([
     ['filesystem', 'Add the folder', '/tmp/notes', '@modelcontextprotocol/server-filesystem@1.0.0'],
