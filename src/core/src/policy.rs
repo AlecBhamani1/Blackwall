@@ -708,7 +708,7 @@ pub fn save_owner_rules(
 
 /// The changes from `before` to `after` that make the rules weaker, in plain words: an allow
 /// rule that is new or changed, a deny or ask rule that is removed or changed, or a new mode.
-pub fn loosened(before: &RulesFile, after: &RulesFile) -> Vec<String> {
+fn loosened(before: &RulesFile, after: &RulesFile) -> Vec<String> {
     let describe = |rule: &Rule| {
         let subject = [&rule.command, &rule.path, &rule.host, &rule.tool]
             .into_iter()
@@ -752,6 +752,23 @@ pub fn loosened(before: &RulesFile, after: &RulesFile) -> Vec<String> {
         );
     }
     changes
+}
+
+/// Before a save: refuse `rules` the loader would refuse, then, if they are weaker than `shown`,
+/// ask `confirm` with the changes in plain words. A refusal by the owner is "Not saved.".
+pub fn confirm_loosening(
+    shown: &RulesFile,
+    rules: &[Rule],
+    confirm: impl FnOnce(&[String]) -> bool,
+) -> Result<(), String> {
+    let mut after = shown.clone();
+    after.rules = validate(rules.to_vec())?;
+    let changes = loosened(shown, &after);
+    if changes.is_empty() || confirm(&changes) {
+        Ok(())
+    } else {
+        Err("Not saved.".into())
+    }
 }
 
 /// A tested subject's verdict.
@@ -1700,6 +1717,41 @@ mod tests {
             loosened(&ordered(&before.rules), &before),
             ["Change the mode to strictest: deny outranks ask, and ask outranks allow"]
         );
+    }
+
+    #[test]
+    fn loosening_asks_only_for_valid_rules_and_only_when_weaker() {
+        let deny = rule(json!({"decision":"deny","kind":"file","path":".git"}));
+        let allow = rule(json!({"decision":"allow","kind":"file","path":"src"}));
+        let wildcard = rule(json!({"decision":"allow","kind":"file","path":"src/**"}));
+        let before = strictest(std::slice::from_ref(&deny));
+        let asked = std::cell::Cell::new(0);
+        let confirm = |answer: bool| {
+            let asked = &asked;
+            move |changes: &[String]| {
+                asked.set(asked.get() + 1);
+                assert_eq!(changes, ["Allow file src"]);
+                answer
+            }
+        };
+        let error =
+            confirm_loosening(&before, &[deny.clone(), wildcard], confirm(true)).unwrap_err();
+        assert!(error.contains("wildcard"), "{error}");
+        assert_eq!(asked.get(), 0);
+        let both = [deny.clone(), allow];
+        assert_eq!(
+            confirm_loosening(&before, &both, confirm(false)).unwrap_err(),
+            "Not saved."
+        );
+        assert_eq!(asked.get(), 1);
+        confirm_loosening(&before, &both, confirm(true)).unwrap();
+        // Equal and tighter rules are not asked about.
+        let stricter = rule(json!({"decision":"deny","kind":"exec","command":"rm"}));
+        confirm_loosening(&before, std::slice::from_ref(&deny), |_| {
+            panic!("not weaker")
+        })
+        .unwrap();
+        confirm_loosening(&before, &[deny, stricter], |_| panic!("not weaker")).unwrap();
     }
 
     #[test]

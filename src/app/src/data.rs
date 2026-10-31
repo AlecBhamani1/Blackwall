@@ -1087,13 +1087,9 @@ pub async fn save_owner_rules(
     shown: blackwall_core::policy::RulesFile,
     rules: Vec<blackwall_core::policy::Rule>,
 ) -> Result<(), String> {
-    crate::auth::require_unlocked(&app).await?;
-    let mut after = shown.clone();
-    after.rules.clone_from(&rules);
-    let loosened = blackwall_core::policy::loosened(&shown, &after);
-    if !loosened.is_empty() {
-        let asker = app.clone();
-        let confirmed = tokio::task::spawn_blocking(move || {
+    let asker = app.clone();
+    with_mcp(&app, move |directory| {
+        blackwall_core::policy::confirm_loosening(&shown, &rules, |loosened| {
             asker
                 .dialog()
                 .message(format!(
@@ -1106,14 +1102,7 @@ pub async fn save_owner_rules(
                     "Cancel".into(),
                 ))
                 .blocking_show()
-        })
-        .await
-        .map_err(|_| "The confirmation could not open.")?;
-        if !confirmed {
-            return Err("Not saved.".into());
-        }
-    }
-    with_mcp(&app, move |directory| {
+        })?;
         blackwall_core::policy::save_owner_rules(directory, &shown, rules)
     })
     .await
