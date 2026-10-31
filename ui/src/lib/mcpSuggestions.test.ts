@@ -7,8 +7,15 @@ describe('suggested MCP servers', () => {
     expect(new Set(names).size).toBe(names.length);
     for (const item of MCP_SUGGESTIONS) {
       expect(item.name).toMatch(/^[a-z0-9-]{1,32}$/);
-      expect(item.command.slice(0, 2)).toEqual(['npx', '-y']);
-      expect(item.command[2]).toMatch(/^(@[a-z0-9-]+\/)?[a-z0-9-]+@\d+\.\d+\.\d+$/);
+      if (item.runtime === 'npx') {
+        expect(item.command.slice(0, 2)).toEqual(['npx', '-y']);
+        expect(item.command[2]).toMatch(/^(@[a-z0-9-]+\/)?[a-z0-9-]+@\d+\.\d+\.\d+$/);
+      } else {
+        expect(item.command).toEqual([
+          'uvx',
+          expect.stringMatching(/^mcp-server-[a-z]+@\d+\.\d+\.\d+$/),
+        ]);
+      }
     }
     expect(MCP_SUGGESTIONS.filter((item) => item.needs).map((item) => [item.name, item.needs])).toEqual([
       ['filesystem', 'folder'],

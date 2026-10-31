@@ -23,10 +23,11 @@ describe('MCP server management', () => {
       },
     ]);
     vi.spyOn(persistence, 'mcpToolRules').mockResolvedValue([]);
+    vi.spyOn(persistence, 'mcpRuntimeStatus').mockResolvedValue([true, true]);
   });
   it('adds a server from a command line and toggles one', async () => {
     const user = userEvent.setup();
-    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     const toggle = vi.spyOn(persistence, 'setMcpServerEnabled').mockResolvedValue();
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Disable jira' }));
@@ -89,7 +90,7 @@ describe('MCP server management', () => {
   });
   it('adds a command with a quoted argument and refuses an unclosed quote', async () => {
     const user = userEvent.setup();
-    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add server' }));
     await user.type(screen.getByLabelText('Name'), 'files');
@@ -216,10 +217,10 @@ describe('MCP server management', () => {
     vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
       { name: 'git', command: ['git-mcp'], enabled: true },
     ]);
-    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add server' }));
-    expect(screen.getByRole('button', { name: /^git/ })).toBeDisabled();
+    expect(screen.getByText('git').closest('button')).toBeDisabled();
     expect(screen.getByText('Already added')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /^context7/ }));
     expect(screen.getByLabelText('Name')).toHaveValue('context7');
@@ -228,12 +229,27 @@ describe('MCP server management', () => {
     await user.click(screen.getByRole('button', { name: 'Add server' }));
     expect(add).toHaveBeenCalledWith('context7', ['npx', '-y', '@upstash/context7-mcp@4.4.1']);
   });
+  it('shows first-start progress and then the ready tool count', async () => {
+    let finish: (result: { tools: number; error: string | null }) => void = () => {};
+    vi.spyOn(persistence, 'addMcpServer').mockReturnValue(
+      new Promise((resolve) => (finish = resolve)),
+    );
+    const user = userEvent.setup();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    await user.type(screen.getByLabelText('Name'), 'local');
+    await user.type(screen.getByLabelText('Command'), 'local-server');
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    expect(screen.getByText(/Starting… first start can take a minute/)).toBeVisible();
+    finish({ tools: 3, error: null });
+    expect(await screen.findByText('Ready: 3 tools')).toBeVisible();
+  });
   it.each([
     ['filesystem', 'Add the folder', '/tmp/notes', '@modelcontextprotocol/server-filesystem@1.0.0'],
     ['remote', 'Add the web address', 'https://mcp.example.com/mcp', 'mcp-remote@0.14.3'],
   ])('asks for what %s needs before adding it', async (name, message, value, pkg) => {
     const user = userEvent.setup();
-    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add server' }));
     await user.click(screen.getByRole('button', { name: new RegExp(`^${name}`) }));
@@ -253,9 +269,16 @@ describe('MCP server management', () => {
     expect(screen.queryByRole('button', { name: /^context7/ })).not.toBeInTheDocument();
     expect(screen.getByText(/cannot run on Windows yet/)).toBeInTheDocument();
   });
+  it('offers uvx suggestions on Windows', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (Windows NT 10.0)');
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Add server' }));
+    expect(screen.getByRole('button', { name: /^time/ })).toBeInTheDocument();
+  });
   it('forgets a suggestion when the form is cancelled or the command is retyped', async () => {
     const user = userEvent.setup();
-    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const add = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add server' }));
     await user.click(screen.getByRole('button', { name: /^filesystem/ }));
@@ -294,7 +317,7 @@ describe('MCP server management', () => {
       vi.spyOn(persistence, 'mcpServers').mockResolvedValue([other, added]);
       return 'docs';
     });
-    const command = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue();
+    const command = vi.spyOn(persistence, 'addMcpServer').mockResolvedValue({ tools: 0, error: null });
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByRole('button', { name: 'Add server' }));
     expect(screen.getByRole('radio', { name: 'Command' })).toHaveAttribute('aria-checked', 'true');

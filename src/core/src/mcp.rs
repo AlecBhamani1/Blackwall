@@ -28,11 +28,20 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 /// Requests a server may send back while answering one of ours.
 const MAX_SERVER_REQUESTS: usize = 32;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Package runners may need to download a server immediately after it is added.
+const FIRST_START_TIMEOUT: Duration = Duration::from_secs(120);
 const SECRET_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const EDIT_LOCK: &str = ".mcp.lock";
 const RESERVED_PREFIX: &str =
     "MCP server names starting with p- are reserved for project servers; rename it.";
+
+fn timeout_failure(timeout: Duration) -> String {
+    format!(
+        "didn't answer within {} seconds — the first start may still be downloading the package; try again.",
+        timeout.as_secs()
+    )
+}
 
 /// One server entry in `mcp.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,6 +211,20 @@ fn saved_name(name: &str) -> String {
 /// Add a server under its saved name, which is returned.
 pub fn add_server(directory: &Path, name: &str, command: Vec<String>) -> Result<String, String> {
     add(directory, name, command, None, BTreeMap::new())
+}
+
+/// Whether a command can be launched through the same resolver used by MCP servers. This only
+/// searches for the program; it never executes it.
+pub fn program_found(program: &str) -> bool {
+    crate::command_tools::resolve_program(program, Path::new("")).is_ok()
+}
+
+pub fn missing_program(program: &str) -> String {
+    match program {
+        "npx" => "Needs Node.js (npx), which isn't on this computer.".into(),
+        "uvx" => "Needs uv (uvx), which isn't on this computer.".into(),
+        _ => format!("{program} was not found on this computer."),
+    }
 }
 
 /// Add a streamable HTTP server. Each header is `(header name, secret name)`; the secret's value
@@ -438,13 +461,27 @@ impl McpServers {
             .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
             .unwrap_or_default();
         started
-            .add_servers(configs, Source::Owner, directory, &project, &mut names)
+            .add_servers(
+                configs,
+                Source::Owner,
+                directory,
+                &project,
+                &mut names,
+                STARTUP_TIMEOUT,
+            )
             .await;
         if let Some(workspace) = workspace {
             let projects = project_servers(directory, workspace).await;
             if !projects.is_empty() {
                 started
-                    .add_servers(projects, Source::Project, directory, &project, &mut names)
+                    .add_servers(
+                        projects,
+                        Source::Project,
+                        directory,
+                        &project,
+                        &mut names,
+                        STARTUP_TIMEOUT,
+                    )
                     .await;
             }
         }
@@ -459,6 +496,7 @@ impl McpServers {
         directory: &Path,
         project: &Path,
         names: &mut Vec<String>,
+        startup_timeout: Duration,
     ) {
         let configs = match validate_for(configs, source) {
             Ok(configs) => configs,
@@ -536,7 +574,7 @@ impl McpServers {
             let tail = StdMutex::new(None);
             let secrets: Vec<String> = environment.iter().map(|(_, value)| value.clone()).collect();
             let launched = tokio::time::timeout(
-                STARTUP_TIMEOUT,
+                startup_timeout,
                 launch(
                     &config,
                     directory,
@@ -554,7 +592,7 @@ impl McpServers {
                     continue;
                 }
                 Ok(Err(error)) => format!("did not start: {error}"),
-                Err(_) => "did not start within 15 seconds.".to_owned(),
+                Err(_) => timeout_failure(startup_timeout),
             };
             self.warnings
                 .push(format!("MCP server {} {failure}{hint}", config.name));
@@ -573,6 +611,31 @@ impl McpServers {
                     not_passed,
                 });
             }
+        }
+    }
+
+    /// Start only the server just added, allowing package runners time for their first download.
+    pub async fn first_start(directory: &Path, name: &str) -> Result<usize, String> {
+        let config = read_config(directory)?
+            .into_iter()
+            .find(|config| config.name == name)
+            .ok_or_else(|| format!("No MCP server is named {name:?}."))?;
+        let mut started = Self::default();
+        let mut names = vec![];
+        started
+            .add_servers(
+                vec![config],
+                Source::Owner,
+                directory,
+                Path::new(""),
+                &mut names,
+                FIRST_START_TIMEOUT,
+            )
+            .await;
+        if let Some(warning) = started.warnings.first() {
+            Err(warning.clone())
+        } else {
+            Ok(started.definitions().len())
         }
     }
 
@@ -1774,7 +1837,15 @@ mod tests {
     async fn a_server_that_never_answers_still_shows_its_stderr() {
         let servers = start_failing_fixture("echo 'bad token abc' >&2; sleep 30").await;
         assert!(servers.warnings[0].contains("within 15 seconds"));
+        assert!(servers.warnings[0].contains("first start may still be downloading"));
         assert!(servers.diagnostics[0].stderr.contains("bad token abc"));
+    }
+
+    #[test]
+    fn only_the_immediate_first_start_uses_the_long_timeout() {
+        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(FIRST_START_TIMEOUT, Duration::from_secs(120));
+        assert!(timeout_failure(STARTUP_TIMEOUT).contains("try again"));
     }
 
     #[cfg(unix)]

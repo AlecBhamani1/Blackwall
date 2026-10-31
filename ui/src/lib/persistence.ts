@@ -411,8 +411,12 @@ export const persistence = {
       offsetMinutes: utcOffsetMinutes(),
     }),
   mcpServers: () => command<McpServer[]>('list_mcp_servers'),
+  mcpRuntimeStatus: (programs: string[]) => command<boolean[]>('mcp_runtime_status', { programs }),
   addMcpServer: (name: string, commandArgs: string[]) =>
-    command<void>('add_mcp_server', { name, command: commandArgs }),
+    command<{ tools: number; error: string | null }>('add_mcp_server', {
+      name,
+      command: commandArgs,
+    }),
   /** Each header pairs a header name with a secret saved for this server. Resolves to the saved name. */
   addMcpHttpServer: (name: string, url: string, headers: [string, string][]) =>
     command<string>('add_mcp_http_server', { name, url, headers }),

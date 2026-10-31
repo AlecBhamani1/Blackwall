@@ -13,6 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Settings skills are easier to manage with compact searchable rows, accessible enable switches,
   visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
   and a tighter segmented range control.
+### Fixed
+
+- MCP server suggestions now show whether their npx or uvx runtime is installed, include the
+  official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
+  120 seconds for the first package download while showing startup progress.
 
 ### Added
 

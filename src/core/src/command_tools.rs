@@ -1039,6 +1039,38 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn program_lookup_reports_missing_and_finds_a_path_program() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-program-lookup-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = if cfg!(windows) {
+            "lookup.exe"
+        } else {
+            "lookup"
+        };
+        let program = root.join(name);
+        std::fs::write(&program, b"probe").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::join_paths([&root]).unwrap();
+        let project = root.join("project");
+        assert_eq!(
+            resolve_in("missing", Some(&path), None, &project),
+            Err(NotResolved::Missing)
+        );
+        assert_eq!(
+            resolve_in("lookup", Some(&path), None, &project),
+            Ok(program)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn absolute_programs_inside_the_project_are_refused_even_through_symlinks() {
