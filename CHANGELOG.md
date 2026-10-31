@@ -233,6 +233,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Chats are now stored with each message saved once. `bw` appends only what is new on each save;
+  the desktop app appends when you send a message and rewrites the chat when a streaming answer
+  finishes. The first open after updating backs up the database to `backups/blackwall-backup-1.sqlite3` (then `-2`,
+  `-3`) and upgrades it once; with three backups present, Blackwall asks you to remove one first.
+  Older Blackwall versions cannot open the upgraded data.
 - Start child programs from a cleaned environment instead of Blackwall's own, which changes
   what they see. This covers shell commands, command tools, MCP servers, the git and browser-opener
   helpers (the Linux opener also gets the desktop-session variables it needs), and listening-port

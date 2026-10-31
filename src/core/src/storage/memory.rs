@@ -339,17 +339,9 @@ impl LocalStore {
                 "Memory is disabled or unavailable in this chat.",
             ));
         }
-        let session: String = tx
-            .query_row(
-                "SELECT body FROM sessions WHERE id=?1",
-                [&source.session_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(StorageError::Invalid(
-                "Save the source conversation before proposing a memory.",
-            ))?;
-        let session: serde_json::Value = serde_json::from_str(&session)?;
+        let (session, _) = super::chats::read_chat(&tx, &source.session_id)?.ok_or(
+            StorageError::Invalid("Save the source conversation before proposing a memory."),
+        )?;
         let has_source = session["messages"].as_array().is_some_and(|messages| {
             messages.iter().any(|message| {
                 message["id"].as_str() == Some(&source.message_id) && message["role"] == "user"

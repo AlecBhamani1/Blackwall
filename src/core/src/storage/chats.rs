@@ -1,7 +1,5 @@
 //! The v6 chat store: each chat is a `sessions` row plus its add-only `chat_events` rows, and its
 //! model context in `chat_context`. A chat is rebuilt from those rows on load (see `view`).
-//!
-//! Dormant: `LocalStore::open` still opens v5. `open_at(directory, 6)` upgrades (see `upgrade`).
 
 use super::view::{build_view, ContextRow, EventRow, Kind};
 use super::{search, validate_id, validate_message, LocalStore, StorageError};
@@ -272,9 +270,7 @@ pub(crate) mod tests {
 
     /// An in-memory v6 store.
     pub(crate) fn v6_store() -> LocalStore {
-        let store = LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap();
-        apply_v6_schema(store.connection()).unwrap();
-        store
+        LocalStore::initialize(Connection::open_in_memory().unwrap()).unwrap()
     }
 
     pub(crate) fn new_chat(store: &LocalStore, id: &str) {

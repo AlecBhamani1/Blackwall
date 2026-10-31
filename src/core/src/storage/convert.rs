@@ -6,7 +6,7 @@
 
 use super::chats::{append, read_chat, write_context, write_tx};
 use super::view::{accumulate, ContextRow, Kind};
-use super::{search, validate_session, LocalStore, StorageError};
+use super::{search, validate_session, LocalStore, StorageError, MAX_SESSIONS};
 use crate::{model::message_form, protocol::ChatMessage};
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
@@ -15,9 +15,86 @@ use std::collections::HashMap;
 pub(crate) const NOT_CONVERTED: &str =
     "Couldn't upgrade a saved conversation, so nothing was changed. Your existing data has been left in place.";
 
-/// Converts the chat whose `sessions` row has id `session["id"]`. Its v5 body is emptied.
+/// Converts the chat whose `sessions` row has id `session["id"]` and no rows yet. Its v5 body is
+/// emptied.
 pub(crate) fn convert_session(tx: &Connection, session: &Value) -> Result<(), StorageError> {
-    let (id, title, updated_at, _) = validate_session(session)?;
+    rewrite(tx, session, validate_session(session)?)
+}
+
+/// `convert_session` for a session already validated into `columns`.
+fn rewrite(
+    tx: &Connection,
+    session: &Value,
+    columns: (&str, &str, i64),
+) -> Result<(), StorageError> {
+    if !write_chat(tx, session, columns, vec![], vec![])? {
+        eprintln!(
+            "warn: chat {} did not rebuild to its saved copy",
+            session["id"].as_str().unwrap_or_default()
+        );
+        return Err(StorageError::Invalid(NOT_CONVERTED));
+    }
+    Ok(())
+}
+
+/// Saves a whole session JSON over its chat. When the stored messages and transcript begin the new
+/// ones, only the rest is appended and the context replaced; otherwise the chat is rewritten.
+pub(crate) fn save(tx: &Connection, session: &Value) -> Result<(), StorageError> {
+    let columns = validate_session(session)?;
+    let (id, title, updated_at) = columns;
+    let Some((stored, ui)) = read_chat(tx, id)? else {
+        let count: i64 = tx.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+        if count >= MAX_SESSIONS {
+            return Err(StorageError::Invalid("Your history has reached 500 conversations. Export or delete an older conversation before starting another."));
+        }
+        tx.execute(
+            "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,'')",
+            params![id, title, updated_at],
+        )?;
+        return rewrite(tx, session, columns);
+    };
+    let old = transcript(&stored);
+    if messages(session).starts_with(messages(&stored)) && transcript(session).starts_with(old) {
+        let model = tx
+            .prepare(
+                "SELECT seq FROM chat_events WHERE session_id=?1 AND kind='model'
+                 AND seq >= (SELECT model_from FROM chat_context WHERE session_id=?1)
+                 ORDER BY seq LIMIT ?2",
+            )?
+            .query_map(params![id, old.len() as i64], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if write_chat(tx, session, columns, ui, model)? {
+            return Ok(());
+        }
+    }
+    tx.execute("DELETE FROM chat_events WHERE session_id=?1", [id])?;
+    tx.execute("DELETE FROM chat_context WHERE session_id=?1", [id])?;
+    rewrite(tx, session, columns)
+}
+
+fn messages(session: &Value) -> &[Value] {
+    session["messages"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+}
+
+fn transcript(session: &Value) -> &[Value] {
+    session
+        .get("contextState")
+        .and_then(|context| context["transcript"].as_array())
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// Writes `session` over its chat: the `sessions` columns, the messages and transcript entries
+/// after the first `ui.len()` and `model.len()`, which are stored at those seqs, and the context.
+/// Returns whether the chat then rebuilds to `session`.
+fn write_chat(
+    tx: &Connection,
+    session: &Value,
+    (id, title, updated_at): (&str, &str, i64),
+    mut ui: Vec<i64>,
+    mut model: Vec<i64>,
+) -> Result<bool, StorageError> {
     let text = |key: &str| session.get(key).and_then(Value::as_str);
     // Every key no column or row holds stays in `metadata`, a literal `contextState: null` too.
     let metadata: Map<String, Value> = session
@@ -44,45 +121,58 @@ pub(crate) fn convert_session(tx: &Connection, session: &Value) -> Result<(), St
             serde_json::to_string(&metadata)?
         ],
     )?;
-    let messages = session["messages"]
-        .as_array()
-        .map_or(&[][..], Vec::as_slice);
-    let context = session.get("contextState").filter(|value| !value.is_null());
-    let transcript = context
-        .and_then(|context| context["transcript"].as_array())
-        .map_or(&[][..], Vec::as_slice);
-    let mut rows = vec![];
-    for (kind, body) in plan(messages, transcript) {
-        rows.push((append(tx, id, kind, &body)?, kind));
+    let messages = messages(session);
+    let transcript = transcript(session);
+    let (old_ui, old_model) = (ui.len(), model.len());
+    let mut next: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq)+1,0) FROM chat_events WHERE session_id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    for (seqs, len) in [(&mut ui, messages.len()), (&mut model, transcript.len())] {
+        while seqs.len() < len {
+            seqs.push(next);
+            next += 1;
+        }
     }
-    if let Some(context) = context.and_then(Value::as_object) {
+    let (mut ui_bodies, mut model_bodies) = (messages.to_vec(), transcript.to_vec());
+    add_references(
+        messages,
+        transcript,
+        (&ui, &model),
+        &mut ui_bodies,
+        &mut model_bodies,
+    );
+    for (message, body) in messages.iter().zip(&ui_bodies).skip(old_ui) {
+        let kind = if body["role"] == "user" {
+            Kind::UiUser
+        } else {
+            Kind::UiAssistant
+        };
+        let row = append(tx, id, kind, body)?;
+        search::index(tx, row, message)?;
+    }
+    for body in model_bodies.iter().skip(old_model) {
+        append(tx, id, Kind::Model, body)?;
+    }
+    if let Some(context) = session["contextState"].as_object() {
         let mut state = context.clone();
         state.remove("transcript");
-        let model_from = i64::try_from(messages.len()).unwrap_or(i64::MAX);
-        let model_len = transcript.len();
         write_context(
             tx,
             id,
             &ContextRow {
-                model_from,
-                model_len,
+                model_from: model.first().copied().unwrap_or(next),
+                model_len: transcript.len(),
                 state,
             },
         )?;
     }
     match read_chat(tx, id) {
-        Ok(Some((chat, _))) if chat == *session => {}
-        Ok(_) | Err(StorageError::Invalid(_) | StorageError::Json(_)) => {
-            eprintln!("warn: upgrade: chat {id} did not rebuild to its v5 copy");
-            return Err(StorageError::Invalid(NOT_CONVERTED));
-        }
-        Err(error) => return Err(error),
+        Ok(Some((chat, _))) => Ok(chat == *session),
+        Ok(None) | Err(StorageError::Invalid(_) | StorageError::Json(_)) => Ok(false),
+        Err(error) => Err(error),
     }
-    let ui_rows = rows.iter().filter(|(_, kind)| *kind != Kind::Model);
-    for ((row, _), message) in ui_rows.zip(messages) {
-        search::index(tx, *row, message)?;
-    }
-    Ok(())
 }
 
 /// The browser's legacy import on a v6 store, once and all or nothing, as v5 runs it. Ids already
@@ -103,13 +193,14 @@ pub(crate) fn migrate_v6(store: &LocalStore, sessions: &[Value]) -> Result<(), S
         if let Some(object) = session.as_object_mut() {
             object.remove("contextState");
         }
-        let (id, title, updated_at, _) = validate_session(&session)?;
+        let columns = validate_session(&session)?;
+        let (id, title, updated_at) = columns;
         let added = tx.execute(
             "INSERT OR IGNORE INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,'')",
             params![id, title, updated_at],
         )?;
         if added == 1 {
-            convert_session(&tx, &session)?;
+            rewrite(&tx, &session, columns)?;
         }
     }
     tx.execute(
@@ -130,26 +221,15 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_string(value).map_or(0, |text| text.len())
 }
 
-/// The rows in seq order: the UI messages (seqs `0..n`), then the transcript, with each value the
-/// transcript repeats as a reference where that is smaller.
-fn plan(messages: &[Value], transcript: &[Value]) -> Vec<(Kind, Value)> {
-    let mut ui = messages.to_vec();
-    let mut model = transcript.to_vec();
-    add_references(messages, transcript, &mut ui, &mut model);
-    let ui = ui.into_iter().map(|body| {
-        let kind = if body["role"] == "user" {
-            Kind::UiUser
-        } else {
-            Kind::UiAssistant
-        };
-        (kind, body)
-    });
-    ui.chain(model.into_iter().map(|body| (Kind::Model, body)))
-        .collect()
-}
-
-fn add_references(messages: &[Value], transcript: &[Value], ui: &mut [Value], model: &mut [Value]) {
-    let n = messages.len();
+/// Writes each value the transcript repeats as a reference into `ui` and `model`, where that is
+/// smaller. `seqs` holds each message's and each transcript entry's seq.
+fn add_references(
+    messages: &[Value],
+    transcript: &[Value],
+    (ui_seq, model_seq): (&[i64], &[i64]),
+    ui: &mut [Value],
+    model: &mut [Value],
+) {
     // User refs: each user entry to the first user message at or after the last match whose
     // model form it is, else to the first one anywhere.
     let mut forms: HashMap<String, Vec<usize>> = HashMap::new();
@@ -172,7 +252,7 @@ fn add_references(messages: &[Value], transcript: &[Value], ui: &mut [Value], mo
         let Some(&message) = candidates.get(at).or(candidates.first()) else {
             continue;
         };
-        model[row] = json!({ "ref": message });
+        model[row] = json!({ "ref": ui_seq[message] });
         last_ref.insert(message, row);
         next = message + 1;
     }
@@ -197,10 +277,11 @@ fn add_references(messages: &[Value], transcript: &[Value], ui: &mut [Value], mo
         let content = message["content"].as_str().unwrap_or_default();
         let (tail, echo) = content_form(transcript, &mut turns, content);
         if let Some(echo) = echo {
-            model[echo] = json!({ "ref": index });
+            model[echo] = json!({ "ref": ui_seq[index] });
         }
         if let Some(tail) = tail {
-            let mut form = json!({ "turns": turns.iter().map(|t| n + t).collect::<Vec<_>>() });
+            let mut form =
+                json!({ "turns": turns.iter().map(|&t| model_seq[t]).collect::<Vec<_>>() });
             if !tail.is_empty() {
                 form["tail"] = json!(tail);
             }
@@ -227,8 +308,8 @@ fn add_references(messages: &[Value], transcript: &[Value], ui: &mut [Value], mo
             if result.is_some() {
                 residual.remove("output");
             }
-            residual.insert("call".into(), json!([n + turn, call]));
-            residual.insert("result".into(), json!(result.map(|row| n + row)));
+            residual.insert("call".into(), json!([model_seq[turn], call]));
+            residual.insert("result".into(), json!(result.map(|row| model_seq[row])));
             let residual = Value::Object(residual);
             if json_len(&residual) < json_len(tool) {
                 ui[index]["tools"][position] = residual;

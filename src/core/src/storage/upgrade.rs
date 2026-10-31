@@ -27,17 +27,20 @@ fn user_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
+/// Upgrades an older database at `connection` to v6. `directory` is its data folder, for the
+/// backup; tests pass `None` for an in-memory database.
 pub(super) fn open_v6(
-    directory: &Path,
+    directory: Option<&Path>,
     connection: Connection,
 ) -> Result<LocalStore, StorageError> {
+    // An upgrade of a large history, and its VACUUM, take seconds and lock out readers too, so a
+    // second opener waits it out, even to read the schema and the version.
+    connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
     connection.execute_batch(
         "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
     )?;
     if user_version(&connection)? != V6 {
         // Re-read under the writer lock: another window may have upgraded while this one waited.
-        // An upgrade of a large history takes seconds, so a second opener waits it out.
-        connection.busy_timeout(UPGRADE_BUSY_TIMEOUT)?;
         let tx = write_tx(&connection)?;
         let version = user_version(&tx)?;
         if version > V6 {
@@ -51,7 +54,7 @@ pub(super) fn open_v6(
                 [version],
                 |row| row.get(0),
             )?;
-            if has_data {
+            if let Some(directory) = directory.filter(|_| has_data) {
                 back_up(directory)?;
             }
             LocalStore::legacy_schema(&tx, version)?;
@@ -75,8 +78,8 @@ pub(super) fn open_v6(
             // failure here (no room for the temporary copy) only leaves the file larger.
             let _ = connection.execute_batch("VACUUM");
         }
-        connection.busy_timeout(BUSY_TIMEOUT)?;
     }
+    connection.busy_timeout(BUSY_TIMEOUT)?;
     Ok(LocalStore { connection })
 }
 
@@ -134,12 +137,25 @@ pub(crate) mod tests {
         ))
     }
 
-    /// A v5 data folder, saved through the v5 store itself.
-    fn v5_folder(name: &str, chats: &[Value]) -> PathBuf {
+    /// A v5 data folder: the v5 tables, each chat a whole `sessions.body`.
+    pub(crate) fn v5_folder(name: &str, chats: &[Value]) -> PathBuf {
         let directory = folder(name);
-        let store = LocalStore::open(&directory).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let connection = Connection::open(directory.join(DATABASE_FILE)).unwrap();
+        LocalStore::legacy_schema(&connection, 0).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         for chat in chats {
-            store.save_session(chat).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![
+                        chat["id"].as_str(),
+                        chat["title"].as_str(),
+                        chat["updatedAt"].as_i64(),
+                        chat.to_string()
+                    ],
+                )
+                .unwrap();
         }
         directory
     }
@@ -148,11 +164,29 @@ pub(crate) mod tests {
         user_version(&Connection::open(path).unwrap()).unwrap()
     }
 
+    /// A database's version and `sessions.body` rows, read without opening it as a store.
+    fn v5_rows(path: &Path) -> (i64, Vec<String>) {
+        let connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let bodies = connection
+            .prepare("SELECT body FROM sessions ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (user_version(&connection).unwrap(), bodies)
+    }
+
+    fn as_v5(chats: &[Value]) -> (i64, Vec<String>) {
+        (5, chats.iter().map(Value::to_string).collect())
+    }
+
     #[test]
     fn every_v5_chat_loads_back_unchanged_and_is_stored_once() {
         let chats = v5_chats();
         let directory = v5_folder("convert", &chats);
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         for chat in &chats {
             let id = chat["id"].as_str().unwrap();
             assert_eq!(store.load_chat(id).unwrap().as_ref(), Some(chat), "{id}");
@@ -205,7 +239,7 @@ pub(crate) mod tests {
         assert!(!hits.results.is_empty());
         // A second open finds v6 and changes nothing.
         drop(store);
-        let again = LocalStore::open_at(&directory, V6).unwrap();
+        let again = LocalStore::open(&directory).unwrap();
         assert_eq!(again.list_chats().unwrap().len(), chats.len());
         drop(again); // Windows cannot delete a file that is still open.
         fs::remove_dir_all(&directory).unwrap();
@@ -222,35 +256,30 @@ pub(crate) mod tests {
                 .join(format!("blackwall-backup-{n}.sqlite3"))
         };
         for n in 1..=3 {
-            LocalStore::open_at(&directory, V6).unwrap();
+            LocalStore::open(&directory).unwrap();
             assert_eq!(version(&database), V6);
             // Each backup is the whole v5 database.
-            assert_eq!(version(&backup(n)), 5);
+            assert_eq!(v5_rows(&backup(n)), as_v5(std::slice::from_ref(chat)));
             assert!(!backup(n + 1).exists());
-            let restored = LocalStore::open(&directory);
-            assert!(restored.is_err(), "v6 is newer than v5");
             // The owner restores the backup, so the next open upgrades again.
             fs::copy(backup(n), &database).unwrap();
-            assert_eq!(
-                LocalStore::open(&directory)
-                    .unwrap()
-                    .load_session(chat["id"].as_str().unwrap())
-                    .unwrap()
-                    .as_ref(),
-                Some(chat)
-            );
+            assert_eq!(v5_rows(&database), as_v5(std::slice::from_ref(chat)));
         }
         assert!(matches!(
-            LocalStore::open_at(&directory, V6),
+            LocalStore::open(&directory),
             Err(StorageError::BackupsFull)
         ));
-        assert_eq!(version(&database), 5, "nothing was converted");
+        assert_eq!(
+            v5_rows(&database),
+            as_v5(std::slice::from_ref(chat)),
+            "nothing was converted"
+        );
         assert!(!backup(4).exists());
         // Once the owner removes one, its slot is used again.
         fs::remove_file(backup(2)).unwrap();
-        LocalStore::open_at(&directory, V6).unwrap();
+        LocalStore::open(&directory).unwrap();
         assert_eq!(version(&database), V6);
-        assert_eq!(version(&backup(2)), 5);
+        assert_eq!(v5_rows(&backup(2)), as_v5(std::slice::from_ref(chat)));
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -263,23 +292,17 @@ pub(crate) mod tests {
         let chats = [v5_chats()[1].clone(), bad];
         let directory = v5_folder("rollback", &chats);
         assert!(matches!(
-            LocalStore::open_at(&directory, V6),
+            LocalStore::open(&directory),
             Err(StorageError::Invalid(message)) if message == super::super::convert::NOT_CONVERTED
         ));
-        assert_eq!(version(&directory.join(DATABASE_FILE)), 5);
-        let store = LocalStore::open(&directory).unwrap();
-        for chat in &chats {
-            let id = chat["id"].as_str().unwrap();
-            assert_eq!(store.load_session(id).unwrap().as_ref(), Some(chat));
-        }
-        drop(store); // Windows cannot delete a file that is still open.
+        assert_eq!(v5_rows(&directory.join(DATABASE_FILE)), as_v5(&chats));
         fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
     fn the_browser_import_on_v6_converts_once_without_the_webview_context() {
         let directory = folder("import");
-        let mut store = LocalStore::open_at(&directory, V6).unwrap();
+        let mut store = LocalStore::open(&directory).unwrap();
         let chats = v5_chats();
         store.migrate_sessions(&chats[..3]).unwrap();
         for chat in &chats[..3] {
@@ -298,11 +321,52 @@ pub(crate) mod tests {
     #[test]
     fn a_new_database_opens_at_v6_without_a_backup() {
         let directory = folder("fresh");
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         assert_eq!(version(&directory.join(DATABASE_FILE)), V6);
         assert!(!directory.join(BACKUPS_DIR).exists());
         assert!(store.list_chats().unwrap().is_empty());
         drop(store); // Windows cannot delete a file that is still open.
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_second_opener_waits_for_the_upgrade_and_does_not_fail() {
+        // Longer than the usual busy timeout, so only the upgrade timeout waits it out.
+        const HOLD: Duration = Duration::from_secs(BUSY_TIMEOUT.as_secs() + 2);
+        let chats = v5_chats();
+        let directory = v5_folder("together", &chats);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        // `bw` and the app, each with its own connection.
+        let openers: Vec<_> = (0..2)
+            .map(|_| {
+                let (directory, barrier) = (directory.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    LocalStore::open(&directory)?.list_sessions()
+                })
+            })
+            .collect();
+        for opener in openers {
+            assert_eq!(opener.join().unwrap().unwrap().len(), chats.len());
+        }
+        assert_eq!(version(&directory.join(DATABASE_FILE)), V6);
+        let backups = directory.join(BACKUPS_DIR);
+        assert!(backups.join("blackwall-backup-1.sqlite3").exists());
+        assert!(
+            !backups.join("blackwall-backup-2.sqlite3").exists(),
+            "one upgrade"
+        );
+        // A large upgrade's commit and VACUUM lock out readers too, for longer than the usual
+        // busy timeout. An opener still waits it out, even to read the version.
+        let holder = Connection::open(directory.join(DATABASE_FILE)).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        let opened = LocalStore::open(&directory).and_then(|store| store.list_sessions());
+        release.join().unwrap();
+        assert_eq!(opened.unwrap().len(), chats.len());
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -351,7 +415,7 @@ pub(crate) mod tests {
     fn a_300_message_chat_loads_within_50_ms() {
         let chat = long_chat(150);
         let directory = v5_folder("speed", std::slice::from_ref(&chat));
-        let store = LocalStore::open_at(&directory, V6).unwrap();
+        let store = LocalStore::open(&directory).unwrap();
         assert_eq!(store.load_chat("long").unwrap().as_ref(), Some(&chat));
         let references: i64 = store
             .connection()

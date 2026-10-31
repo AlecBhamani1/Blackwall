@@ -1,12 +1,10 @@
 //! Search only saved message text. Tool calls, attachments and approval records stay inert.
 use super::{LocalStore, StorageError};
 use crate::memory::MemoryClient;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MIGRATION_BATCH: i64 = 5;
-const SESSION_TEXT_BYTES: usize = 512 * 1024;
 pub(super) const MESSAGE_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -57,50 +55,6 @@ pub(super) fn schema(db: &Connection) -> Result<(), StorageError> {
             INSERT INTO message_search(message_search,rowid,content) VALUES ('delete',old.id,old.content); END;
         PRAGMA user_version=4;
     ")?;
-    Ok(())
-}
-
-pub(super) fn index(db: &Connection, session: &Value) -> Result<(), StorageError> {
-    let id = session["id"]
-        .as_str()
-        .ok_or(StorageError::Invalid("Missing conversation identifier."))?;
-    db.execute("DELETE FROM session_messages WHERE session_id=?1", [id])?;
-    let mut remaining = SESSION_TEXT_BYTES;
-    if let Some(messages) = session["messages"].as_array() {
-        for (position, message) in messages.iter().take(2000).enumerate() {
-            let role = message["role"].as_str().unwrap_or("");
-            if !matches!(role, "user" | "assistant") {
-                continue;
-            }
-            let text = message["content"].as_str().unwrap_or("");
-            let mut end = text.len().min(MESSAGE_TEXT_BYTES).min(remaining);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            if end == 0 {
-                continue;
-            }
-            remaining -= end;
-            let fallback = format!("message_{position}");
-            let message_id = message["id"]
-                .as_str()
-                .filter(|id| id.len() <= 128)
-                .unwrap_or(&fallback);
-            db.execute("INSERT INTO session_messages(session_id,message_id,message_index,role,content) VALUES (?1,?2,?3,?4,?5)", params![id,message_id,position as i64,role,&text[..end]])?;
-        }
-    }
-    let project = session["workspace"]
-        .as_str()
-        .filter(|path| path.len() <= 2048);
-    let mode = match session["mode"].as_str() {
-        Some("agent") => "agent",
-        None if id.starts_with("cli_") => "agent",
-        _ => "chat",
-    };
-    db.execute(
-        "INSERT INTO indexed_sessions(session_id,project,mode) VALUES (?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET project=excluded.project,mode=excluded.mode",
-        params![id,project,mode],
-    )?;
     Ok(())
 }
 
@@ -160,57 +114,6 @@ pub(super) fn cap_results(
 }
 
 impl LocalStore {
-    pub(super) fn message_index_is_current(&self) -> Result<bool, StorageError> {
-        Ok(self.connection.query_row(
-            "SELECT NOT EXISTS(
-                SELECT 1 FROM sessions
-                WHERE id NOT IN (SELECT session_id FROM indexed_sessions)
-                LIMIT 1
-            )",
-            [],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// Each database open backfills at most five existing sessions, in one transaction.
-    /// New saves are indexed synchronously; no background worker retains deleted text.
-    pub(super) fn migrate_message_index(&self) -> Result<(), StorageError> {
-        let sessions = {
-            let mut statement = self.connection.prepare("SELECT id, body FROM sessions WHERE id NOT IN (SELECT session_id FROM indexed_sessions) ORDER BY updated_at DESC LIMIT ?1")?;
-            let rows = statement.query_map([MIGRATION_BATCH], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut sessions = Vec::new();
-            for row in rows {
-                let (id, body) = row?;
-                if body.len() > super::MAX_SESSION_BYTES {
-                    return Err(StorageError::Invalid(
-                        "A saved conversation exceeds the migration limit.",
-                    ));
-                }
-                let session: Value = serde_json::from_str(&body)?;
-                sessions.push((id, session));
-            }
-            sessions
-        };
-
-        let transaction = self.connection.unchecked_transaction()?;
-        for (id, session) in sessions {
-            let should_index: bool = transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sessions
-                    WHERE id=?1 AND id NOT IN (SELECT session_id FROM indexed_sessions)
-                )",
-                [&id],
-                |row| row.get(0),
-            )?;
-            if should_index {
-                index(&transaction, &session)?;
-            }
-        }
-        transaction.commit()?;
-        Ok(())
-    }
     pub fn recall_enabled(&self, client: MemoryClient) -> Result<bool, StorageError> {
         let keys: &[&str] = match client {
             MemoryClient::Guest => return Ok(false),
@@ -231,43 +134,7 @@ impl LocalStore {
         client: MemoryClient,
         query: &RecallQuery,
     ) -> Result<RecallResults, StorageError> {
-        let expression = match_expression(client, query)?;
-        let mut statement = self.connection.prepare("SELECT s.id,m.message_id,m.message_index,s.title,
-            i.mode,i.project,s.updated_at,m.role,snippet(message_search,0,'','',' … ',32)
-            FROM message_search JOIN session_messages m ON m.id=message_search.rowid JOIN sessions s ON s.id=m.session_id JOIN indexed_sessions i ON i.session_id=s.id
-            WHERE message_search MATCH ?1 AND (?2 IS NULL OR i.project=?2)
-            AND (?3 IS NULL OR s.updated_at>=?3) AND (?4 IS NULL OR s.updated_at<=?4)
-            ORDER BY bm25(message_search),s.updated_at DESC,m.message_index LIMIT ?5")?;
-        let rows = statement.query_map(
-            params![
-                expression,
-                query.project,
-                query.after,
-                query.before,
-                query.limit.unwrap_or(5) as i64
-            ],
-            |row| {
-                let excerpt: String = row.get(8)?;
-                let title: String = row.get(3)?;
-                Ok(RecallHit {
-                    session_id: row.get(0)?,
-                    message_id: row.get(1)?,
-                    message_index: row.get(2)?,
-                    title: title.chars().take(120).collect(),
-                    mode: row.get(4)?,
-                    project: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    role: row.get(7)?,
-                    excerpt: excerpt.chars().take(600).collect(),
-                })
-            },
-        )?;
-        let results = cap_results(rows)?;
-        let remaining_sessions = self.connection.query_row("SELECT COUNT(*) FROM sessions WHERE id NOT IN (SELECT session_id FROM indexed_sessions)", [], |row| row.get(0))?;
-        Ok(RecallResults {
-            results,
-            remaining_sessions,
-        })
+        self.search_chats(client, query)
     }
 }
 
@@ -328,7 +195,7 @@ mod tests {
         assert!(search(&db, "needle").results.is_empty());
         let count: i64 = db
             .connection
-            .query_row("SELECT COUNT(*) FROM message_search", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM chat_search", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -371,45 +238,44 @@ mod tests {
         assert!(db.search_messages(MemoryClient::Cli, &query).is_err());
     }
     #[test]
-    fn migration_is_bounded_repeatable_and_preserves_history() {
-        let db = store();
-        for i in 0..12 {
-            let value = session(&format!("old_{i}"), "migration needle", "/project", 100);
-            db.connection
-                .execute(
-                    "INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,'Old',100,?2)",
-                    params![value["id"].as_str(), value.to_string()],
-                )
-                .unwrap();
-        }
-        db.connection
+    fn upgrade_indexes_every_old_chat_in_one_open_and_preserves_history() {
+        let chats: Vec<_> = (0..12)
+            .map(|i| {
+                let text = format!("migration needle word{i}");
+                session(&format!("old_{i}"), &text, "/project", 100)
+            })
+            .collect();
+        let directory = super::super::upgrade::tests::v5_folder("v3", &chats);
+        Connection::open(directory.join(super::super::DATABASE_FILE))
+            .unwrap()
             .pragma_update(None, "user_version", 3)
             .unwrap();
-        let db = LocalStore::initialize(db.connection).unwrap();
-        // The schema-migration open releases its writer lock without starting the backfill.
-        assert_eq!(search(&db, "needle").remaining_sessions, 12);
-        db.delete_session("old_9").unwrap(); // Deletion before backfill must never resurrect text.
-        let db = LocalStore::initialize(db.connection).unwrap();
-        assert_eq!(search(&db, "needle").remaining_sessions, 6);
-        let db = LocalStore::initialize(db.connection).unwrap();
-        assert_eq!(search(&db, "needle").remaining_sessions, 1);
-        let db = LocalStore::initialize(db.connection).unwrap();
+        let db = LocalStore::open(&directory).unwrap();
+        // One open converts and indexes every old chat: nothing is left for a later open.
         assert_eq!(search(&db, "needle").remaining_sessions, 0);
+        for i in 0..12 {
+            let hits = search(&db, &format!("word{i}")).results;
+            assert_eq!(hits.len(), 1, "old_{i}");
+            assert_eq!(hits[0].session_id, format!("old_{i}"));
+        }
+        db.delete_session("old_9").unwrap(); // Deletion must never resurrect text.
+        assert!(search(&db, "word9").results.is_empty());
         assert!(db.load_session("old_9").unwrap().is_none());
-        let before: i64 = db
-            .connection
-            .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
-            .unwrap();
-        let db = LocalStore::initialize(db.connection).unwrap();
-        let after: i64 = db
-            .connection
-            .query_row("SELECT COUNT(*) FROM session_messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!((before, after), (22, 22));
+        let indexed = |db: &LocalStore| -> i64 {
+            db.connection
+                .query_row("SELECT COUNT(*) FROM chat_search", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = indexed(&db);
+        drop(db);
+        let db = LocalStore::open(&directory).unwrap();
+        assert_eq!((before, indexed(&db)), (22, 22));
         assert_eq!(
             db.load_session("old_0").unwrap().unwrap()["messages"][1]["tools"][0]["arguments"],
             "toolsecret"
         );
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn legacy_import_and_missing_message_ids_are_searchable() {
@@ -461,30 +327,26 @@ mod tests {
     #[test]
     fn text_limits_do_not_split_unicode_or_index_later_overflow() {
         let db = store();
-        let text = format!("{} overflowword", "é🦀".repeat(12000));
-        let mut value = session("large", &text, "/project", 100);
+        // `word` ends 6 bytes before 64 KiB, the next character crosses it, and a word follows.
+        let text = |word: &str| format!("{} {word} 🦀🦀 overflowword", "é🦀".repeat(10920));
+        let edge = text("edgeword");
+        assert_eq!(MESSAGE_TEXT_BYTES, 64 * 1024);
+        assert_eq!(edge.find("edgeword").unwrap() + "edgeword".len(), 65_529);
+        assert!(edge.find(" overflowword").unwrap() > MESSAGE_TEXT_BYTES);
+        let mut value = session("large", &edge, "/project", 100);
         let message = value["messages"][0].clone();
-        value["messages"] = Value::Array(vec![message; 10]);
+        let mut messages = vec![message.clone(); 9];
+        // The tenth message lies past 512 KiB of the chat's text: each message has its own cap.
+        let mut last = message;
+        last["content"] = json!(text("lastword"));
+        messages.push(last);
+        value["messages"] = Value::Array(messages);
         db.save_session(&value).unwrap();
         assert!(search(&db, "overflowword").results.is_empty());
-        let bytes: i64 = db
-            .connection
-            .query_row(
-                "SELECT SUM(length(CAST(content AS BLOB))) FROM session_messages",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(bytes <= SESSION_TEXT_BYTES as i64);
-        let texts: Vec<String> = db
-            .connection
-            .prepare("SELECT content FROM session_messages")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(texts.iter().all(|text| text.len() <= MESSAGE_TEXT_BYTES));
+        assert!(!search(&db, "edgeword").results.is_empty());
+        let last = search(&db, "lastword").results;
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].message_index, 9);
     }
     #[test]
     fn rejects_invalid_save_without_removing_existing_excerpts() {

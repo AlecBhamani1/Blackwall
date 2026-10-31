@@ -85,9 +85,6 @@ pub fn search(store: &LocalStore, args: &[String]) -> Result<(), String> {
             }
         );
     }
-    if results.remaining_sessions > 0 {
-        println!("{} older conversations still need indexing. Run the search again to continue the bounded migration.", results.remaining_sessions);
-    }
     Ok(())
 }
 #[cfg(test)]
