@@ -94,6 +94,8 @@ mod convert;
 pub(crate) mod fixtures;
 mod memory;
 #[cfg(test)]
+mod perf_tests;
+#[cfg(test)]
 mod property_tests;
 mod recall;
 mod search;

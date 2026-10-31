@@ -688,6 +688,47 @@ fn plain_chat(index: u64) -> Chat {
     chat
 }
 
+/// A desktop chat of `2 * exchanges` messages, made by the same simulator as the fixtures: every
+/// third exchange runs a tool (a call, its output and a final answer) and the rest answer in
+/// plain text. `seed` varies the texts, so no two seeds share a message. It leaks its few
+/// thousand short strings, which is fine in a test.
+pub(crate) fn long_chat(id: &str, seed: u64, exchanges: usize) -> Value {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let mut chat = Chat::new(seed);
+    for n in 0..exchanges {
+        let ask = format!(
+            "Question {n} of chat {seed}: how does step {n} of the pipeline handle a retry after a timeout?"
+        );
+        let answer = leak(format!(
+            "Step {n} retries the request once after a timeout, then reports the failure to the caller. \
+             It keeps the partial result so the next attempt resumes where this one stopped (chat {seed})."
+        ));
+        let turns = if n % 3 == 2 {
+            vec![
+                turn(
+                    "Checking the file first.",
+                    vec![call(
+                        leak(format!("c{seed}_{n}")),
+                        "read_file",
+                        leak(format!(r#"{{"path":"src/step_{n}.rs"}}"#)),
+                        leak(format!(
+                            "fn step_{n}() {{\n    retry_once();\n    keep_partial_result();\n}}\n"
+                        )),
+                    )],
+                )
+                .usage(300, 40),
+                say(answer).usage(420, 55),
+            ]
+        } else {
+            vec![say(answer).usage(200, 30)]
+        };
+        chat.exchange(&ask, turns);
+    }
+    chat.desktop(id, false)
+}
+
 fn ids_missing_and_duplicate() -> Value {
     let mut session = plain_chat(5).desktop("ids_missing_and_duplicate", false);
     // v5 accepted data from before rows had ids, and a duplicated id.

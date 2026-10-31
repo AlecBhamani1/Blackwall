@@ -273,23 +273,24 @@ pub(crate) fn write_tx(connection: &Connection) -> Result<Transaction<'_>, Stora
     )?)
 }
 
+/// The counters read: one seek on the `sessions` primary key.
+pub(super) const COUNTERS_SQL: &str =
+    "SELECT next_seq,total_bytes,ui_count,model_count,search_bytes FROM sessions WHERE id=?1";
+
 /// The session's counters, or `NotFound` when it has no row.
 pub(crate) fn read_counters(tx: &Connection, id: &str) -> Result<Counters, StorageError> {
-    let raw = stmt(
-        tx,
-        "SELECT next_seq,total_bytes,ui_count,model_count,search_bytes FROM sessions WHERE id=?1",
-    )?
-    .query_row([id], |row| {
-        Ok([
-            row.get::<_, i64>(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-        ])
-    })
-    .optional()?
-    .ok_or(StorageError::NotFound)?;
+    let raw = stmt(tx, COUNTERS_SQL)?
+        .query_row([id], |row| {
+            Ok([
+                row.get::<_, i64>(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ])
+        })
+        .optional()?
+        .ok_or(StorageError::NotFound)?;
     Ok(Counters {
         next_seq: raw[0],
         total_bytes: unsigned(raw[1])?,
@@ -710,6 +711,10 @@ fn context_reason(error: &ViewError) -> &'static str {
     }
 }
 
+/// A chat's whole log, in order: one range scan on the `chat_events` primary key, no sort.
+pub(super) const EVENTS_SQL: &str =
+    "SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq";
+
 /// Reads and rebuilds a session. It starts no transaction: the caller owns the snapshot, which is
 /// how the upgrade reads inside its own.
 fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError> {
@@ -754,10 +759,7 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
     let mut tally = Tally::default();
     let mut events = vec![];
     {
-        let mut statement = stmt(
-            conn,
-            "SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq",
-        )?;
+        let mut statement = stmt(conn, EVENTS_SQL)?;
         let mut rows = statement.query([id])?;
         while let Some(row) = rows.next()? {
             let seq: i64 = row.get(0)?;
@@ -934,6 +936,15 @@ pub(crate) fn load_json_v6_from(conn: &Connection, id: &str) -> Result<Value, St
     Ok(chat_json(&loaded))
 }
 
+/// The session list: the newest 500 by `sessions_updated_at`, typed columns only.
+pub(super) const LIST_SQL: &str = "SELECT id, title, updated_at, mode, workspace
+             FROM (
+                 SELECT id, title, updated_at, mode, workspace
+                 FROM sessions
+                 ORDER BY updated_at DESC LIMIT 500
+             )
+             ORDER BY updated_at DESC";
+
 impl LocalStore {
     /// Adds an empty session at revision 1, inside one write transaction that also enforces the
     /// 500-session limit.
@@ -1066,16 +1077,7 @@ impl LocalStore {
 
     /// The session list as today's JSON, from typed columns only; no `chat_events` row is read.
     pub(crate) fn list_v6(&self) -> Result<Vec<Value>, StorageError> {
-        let mut statement = stmt(
-            &self.connection,
-            "SELECT id, title, updated_at, mode, workspace
-             FROM (
-                 SELECT id, title, updated_at, mode, workspace
-                 FROM sessions
-                 ORDER BY updated_at DESC LIMIT 500
-             )
-             ORDER BY updated_at DESC",
-        )?;
+        let mut statement = stmt(&self.connection, LIST_SQL)?;
         let rows = statement.query_map([], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
