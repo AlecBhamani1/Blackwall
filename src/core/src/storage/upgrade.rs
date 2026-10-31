@@ -420,7 +420,13 @@ fn convert_all(
         .query([])?
         .next()?
         .is_some();
-    if broken {
+    // Every chat kept was given its key as it converted (R6-1).
+    let keyless: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE key IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if broken || keyless {
         return Err(StorageError::Invalid(FOREIGN_KEYS_BROKEN));
     }
     tx.pragma_update(None, "user_version", V6)?;

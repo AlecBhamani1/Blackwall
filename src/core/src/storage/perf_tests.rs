@@ -12,7 +12,7 @@ use super::{
     chats::{
         append, append_model, append_run_start, append_ui_assistant, append_ui_user,
         counter_repairs, read_counters, statements, v6_in_memory, write_context, write_counters,
-        write_tx, Counters, COUNTERS_SQL, EVENTS_SQL, LIST_SQL,
+        write_tx, Counters, COUNTERS_SQL, EVENTS_SQL, INSERT_EVENT_SQL, LIST_SQL,
     },
     convert::upgrade_inline_values,
     fixtures::{build_v5, long_chat},
@@ -231,16 +231,28 @@ fn load_list_and_counter_reads_use_their_indexes() {
     chat_with_history(&db, "s", 20);
     make(&db, "t");
 
-    // Load: a range seek on the (session_id, seq) primary key, already in order.
-    let load = plan(&db, EVENTS_SQL, &["s"]);
+    // Load: a range seek on the (sid, seq) unique index, already in order (R6-1).
+    let events_index: String = db
+        .connection()
+        .query_row(
+            "SELECT name FROM pragma_index_list('chat_events') WHERE origin='u'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let load = plan(&db, EVENTS_SQL, &["1"]);
     assert!(load.contains("SEARCH chat_events"), "{load}");
-    assert!(load.contains("USING PRIMARY KEY"), "{load}");
-    assert!(load.contains("session_id=?"), "{load}");
+    assert!(load.contains(&format!("INDEX {events_index}")), "{load}");
+    assert!(load.contains("sid=?"), "{load}");
     assert!(!load.contains("SCAN"), "{load}");
     assert!(
         !load.contains("TEMP B-TREE"),
-        "{load}: the primary key is the order"
+        "{load}: the index is the order"
     );
+    // An append finds the session's key with one seek on `sessions.id`.
+    let insert = plan(&db, INSERT_EVENT_SQL, &["s", "0", "model", "{}"]);
+    assert!(insert.contains("SEARCH sessions"), "{insert}");
+    assert!(!insert.contains("SCAN"), "{insert}");
 
     // Counters: a seek on the unique index SQLite builds for `sessions.id TEXT PRIMARY KEY`.
     let autoindex: String = db
@@ -272,7 +284,12 @@ fn load_list_and_counter_reads_use_their_indexes() {
         .unwrap();
     assert_eq!(index_exists, 1);
     let list = plan(&db, LIST_SQL, &[]);
-    assert!(list.contains("USING INDEX sessions_updated_at"), "{list}");
+    // SQLite may read it as a covering index when every listed column is in it.
+    assert!(
+        list.contains("USING INDEX sessions_updated_at")
+            || list.contains("USING COVERING INDEX sessions_updated_at"),
+        "{list}"
+    );
     assert!(!list.contains("chat_events"), "{list}");
     assert!(!list.contains("TEMP B-TREE"), "{list}");
 }

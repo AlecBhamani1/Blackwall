@@ -59,7 +59,8 @@ pub(super) fn derived_bytes(messages: &[Value], skip: Option<u64>) -> u64 {
 
 /// Adds one UI message to the search index, inside the caller's write transaction. `seq` is the
 /// event that holds it and `message_index` its position among the chat's UI messages. A message
-/// with no text, or past the session's allowance, gets no entry.
+/// with no text, or past the session's allowance, gets no entry. The key row holds positions
+/// only: a hit's id and role come from the message itself when it is rebuilt (R6-2).
 pub(crate) fn index_message(
     tx: &Connection,
     id: &str,
@@ -77,27 +78,47 @@ pub(crate) fn index_message(
     if end == 0 {
         return Ok(());
     }
-    let fallback = format!("message_{message_index}");
-    let message_id = message["id"]
-        .as_str()
-        .filter(|id| id.len() <= 128)
-        .unwrap_or(&fallback);
     stmt(
         tx,
-        "INSERT INTO chat_search_keys(session_id,seq,message_index,message_id,role) VALUES (?1,?2,?3,?4,?5)",
+        "INSERT INTO chat_search_keys(sid,seq,message_index) \
+         VALUES ((SELECT key FROM sessions WHERE id=?1),?2,?3)",
     )?
     .execute(params![
         id,
         seq,
-        i64::try_from(message_index).unwrap_or(i64::MAX),
-        message_id,
-        role
+        i64::try_from(message_index).unwrap_or(i64::MAX)
     ])?;
     let key = tx.last_insert_rowid();
     stmt(tx, "INSERT INTO chat_search(rowid,content) VALUES (?1,?2)")?
         .execute(params![key, &text[..end]])?;
     c.search_bytes += end as u64;
     Ok(())
+}
+
+/// One indexed message of a rebuilt chat, as a hit reports it.
+struct Indexed {
+    position: usize,
+    text: String,
+    /// The message's own id when it has one of at most 128 bytes, else `message_{index}`, as v5
+    /// recall reported it.
+    message_id: String,
+    role: String,
+}
+
+impl Indexed {
+    fn new(message: &Value, position: usize, text: &str) -> Self {
+        let message_id = message["id"]
+            .as_str()
+            .filter(|id| id.len() <= 128)
+            .map_or_else(|| format!("message_{position}"), str::to_owned);
+        Self {
+            position,
+            text: text.to_owned(),
+            message_id,
+            // `indexed_texts` keeps only user and assistant messages.
+            role: message["role"].as_str().unwrap_or_default().to_owned(),
+        }
+    }
 }
 
 /// The excerpt for each text, made with the same FTS5 `snippet()` call v5 ran against its stored
@@ -137,25 +158,23 @@ pub(crate) fn search_v6(
     struct Row {
         key: i64,
         session_id: String,
-        message_id: String,
         message_index: u32,
         title: String,
         mode: String,
         project: Option<String>,
         updated_at: i64,
-        role: String,
     }
     let rows: Vec<Row> = {
         let mut statement = stmt(
             store.connection(),
-            "SELECT k.id, s.id, k.message_id, k.message_index, s.title,
+            "SELECT k.id, s.id, k.message_index, s.title,
                 CASE WHEN s.mode='agent' THEN 'agent'
                      WHEN s.mode IS NULL AND substr(s.id,1,4)='cli_' THEN 'agent'
                      ELSE 'chat' END,
-                s.workspace, s.updated_at, k.role
+                s.workspace, s.updated_at
              FROM chat_search
              JOIN chat_search_keys k ON k.id = chat_search.rowid
-             JOIN sessions s ON s.id = k.session_id
+             JOIN sessions s ON s.key = k.sid
              WHERE chat_search MATCH ?1 AND (?2 IS NULL OR s.workspace = ?2)
              AND (?3 IS NULL OR s.updated_at >= ?3) AND (?4 IS NULL OR s.updated_at <= ?4)
              ORDER BY bm25(chat_search), s.updated_at DESC, k.message_index LIMIT ?5",
@@ -172,28 +191,27 @@ pub(crate) fn search_v6(
                 Ok(Row {
                     key: row.get(0)?,
                     session_id: row.get(1)?,
-                    message_id: row.get(2)?,
-                    message_index: row.get(3)?,
-                    title: row.get(4)?,
-                    mode: row.get(5)?,
-                    project: row.get(6)?,
-                    updated_at: row.get(7)?,
-                    role: row.get(8)?,
+                    message_index: row.get(2)?,
+                    title: row.get(3)?,
+                    mode: row.get(4)?,
+                    project: row.get(5)?,
+                    updated_at: row.get(6)?,
                 })
             },
         )?;
         rows.collect::<Result<_, _>>()?
     };
     // Only the matching messages are rebuilt, each chat once.
-    let mut chats: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut chats: HashMap<String, Vec<Indexed>> = HashMap::new();
     let mut texts = vec![];
+    let mut found = HashMap::new();
     for row in &rows {
         if !chats.contains_key(&row.session_id) {
             // A chat that cannot be rebuilt loses its own hits, not everyone's.
             let indexed = match store.load_for_search(&row.session_id) {
                 Ok(Some((messages, open))) => indexed_texts(&messages, open)
                     .into_iter()
-                    .map(|(position, text)| (position, text.to_owned()))
+                    .map(|(position, text)| Indexed::new(&messages[position], position, text))
                     .collect(),
                 Ok(None) => vec![],
                 Err(error) => {
@@ -203,12 +221,12 @@ pub(crate) fn search_v6(
             };
             chats.insert(row.session_id.clone(), indexed);
         }
-        let text = chats[&row.session_id]
+        let hit = chats[&row.session_id]
             .iter()
-            .find(|(position, _)| *position == row.message_index as usize)
-            .map(|(_, text)| text.clone());
-        if let Some(text) = text {
-            texts.push((row.key, text));
+            .find(|indexed| indexed.position == row.message_index as usize);
+        if let Some(hit) = hit {
+            texts.push((row.key, hit.text.clone()));
+            found.insert(row.key, (hit.message_id.clone(), hit.role.clone()));
         }
     }
     if texts.is_empty() {
@@ -220,15 +238,16 @@ pub(crate) fn search_v6(
     let mut excerpts = snippets(store.connection(), &texts, &expression)?;
     let hits = rows.into_iter().filter_map(|row| {
         let excerpt = excerpts.remove(&row.key)?;
+        let (message_id, role) = found.remove(&row.key)?;
         Some(Ok(RecallHit {
             session_id: row.session_id,
-            message_id: row.message_id,
+            message_id,
             message_index: row.message_index,
             title: row.title.chars().take(120).collect(),
             mode: row.mode,
             project: row.project,
             updated_at: row.updated_at,
-            role: row.role,
+            role,
             excerpt: excerpt.chars().take(600).collect(),
         }))
     });
@@ -1061,7 +1080,8 @@ mod tests {
         assert_eq!(find(&db, "sharedterm").results.len(), 2);
         db.connection()
             .execute(
-                "UPDATE chat_events SET body='not json' WHERE session_id='bad' AND seq=0",
+                "UPDATE chat_events SET body='not json'
+                 WHERE sid=(SELECT key FROM sessions WHERE id='bad') AND seq=0",
                 [],
             )
             .unwrap();

@@ -743,7 +743,9 @@ fn upgrade_and_check(store: &LocalStore, body: &Value, markers: &[String]) -> Re
     let bodies: Vec<String> = {
         let mut statement = store
             .connection()
-            .prepare("SELECT body FROM chat_events WHERE session_id=?1")
+            .prepare(
+                "SELECT body FROM chat_events WHERE sid=(SELECT key FROM sessions WHERE id=?1)",
+            )
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([id], |row| row.get(0))

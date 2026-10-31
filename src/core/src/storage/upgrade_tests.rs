@@ -192,6 +192,48 @@ fn every_fixture_upgrades_with_equal_json_list_context_and_recall() {
 }
 
 #[test]
+fn keys_follow_the_conversion_order_and_a_new_chat_takes_the_next() {
+    let dir = Scratch::new("keys");
+    build_v5(&dir, &v5_sessions(), 5);
+    let db = open6(&dir).unwrap();
+    let ids = |sql: &str| -> Vec<String> {
+        let mut statement = db.connection().prepare(sql).unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    // Newest first, as `convert_all` walks them; the set-aside chat's key was rolled back with it.
+    let by_key = ids("SELECT id FROM sessions ORDER BY key");
+    assert_eq!(
+        by_key,
+        ids("SELECT id FROM sessions ORDER BY updated_at DESC, rowid")
+    );
+    let keys: Vec<i64> = {
+        let mut statement = db
+            .connection()
+            .prepare("SELECT key FROM sessions ORDER BY key")
+            .unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    assert_eq!(keys, (1..=by_key.len() as i64).collect::<Vec<_>>());
+    db.create_session(&crate::storage::NewSession {
+        id: "brand_new".into(),
+        title: "New".into(),
+        mode: None,
+        workspace: None,
+        updated_at: 1,
+    })
+    .unwrap();
+    let key: i64 = db
+        .connection()
+        .query_row("SELECT key FROM sessions WHERE id='brand_new'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(key, by_key.len() as i64 + 1);
+}
+
+#[test]
 fn the_invalid_fixture_is_set_aside_and_noticed_once() {
     let dir = Scratch::new("notices");
     build_v5(&dir, &v5_sessions(), 5);
@@ -1099,7 +1141,7 @@ fn v6_dump(database: &Path) -> Vec<(String, Vec<String>)> {
     let connection = Connection::open(database).unwrap();
     [
         "sessions ORDER BY id",
-        "chat_events ORDER BY session_id, seq",
+        "chat_events ORDER BY sid, seq",
         "chat_context ORDER BY session_id",
         "chat_checkpoints ORDER BY session_id, ordinal",
         "chat_search_keys ORDER BY id",
@@ -1168,14 +1210,26 @@ fn a_v5_delete_on_v6_cascades_cleanly() {
         "chat_checkpoints",
         "chat_search_keys",
     ];
-    let rows = |id: &str| -> Vec<i64> {
+    // A chat's rows by its id, or by its integer key for the tables keyed on it (R6-1). The key
+    // is read before the delete: once the row is gone, a lookup by id would find nothing anyway.
+    let key = |id: &str| {
+        // A chat set aside by the upgrade has no row and no key.
+        let sql = "SELECT COALESCE((SELECT key FROM sessions WHERE id=?1), -1)";
+        count(&dir.database(), sql, id)
+    };
+    let rows = |id: &str, key: i64| -> Vec<i64> {
         tables
             .iter()
             .map(|table| {
+                // `sid` has integer affinity, so the key compares as a number.
+                let (column, value) = match *table {
+                    "chat_events" | "chat_search_keys" => ("sid", key.to_string()),
+                    _ => ("session_id", id.to_owned()),
+                };
                 count(
                     &dir.database(),
-                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id=?1"),
-                    id,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+                    &value,
                 )
             })
             .collect()
@@ -1184,11 +1238,12 @@ fn a_v5_delete_on_v6_cascades_cleanly() {
     let id = sessions
         .iter()
         .map(|s| s["id"].as_str().unwrap())
-        .max_by_key(|id| rows(id).iter().sum::<i64>())
+        .max_by_key(|id| rows(id, key(id)).iter().sum::<i64>())
         .unwrap()
         .to_owned();
     let id = id.as_str();
-    let before = rows(id);
+    let id_key = key(id);
+    let before = rows(id, id_key);
     assert!(before[0] > 0 && before[3] > 0, "{id}: {before:?}");
     let others = v6_dump(&dir.database());
     let search_before = count(
@@ -1199,7 +1254,7 @@ fn a_v5_delete_on_v6_cascades_cleanly() {
 
     stale.delete_session(id).unwrap();
 
-    assert_eq!(rows(id), vec![0; tables.len()]);
+    assert_eq!(rows(id, id_key), vec![0; tables.len()]);
     assert_eq!(
         count(
             &dir.database(),

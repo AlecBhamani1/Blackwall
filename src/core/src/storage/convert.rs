@@ -306,8 +306,14 @@ fn convert(conn: &Connection, id: &str, updated_at: i64, raw: &str) -> Result<Co
     if metadata.len() > MAX_METADATA_BYTES {
         return Err(StorageError::Limit(Cap::Metadata).into());
     }
-    if stmt(conn, "UPDATE sessions SET body='',metadata=?2 WHERE id=?1")?
-        .execute(params![id, metadata])?
+    // A v5 row gets its key here, so keys follow the conversion order (R6-1); a row inserted
+    // since the v6 schema already has one.
+    if stmt(
+        conn,
+        "UPDATE sessions SET body='',metadata=?2,
+         key=COALESCE(key,(SELECT COALESCE(MAX(key),0)+1 FROM sessions)) WHERE id=?1",
+    )?
+    .execute(params![id, metadata])?
         == 0
     {
         return Err(Fail::Storage(StorageError::NotFound));
@@ -1235,7 +1241,10 @@ mod tests {
     fn event_bodies(db: &LocalStore, id: &str) -> Vec<(String, Value)> {
         let mut statement = db
             .connection()
-            .prepare("SELECT kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq")
+            .prepare(
+                "SELECT kind,body FROM chat_events
+                 WHERE sid=(SELECT key FROM sessions WHERE id=?1) ORDER BY seq",
+            )
             .unwrap();
         let rows = statement
             .query_map([id], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))
@@ -1731,13 +1740,14 @@ mod tests {
             }
         );
         assert_eq!(upgrade_inline_values(), before + 1);
+        // The only chat was set aside, so nothing of it is left in any table.
         for table in [
             "chat_events",
             "chat_context",
             "chat_checkpoints",
             "chat_search_keys",
         ] {
-            let sql = format!("SELECT count(*) FROM {table} WHERE session_id=?1");
+            let sql = format!("SELECT count(*) FROM {table} WHERE ?1 IS NOT NULL");
             assert_eq!(count(&db, &sql, "desktop_plain"), 0, "{table}");
         }
         assert_eq!(
@@ -1790,16 +1800,15 @@ mod tests {
         );
         tx.commit().unwrap();
         assert_eq!(quarantined(&db, "huge").unwrap().1.len(), raw.len());
-        for id in ["many_attachments", "big_attachment", "huge"] {
-            assert_eq!(
-                count(
-                    &db,
-                    "SELECT count(*) FROM chat_events WHERE session_id=?1",
-                    id
-                ),
-                0
-            );
-        }
+        // Every chat was set aside, so no event of any of them is left.
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM chat_events WHERE ?1 IS NOT NULL",
+                "any"
+            ),
+            0
+        );
     }
 
     #[test]
@@ -1899,7 +1908,7 @@ mod tests {
         assert_eq!(
             count(
                 &db,
-                "SELECT count(*) FROM chat_events WHERE session_id=?1",
+                "SELECT count(*) FROM chat_events WHERE sid=(SELECT key FROM sessions WHERE id=?1)",
                 "compacted"
             ),
             0
@@ -2029,10 +2038,11 @@ mod tests {
                 set_aside_for(UNSUPPORTED),
                 "{name}"
             );
+            // Every case so far was set aside, so no event is left at all.
             assert_eq!(
                 count(
                     &db,
-                    "SELECT count(*) FROM chat_events WHERE session_id=?1",
+                    "SELECT count(*) FROM chat_events WHERE ?1 IS NOT NULL",
                     &id
                 ),
                 0

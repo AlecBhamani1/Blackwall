@@ -57,6 +57,13 @@ impl Cap {
 /// Turns a v5 database into the v6 shape. The caller owns the surrounding transaction.
 ///
 /// The v5 `sessions.body` column stays, and new rows leave it empty: no `DROP COLUMN`, no rebuild.
+///
+/// `sessions.key` is the integer every chat row hangs off (R6-1), so `chat_events` is an ordinary
+/// rowid table whose rows stay on their leaf pages. It is explicit, never `sessions.rowid`, which
+/// VACUUM may renumber. `ADD COLUMN` cannot declare it `NOT NULL` (that needs a constant default,
+/// which the unique index would refuse twice), so it is never null by construction instead: the
+/// upgrade gives each v5 row its key as it converts it, in conversion order, and checks that none
+/// is left; a row inserted afterwards gets `MAX(key)+1` from `sessions_key_ai`.
 #[cfg_attr(not(test), allow(dead_code))] // the upgrade that calls it lands later
 pub(crate) fn apply_v6_schema(tx: &Connection) -> Result<(), StorageError> {
     tx.execute_batch(
@@ -74,12 +81,18 @@ pub(crate) fn apply_v6_schema(tx: &Connection) -> Result<(), StorageError> {
         ALTER TABLE sessions ADD COLUMN ui_count INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE sessions ADD COLUMN model_count INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE sessions ADD COLUMN search_bytes INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sessions ADD COLUMN key INTEGER;
+        CREATE UNIQUE INDEX sessions_key ON sessions(key);
+        CREATE TRIGGER sessions_key_ai AFTER INSERT ON sessions WHEN new.key IS NULL BEGIN
+            UPDATE sessions SET key = (SELECT COALESCE(MAX(key), 0) + 1 FROM sessions)
+            WHERE rowid = new.rowid; END;
         CREATE TABLE chat_events (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            id INTEGER PRIMARY KEY,
+            sid INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
             seq INTEGER NOT NULL,
             kind TEXT NOT NULL CHECK (kind IN ('ui_user','model','ui_progress','ui_assistant')),
             body TEXT NOT NULL,
-            PRIMARY KEY (session_id, seq)) WITHOUT ROWID;
+            UNIQUE (sid, seq));
         CREATE TABLE chat_context (
             session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
             model_from INTEGER NOT NULL,
@@ -94,12 +107,10 @@ pub(crate) fn apply_v6_schema(tx: &Connection) -> Result<(), StorageError> {
             PRIMARY KEY (session_id, ordinal)) WITHOUT ROWID;
         CREATE TABLE chat_search_keys (
             id INTEGER PRIMARY KEY,
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            sid INTEGER NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
             seq INTEGER NOT NULL,
             message_index INTEGER NOT NULL,
-            message_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            UNIQUE (session_id, seq));
+            UNIQUE (sid, seq));
         CREATE VIRTUAL TABLE chat_search USING fts5(content, content='', contentless_delete=1);
         INSERT INTO chat_search(chat_search, rank) VALUES ('secure-delete', 1);
         CREATE TRIGGER chat_search_keys_ad AFTER DELETE ON chat_search_keys BEGIN
@@ -376,18 +387,17 @@ fn marks_run(kind: Kind, body: &Value) -> bool {
 
 /// Recomputes the counters from the session's rows.
 pub(crate) fn recount(tx: &Connection, id: &str) -> Result<Counters, StorageError> {
-    let (metadata, search_bytes): (String, i64) =
-        stmt(tx, "SELECT metadata,search_bytes FROM sessions WHERE id=?1")?
-            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?
-            .ok_or(StorageError::NotFound)?;
+    let (metadata, search_bytes, key): (String, i64, i64) = stmt(
+        tx,
+        "SELECT metadata,search_bytes,key FROM sessions WHERE id=?1",
+    )?
+    .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    .optional()?
+    .ok_or(StorageError::NotFound)?;
     let mut tally = Tally::default();
     let mut events = vec![];
-    let mut statement = stmt(
-        tx,
-        "SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq",
-    )?;
-    let mut rows = statement.query([id])?;
+    let mut statement = stmt(tx, EVENTS_SQL)?;
+    let mut rows = statement.query([key])?;
     while let Some(row) = rows.next()? {
         let seq: i64 = row.get(0)?;
         let kind = parse_kind(&row.get::<_, String>(1)?)?;
@@ -463,6 +473,10 @@ pub(crate) fn validate_ui_message(message: &Value, role: &str) -> Result<(), Sto
 
 // ---- appending ----
 
+/// One event row. The session's key is one seek on `sessions.id`, inside the same statement.
+pub(super) const INSERT_EVENT_SQL: &str = "INSERT INTO chat_events(sid,seq,kind,body) \
+     VALUES ((SELECT key FROM sessions WHERE id=?1),?2,?3,?4)";
+
 /// Adds one event: a single `INSERT`, with the caps checked first and nothing written on a
 /// refusal. It moves `next_seq`, `total_bytes` and (for a `model` row) `model_count` in `c`; the
 /// caller stores `c` with [`write_counters`] in the same transaction. It never counts a UI
@@ -487,11 +501,7 @@ pub(crate) fn append(
         return Err(StorageError::Limit(Cap::ModelEntries));
     }
     let seq = c.next_seq;
-    stmt(
-        tx,
-        "INSERT INTO chat_events(session_id,seq,kind,body) VALUES (?1,?2,?3,?4)",
-    )?
-    .execute(params![id, seq, kind_name(kind), text])?;
+    stmt(tx, INSERT_EVENT_SQL)?.execute(params![id, seq, kind_name(kind), text])?;
     c.next_seq += 1;
     c.total_bytes += len as u64;
     c.model_count += model;
@@ -711,9 +721,10 @@ fn context_reason(error: &ViewError) -> &'static str {
     }
 }
 
-/// A chat's whole log, in order: one range scan on the `chat_events` primary key, no sort.
+/// A chat's whole log by its `sessions.key`, in order: one range scan on the `(sid, seq)` unique
+/// index, no sort.
 pub(super) const EVENTS_SQL: &str =
-    "SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq";
+    "SELECT seq,kind,body FROM chat_events WHERE sid=?1 ORDER BY seq";
 
 /// Reads and rebuilds a session. It starts no transaction: the caller owns the snapshot, which is
 /// how the upgrade reads inside its own.
@@ -726,11 +737,12 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
         String,
         i64,
         [i64; 5],
+        i64,
     );
     let columns: Option<Columns> = stmt(
         conn,
         "SELECT title,updated_at,mode,workspace,metadata,revision,
-         next_seq,total_bytes,ui_count,model_count,search_bytes FROM sessions WHERE id=?1",
+         next_seq,total_bytes,ui_count,model_count,search_bytes,key FROM sessions WHERE id=?1",
     )?
     .query_row([id], |row| {
         Ok((
@@ -747,10 +759,11 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
                 row.get(9)?,
                 row.get(10)?,
             ],
+            row.get(11)?,
         ))
     })
     .optional()?;
-    let Some((title, updated_at, mode, workspace, metadata_text, revision, stored)) = columns
+    let Some((title, updated_at, mode, workspace, metadata_text, revision, stored, key)) = columns
     else {
         return Ok(None);
     };
@@ -760,7 +773,7 @@ fn read_chat(conn: &Connection, id: &str) -> Result<Option<Loaded>, StorageError
     let mut events = vec![];
     {
         let mut statement = stmt(conn, EVENTS_SQL)?;
-        let mut rows = statement.query([id])?;
+        let mut rows = statement.query([key])?;
         while let Some(row) = rows.next()? {
             let seq: i64 = row.get(0)?;
             let kind = parse_kind(&row.get::<_, String>(1)?)?;
@@ -1103,7 +1116,8 @@ impl LocalStore {
         let tx = write_tx(&self.connection)?;
         let indexed: bool = stmt(
             &tx,
-            "SELECT EXISTS(SELECT 1 FROM chat_search_keys WHERE session_id=?1)",
+            "SELECT EXISTS(SELECT 1 FROM chat_search_keys
+             WHERE sid=(SELECT key FROM sessions WHERE id=?1))",
         )?
         .query_row([id], |row| row.get(0))?;
         stmt(&tx, "DELETE FROM sessions WHERE id=?1")?.execute([id])?;
@@ -1233,11 +1247,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (String::new(), "{}".into(), 1, 0, 0, 0, 0));
-        // chat_events is a rowid-less add-only log keyed by (session, seq).
+        // A new row gets the next integer key, and its events hang off that key.
+        let key = |id: &str| -> i64 {
+            db.connection()
+                .query_row("SELECT key FROM sessions WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(key("a"), 1);
+        db.connection()
+            .execute(
+                "INSERT INTO sessions(id,title,updated_at,body) VALUES ('b','t',1,'')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(key("b"), 2);
+        // A taken key is refused, so no two chats share one.
         assert!(db
             .connection()
             .execute(
-                "INSERT INTO chat_events(session_id,seq,kind,body) VALUES ('a',0,'bogus','{}')",
+                "INSERT INTO sessions(id,title,updated_at,body,key) VALUES ('c','t',1,'',2)",
+                [],
+            )
+            .is_err());
+        // chat_events is an ordinary rowid table (R6-1): rows stay on their leaf pages.
+        let without_rowid: i64 = db
+            .connection()
+            .query_row(
+                "SELECT wr FROM pragma_table_list WHERE name='chat_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(without_rowid, 0);
+        // An unknown kind, and a key no session has, are refused.
+        for (sid, kind) in [(1, "bogus"), (99, "ui_user")] {
+            assert!(db
+                .connection()
+                .execute(
+                    "INSERT INTO chat_events(sid,seq,kind,body) VALUES (?1,0,?2,'{}')",
+                    params![sid, kind],
+                )
+                .is_err());
+        }
+        db.connection()
+            .execute(
+                "INSERT INTO chat_events(sid,seq,kind,body) VALUES (1,0,'ui_user','{}')",
+                [],
+            )
+            .unwrap();
+        // (sid, seq) is unique.
+        assert!(db
+            .connection()
+            .execute(
+                "INSERT INTO chat_events(sid,seq,kind,body) VALUES (1,0,'ui_user','{}')",
                 [],
             )
             .is_err());
@@ -1392,7 +1454,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "INSERT INTO chat_events(session_id,seq,kind,body) VALUES ('s',0,'ui_user','{}')",
+            "INSERT INTO chat_events(sid,seq,kind,body) VALUES (1,0,'ui_user','{}')",
             [],
         )
         .unwrap();
@@ -1407,7 +1469,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "INSERT INTO chat_search_keys(id,session_id,seq,message_index,message_id,role) VALUES (5,'s',0,0,'m','user')",
+            "INSERT INTO chat_search_keys(id,sid,seq,message_index) VALUES (5,1,0,0)",
             [],
         )
         .unwrap();
@@ -1485,7 +1547,10 @@ mod tests {
     fn rows(db: &LocalStore, id: &str) -> Vec<(i64, String, String)> {
         let mut statement = db
             .connection()
-            .prepare("SELECT seq,kind,body FROM chat_events WHERE session_id=?1 ORDER BY seq")
+            .prepare(
+                "SELECT seq,kind,body FROM chat_events
+                 WHERE sid=(SELECT key FROM sessions WHERE id=?1) ORDER BY seq",
+            )
             .unwrap();
         let rows = statement
             .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -2429,7 +2494,8 @@ mod tests {
             (1002, "kept", "zqxjkeptterm"),
         ] {
             c.execute(
-                "INSERT INTO chat_search_keys(id,session_id,seq,message_index,message_id,role) VALUES (?1,?2,?1,0,'m','user')",
+                "INSERT INTO chat_search_keys(id,sid,seq,message_index)
+                 VALUES (?1,(SELECT key FROM sessions WHERE id=?2),?1,0)",
                 params![rowid, session],
             )
             .unwrap();
@@ -2441,6 +2507,13 @@ mod tests {
         }
         let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
         assert!(contains(&shadow_bytes(&db), b"zqxjgoneterm"));
+        let gone = count(&db, "SELECT key FROM sessions WHERE id='gone'");
+        assert!(
+            count(
+                &db,
+                &format!("SELECT count(*) FROM chat_events WHERE sid={gone}")
+            ) > 0
+        );
         db.delete_v6("gone").unwrap();
         let shadow = shadow_bytes(&db);
         assert!(
@@ -2449,13 +2522,16 @@ mod tests {
         );
         assert!(contains(&shadow, b"zqxjkeptterm"));
         assert!(db.load_chat("gone").unwrap().is_none());
-        assert_eq!(
-            count(
-                &db,
-                "SELECT count(*) FROM chat_events WHERE session_id='gone'"
-            ),
-            0
-        );
+        for table in ["chat_events", "chat_search_keys"] {
+            assert_eq!(
+                count(
+                    &db,
+                    &format!("SELECT count(*) FROM {table} WHERE sid={gone}")
+                ),
+                0,
+                "{table}"
+            );
+        }
         assert!(db.load_chat("kept").unwrap().is_some());
         db.delete_v6("gone").unwrap(); // idempotent, as v5's delete is
     }
