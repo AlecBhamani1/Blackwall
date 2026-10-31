@@ -765,6 +765,10 @@
     accent-color: var(--accent);
     width: 17px;
     height: 17px;
+    vertical-align: middle;
+  }
+  input[type='radio'] {
+    vertical-align: middle;
   }
   label {
     display: block;
@@ -773,7 +777,7 @@
     margin-bottom: 9px;
   }
   textarea,
-  input:not([type='checkbox']) {
+  input:not([type='checkbox']):not([type='radio']) {
     width: 100%;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);

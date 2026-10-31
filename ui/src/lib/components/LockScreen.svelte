@@ -110,6 +110,9 @@
     color: var(--text-on-accent);
     font-weight: 600;
   }
+  p + button {
+    margin-top: 12px;
+  }
   button:disabled {
     opacity: 0.5;
   }
