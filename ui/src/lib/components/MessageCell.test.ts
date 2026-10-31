@@ -2,7 +2,13 @@ import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { ChatMessage } from '../types';
+import * as markdown from '../markdown';
 import MessageCell from './MessageCell.svelte';
+
+vi.mock('../markdown', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../markdown')>();
+  return { ...original, renderMarkdown: vi.fn(original.renderMarkdown) };
+});
 
 function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -35,6 +41,39 @@ describe('MessageCell', () => {
     await user.click(screen.getByText('Thought for 3s'));
     expect(thought.open).toBe(true);
     expect(thought).toHaveTextContent('First I checked the plan.');
+  });
+
+  it('renders reasoning markdown only once it is opened, and only once per text', async () => {
+    const user = userEvent.setup();
+    const reasoning = 'Check **the plan** first.';
+    const rendered = () =>
+      vi.mocked(markdown.renderMarkdown).mock.calls.filter(([source]) => source === reasoning);
+    const props = (content: string) => ({
+      message: message({ content, reasoning, reasoningMs: 2600 }),
+    });
+    const { container, rerender } = render(MessageCell, { props: props('One') });
+    const thought = container.querySelector<HTMLDetailsElement>('details.reasoning')!;
+    expect(rendered()).toHaveLength(0);
+    expect(thought.querySelector('strong')).toBeNull();
+
+    await user.click(screen.getByText('Thought for 3s'));
+    expect(rendered()).toHaveLength(1);
+    expect(thought.querySelector('strong')).toHaveTextContent('the plan');
+    expect(thought).not.toHaveTextContent('**');
+
+    await rerender(props('One, then two'));
+    await user.click(screen.getByText('Thought for 3s'));
+    await user.click(screen.getByText('Thought for 3s'));
+    expect(rendered()).toHaveLength(1);
+  });
+
+  it('sanitizes markup in reasoning', async () => {
+    const user = userEvent.setup();
+    const { container } = render(MessageCell, {
+      props: { message: message({ reasoning: 'Hi <script>window.bad = true</script>' }) },
+    });
+    await user.click(screen.getByText('Thought for 1s'));
+    expect(container.querySelector('script')).toBeNull();
   });
 
   it('shows no reasoning section when the model did not reason', () => {

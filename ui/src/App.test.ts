@@ -117,6 +117,55 @@ it('uses only sidebar modes, separates histories, and keeps and restores Agent p
   expect(screen.queryByRole('button', { name: 'demo' })).not.toBeInTheDocument();
 });
 
+it('makes choosing a project folder the call to action when Agent has none', async () => {
+  const user = userEvent.setup();
+  render(App);
+  const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await screen.findByRole('combobox', { name: 'Model' });
+  expect(screen.getByText(/Chat with your model/)).toBeInTheDocument();
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  const choose = screen.getByRole('button', { name: 'Choose project folder' });
+  expect(screen.getByText(/Choose a project folder to begin/)).toBeInTheDocument();
+  expect(screen.queryByText(/Chat with your model/)).not.toBeInTheDocument();
+  expect(choose).toHaveClass('needs-folder');
+  expect(choose).not.toHaveClass('pulse');
+
+  await user.type(input, 'Do the task{Enter}');
+  expect(
+    await screen.findByText('Choose a project folder before starting an agent task.'),
+  ).toBeInTheDocument();
+  expect(choose).toHaveClass('pulse');
+  expect(vi.mocked(localModelClient.streamChat)).not.toHaveBeenCalled();
+
+  await user.click(screen.getByRole('button', { name: 'Choose a project folder' }));
+  expect(native.invoke.mock.calls.some(([command]) => command === 'choose_workspace')).toBe(true);
+  const demo = await screen.findByRole('button', { name: 'demo' });
+  expect(demo).not.toHaveClass('needs-folder');
+  expect(screen.queryByText(/Choose a project folder to begin/)).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Choose a project folder' })).not.toBeInTheDocument();
+});
+
+it('toggles the project files pane with a panel icon, filled while it is shown', async () => {
+  const user = userEvent.setup();
+  render(App);
+  await screen.findByRole('combobox', { name: 'Model' });
+  await fireEvent.click(
+    within(screen.getByLabelText('History mode')).getByRole('button', { name: 'Agent' }),
+  );
+  await user.click(screen.getByRole('button', { name: 'Choose project folder' }));
+  const hide = await screen.findByRole('button', { name: 'Hide files' });
+  expect(hide).toHaveAttribute('title', 'Hide files');
+  expect(hide).toHaveAttribute('aria-pressed', 'true');
+  expect(hide.querySelector('path[fill="currentColor"]')).not.toBeNull();
+  await user.click(hide);
+  const show = screen.getByRole('button', { name: 'Show files' });
+  expect(show).toHaveAttribute('title', 'Show files');
+  expect(show.querySelector('rect')).not.toBeNull();
+  expect(show.querySelector('path[fill="currentColor"]')).toBeNull();
+});
+
 it('sends the selected command boundary and resets full access on a new session', async () => {
   const user = userEvent.setup();
   render(App);

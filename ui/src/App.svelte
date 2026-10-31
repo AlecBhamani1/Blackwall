@@ -15,6 +15,7 @@
   import ProjectTrust from './lib/components/ProjectTrust.svelte';
 
   import Sidebar from './lib/components/Sidebar.svelte';
+  import Icon from './lib/components/Icon.svelte';
   import { createChatController } from './lib/store';
   import { createAppUpdateController } from './lib/updates';
   import { sandboxClient, type SandboxStatus } from './lib/ipc';
@@ -33,6 +34,7 @@
     selectedModel,
     endpoint,
     notice,
+    folderRequests,
     connectionError,
     persistenceError,
     agentMode,
@@ -161,6 +163,8 @@
   let startupServers: LocalService[] | null = null;
   $: if (!setupOpen) startupServers = null;
   let filesVisible = true;
+  let folderPulse = false;
+  $: if ($folderRequests) folderPulse = true;
   let sidebarVisible = typeof window === 'undefined' ? true : window.innerWidth > 760;
   const showHarnessDemo =
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo');
@@ -282,6 +286,9 @@
         <div class="project-bar">
           {#if $agentMode}<button
               class="project-choice"
+              class:needs-folder={!$workspace}
+              class:pulse={folderPulse}
+              onanimationend={() => (folderPulse = false)}
               disabled={$sessionLocked || $runState !== 'idle'}
               title={$workspace || 'Choose the folder Blackwall can work in'}
               onclick={controller.chooseWorkspace}
@@ -313,9 +320,11 @@
             access</label
           >{#if $agentMode}<button
               class="export"
+              aria-label={filesVisible ? 'Hide files' : 'Show files'}
+              title={filesVisible ? 'Hide files' : 'Show files'}
               aria-pressed={filesVisible}
               onclick={() => (filesVisible = !filesVisible)}
-              >{filesVisible ? 'Hide files' : 'Show files'}</button
+              ><Icon name={filesVisible ? 'panel-right-open' : 'panel-right'} size={16} /></button
             >{/if}{#if $messages.length}<button
               class="export"
               onclick={controller.exportConversation}>Export chat</button
@@ -394,6 +403,8 @@
                 messages={$messages}
                 connectionState={$connectionState}
                 {showHarnessDemo}
+                needsFolder={isDesktop() && $agentMode && !$workspace}
+                onChooseFolder={controller.chooseWorkspace}
               />
               {#if $approval}<ApprovalCard
                   approval={$approval}
@@ -500,6 +511,26 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 250px;
+  }
+  .project-choice.needs-folder {
+    border-radius: 6px;
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    color: var(--text-primary);
+  }
+  .project-choice.pulse {
+    animation: folder-pulse 700ms ease-out 2;
+  }
+  @keyframes folder-pulse {
+    50% {
+      outline-offset: 5px;
+      outline-color: transparent;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .project-choice.pulse {
+      animation: none;
+    }
   }
   .storage-error button {
     flex: 0 0 auto;

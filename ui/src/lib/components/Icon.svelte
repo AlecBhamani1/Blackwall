@@ -21,6 +21,10 @@
     | 'link'
     | 'menu'
     | 'new-chat'
+    | 'panel-left'
+    | 'panel-left-open'
+    | 'panel-right'
+    | 'panel-right-open'
     | 'paperclip'
     | 'refresh'
     | 'stop'
@@ -102,6 +106,20 @@
   {:else if name === 'new-chat'}
     <path d="M12 20h9" />
     <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" />
+  {:else if name === 'panel-left'}
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+    <path d="M9 3v18" />
+  {:else if name === 'panel-left-open'}
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+    <path d="M9 3v18" />
+    <path d="M5 3h4v18H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z" fill="currentColor" stroke="none" />
+  {:else if name === 'panel-right'}
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+    <path d="M15 3v18" />
+  {:else if name === 'panel-right-open'}
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+    <path d="M15 3v18" />
+    <path d="M19 3h-4v18h4a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Z" fill="currentColor" stroke="none" />
   {:else if name === 'paperclip'}
     <path
       d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.5 9.5a2 2 0 0 1-2.9-2.8l8.9-8.9"
