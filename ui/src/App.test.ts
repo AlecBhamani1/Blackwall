@@ -398,8 +398,29 @@ it('asks which server to use on a first launch instead of connecting on its own'
   ).toBeVisible();
   expect(discoverModels).not.toHaveBeenCalled();
   await user.click(list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }));
+  expect(await screen.findByRole('heading', { name: 'Choose a model.' })).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Return to your conversation' }),
+  ).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Use this model' }));
   expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
   expect(discoverModels).toHaveBeenCalledWith('http://127.0.0.1:18040/v1');
+});
+
+it('shows the empty model step through the controller and does not offer to return', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(localModelClient, 'discoverModels')
+    .mockResolvedValueOnce([])
+    .mockResolvedValueOnce([]);
+  render(App);
+  await user.click(await screen.findByRole('button', { name: 'Enter a server address' }));
+  await user.type(screen.getByLabelText('Model service address'), 'https://empty.example/v1');
+  await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+  expect(await screen.findByText('This server has no chat models yet.')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Back' })).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Return to your conversation' }),
+  ).not.toBeInTheDocument();
 });
 
 it('reconnects a saved connection at startup without asking again', async () => {

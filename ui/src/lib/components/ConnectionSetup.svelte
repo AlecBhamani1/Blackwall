@@ -8,6 +8,7 @@
     isDesktop,
     serviceAddress,
     serviceName,
+    normalizeEndpoint,
     type SetupClient,
     type LocalService,
     type DownloadProgress,
@@ -27,6 +28,8 @@
   export let onForget: (endpoint: string) => void = () => {};
   export let onDone: () => void = () => {};
   export let onChooseModel: (model: string) => void = () => {};
+  export let models: string[] = [];
+  export let currentModel = '';
   export let client: SetupClient = setupClient;
   export let desktop = isDesktop();
   export let currentEndpoint = '';
@@ -34,7 +37,7 @@
   /** Servers startup already found; `null` looks for them when setup opens. */
   export let found: LocalService[] | null = null;
 
-  type Step = 'choose' | 'local' | 'remote' | 'invite' | 'advanced' | 'success';
+  type Step = 'choose' | 'local' | 'remote' | 'invite' | 'advanced' | 'model' | 'success';
   let step: Step = 'choose';
   let busy = false;
   let savingKey = false;
@@ -43,7 +46,15 @@
   let scanned = false;
   // Setup can first appear because the automatic saved-connection check failed.
   let error = connectionError;
-  let address = currentEndpoint;
+  let savedConnection = false;
+  try {
+    savedConnection = connections.some(
+      (profile) => normalizeEndpoint(profile.endpoint) === normalizeEndpoint(currentEndpoint),
+    );
+  } catch {
+    // Invalid drafts are not saved connections.
+  }
+  let address = savedConnection ? currentEndpoint : '';
   let accessKey = '';
   let connectionName = '';
   let invitation = '';
@@ -55,6 +66,9 @@
   let heading: HTMLHeadingElement;
   let errorMessage: HTMLDivElement | undefined;
   let connectedName = '';
+  let offeredModels: string[] = [];
+  let selectedModel = '';
+  let modelReturnStep: Step = 'choose';
   let keyNotSaved = false;
   let foundServices: LocalService[] = found ?? [];
   let foundScanning = false;
@@ -78,7 +92,7 @@
   function connectFound(service: LocalService) {
     // A server with nothing installed continues in the download flow.
     if (!service.models.length) void navigate('local');
-    else void connect(service.endpoint, serviceName(service));
+    else void connect(service.endpoint, serviceName(service), service.models);
   }
 
   async function navigate(next: Step) {
@@ -107,7 +121,7 @@
       if (version === operation) scanning = false;
     }
   }
-  async function connect(endpoint: string, name: string) {
+  async function connect(endpoint: string, name: string, serviceModels?: string[]) {
     if (busy) return;
     busy = true;
     error = '';
@@ -121,7 +135,15 @@
       }
       if (await onConnect(endpoint, name)) {
         connectedName = name || profileName(endpoint);
-        step = 'success';
+        await tick();
+        offeredModels = serviceModels ?? models;
+        selectedModel = offeredModels.includes(currentModel)
+          ? currentModel
+          : offeredModels.length === 1
+            ? offeredModels[0]
+            : '';
+        modelReturnStep = step;
+        step = 'model';
         await tick();
         heading?.focus();
       } else
@@ -143,6 +165,13 @@
         errorMessage?.focus();
       }
     }
+  }
+  async function chooseModel() {
+    if (!selectedModel) return;
+    onChooseModel(selectedModel);
+    step = 'success';
+    await tick();
+    heading?.focus();
   }
   async function startDownload(service: LocalService) {
     busy = true;
@@ -220,7 +249,7 @@
       <div class="brand"><LogoMark size={26} /><span>Blackwall</span></div>
       <span class="eyebrow">{step === 'success' ? 'Ready to chat' : 'Connection setup'}</span>
     </div>
-    {#if step !== 'choose' && step !== 'success'}
+    {#if step !== 'choose' && step !== 'model' && step !== 'success'}
       <button class="back" disabled={busy} onclick={() => navigate('choose')}
         ><Icon name="chevron-left" size={14} />All connection options</button
       >
@@ -236,7 +265,11 @@
       {:else}
         <p class="intro">Choose where your model runs.<br />We’ll help you get connected.</p>
       {/if}
-      {#if error}
+      {#if !savedConnection}
+        {#if !foundScanning && !foundAvailable.length}
+          <p class="no-server">No model server found on this computer.</p>
+        {/if}
+      {:else if error}
         <div class="error" role="alert" tabindex="-1" bind:this={errorMessage}>{error}</div>
       {/if}
       {#if connections.length}
@@ -376,7 +409,7 @@
               <button
                 class="primary"
                 disabled={busy}
-                onclick={() => connect(service.endpoint, 'This computer')}
+                onclick={() => connect(service.endpoint, 'This computer', service.models)}
                 >{busy ? 'Connecting…' : 'Use these models'}</button
               >
             {:else if service.supportsDownload}
@@ -433,7 +466,8 @@
       <h1 bind:this={heading} tabindex="-1">Your other computer. Ready when you are.</h1>
       <PairingPanel
         {desktop}
-        onConnect={(endpoint, name) => connect(endpoint, name).then(() => step === 'success')}
+        onConnect={(endpoint, name) =>
+          connect(endpoint, name).then(() => step === 'model' || step === 'success')}
         {onForget}
       />
       <button class="text-button advanced-link" onclick={() => navigate('advanced')}
@@ -458,7 +492,7 @@
         <input
           id="setup-address"
           bind:value={address}
-          placeholder="http://my-computer.local:11434"
+          placeholder="http://localhost:11434/v1"
           autocomplete="url"
           autocapitalize="none"
           spellcheck="false"
@@ -523,11 +557,29 @@
           >{busy ? 'Opening…' : 'Open invitation'}</button
         >
       </form>
+    {:else if step === 'model'}
+      <h1 bind:this={heading} tabindex="-1">Choose a model.</h1>
+      {#if offeredModels.length}
+        <p class="intro">Select the model Blackwall will use for this conversation.</p>
+        <fieldset disabled={busy}>
+          <legend class="sr-only">Chat model</legend>
+          {#each offeredModels as option}
+            <label class:selected={selectedModel === option} class="model-option"
+              ><input type="radio" bind:group={selectedModel} value={option} name="chat-model" />
+              <span><strong>{option}</strong></span></label
+            >
+          {/each}
+        </fieldset>
+        <button class="primary" disabled={!selectedModel} onclick={chooseModel}>Use this model</button>
+      {:else}
+        <p class="intro">This server has no chat models yet.</p>
+        <button class="secondary" onclick={() => navigate(modelReturnStep)}>Back</button>
+      {/if}
     {:else if step === 'success'}
       <div class="success-mark"><Icon name="check" size={26} /></div>
       <h1 bind:this={heading} tabindex="-1">You’re connected.</h1>
       <p class="intro">
-        {connectedName} is ready.<br />Start a conversation, or choose a model from the top bar.
+        {connectedName} is ready with {selectedModel}.
       </p>
       {#if keyNotSaved}<p class="footnote">{KEY_NOT_SAVED}</p>{/if}
       <button class="primary" onclick={onDone}
@@ -542,15 +594,20 @@
       >
         {error}
       </div>{/if}
-    <div class="setup-footer">
-      <span class="footer-dot"></span>No model runs until you choose one.
-    </div>
+    {#if step !== 'success'}<div class="setup-footer">
+        <span class="footer-dot"></span>No model runs until you choose one.
+      </div>{/if}
   </div>
 </div>
 
 <style>
   .remembered {
     margin: 24px 0;
+  }
+  .no-server {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin: 0 0 18px;
   }
 
   .setup-scroll {
@@ -838,6 +895,9 @@
     border-radius: var(--radius-sm);
     padding: 10px 12px;
     font-size: 13px;
+  }
+  form > input + label {
+    margin-top: 18px;
   }
   .checking {
     display: flex;

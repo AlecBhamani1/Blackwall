@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ConnectionSetup from './ConnectionSetup.svelte';
 import { persistence } from '../persistence';
+import { pairingClient } from '../pairing';
 import type { SetupClient } from '../setup';
 function client(): SetupClient {
   return {
@@ -34,7 +35,7 @@ describe('guided model setup', () => {
       )
       .mockResolvedValue({ saved: true });
     const onConnect = vi.fn().mockResolvedValue(true);
-    render(ConnectionSetup, { props: { desktop: true, onConnect } });
+    render(ConnectionSetup, { props: { desktop: true, onConnect, models: ['test-model'] } });
     await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
     await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
     await user.click(screen.getByText('Access key (if your service requires one)'));
@@ -52,6 +53,7 @@ describe('guided model setup', () => {
     expect(input).toHaveValue('replacement');
     expect(onConnect).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    await user.click(await screen.findByRole('button', { name: 'Use this model' }));
     expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
     expect(saveKey).toHaveBeenCalledTimes(2);
     expect(onConnect).toHaveBeenCalledOnce();
@@ -61,6 +63,8 @@ describe('guided model setup', () => {
     render(ConnectionSetup, {
       props: {
         onConnect: vi.fn(),
+        currentEndpoint: 'https://model.example/v1',
+        connections: [{ endpoint: 'https://model.example/v1', name: 'Saved' }],
         connectionError: 'Check the macOS Keychain prompt, then reconnect.',
       },
     });
@@ -72,6 +76,148 @@ describe('guided model setup', () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Enter a server address' })).toBeEnabled();
+  });
+  it('shows a neutral first-run message before any connection is configured', () => {
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn(),
+        currentEndpoint: 'http://localhost:11434/v1',
+        connectionError: 'Blackwall could not reach your model.',
+        found: [],
+      },
+    });
+    expect(screen.getByText('No model server found on this computer.')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('waits for the local scan before showing the neutral first-run message', () => {
+    const mock = client();
+    mock.discover = vi.fn().mockReturnValue(new Promise(() => {}));
+    render(ConnectionSetup, {
+      props: {
+        client: mock,
+        desktop: true,
+        onConnect: vi.fn(),
+        currentEndpoint: 'http://localhost:11434/v1',
+        connectionError: 'Blackwall could not reach your model.',
+      },
+    });
+    expect(screen.queryByText('No model server found on this computer.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('starts a new server address empty with the localhost example as its placeholder', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: { onConnect: vi.fn(), currentEndpoint: 'http://localhost:11434/v1' },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    expect(screen.getByLabelText('Model service address')).toHaveValue('');
+    expect(screen.getByLabelText('Model service address')).toHaveAttribute(
+      'placeholder',
+      'http://localhost:11434/v1',
+    );
+  });
+  it('prefills an equivalent normalized saved connection', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn(),
+        currentEndpoint: 'http://host:11434',
+        connections: [{ endpoint: 'http://host:11434/v1', name: 'Saved' }],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    expect(screen.getByLabelText('Model service address')).toHaveValue('http://host:11434');
+  });
+  it('accepts a paired connection that advances to model selection', async () => {
+    const user = userEvent.setup();
+    pairingClient.snapshot.set({
+      devices: [
+        {
+          id: 'paired',
+          name: 'Home Mac',
+          model: 'qwen3.6',
+          endpoint: 'https://relay.example/s/paired/v1',
+          role: 'client',
+          state: 'active',
+          online: false,
+        },
+      ],
+      host: null,
+      client: null,
+      warnings: [],
+    });
+    render(ConnectionSetup, {
+      props: {
+        desktop: true,
+        onConnect: vi.fn().mockResolvedValue(true),
+        models: ['qwen3.6'],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: /Use another computer/ }));
+    await user.click(screen.getByRole('button', { name: 'Connect to Home Mac' }));
+    expect(await screen.findByRole('heading', { name: 'Choose a model.' })).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('offers a way back when the connected server has no chat models', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: { onConnect: vi.fn().mockResolvedValue(true), models: [] },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
+    await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    expect(await screen.findByText('This server has no chat models yet.')).toBeVisible();
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.getByRole('heading', { name: 'Connect a model service.' })).toBeVisible();
+  });
+  it('requires a model choice and saves the selected model', async () => {
+    const user = userEvent.setup();
+    const choose = vi.fn();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn().mockResolvedValue(true),
+        onChooseModel: choose,
+        models: ['qwen3.6', 'llama3.2'],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
+    await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    expect(await screen.findByRole('heading', { name: 'Choose a model.' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Use this model' })).toBeDisabled();
+    await user.click(screen.getByRole('radio', { name: 'llama3.2' }));
+    await user.click(screen.getByRole('button', { name: 'Use this model' }));
+    expect(choose).toHaveBeenCalledWith('llama3.2');
+    expect(screen.getByRole('heading', { name: 'You’re connected.' })).toBeVisible();
+  });
+  it('preselects the only chat model', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn().mockResolvedValue(true),
+        models: ['qwen3.6'],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
+    await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
+    await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    expect(await screen.findByRole('radio', { name: 'qwen3.6' })).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Use this model' })).toBeEnabled();
+  });
+  it('preselects the saved model when reconnecting to a multi-model server', async () => {
+    const user = userEvent.setup();
+    render(ConnectionSetup, {
+      props: {
+        onConnect: vi.fn().mockResolvedValue(true),
+        models: ['qwen3.6', 'llama3.2'],
+        currentModel: 'llama3.2',
+        connections: [{ endpoint: 'https://model.example/v1', name: 'Saved' }],
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Connect to Saved' }));
+    expect(await screen.findByRole('radio', { name: 'llama3.2' })).toBeChecked();
+    expect(screen.getByRole('heading', { name: 'Choose a model.' })).toBeVisible();
   });
   it('focuses Keychain recovery guidance and allows an explicit connection retry', async () => {
     const user = userEvent.setup();
@@ -87,6 +233,7 @@ describe('guided model setup', () => {
     expect(screen.getByRole('button', { name: 'Use these models' })).toBeEnabled();
     expect(onConnect).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: 'Use these models' }));
+    await user.click(await screen.findByRole('button', { name: 'Use this model' }));
     expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toHaveFocus();
     expect(onConnect).toHaveBeenCalledTimes(2);
   });
@@ -99,6 +246,7 @@ describe('guided model setup', () => {
     await user.click(screen.getByRole('button', { name: /Use this computer/ }));
     await user.click(await screen.findByRole('button', { name: 'Use these models' }));
     expect(onConnect).toHaveBeenCalledWith('http://127.0.0.1:11434/v1', 'This computer');
+    await user.click(await screen.findByRole('button', { name: 'Use this model' }));
     expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toHaveFocus();
     await user.click(screen.getByRole('button', { name: /Start chatting/ }));
     expect(onDone).toHaveBeenCalledOnce();
@@ -202,6 +350,7 @@ describe('guided model setup', () => {
     expect(mock.discover).not.toHaveBeenCalled();
     await user.click(list.getByRole('button', { name: 'Connect to llama.cpp at 127.0.0.1:18040' }));
     expect(onConnect).toHaveBeenCalledWith('http://127.0.0.1:18040/v1', 'llama.cpp :18040');
+    await user.click(await screen.findByRole('button', { name: 'Use this model' }));
     expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
   });
   it('looks for servers when it opens and sends an empty Ollama to the download step', async () => {
@@ -238,13 +387,18 @@ describe('guided model setup', () => {
     const user = userEvent.setup();
     const saveKey = vi.spyOn(persistence, 'saveKey').mockResolvedValue({ saved: false });
     render(ConnectionSetup, {
-      props: { desktop: true, onConnect: vi.fn().mockResolvedValue(true) },
+      props: {
+        desktop: true,
+        onConnect: vi.fn().mockResolvedValue(true),
+        models: ['test-model'],
+      },
     });
     await user.click(screen.getByRole('button', { name: 'Enter a server address' }));
     await user.type(screen.getByLabelText('Model service address'), 'https://model.example/v1');
     await user.click(screen.getByText('Access key (if your service requires one)'));
     await user.type(screen.getByLabelText('Access key'), 'session-key');
     await user.click(screen.getByRole('button', { name: 'Connect and continue' }));
+    await user.click(await screen.findByRole('button', { name: 'Use this model' }));
     expect(await screen.findByRole('heading', { name: 'You’re connected.' })).toBeVisible();
     expect(screen.getByText('Not saved: no system keyring')).toBeVisible();
     saveKey.mockRestore();
