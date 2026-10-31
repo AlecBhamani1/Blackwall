@@ -12,6 +12,7 @@
   import CredentialSettings from './CredentialSettings.svelte';
   import TelemetrySettings from './TelemetrySettings.svelte';
   import TrustedProjects from './TrustedProjects.svelte';
+  import OwnerRules from './OwnerRules.svelte';
   import SavedConnections from './SavedConnections.svelte';
   import FoundServers from './FoundServers.svelte';
   import { connectionProfiles } from '../connections';
@@ -73,6 +74,7 @@
 
   let keysOpen = false;
   let trustedOpen = false;
+  let rulesOpen = false;
   let selectedSetting: SettingsPage = 'connection';
   let settingsQuery = '';
   let dialogContent: HTMLElement;
@@ -850,6 +852,12 @@
             <details class="access-keys" bind:open={trustedOpen}>
               <summary>Trusted projects</summary>
               {#if trustedOpen}<TrustedProjects />{/if}
+            </details>
+            <details class="access-keys" bind:open={rulesOpen}>
+              <summary>Your rules</summary>
+              {#if rulesOpen}<OwnerRules
+                  isolation={contextPreferences.commandToolsIsolation ?? 'outside'}
+                />{/if}
             </details>
           {/if}
         {/if}
