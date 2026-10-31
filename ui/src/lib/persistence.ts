@@ -368,6 +368,8 @@ export const persistence = {
     command<string>('add_mcp_http_server', { name, url, headers }),
   setMcpServerEnabled: (name: string, enabled: boolean) =>
     command<void>('set_mcp_server_enabled', { name, enabled }),
+  setMcpEndpoint: (name: string, commandArgs: string[], url: string | null) =>
+    command<void>('set_mcp_endpoint', { name, command: commandArgs, url }),
   removeMcpServer: (name: string) => command<void>('remove_mcp_server', { name }),
   saveMcpSecret: (name: string, key: string, value: string) =>
     command<void>('save_mcp_secret', { name, key, value }),

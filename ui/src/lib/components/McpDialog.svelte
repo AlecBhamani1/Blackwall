@@ -3,6 +3,7 @@
   import { MCP_SUGGESTIONS, type McpSuggestion } from '../mcpSuggestions';
   import { persistence, type McpServer, type McpToolRule } from '../persistence';
   import { authStatus, NO_KEYRING_NOTE } from '../auth';
+  import { formatCommand, parseCommand } from '../mcpCommand';
   import { detectPlatform } from '../platform';
   import Icon from './Icon.svelte';
   export let onClose: () => void;
@@ -25,6 +26,9 @@
   const windows = detectPlatform() === 'windows';
   let secretName = '';
   let secretValue = '';
+  let secretsOpen = false;
+  let editing = false;
+  let endpoint = '';
   let busy = false;
   let error = '';
   const desktop = persistence.available();
@@ -33,6 +37,8 @@
     selected = server;
     secretName = '';
     secretValue = '';
+    secretsOpen = false;
+    editing = false;
   }
   function secretOf(reference: string) {
     return reference.replace(/^\{secret:(.*)\}$/, '$1');
@@ -176,6 +182,22 @@
         secretName = missingSecrets(added)[0] ?? '';
       }
     }
+  }
+  async function saveEndpoint(event: SubmitEvent) {
+    event.preventDefault();
+    if (!selected) return;
+    const server = selected;
+    const command = server.url ? [] : parseCommand(endpoint);
+    if (!command) {
+      error = 'The command has a quote without a closing quote.';
+      return;
+    }
+    const saved = await run(
+      () =>
+        persistence.setMcpEndpoint(server.name, command, server.url ? endpoint.trim() : null),
+      'This server could not be changed.',
+    );
+    if (saved) editing = false;
   }
   async function saveSecret(event: SubmitEvent) {
     event.preventDefault();
@@ -365,6 +387,8 @@
       </form>
     {:else if selected}
       {@const server = selected}
+      {@const showSecretForm =
+        secretsOpen || (server.secrets?.length ?? 0) > 0 || missingSecrets(server).length > 0}
       <div class="intro">
         <strong>{server.name}</strong><button
           class="secondary"
@@ -372,7 +396,35 @@
           onclick={() => open(null)}>Back</button
         >
       </div>
-      {#if server.url}<code>{server.url}</code>
+      {#if editing}<form onsubmit={saveEndpoint}>
+          <label for="mcp-endpoint">{server.url ? 'URL' : 'Command'}</label><input
+            id="mcp-endpoint"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+            class="code"
+            bind:value={endpoint}
+            required
+            disabled={busy}
+          />
+          <div class="actions">
+            <button type="button" class="secondary" disabled={busy} onclick={() => (editing = false)}
+              >Cancel</button
+            ><span></span><button class="primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>
+          </div>
+        </form>
+      {:else}<div class="endpoint">
+          <code>{server.url ?? formatCommand(server.command ?? [])}</code><button
+            class="secondary"
+            disabled={busy}
+            onclick={() => {
+              endpoint = server.url ?? formatCommand(server.command ?? []);
+              error = '';
+              editing = true;
+            }}>Edit</button
+          >
+        </div>{/if}
+      {#if server.url}
         {#each Object.entries(server.headers ?? {}) as [header, reference] (header)}{@const problem =
             secretProblem(server, secretOf(reference))}
           <p class="header-line">
@@ -380,7 +432,7 @@
                 class="missing">{` · ${problem}`}</span
               >{/if}
           </p>{/each}
-      {:else}<code>{JSON.stringify(server.command ?? [])}</code>{/if}
+      {/if}
       <h3>Allowed without asking</h3>
       {#each serverRules(rules, server.name) as rule (`${rule.tool} ${rule.project}`)}<article>
           <span class="rule"
@@ -418,7 +470,7 @@
           No secrets. Add one if this server needs a token.
         </p>{/each}
       <form onsubmit={saveSecret}>
-        <label for="mcp-secret-name">{server.url ? 'Secret name' : 'Environment variable'}</label
+        {#if showSecretForm}<label for="mcp-secret-name">{server.url ? 'Secret name' : 'Environment variable'}</label
         ><input
           id="mcp-secret-name"
           autocapitalize="none"
@@ -445,7 +497,7 @@
           Saved values are kept only in the system credential store and given to this server when it
           {server.url ? 'connects, in the headers that name them' : 'starts'}. They are never shown
           again.
-        </p>
+        </p>{/if}
         <div class="actions">
           <button
             type="button"
@@ -456,9 +508,15 @@
                 () => persistence.removeMcpServer(server.name),
                 'This server could not be removed.',
               )}>Remove server</button
-          ><span></span><button class="primary" disabled={busy || !$authStatus.keyring}
-            >{busy ? 'Saving…' : 'Save secret'}</button
-          >
+          ><span></span>{#if showSecretForm}<button
+              class="primary"
+              disabled={busy || !$authStatus.keyring}>{busy ? 'Saving…' : 'Save secret'}</button
+            >{:else}<button
+              type="button"
+              class="secondary"
+              disabled={busy}
+              onclick={() => (secretsOpen = true)}>Add secret</button
+            >{/if}
         </div>
       </form>
     {:else}
@@ -475,7 +533,7 @@
       {#each servers as server (server.name)}<article>
           <button class="server" disabled={busy} onclick={() => open(server)}
             ><strong>{server.name}</strong>
-            <p class="code">{server.url ?? (server.command ?? []).join(' ')}</p>
+            <p class="code">{server.url ?? formatCommand(server.command ?? [])}</p>
             <small>{summary(rules, server)}</small></button
           ><button
             class="secondary manage"
@@ -696,6 +754,14 @@
     gap: 8px;
     align-items: center;
     margin: 0 0 8px;
+  }
+  .endpoint {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .endpoint code {
+    flex: 1;
   }
   .header-line {
     margin: 6px 0 0;

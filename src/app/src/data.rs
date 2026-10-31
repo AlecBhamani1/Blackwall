@@ -1020,6 +1020,19 @@ pub async fn set_mcp_server_enabled(
     })
     .await
 }
+/// A server keeps its kind: `command` is for a local server and `url` for an HTTP one.
+#[tauri::command]
+pub async fn set_mcp_endpoint(
+    app: AppHandle,
+    name: String,
+    command: Vec<String>,
+    url: Option<String>,
+) -> Result<(), String> {
+    with_mcp(&app, move |directory| {
+        blackwall_core::mcp::set_endpoint(directory, &name, command, url)
+    })
+    .await
+}
 #[tauri::command]
 pub async fn remove_mcp_server(app: AppHandle, name: String) -> Result<(), String> {
     with_mcp(&app, move |directory| {

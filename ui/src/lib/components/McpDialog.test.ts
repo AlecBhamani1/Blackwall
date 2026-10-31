@@ -49,10 +49,13 @@ describe('MCP server management', () => {
     ]);
     render(McpDialog, { props: { onClose: vi.fn() } });
     await user.click(await screen.findByText('jira'));
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
     await user.type(screen.getByLabelText('Environment variable'), 'TOKEN');
     await user.type(screen.getByLabelText('Value'), 'jira-only');
     await user.click(screen.getByRole('button', { name: 'Back' }));
     await user.click(screen.getByText('gitlab'));
+    expect(screen.queryByLabelText('Environment variable')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
     expect(screen.getByLabelText('Environment variable')).toHaveValue('');
     expect(screen.getByLabelText('Value')).toHaveValue('');
   });
@@ -83,6 +86,85 @@ describe('MCP server management', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Keychain is locked.');
     expect(screen.getByLabelText('Value')).toHaveValue('');
     expect(screen.getByLabelText('Environment variable')).toHaveValue('JIRA_API_TOKEN');
+  });
+  it('shows a command as a command line and edits it', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      {
+        name: 'time',
+        command: ['/home/riz/.local/bin/uvx', 'mcp-server-time', '--root', 'my folder'],
+        enabled: true,
+        secrets: ['TZ_TOKEN'],
+      },
+    ]);
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    const line = '/home/riz/.local/bin/uvx mcp-server-time --root "my folder"';
+    expect(await screen.findByText(line)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Manage time' }));
+    expect(screen.getByText(line)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const field = screen.getByLabelText('Command');
+    expect(field).toHaveValue(line);
+    await user.clear(field);
+    await user.type(field, 'uvx mcp-server-time --root "other folder"');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(edit).toHaveBeenCalledWith(
+      'time',
+      ['uvx', 'mcp-server-time', '--root', 'other folder'],
+      null,
+    );
+    await vi.waitFor(() => expect(screen.queryByLabelText('Command')).not.toBeInTheDocument());
+  });
+  it('edits the address of a URL server', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      { name: 'docs', url: 'https://mcp.example.com/mcp', enabled: true },
+    ]);
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByText('docs'));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const field = screen.getByLabelText('URL');
+    expect(field).toHaveValue('https://mcp.example.com/mcp');
+    await user.clear(field);
+    await user.type(field, 'https://mcp.example.org/v2');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(edit).toHaveBeenCalledWith('docs', [], 'https://mcp.example.org/v2');
+  });
+  it('does not save a command whose quote is never closed', async () => {
+    const user = userEvent.setup();
+    const edit = vi.spyOn(persistence, 'setMcpEndpoint').mockResolvedValue();
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByText('jira'));
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.type(screen.getByLabelText('Command'), ' "my folder');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('closing quote');
+    expect(edit).not.toHaveBeenCalled();
+  });
+  it('keeps the secret form closed until it is needed', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'mcpServers').mockResolvedValue([
+      { name: 'time', command: ['uvx', 'mcp-server-time'], enabled: true },
+      {
+        name: 'docs',
+        url: 'https://mcp.example.com/mcp',
+        headers: { Authorization: '{secret:DOCS_TOKEN}' },
+        enabled: true,
+      },
+    ]);
+    render(McpDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('button', { name: 'Manage time' }));
+    expect(screen.queryByLabelText('Environment variable')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove server' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add secret' }));
+    expect(screen.getByLabelText('Environment variable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add secret' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    // A header that names a secret that is not saved yet needs the form.
+    await user.click(screen.getByRole('button', { name: 'Manage docs' }));
+    expect(screen.getByLabelText('Secret name')).toBeInTheDocument();
   });
   it('lists and removes the rules that allow a server without asking', async () => {
     const user = userEvent.setup();
