@@ -19,7 +19,11 @@
 </script>
 
 <header aria-label="Conversation header">
-  <button class="icon-button" aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'} onclick={onToggleSidebar}>
+  <button
+    class="icon-button"
+    aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
+    onclick={onToggleSidebar}
+  >
     <Icon name={sidebarVisible ? 'panel-left-open' : 'panel-left'} size={18} />
   </button>
   <strong class="conversation-title">{setupMode ? 'Setup' : conversationTitle}</strong>
@@ -40,7 +44,13 @@
     {#if canExport}<button class="header-action" onclick={onExport}>Export chat</button>{/if}
     <button class="header-action" onclick={onSearch}>Search history</button>
     {#if agentMode}
-      <button class="icon-button" aria-label={filesVisible ? 'Hide files' : 'Show files'} title={filesVisible ? 'Hide files' : 'Show files'} aria-pressed={filesVisible} onclick={onToggleFiles}>
+      <button
+        class="icon-button"
+        aria-label={filesVisible ? 'Hide files' : 'Show files'}
+        title={filesVisible ? 'Hide files' : 'Show files'}
+        aria-pressed={filesVisible}
+        onclick={onToggleFiles}
+      >
         <Icon name={filesVisible ? 'panel-right-open' : 'panel-right'} size={16} />
       </button>
     {/if}
@@ -70,7 +80,10 @@
     background: transparent;
     color: var(--text-muted);
   }
-  .icon-button:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .icon-button:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
   .conversation-title {
     max-width: 240px;
     overflow: hidden;
@@ -79,7 +92,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .spacer { flex: 1; }
+  .spacer {
+    flex: 1;
+  }
   .project-choice,
   .header-action {
     max-width: 250px;
@@ -97,7 +112,18 @@
     outline-offset: 1px;
     color: var(--text-primary);
   }
-  .project-choice.pulse { animation: folder-pulse 700ms ease-out 2; }
-  @keyframes folder-pulse { 50% { outline-offset: 5px; outline-color: transparent; } }
-  @media (prefers-reduced-motion: reduce) { .project-choice.pulse { animation: none; } }
+  .project-choice.pulse {
+    animation: folder-pulse 700ms ease-out 2;
+  }
+  @keyframes folder-pulse {
+    50% {
+      outline-offset: 5px;
+      outline-color: transparent;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .project-choice.pulse {
+      animation: none;
+    }
+  }
 </style>

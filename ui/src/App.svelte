@@ -381,7 +381,7 @@
                 executionProfile={$executionProfile}
                 commandNetwork={$commandNetwork}
                 webEnabled={$webEnabled}
-                workspaceWrite={workspaceWrite}
+                {workspaceWrite}
                 controlsDisabled={$runState !== 'idle'}
                 onDismissNotice={controller.dismissNotice}
                 onModelChange={controller.chooseModel}

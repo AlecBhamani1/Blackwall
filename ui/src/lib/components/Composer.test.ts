@@ -28,10 +28,14 @@ describe('Composer', () => {
     const composer = screen.getByRole('group', { name: 'Message composer' });
     expect(within(composer).getByRole('combobox', { name: 'Model' })).toBeInTheDocument();
     expect(within(composer).getByRole('checkbox', { name: 'Web access' })).toBeInTheDocument();
-    expect(within(composer).getByRole('button', { name: 'Add photos or files' })).toBeInTheDocument();
+    expect(
+      within(composer).getByRole('button', { name: 'Add photos or files' }),
+    ).toBeInTheDocument();
     expect(within(composer).getByRole('button', { name: 'Send message' })).toBeInTheDocument();
     expect(within(composer).queryByText('Sent only to your model')).not.toBeInTheDocument();
-    expect(within(composer).queryByRole('combobox', { name: 'Command execution profile' })).not.toBeInTheDocument();
+    expect(
+      within(composer).queryByRole('combobox', { name: 'Command execution profile' }),
+    ).not.toBeInTheDocument();
   });
 
   it('adds Agent command controls to the composer footer', () => {

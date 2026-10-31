@@ -363,26 +363,66 @@
       <div class="composer-actions">
         <div class="left-actions">
           <div class="model-control">
-            <span class:ready={connectionState === 'ready'} class:offline={connectionState === 'offline'} class="state-dot" aria-hidden="true"></span>
+            <span
+              class:ready={connectionState === 'ready'}
+              class:offline={connectionState === 'offline'}
+              class="state-dot"
+              aria-hidden="true"
+            ></span>
             {#if models.length > 0}
               <label class="sr-only" for="model-select">Model</label>
-              <select id="model-select" value={selectedModel} onchange={(event) => onModelChange(event.currentTarget.value)}>
-                {#each models as model (model.id)}<option value={model.id}>{modelLabel(model.name)}</option>{/each}
+              <select
+                id="model-select"
+                value={selectedModel}
+                onchange={(event) => onModelChange(event.currentTarget.value)}
+              >
+                {#each models as model (model.id)}<option value={model.id}
+                    >{modelLabel(model.name)}</option
+                  >{/each}
               </select>
-            {:else}<span class="model-placeholder">{connectionState === 'checking' ? 'Finding your model…' : 'Model unavailable'}</span>{/if}
-            {#if connectionState === 'offline'}<button class="reconnect" onclick={onReconnect}><Icon name="refresh" size={14} />Reconnect</button>{/if}
+            {:else}<span class="model-placeholder"
+                >{connectionState === 'checking'
+                  ? 'Finding your model…'
+                  : 'Model unavailable'}</span
+              >{/if}
+            {#if connectionState === 'offline'}<button class="reconnect" onclick={onReconnect}
+                ><Icon name="refresh" size={14} />Reconnect</button
+              >{/if}
           </div>
           {#if agentMode}
-            <label class="compact-control">Commands
-              <select aria-label="Command execution profile" value={executionProfile} disabled={controlsDisabled} onfocus={() => onProfileFocusChange(true)} onblur={() => onProfileFocusChange(false)} onchange={(event) => onExecutionProfileChange(event.currentTarget.value as ExecutionProfile)}>
+            <label class="compact-control"
+              >Commands
+              <select
+                aria-label="Command execution profile"
+                value={executionProfile}
+                disabled={controlsDisabled}
+                onfocus={() => onProfileFocusChange(true)}
+                onblur={() => onProfileFocusChange(false)}
+                onchange={(event) =>
+                  onExecutionProfileChange(event.currentTarget.value as ExecutionProfile)}
+              >
                 <option value="read-only">Read-only</option>
                 <option value="workspace-write" disabled={!workspaceWrite}>Workspace-write</option>
                 <option value="unsandboxed">Unsandboxed (full access)</option>
               </select>
             </label>
-            <label class="compact-control"><input type="checkbox" checked={commandNetwork || executionProfile === 'unsandboxed'} onchange={(event) => onCommandNetworkChange(event.currentTarget.checked)} disabled={controlsDisabled || executionProfile === 'unsandboxed'} />Command network</label>
+            <label class="compact-control"
+              ><input
+                type="checkbox"
+                checked={commandNetwork || executionProfile === 'unsandboxed'}
+                onchange={(event) => onCommandNetworkChange(event.currentTarget.checked)}
+                disabled={controlsDisabled || executionProfile === 'unsandboxed'}
+              />Command network</label
+            >
           {/if}
-          <label class="compact-control"><input type="checkbox" checked={webEnabled} onchange={(event) => onWebEnabledChange(event.currentTarget.checked)} disabled={controlsDisabled} />Web access</label>
+          <label class="compact-control"
+            ><input
+              type="checkbox"
+              checked={webEnabled}
+              onchange={(event) => onWebEnabledChange(event.currentTarget.checked)}
+              disabled={controlsDisabled}
+            />Web access</label
+          >
           <button
             class="attach"
             aria-label="Add photos or files"
@@ -558,7 +598,7 @@
 
   .model-control select,
   .compact-control select {
-    max-width: 150px;
+    max-width: 220px;
     border: 1px solid var(--border);
     border-radius: 5px;
     padding: 3px 5px;
@@ -567,12 +607,35 @@
     font: inherit;
   }
 
-  .compact-control input { margin: 0; accent-color: var(--accent); }
-  .state-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--warn); }
-  .state-dot.ready { background: var(--ok); }
-  .state-dot.offline { background: var(--err); }
-  .model-placeholder { font-size: 10.5px; }
-  .reconnect { display: flex; align-items: center; gap: 4px; padding: 3px 5px; background: transparent; color: var(--text-muted); font: inherit; }
+  .compact-control input {
+    margin: 0;
+    accent-color: var(--accent);
+  }
+  .state-dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--warn);
+  }
+  .state-dot.ready {
+    background: var(--ok);
+  }
+  .state-dot.offline {
+    background: var(--err);
+  }
+  .model-placeholder {
+    font-size: 10.5px;
+  }
+  .reconnect {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+  }
 
   .attach,
   .send {
