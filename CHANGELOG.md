@@ -186,6 +186,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Radio buttons sit inline with their labels again, and checkbox rows line up (Memory → Advanced,
+  Runs, Recall). Native dropdowns use the app's colors, so they are readable on Linux. The lock
+  screen's Try again button has space above it. Linux menus and switchers show "Local AI
+  assistant" as Blackwall's description.
+
 - Before setup, `bw status` shows the model and endpoint as not set instead of printing defaults
   such as `llama3.2` as if they were configured.
 

@@ -118,7 +118,7 @@
     gap: 6px;
     font-size: 12px;
   }
-  input,
+  input:not([type='checkbox']),
   button {
     padding: 8px;
     border: 1px solid var(--border);
@@ -133,6 +133,9 @@
     flex-direction: row;
     align-items: center;
     margin-top: 12px;
+  }
+  .toggle input {
+    margin: 0;
   }
   .hint,
   small {

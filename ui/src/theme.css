@@ -92,6 +92,18 @@ input {
   font: inherit;
 }
 
+select {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  color-scheme: inherit;
+}
+
+option {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
 button {
   border: 0;
 }
