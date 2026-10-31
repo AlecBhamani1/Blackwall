@@ -250,6 +250,32 @@ impl Workspace {
             instruction_files: Vec::new(),
         })
     }
+    pub(crate) fn lexical(&self, path: &str) -> Result<PathBuf, ToolError> {
+        let input = Path::new(path);
+        if input.as_os_str().len() > 2048 {
+            return Err(ToolError::Path);
+        }
+        let input = if input.is_absolute() {
+            input
+                .strip_prefix(&self.path)
+                .map_err(|_| ToolError::Path)?
+        } else {
+            input
+        };
+        let mut normalized = PathBuf::new();
+        for component in input.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(component) => normalized.push(component),
+                Component::ParentDir if normalized.pop() => {}
+                _ => return Err(ToolError::Path),
+            }
+        }
+        if normalized.as_os_str().is_empty() {
+            normalized.push(".");
+        }
+        Ok(normalized)
+    }
     pub(crate) fn checked(&self, path: &str) -> Result<PathBuf, ToolError> {
         let input = Path::new(path);
         if input.as_os_str().len() > 2048 {
@@ -556,7 +582,9 @@ pub async fn execute(
         name @ ("read_file" | "list_files" | "search_files") => {
             let path = argument(&arguments, "path")?;
             // Deny `file` rules cover reading too; allow and ask rules only gate edits.
-            let policy = approvals.policy(request_id);
+            let policy = approvals
+                .policy(request_id)
+                .map_err(|_| ToolError::Denied)?;
             let denied = |path: &Path| {
                 policy.as_ref().and_then(|policy| {
                     let verdict = policy.evaluate(ApprovalKind::File, path.to_str()?);
@@ -564,11 +592,20 @@ pub async fn execute(
                 })
             };
             let checked = workspace.checked(path)?;
-            if let (Some(policy), Some(verdict)) = (&policy, denied(&checked)) {
+            // The name as written can be a symlink to an allowed file, so both are checked. An
+            // absolute path spelled through a symlinked parent has no lexical form; `checked` covers it.
+            let lexical = workspace.lexical(path).ok();
+            if let (Some(policy), Some((subject, verdict))) = (
+                &policy,
+                lexical
+                    .as_ref()
+                    .and_then(|lexical| denied(lexical).map(|verdict| (lexical, verdict)))
+                    .or_else(|| denied(&checked).map(|verdict| (&checked, verdict))),
+            ) {
                 policy
                     .record(
                         ApprovalKind::File,
-                        &checked.to_string_lossy(),
+                        &subject.to_string_lossy(),
                         Decision::Deny,
                         false,
                         None,
@@ -1675,6 +1712,13 @@ mod tests {
         std::fs::write(project.join(".env"), "TOKEN=needle").unwrap();
         std::fs::write(project.join("secrets/key.txt"), "needle").unwrap();
         std::fs::write(project.join("src/ok.txt"), "needle").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(project.join("config")).unwrap();
+            std::fs::write(project.join("config/real.env"), "TOKEN=linked").unwrap();
+            std::fs::remove_file(project.join(".env")).unwrap();
+            std::os::unix::fs::symlink("config/real.env", project.join(".env")).unwrap();
+        }
         let workspace = Workspace::open(&project).unwrap();
         let approvals = Approvals::default();
         approvals
@@ -1756,6 +1800,41 @@ mod tests {
             record["rule"],
             json!({"source":"project","index":0,"mode":"strictest"})
         );
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn poisoned_approval_registry_denies_reads() {
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-tools-poisoned-policy-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "private").unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let approvals = Approvals::default();
+        approvals.poison();
+        let call = ToolCall {
+            id: "read".into(),
+            function: crate::model::ToolFunction {
+                name: "read_file".into(),
+                arguments: json!({"path":"file.txt"}).to_string(),
+            },
+        };
+        assert!(matches!(
+            execute(
+                &workspace,
+                &call,
+                "run",
+                &approvals,
+                &|_| {},
+                Duration::from_secs(1),
+                &OutputCap::default(),
+            )
+            .await,
+            Err(ToolError::Denied)
+        ));
         drop(workspace);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -256,6 +256,9 @@ impl Agent<'_> {
                         }
                         None => None,
                     };
+                    if let Some(error) = policy.as_ref().and_then(|policy| policy.error.clone()) {
+                        return Err(tools::ToolError::Execution(error).into());
+                    }
                     let snapshot = crate::review::ReviewSnapshot::collect(
                         &self.workspace.path,
                         &target,

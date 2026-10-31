@@ -77,6 +77,16 @@ impl Drop for Waiting {
     }
 }
 impl Approvals {
+    #[cfg(test)]
+    pub(crate) fn poison(&self) {
+        let state = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison approval registry");
+        })
+        .join();
+    }
+
     /// Apply global owner rules to a run without a selected project.
     pub async fn load_global_policy(
         &self,
@@ -114,8 +124,14 @@ impl Approvals {
         Ok(settings)
     }
     /// The rules applied to this run, if any.
-    pub(crate) fn policy(&self, request_id: &str) -> Option<Arc<Policy>> {
-        self.0.lock().ok()?.policies.get(request_id).cloned()
+    pub(crate) fn policy(&self, request_id: &str) -> Result<Option<Arc<Policy>>, String> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .policies
+            .get(request_id)
+            .cloned())
     }
     /// `subject` is the command, workspace-relative path, or host that rules match.
     pub async fn request(

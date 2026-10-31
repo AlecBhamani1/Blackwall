@@ -244,15 +244,22 @@ impl ReviewSnapshot {
         }
         // A deny `file` rule keeps a file out of the review entirely, even through a symlink.
         let denied = |name: &str| {
-            let path = workspace.checked(name).map_or_else(
-                |_| workspace.path.join(name),
-                |path| workspace.path.join(path),
-            );
             policy.is_some_and(|policy| {
-                path.strip_prefix(policy.scope().1)
-                    .ok()
+                let lexical = workspace.lexical(name).ok();
+                let path = workspace
+                    .path
+                    .join(workspace.checked(name).unwrap_or_else(|_| name.into()));
+                lexical
+                    .as_deref()
                     .and_then(Path::to_str)
                     .is_some_and(|path| policy.decide(ApprovalKind::File, path) == Decision::Deny)
+                    || path
+                        .strip_prefix(policy.scope().1)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .is_some_and(|path| {
+                            policy.decide(ApprovalKind::File, path) == Decision::Deny
+                        })
             })
         };
         let excluded = paths
@@ -530,6 +537,11 @@ mod tests {
     async fn denied_files_stay_out_of_the_review() {
         let repo = Repo::new();
         fs::create_dir(repo.0.join("secrets")).unwrap();
+        #[cfg(unix)]
+        {
+            fs::create_dir(repo.0.join("config")).unwrap();
+            fs::write(repo.0.join("config/real.env"), "TOKEN=linked private\n").unwrap();
+        }
         repo.write("file", "original\n");
         repo.write("secrets/key", "tracked private\n");
         repo.commit();
@@ -538,7 +550,11 @@ mod tests {
         repo.write(".env", "TOKEN=private\n");
         repo.write("notes.txt", "visible\n");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(".env", repo.0.join("alias")).unwrap();
+        {
+            fs::remove_file(repo.0.join(".env")).unwrap();
+            std::os::unix::fs::symlink("config/real.env", repo.0.join(".env")).unwrap();
+            std::os::unix::fs::symlink("secrets/key", repo.0.join("alias")).unwrap();
+        }
         let data = repo.0.join("owner");
         fs::create_dir(&data).unwrap();
         let rules = json!({"rules":[
@@ -894,6 +910,21 @@ mod tests {
             .await
             .unwrap();
         assert!(answer.contains("No findings"));
+        fs::write(
+            user.join(crate::policy::POLICY_FILE),
+            r#"{"rules":[{"decision":"deny","kind":"file","path":"*.env"}]}"#,
+        )
+        .unwrap();
+        let error = agent
+            .run_with_user_instructions(
+                "invalid-policy-review",
+                vec![json!({"role":"user","content":"/review --uncommitted"})],
+                Some(&user),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("uses a wildcard"), "{error}");
+        fs::remove_file(user.join(crate::policy::POLICY_FILE)).unwrap();
         let image_answer = agent.run("review-with-image", vec![json!({"role":"user","content":[{"type":"text","text":"/review"},{"type":"image_url","image_url":{"url":"data:image/png;base64,unused"}}]})]).await.unwrap();
         assert!(image_answer.contains("No findings"));
         assert!(!repo.0.join("mcp-ran").exists());

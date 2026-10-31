@@ -297,7 +297,7 @@ impl Policy {
         }
         user.rules = kept;
         let mut layers = vec![user];
-        let mut warnings = vec![];
+        let mut warnings: Vec<String> = error.iter().cloned().collect();
         let mut ask_all = false;
         let mut project_limits = None;
         let mut project_instructions = None;
@@ -317,7 +317,7 @@ impl Policy {
                             error.get_or_insert(message.clone());
                         }
                     }
-                    warnings = loaded.warnings;
+                    warnings.extend(loaded.warnings);
                     if loaded.trust == crate::project::Trust::Trusted {
                         project_limits = loaded.config.limits;
                         project_instructions = loaded.config.instructions;
@@ -1286,6 +1286,10 @@ mod tests {
                 .unwrap();
             let invalid = Policy::load(&directory, Path::new("/workspace")).await;
             assert!(invalid.error.is_some(), "{body}");
+            assert_eq!(
+                invalid.warnings,
+                invalid.error.iter().cloned().collect::<Vec<_>>()
+            );
             assert_eq!(invalid.decide(ApprovalKind::Exec, "ls"), Decision::Ask);
         }
         record_secret(&missing).await;

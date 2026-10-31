@@ -35,6 +35,9 @@ async fn execute(
 ) -> Result<(), String> {
     // The owner's and the project's deny `file` rules keep files out of the review.
     let policy = Policy::load(directory, path).await;
+    if let Some(error) = policy.error.as_ref() {
+        return Err(error.clone());
+    }
     let snapshot = ReviewSnapshot::collect(path, target, Some(&policy))
         .await
         .map_err(|e| e.to_string())?;
