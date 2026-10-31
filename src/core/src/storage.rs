@@ -1,5 +1,5 @@
 //! Versioned local SQLite persistence. All values are bounded and writes are transactional.
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
 use thiserror::Error;
@@ -13,8 +13,7 @@ pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const BACKFILL_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = upgrade::V6;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -55,10 +54,10 @@ impl LocalStore {
     pub fn open(directory: &Path) -> Result<Self, StorageError> {
         Self::open_at(directory, SCHEMA_VERSION)
     }
-    /// Opens the database at schema version `target`: 5, or 6, which first upgrades an older
-    /// database (see `upgrade`). `open` stays at v5 until the v6 chat store is switched on.
+    /// Opens the database at schema version `target`, which must be 6. An older database is
+    /// upgraded first (see `upgrade`).
     pub fn open_at(directory: &Path, target: i64) -> Result<Self, StorageError> {
-        if target != SCHEMA_VERSION && target != upgrade::V6 {
+        if target != SCHEMA_VERSION {
             return Err(StorageError::Invalid(
                 "This version of Blackwall cannot open that storage format yet.",
             ));
@@ -110,54 +109,12 @@ impl LocalStore {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
-        if target == upgrade::V6 {
-            return upgrade::open_v6(directory, connection);
-        }
-        Self::initialize(connection)
+        upgrade::open_v6(Some(directory), connection)
     }
+    /// An in-memory store for tests, at v6.
+    #[cfg(test)]
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;",
-        )?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(
-                "This data was created by a newer Blackwall version. Update the app to open it.",
-            ));
-        }
-        if version == SCHEMA_VERSION {
-            let store = Self { connection };
-            if store.message_index_is_current()? {
-                return Ok(store);
-            }
-            store.connection.busy_timeout(BACKFILL_BUSY_TIMEOUT)?;
-            let result = store.migrate_message_index();
-            store.connection.busy_timeout(BUSY_TIMEOUT)?;
-            return match result {
-                Err(error) if is_busy(&error) => Ok(store),
-                result => result.map(|()| store),
-            };
-        }
-
-        // Only schema creation and upgrades wait for the writer lock. Re-read the version after
-        // acquiring it because another opener may have completed the upgrade while this one waited.
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(StorageError::Invalid(
-                "This data was created by a newer Blackwall version. Update the app to open it.",
-            ));
-        }
-        if version == SCHEMA_VERSION {
-            connection.execute_batch("ROLLBACK;")?;
-            return Ok(Self { connection });
-        }
-        Self::legacy_schema(&connection, version)?;
-        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        connection.execute_batch("COMMIT;")?;
-        // Defer legacy message indexing until a later open so the migration winner releases the
-        // writer lock directly to any other openers waiting to observe the new schema.
-        Ok(Self { connection })
+        upgrade::open_v6(None, connection)
     }
     /// Brings a database below v5 to the v5 tables, inside the caller's write transaction.
     fn legacy_schema(connection: &Connection, version: i64) -> Result<(), StorageError> {
@@ -253,98 +210,23 @@ impl LocalStore {
         Ok(())
     }
     pub fn list_sessions(&self) -> Result<Vec<Value>, StorageError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, title, updated_at,
-                    json_extract(body, '$.mode'), json_extract(body, '$.workspace')
-             FROM (
-                 SELECT id, title, updated_at, body
-                 FROM sessions
-                 ORDER BY updated_at DESC LIMIT 500
-             )
-             ORDER BY updated_at DESC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "title": row.get::<_, String>(1)?,
-                "updatedAt": row.get::<_, i64>(2)?,
-                "messages": [],
-                "mode": row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "chat".into()),
-                "workspace": row.get::<_, Option<String>>(4)?,
-            }))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.list_chats()
     }
     pub fn load_session(&self, id: &str) -> Result<Option<Value>, StorageError> {
-        validate_id(id)?;
-        let body: Option<String> = self
-            .connection
-            .query_row("SELECT body FROM sessions WHERE id=?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        body.map(|body| serde_json::from_str(&body).map_err(StorageError::from))
-            .transpose()
+        self.load_chat(id)
     }
+    /// Saves the whole session JSON: what is new is appended, or the chat is rewritten.
     pub fn save_session(&self, session: &Value) -> Result<(), StorageError> {
-        let (id, title, updated, body) = validate_session(session)?;
-        let exists: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
-            [id],
-            |r| r.get(0),
-        )?;
-        let count: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        if !exists && count >= MAX_SESSIONS {
-            return Err(StorageError::Invalid("Your history has reached 500 conversations. Export or delete an older conversation before starting another."));
-        }
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute("INSERT INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at=excluded.updated_at,body=excluded.body", params![id, title, updated, body])?;
-        recall::index(&transaction, session)?;
+        let transaction = chats::write_tx(&self.connection)?;
+        convert::save(&transaction, session)?;
         transaction.commit()?;
         Ok(())
     }
     pub fn delete_session(&self, id: &str) -> Result<(), StorageError> {
-        validate_id(id)?;
-        self.connection
-            .execute("DELETE FROM sessions WHERE id=?1", [id])?;
-        Ok(())
+        self.delete_chat(id)
     }
     pub fn migrate_sessions(&mut self, sessions: &[Value]) -> Result<(), StorageError> {
-        let version: i64 = self
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version >= upgrade::V6 {
-            return convert::migrate_v6(self, sessions);
-        }
-        if self.setting("legacy_sessions_migrated")?.is_some() {
-            return Ok(());
-        }
-        if sessions.len() > 30 {
-            return Err(StorageError::Invalid(
-                "The old history contains too many conversations to migrate safely.",
-            ));
-        }
-        // Validate everything before starting, and keep migration all-or-nothing.
-        let validated: Vec<_> = sessions
-            .iter()
-            .map(validate_session)
-            .collect::<Result<_, _>>()?;
-        let transaction = self.connection.transaction()?;
-        for (id, title, updated, body) in validated {
-            transaction.execute(
-                "INSERT OR IGNORE INTO sessions(id,title,updated_at,body) VALUES (?1,?2,?3,?4)",
-                params![id, title, updated, body],
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO settings(key,value) VALUES ('legacy_sessions_migrated','true')",
-            [],
-        )?;
-        transaction.commit()?;
-        self.migrate_message_index()?;
-        Ok(())
+        convert::migrate_v6(self, sessions)
     }
     pub fn setting(&self, key: &str) -> Result<Option<String>, StorageError> {
         Ok(self
@@ -467,14 +349,6 @@ fn validate_message(message: &Value) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn is_busy(error: &StorageError) -> bool {
-    matches!(
-        error,
-        StorageError::Database(rusqlite::Error::SqliteFailure(error, _))
-            if matches!(error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -589,9 +463,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        transaction
-            .execute("DELETE FROM indexed_sessions", [])
-            .unwrap();
         transaction.commit().unwrap();
         drop(store);
         SyntheticStore { directory }
@@ -629,11 +500,6 @@ mod tests {
         let fixture = build_synthetic_store(3, 2);
         let database = fixture.directory.join(DATABASE_FILE);
         let writer = Connection::open(database).unwrap();
-        let indexed_before: i64 = writer
-            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
         writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         let started = Instant::now();
@@ -647,29 +513,23 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "opening a current database waited for an unrelated writer"
         );
-        let indexed_while_locked: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(indexed_while_locked, indexed_before);
 
         writer.execute_batch("COMMIT;").unwrap();
         drop(store);
         let reopened = LocalStore::open(&fixture.directory).unwrap();
-        let indexed_after: i64 = reopened
-            .connection
-            .query_row("SELECT COUNT(*) FROM indexed_sessions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(indexed_after > indexed_before);
+        for index in 0..3 {
+            let chat = synthetic_session(index, 2);
+            let id = chat["id"].as_str().unwrap();
+            assert_eq!(reopened.load_session(id).unwrap(), Some(chat));
+        }
     }
 
     #[test]
     fn version_four_database_without_session_index_upgrades_and_lists_in_order() {
-        let fixture = build_synthetic_store(3, 1);
+        let chats: Vec<_> = (0..3).map(|index| synthetic_session(index, 1)).collect();
+        let fixture = SyntheticStore {
+            directory: upgrade::tests::v5_folder("v4", &chats),
+        };
         let database = fixture.directory.join(DATABASE_FILE);
         let connection = Connection::open(database).unwrap();
         connection
@@ -805,13 +665,15 @@ mod tests {
     }
     #[test]
     fn pairing_schema_upgrade_preserves_existing_conversations_and_rejects_future_data() {
-        let db = store();
         let conversation = session("before_pairing");
-        db.save_session(&conversation).unwrap();
-        db.connection
+        let fixture = SyntheticStore {
+            directory: upgrade::tests::v5_folder("v1", std::slice::from_ref(&conversation)),
+        };
+        Connection::open(fixture.directory.join(DATABASE_FILE))
+            .unwrap()
             .execute_batch("DROP TABLE paired_devices; DROP TABLE memory; DROP TABLE memory_proposals; CREATE TABLE memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at INTEGER NOT NULL); PRAGMA user_version=1;")
             .unwrap();
-        let upgraded = LocalStore::initialize(db.connection).unwrap();
+        let upgraded = LocalStore::open(&fixture.directory).unwrap();
         assert_eq!(
             upgraded.load_session("before_pairing").unwrap(),
             Some(conversation)
@@ -826,7 +688,8 @@ mod tests {
             .connection
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
-        assert!(LocalStore::initialize(upgraded.connection).is_err());
+        drop(upgraded);
+        assert!(LocalStore::open(&fixture.directory).is_err());
     }
     #[test]
     fn a_new_database_is_marked_as_having_no_app_lock() {
@@ -911,6 +774,77 @@ mod tests {
         assert_eq!(db.memories("detailed").unwrap().len(), 1);
         db.delete_memory(&entry.id).unwrap();
         assert!(db.memories("detailed").unwrap().is_empty());
+    }
+
+    /// Counts the `chat_events` rows deleted from here on: a rewrite deletes, an append does not.
+    fn count_deletes(db: &LocalStore) -> impl Fn() -> i64 + '_ {
+        db.connection
+            .execute_batch(
+                "CREATE TEMP TABLE deleted(n); CREATE TEMP TRIGGER count_deletes
+                 AFTER DELETE ON chat_events BEGIN INSERT INTO deleted VALUES (1); END;",
+            )
+            .unwrap();
+        || {
+            db.connection
+                .query_row("SELECT count(*) FROM temp.deleted", [], |row| row.get(0))
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn saving_a_growing_chat_appends_and_loads_back_exactly() {
+        let db = store();
+        let deleted = count_deletes(&db);
+        for messages in [1, 2, 4] {
+            let chat = synthetic_session(0, messages);
+            db.save_session(&chat).unwrap();
+            assert_eq!(db.load_session("perf_session_0000").unwrap(), Some(chat));
+        }
+        assert_eq!(deleted(), 0, "the second and third saves appended");
+        let rows = |kind: &str| -> i64 {
+            db.connection
+                .query_row(
+                    "SELECT count(*) FROM chat_events WHERE kind=?1",
+                    [kind],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        // Each message once, and each transcript entry once, as a reference to its message.
+        assert_eq!(
+            (rows("ui_user"), rows("ui_assistant"), rows("model")),
+            (2, 2, 4)
+        );
+        let references: i64 = db
+            .connection
+            .query_row(
+                "SELECT count(*) FROM chat_events WHERE body LIKE '{\"ref\":%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(references, 2, "each user turn is stored once");
+    }
+
+    #[test]
+    fn saving_an_edited_earlier_message_rewrites_the_chat() {
+        let db = store();
+        let chat = synthetic_session(1, 4);
+        db.save_session(&chat).unwrap();
+        let deleted = count_deletes(&db);
+        let mut edited = chat.clone();
+        edited["messages"][0]["content"] = json!("An edited first question");
+        let transcript: Vec<Value> = edited["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| json!({"role": message["role"], "content": message["content"]}))
+            .collect();
+        edited["contextState"] =
+            json!(crate::context::ContextState::restore(&transcript, None).unwrap());
+        db.save_session(&edited).unwrap();
+        assert!(deleted() > 0, "the chat was rewritten");
+        assert_eq!(db.load_session("perf_session_0001").unwrap(), Some(edited));
     }
 }
 
