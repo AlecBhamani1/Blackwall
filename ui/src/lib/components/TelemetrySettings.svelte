@@ -9,6 +9,7 @@
   } from '../persistence';
   import { authStatus, NO_KEYRING_NOTE } from '../auth';
   import { platform } from '../platform';
+  import SettingsFooter from './SettingsFooter.svelte';
 
   export let client = telemetryClient;
 
@@ -66,6 +67,10 @@
   function retention(): Retention {
     return forever ? 'forever' : Math.round(days);
   }
+  function cancel() {
+    if (saved) apply(saved);
+    error = '';
+  }
   $: savedExport = { ...blank, ...(saved?.export ?? {}) };
   $: headers = savedExport.headers;
   $: endpointChanged = endpoint.trim() !== (savedExport.endpoint ?? '');
@@ -75,7 +80,7 @@
     traces !== savedExport.traces ||
     metrics !== savedExport.metrics ||
     includeProject !== savedExport.includeProject ||
-    (saved !== null && retention() !== saved.retention);
+    (saved !== null && (forever ? 'forever' : Math.round(days)) !== saved.retention);
   $: canAddHeader = Boolean(saved?.origin) && !endpointChanged && $authStatus.keyring;
 
   async function load() {
@@ -273,7 +278,6 @@
       </div>
     {/if}
     <div class="actions">
-      <button type="submit" class="primary" disabled={busy}>Save</button>
       <button
         type="button"
         onclick={sendTest}
@@ -282,6 +286,18 @@
         >Send test span</button
       >
     </div>
+    {#if !confirmingContent}
+      <SettingsFooter
+        dirty={saved !== null && dirty}
+        canSave={forever || (Number.isInteger(days) && days >= 30 && days <= 3650)}
+        {busy}
+        saveLabel="Save"
+        {feedback}
+        {error}
+        onSave={() => save(false)}
+        onCancel={cancel}
+      />
+    {/if}
     {#if dirty && savedExport.endpoint}<p class="hint">
         The test span uses the saved settings. Save first to test changes.
       </p>{/if}
@@ -363,8 +379,6 @@
           : 'Save the endpoint first: a header is saved for that endpoint only.'}
     </p>
   </form>
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if feedback}<p class="feedback" role="status">{feedback}</p>{/if}
 </section>
 
 <style>
@@ -523,11 +537,9 @@
   .add {
     padding-top: 4px;
   }
-  .error,
   .result.bad {
     color: var(--err);
   }
-  .feedback,
   .result {
     color: var(--ok);
   }

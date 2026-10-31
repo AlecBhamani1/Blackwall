@@ -244,6 +244,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Settings now use a full-page layout with embedded content panes, sticky action footers, save
+  feedback, and quieter warning callouts.
 - Rule paths with `*` or `?` are now refused with an error naming the rule, instead of being
   accepted and never matching. Paths are plain prefixes: use `src`, not `src/**`.
 - Chats are now stored with each message saved once. `bw` appends only what is new on each save;

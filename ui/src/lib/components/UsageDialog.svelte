@@ -8,6 +8,7 @@
   import UsageTable from './usage/UsageTable.svelte';
   import { ago, compact, dayLabel, modeNames, percent, plural } from './usage/format';
   export let onClose: () => void;
+  export let embedded = false;
 
   /** The page re-reads the metrics files this often while it is visible. */
   const REFRESH_MS = 120_000;
@@ -156,7 +157,8 @@
   }
 
   onMount(() => {
-    dialog.showModal();
+    if (embedded) dialog.setAttribute('open', '');
+    else dialog.showModal();
     // Start on the dialog itself, not the first range option, so no focus ring shows on open.
     dialog.focus();
     if (!desktop) return;
@@ -173,7 +175,13 @@
   });
 </script>
 
-<dialog bind:this={dialog} onclose={onClose} aria-labelledby="usage-title" tabindex="-1">
+<dialog
+  class:embedded
+  bind:this={dialog}
+  onclose={onClose}
+  aria-labelledby="usage-title"
+  tabindex="-1"
+>
   <header>
     <h2 id="usage-title">Usage</h2>
     <fieldset class="segmented" aria-label="Range">
@@ -390,6 +398,23 @@
   dialog::backdrop {
     background: var(--bg-scrim);
     backdrop-filter: blur(3px);
+  }
+  dialog.embedded {
+    position: static;
+    display: block;
+    width: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  dialog.embedded header {
+    padding: 0 0 20px;
+  }
+  dialog.embedded header .icon-button {
+    display: none;
   }
   header {
     display: flex;

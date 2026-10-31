@@ -6,6 +6,7 @@
   import SkillImport from './SkillImport.svelte';
   import { platform } from '../platform';
   export let onClose: () => void;
+  export let embedded = false;
   let dialog: HTMLDialogElement;
   let skills: Skill[] = [];
   let warnings: string[] = [];
@@ -131,7 +132,8 @@
     }
   }
   onMount(() => {
-    dialog.showModal();
+    if (embedded) dialog.setAttribute('open', '');
+    else dialog.showModal();
     if (desktop)
       void load().catch(
         () => (error = 'Your skills could not be opened. Existing files have been left in place.'),
@@ -139,7 +141,7 @@
   });
 </script>
 
-<dialog bind:this={dialog} onclose={onClose} aria-labelledby="skills-title">
+<dialog class:embedded bind:this={dialog} onclose={onClose} aria-labelledby="skills-title">
   <header>
     <div>
       <h2 id="skills-title">Skills</h2>
@@ -347,6 +349,26 @@
   dialog::backdrop {
     background: var(--bg-scrim);
     backdrop-filter: blur(3px);
+  }
+  dialog.embedded {
+    position: static;
+    display: block;
+    width: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  dialog.embedded header {
+    padding: 0 0 20px;
+  }
+  dialog.embedded header .icon-button {
+    display: none;
+  }
+  dialog.embedded .content {
+    padding: 0;
   }
   header {
     display: flex;

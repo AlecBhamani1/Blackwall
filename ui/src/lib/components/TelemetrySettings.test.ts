@@ -67,6 +67,13 @@ function client(saved: Partial<ExportSettings> = {}, extra: Partial<TelemetryVie
 }
 
 describe('telemetry settings', () => {
+  it('does not enable Save before settings load', () => {
+    const api = client();
+    api.load.mockReturnValue(new Promise(() => {}));
+    render(TelemetrySettings, { client: api });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
   it('starts off and saves an endpoint, protocol, signals, project names, and retention', async () => {
     const user = userEvent.setup();
     const api = client();
@@ -108,8 +115,11 @@ describe('telemetry settings', () => {
     await waitFor(() => expect(days).toHaveValue(90));
     await user.clear(days);
     await user.type(days, '10');
-    await user.click(screen.getByRole('button', { name: 'Save' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('30 to 3,650 days');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    await waitFor(() => expect(cancel).toBeEnabled());
+    await user.click(cancel);
+    expect(days).toHaveValue(90);
     expect(api.save).not.toHaveBeenCalled();
   });
 
@@ -177,6 +187,7 @@ describe('telemetry settings', () => {
     expect(api.save).toHaveBeenCalledTimes(1);
     expect(await screen.findByText('Saved. New runs are exported.')).toBeInTheDocument();
     // Saving again without moving the endpoint does not ask again.
+    await user.click(screen.getByLabelText('Include project names and session IDs in exported metrics'));
     await user.click(screen.getByRole('button', { name: 'Save' }));
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
     expect(api.save).toHaveBeenCalledTimes(2);

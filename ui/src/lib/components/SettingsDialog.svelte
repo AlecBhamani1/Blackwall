@@ -32,12 +32,7 @@
   import McpDialog from './McpDialog.svelte';
   import RunsDialog from './RunsDialog.svelte';
   import UsageDialog from './UsageDialog.svelte';
-  import {
-    settingsEntries,
-    settingsGroups,
-    type SettingsPage,
-    type SettingsPanel,
-  } from '../settingsNavigation';
+  import { settingsEntries, settingsGroups, type SettingsPage } from '../settingsNavigation';
   import type { Preferences } from '../persistence';
 
   export let contextPreferences: Preferences = {};
@@ -77,14 +72,10 @@
   const RELAY_URL_STORAGE_KEY = 'blackwall.relay-url.v1';
 
   let keysOpen = false;
-  let telemetryOpen = false;
   let trustedOpen = false;
-  let activePanel: SettingsPanel | null = null;
-  let selectedSetting: SettingsPage | null = null;
+  let selectedSetting: SettingsPage = 'connection';
   let settingsQuery = '';
-  let settingsOrder = 'category';
   let dialogContent: HTMLElement;
-  let panelButton: HTMLButtonElement;
 
   $: matchingSettings = settingsEntries.filter((entry) => {
     if (entry.desktopOnly && !isDesktop()) return false;
@@ -96,44 +87,16 @@
       .split(/\s+/)
       .every((word) => text.includes(word));
   });
-  $: menuGroups =
-    settingsOrder === 'alphabetical'
-      ? [
-          {
-            title: 'All settings',
-            entries: [...matchingSettings].sort((a, b) => a.title.localeCompare(b.title)),
-          },
-        ]
-      : settingsGroups.map((title) => ({
-          title,
-          entries: matchingSettings.filter((entry) => entry.group === title),
-        }));
+  $: menuGroups = settingsGroups.map((title) => ({
+    title,
+    entries: matchingSettings.filter((entry) => entry.group === title),
+  }));
 
-  async function openSetting(
-    entry: (typeof settingsEntries)[number],
-    button: HTMLButtonElement,
-  ): Promise<void> {
-    panelButton = button;
-    if (entry.kind === 'dialog') activePanel = entry.id;
-    else {
-      selectedSetting = entry.id;
-      await tick();
-      dialogContent.scrollTop = 0;
-      dialogContent.focus();
-    }
-  }
-
-  async function returnToMenu(): Promise<void> {
-    const previous = selectedSetting;
-    selectedSetting = null;
+  async function openSetting(entry: (typeof settingsEntries)[number]): Promise<void> {
+    selectedSetting = entry.id;
     await tick();
-    dialog.querySelector<HTMLElement>(`[data-setting-id="${previous}"]`)?.focus();
-  }
-
-  async function closePanel(): Promise<void> {
-    activePanel = null;
-    await tick();
-    if (open) panelButton?.focus();
+    dialogContent.scrollTop = 0;
+    dialogContent.focus();
   }
   let expiry: ShareExpiryMinutes = 60;
   let inviteName = '';
@@ -230,7 +193,7 @@
 
   async function focusGuestResult(): Promise<void> {
     await tick();
-    if (!open || selectedSetting !== 'sharing' || activePanel || !dialog) return;
+    if (!open || selectedSetting !== 'sharing' || !dialog) return;
     const active = document.activeElement;
     if (active !== document.body && !dialog.contains(active)) return;
     // Creating/revoking a link removes the initiating control from the DOM.
@@ -418,35 +381,9 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (open && !activePanel && event.key === 'Escape') {
+    if (open && event.key === 'Escape') {
       event.preventDefault();
       onClose();
-    }
-  }
-
-  function trapFocus(event: KeyboardEvent): void {
-    if (activePanel || event.key !== 'Tab') return;
-    const focusable = Array.from(
-      dialog.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])',
-      ),
-    ).filter((element) => !element.closest('details:not([open])') || element.tagName === 'SUMMARY');
-    const first = focusable[0];
-    const last = focusable.at(-1);
-    if (!first || !last) {
-      event.preventDefault();
-      return;
-    }
-
-    if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
-      event.preventDefault();
-      last.focus();
-    } else if (
-      !event.shiftKey &&
-      (document.activeElement === last || document.activeElement === dialog)
-    ) {
-      event.preventDefault();
-      first.focus();
     }
   }
 
@@ -454,15 +391,13 @@
     previouslyOpen = open;
     if (open) {
       copied = false;
-      selectedSetting = null;
+      selectedSetting = 'connection';
       settingsQuery = '';
       endpointDraft = endpoint;
       previousEndpoint = endpoint;
       endpointFeedback = '';
       endpointInputError = '';
       void tick().then(() => dialog?.focus());
-    } else {
-      activePanel = null;
     }
   }
 
@@ -487,16 +422,13 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div class="modal-layer" inert={activePanel !== null}>
-    <button class="backdrop" aria-label="Close settings" onclick={onClose}></button>
+  <div class="modal-layer">
     <div
       class="settings-dialog"
-      role="dialog"
-      aria-modal="true"
+      role="region"
       aria-labelledby="settings-title"
       tabindex="-1"
       bind:this={dialog}
-      onkeydown={trapFocus}
     >
       <header>
         <div>
@@ -508,8 +440,8 @@
         </button>
       </header>
 
-      <div class="dialog-content" tabindex="-1" bind:this={dialogContent}>
-        {#if selectedSetting === null}
+      <div class="settings-layout">
+        <aside class="settings-navigation">
           <div class="menu-controls">
             <label class="settings-search">
               <Icon name="search" size={16} />
@@ -519,13 +451,6 @@
                 placeholder="Search settings"
                 bind:value={settingsQuery}
               />
-            </label>
-            <label class="settings-order">
-              <span>Sort by</span>
-              <select aria-label="Settings order" bind:value={settingsOrder}>
-                <option value="category">Category</option>
-                <option value="alphabetical">Name (A–Z)</option>
-              </select>
             </label>
           </div>
           <nav aria-label="Settings menu">
@@ -538,8 +463,8 @@
                       class="preference-button"
                       data-setting-id={entry.id}
                       title={entry.description}
-                      aria-haspopup={entry.kind === 'dialog' ? 'dialog' : undefined}
-                      onclick={(event) => openSetting(entry, event.currentTarget)}
+                      aria-current={selectedSetting === entry.id ? 'page' : undefined}
+                      onclick={() => openSetting(entry)}
                     >
                       <Icon name={entry.icon} size={19} />
                       <span><strong>{entry.title}</strong></span>
@@ -555,11 +480,13 @@
               </p>
             {/if}
           </nav>
-        {:else}
-          <button class="back-button" onclick={returnToMenu}>
-            <Icon name="chevron-left" size={16} /> All settings
-          </button>
-        {/if}
+        </aside>
+        <main
+          class="dialog-content"
+          data-testid="settings-content-pane"
+          tabindex="-1"
+          bind:this={dialogContent}
+        >
         {#if selectedSetting === 'connection'}
           <section class="connection-section" aria-labelledby="connection-heading">
             <div class="section-heading">
@@ -728,8 +655,9 @@
                   </div>
                 {:else}
                   <div class="notice warning">
-                    This link is active, but its access code is no longer available in this window.
-                    Revoke this link below and create a replacement if you need to share it again.
+                      This link is active, but its access code is no longer available in this
+                      window. Revoke this link below and create a replacement if you need to share
+                      it again.
                   </div>
                 {/if}
 
@@ -742,8 +670,8 @@
                 </div>
 
                 <div class="notice warning">
-                  Anyone with this link can send prompts and files to your model until it expires or
-                  you stop sharing.
+                    Anyone with this link can send prompts and files to your model until it expires
+                    or you stop sharing.
                 </div>
 
                 <button
@@ -785,8 +713,8 @@
                     onchange={rememberRelayUrl}
                   />
                   <p class="relay-hint">
-                    Saved on this {platform.device}. Change this origin whenever you move the relay
-                    to another server.
+                      Saved on this {platform.device}. Change this origin whenever you move the
+                      relay to another server.
                   </p>
 
                   <label for="relay-token">Relay token <span>(optional)</span></label>
@@ -882,7 +810,7 @@
             </p>
           </section>
         {/if}
-        {#if selectedSetting === 'security'}
+          {#if selectedSetting === 'rules'}
           {#if isDesktop()}
             <details class="access-keys" bind:open={keysOpen}>
               <summary>Access keys</summary>
@@ -895,7 +823,8 @@
                   <label for="key-connection">Model service</label>
                   <select class="key-connection" id="key-connection" bind:value={keyEndpoint}>
                     {#each modelKeyConnections as profile}
-                      <option value={profile.endpoint}>{profile.name} · {profile.endpoint}</option>
+                        <option value={profile.endpoint}>{profile.name} · {profile.endpoint}</option
+                        >
                     {/each}
                   </select>
                 {/if}
@@ -911,28 +840,53 @@
                     Connect a model or configure a relay to manage its access key.
                   </p>{/if}
                 <p>
-                  Keys supplied through environment variables are managed outside Blackwall and are
-                  unaffected by removal here.
+                    Keys supplied through environment variables are managed outside Blackwall and
+                    are unaffected by removal here.
                 </p>
               {/if}
             </details>
           {/if}
           {#if isDesktop()}
-            <details class="access-keys">
-              <summary>App lock</summary>
-              <LockSettings {onLock} />
-            </details>
-            <details class="access-keys" bind:open={telemetryOpen}>
-              <summary>Telemetry</summary>
-              <p>Export traces and usage metrics over OTLP, and choose how long usage is kept.</p>
-              {#if telemetryOpen}<TelemetrySettings />{/if}
-            </details>
             <details class="access-keys" bind:open={trustedOpen}>
               <summary>Trusted projects</summary>
               {#if trustedOpen}<TrustedProjects />{/if}
             </details>
           {/if}
         {/if}
+          {#if selectedSetting === 'telemetry'}<TelemetrySettings />{/if}
+          {#if selectedSetting === 'lock'}<LockSettings {onLock} />{/if}
+          {#if selectedSetting === 'memory'}<MemoryDialog
+              embedded
+              section="memory"
+              {contextPreferences}
+              {onPreferences}
+              onClose={() => {}}
+            />{/if}
+          {#if selectedSetting === 'limits'}<MemoryDialog
+              embedded
+              section="limits"
+              {contextPreferences}
+              {onPreferences}
+              onClose={() => {}}
+            />{/if}
+          {#if selectedSetting === 'subagents'}<MemoryDialog
+              embedded
+              section="subagents"
+              {contextPreferences}
+              {onPreferences}
+              onClose={() => {}}
+            />{/if}
+          {#if selectedSetting === 'instructions'}<MemoryDialog
+              embedded
+              section="instructions"
+              {contextPreferences}
+              {onPreferences}
+              onClose={() => {}}
+            />{/if}
+          {#if selectedSetting === 'skills'}<SkillsDialog embedded onClose={() => {}} />{/if}
+          {#if selectedSetting === 'mcp'}<McpDialog embedded onClose={() => {}} />{/if}
+          {#if selectedSetting === 'runs'}<RunsDialog embedded onClose={() => {}} />{/if}
+          {#if selectedSetting === 'usage'}<UsageDialog embedded onClose={() => {}} />{/if}
         {#if selectedSetting === 'updates'}
           <section class="update-section" aria-labelledby="update-heading">
             <div class="section-heading">
@@ -1028,20 +982,10 @@
             {/if}
           </section>
         {/if}
+        </main>
       </div>
     </div>
   </div>
-  {#if activePanel === 'memory'}
-    <MemoryDialog {contextPreferences} {onPreferences} onClose={closePanel} />
-  {:else if activePanel === 'skills'}
-    <SkillsDialog onClose={closePanel} />
-  {:else if activePanel === 'mcp'}
-    <McpDialog onClose={closePanel} />
-  {:else if activePanel === 'runs'}
-    <RunsDialog onClose={closePanel} />
-  {:else if activePanel === 'usage'}
-    <UsageDialog onClose={closePanel} />
-  {/if}
 {/if}
 
 <style>
@@ -1083,19 +1027,6 @@
     outline: none;
     font-size: 13px;
   }
-  .settings-order {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    color: var(--text-muted);
-    font-size: 12px;
-  }
-  .settings-order select {
-    width: auto;
-    margin: 0;
-    padding: 6px 30px 6px 10px;
-  }
   .settings-group + .settings-group {
     margin-top: 22px;
   }
@@ -1117,8 +1048,7 @@
     color: var(--text-muted);
     text-align: left;
   }
-  .preference-button:hover,
-  .back-button:hover {
+  .preference-button:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
@@ -1133,17 +1063,6 @@
     color: var(--text-primary);
     font-size: 14px;
     font-weight: 500;
-  }
-  .back-button {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 20px;
-    border-radius: var(--radius-sm);
-    padding: 8px;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12px;
   }
   .no-settings {
     padding: 16px 10px;
@@ -1247,30 +1166,31 @@
   .modal-layer {
     position: fixed;
     z-index: 100;
-    inset: 0;
-    display: grid;
-    place-items: center;
-    padding: 20px;
-  }
-
-  .backdrop {
-    position: absolute;
-    inset: 0;
-    background: var(--bg-scrim);
-    backdrop-filter: blur(3px);
+    inset: 0 0 0 var(--sidebar-width);
+    background: var(--bg-panel);
   }
 
   .settings-dialog {
     position: relative;
     display: flex;
-    width: min(520px, 100%);
-    max-height: min(740px, calc(100vh - 40px));
+    width: 100%;
+    height: 100%;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
+    border-left: 1px solid var(--border);
     background: var(--bg-panel);
-    box-shadow: var(--shadow-menu);
+  }
+
+  .settings-layout {
+    display: grid;
+    grid-template-columns: 250px minmax(0, 1fr);
+    min-height: 0;
+    flex: 1;
+  }
+  .settings-navigation {
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding: 20px 14px;
   }
 
   header {
@@ -1318,7 +1238,8 @@
 
   .dialog-content {
     overflow-y: auto;
-    padding: 20px;
+    padding: 32px;
+    min-height: 0;
   }
 
   .connection-section,
@@ -1952,19 +1873,24 @@
     line-height: 1.5;
   }
 
-  @media (max-width: 560px) {
+  @media (max-width: 760px) {
     .modal-layer {
-      place-items: end center;
-      padding: 0;
+      inset: 0;
     }
 
     .settings-dialog {
       width: 100%;
-      max-height: calc(100vh - 20px);
+      height: 100%;
       border-right: 0;
       border-bottom: 0;
       border-left: 0;
-      border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+      border-radius: 0;
+    }
+    .settings-layout {
+      grid-template-columns: 190px minmax(0, 1fr);
+    }
+    .dialog-content {
+      padding: 20px;
     }
   }
 </style>

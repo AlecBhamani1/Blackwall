@@ -31,8 +31,7 @@ describe('SettingsDialog', () => {
     vi.unstubAllGlobals();
   });
 
-  it('groups settings by purpose and can sort every destination by name', async () => {
-    const user = userEvent.setup();
+  it('keeps the owner-defined navigation order and has no sort control', () => {
     const client = mockClient();
     render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client } });
 
@@ -42,43 +41,38 @@ describe('SettingsDialog', () => {
         name: /Model connection/,
       }),
     ).toBeInTheDocument();
-    const ai = within(menu.getByRole('region', { name: 'AI capabilities' }));
-    for (const name of ['Memory', 'Skills', 'MCP servers']) {
-      expect(ai.getByRole('button', { name: new RegExp(name) })).toBeInTheDocument();
-    }
+    const groups = menu.getAllByRole('region').map((group) => group.getAttribute('aria-label'));
+    expect(groups).toEqual(['General', 'Agent', 'Memory', 'Workflows']);
     expect(
-      within(menu.getByRole('region', { name: 'Workflows' })).getByRole('button', { name: /Runs/ }),
-    ).toBeInTheDocument();
+      within(menu.getByRole('region', { name: 'Agent' }))
+        .getAllByRole('button')
+        .map((button) => button.textContent?.trim()),
+    ).toEqual(['Limits', 'MCP servers', 'Skills']);
+    expect(menu.queryByRole('button', { name: /Subagents/ })).not.toBeInTheDocument();
+    expect(menu.queryByRole('button', { name: /Instructions/ })).not.toBeInTheDocument();
+    expect(
+      within(menu.getByRole('region', { name: 'Workflows' }))
+        .getAllByRole('button')
+        .map((button) => button.textContent?.trim()),
+    ).toEqual(['Sharing & pairing', 'Runs']);
     expect(client.shareStatus).not.toHaveBeenCalled();
-
-    await user.selectOptions(screen.getByLabelText('Settings order'), 'alphabetical');
-    expect(menu.queryByRole('region', { name: 'AI capabilities' })).not.toBeInTheDocument();
-    expect(
-      menu.getAllByRole('button').map((button) => button.querySelector('strong')?.textContent),
-    ).toEqual([
-      'App updates',
-      'MCP servers',
-      'Memory',
-      'Model connection',
-      'Runs',
-      'Sharing & pairing',
-      'Skills',
-    ]);
-    await user.selectOptions(screen.getByLabelText('Settings order'), 'category');
-    expect(menu.getByRole('region', { name: 'AI capabilities' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Settings order')).not.toBeInTheDocument();
   });
 
-  it('keeps access keys and app lock together under Security on desktop', async () => {
+  it('places rules, telemetry, and lock under Privacy & security on desktop', async () => {
     const user = userEvent.setup();
     vi.stubGlobal('__TAURI_INTERNALS__', {});
     render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
-    const general = within(screen.getByRole('region', { name: 'General' }));
-    await user.click(general.getByRole('button', { name: 'Security' }));
+    const privacy = within(screen.getByRole('region', { name: 'Privacy & security' }));
+    expect(privacy.getAllByRole('button').map((button) => button.textContent?.trim())).toEqual([
+      'Rules & sandbox',
+      'Telemetry',
+      'Lock',
+    ]);
+    await user.click(privacy.getByRole('button', { name: 'Rules & sandbox' }));
     expect(screen.getByText('Access keys', { selector: 'summary' })).toBeInTheDocument();
-    await user.click(screen.getByText('App lock', { selector: 'summary' }));
+    await user.click(privacy.getByRole('button', { name: 'Lock' }));
     expect(screen.getByRole('heading', { name: 'App lock' })).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'All settings' }));
-    expect(screen.getByRole('button', { name: 'Security' })).toHaveFocus();
   });
 
   it('lists Usage next to Runs on desktop and opens it', async () => {
@@ -101,6 +95,21 @@ describe('SettingsDialog', () => {
     expect(screen.getByRole('heading', { name: 'Usage' })).toBeInTheDocument();
     expect(usage).toHaveBeenCalledWith(7);
     usage.mockRestore();
+  });
+
+  it('keeps every embedded panel in the content pane flow', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    vi.spyOn(persistence, 'preferences').mockResolvedValue({});
+    vi.spyOn(persistence, 'memories').mockResolvedValue([]);
+    vi.spyOn(persistence, 'memoryProposals').mockResolvedValue([]);
+    vi.spyOn(persistence, 'usage').mockReturnValue(new Promise(() => {}));
+    render(SettingsDialog, { props: { open: true, onClose: vi.fn(), client: mockClient() } });
+    for (const name of ['Limits', 'Subagents', 'Instructions', 'Saved memories', 'MCP servers', 'Skills', 'Runs', 'Usage']) {
+      await fireEvent.click(screen.getByRole('button', { name: new RegExp(name) }));
+      const embedded = document.querySelector('dialog.embedded');
+      expect(embedded).not.toBeNull();
+      expect(getComputedStyle(embedded!).position).toBe('static');
+    }
   });
 
   it('filters by related terms and category, and explains an empty result', async () => {
@@ -135,7 +144,7 @@ describe('SettingsDialog', () => {
       await fireEvent.click(screen.getByRole('button', { name: 'Sharing & pairing' }));
       await vi.advanceTimersByTimeAsync(10_000);
       expect(client.shareStatus).toHaveBeenCalledTimes(2);
-      await fireEvent.click(screen.getByRole('button', { name: 'All settings' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Model connection' }));
       await vi.advanceTimersByTimeAsync(30_000);
       expect(client.shareStatus).toHaveBeenCalledTimes(2);
       await fireEvent.click(screen.getByRole('button', { name: 'Sharing & pairing' }));
@@ -149,17 +158,19 @@ describe('SettingsDialog', () => {
     }
   });
 
-  it('returns from a settings page to the filtered menu and restores keyboard focus', async () => {
+  it('keeps the navigation and stable content pane while changing sections', async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
     const view = render(SettingsDialog, { props: { open: true, onClose, client: mockClient() } });
     await user.type(screen.getByRole('searchbox'), 'beta');
     await user.click(screen.getByRole('button', { name: /App updates/ }));
-    expect(screen.queryByRole('navigation', { name: 'Settings menu' })).not.toBeInTheDocument();
+    const pane = screen.getByTestId('settings-content-pane');
+    expect(screen.getByRole('navigation', { name: 'Settings menu' })).toBeInTheDocument();
     expect(screen.getByLabelText('Update channel')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'All settings' }));
-    expect(screen.getByRole('searchbox')).toHaveValue('beta');
-    expect(screen.getByRole('button', { name: /App updates/ })).toHaveFocus();
+    await user.clear(screen.getByRole('searchbox'));
+    await user.click(screen.getByRole('button', { name: /Model connection/ }));
+    expect(screen.getByTestId('settings-content-pane')).toBe(pane);
+    expect(screen.getByRole('searchbox')).toHaveValue('');
     await user.keyboard('{Escape}');
     expect(onClose).toHaveBeenCalledOnce();
     await view.rerender({ open: false });
@@ -434,7 +445,7 @@ describe('SettingsDialog', () => {
         },
       },
     });
-    await user.click(screen.getByRole('button', { name: 'Security' }));
+    await user.click(screen.getByRole('button', { name: 'Rules & sandbox' }));
     await user.click(screen.getByText('Access keys', { selector: 'summary' }));
     expect(screen.getByLabelText('Model service').querySelectorAll('option')).toHaveLength(2);
     await user.selectOptions(screen.getByLabelText('Model service'), 'https://second.example/v1');

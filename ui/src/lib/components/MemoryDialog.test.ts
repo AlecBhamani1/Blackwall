@@ -34,7 +34,7 @@ describe('memory management', () => {
   it('saves agent limits only within their ranges', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'limits' } });
     const iterations = await screen.findByLabelText('Agent iteration limit');
     await vi.waitFor(() => expect(iterations).toBeEnabled());
     const timeout = screen.getByLabelText('Command time limit (seconds)');
@@ -51,10 +51,43 @@ describe('memory management', () => {
       expect.objectContaining({ maxIterations: 40, commandTimeoutSeconds: 600 }),
     );
   });
+  it('cancels an invalid context limit edit', async () => {
+    const user = userEvent.setup();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'limits' } });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    await user.clear(context);
+    await user.type(context, '1000');
+    expect(screen.getByRole('button', { name: 'Save context limit' })).toBeDisabled();
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toBeEnabled();
+    await user.click(cancel);
+    expect(context).toHaveValue(32000);
+  });
+  it('starts web limits clean and restores their loaded values', async () => {
+    vi.spyOn(persistence, 'available').mockReturnValue(false);
+    const user = userEvent.setup();
+    render(MemoryDialog, {
+      props: {
+        onClose: vi.fn(),
+        embedded: true,
+        section: 'limits',
+        contextPreferences: { contextWindow: 64000 },
+      },
+    });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    expect(cancel).toBeDisabled();
+    await user.clear(context);
+    await user.type(context, '32000');
+    await user.click(cancel);
+    expect(context).toHaveValue(64000);
+  });
   it('saves the command output cap only within its range', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'limits' } });
     const cap = await screen.findByLabelText('Command output cap (bytes)');
     await vi.waitFor(() => expect(cap).toBeEnabled());
     expect(cap).toHaveValue(65536);
@@ -70,10 +103,9 @@ describe('memory management', () => {
   it('saves subagent steps and tools, and marks a command tool as off-device', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
     const steps = await screen.findByLabelText('Subagent step limit');
     await vi.waitFor(() => expect(steps).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Subagents'));
     expect(steps).toHaveValue(8);
     expect(screen.getByLabelText('Read files')).toBeChecked();
     expect(screen.getByLabelText('Run commands (asks)')).not.toBeChecked();
@@ -93,6 +125,7 @@ describe('memory management', () => {
       subagentRunsOn: 'local',
       commandToolsIsolation: 'outside',
     });
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
     await user.click(screen.getByLabelText('A command tool'));
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
     expect(button).toBeDisabled();
@@ -105,16 +138,55 @@ describe('memory management', () => {
       commandToolsIsolation: 'outside',
     });
   });
+  it('shows command tool settings after choosing a command tool', async () => {
+    const user = userEvent.setup();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const option = await screen.findByLabelText('A command tool');
+    await vi.waitFor(() => expect(option).toBeEnabled());
+    await user.click(option);
+    expect(screen.getByLabelText('Command tool name')).toBeInTheDocument();
+  });
+  it('saves the memory toggle without committing a draft context limit', async () => {
+    const user = userEvent.setup();
+    let stored = { memoryEnabled: false, contextWindow: 32000 };
+    vi.spyOn(persistence, 'preferences').mockImplementation(async () => ({ ...stored }));
+    vi.spyOn(persistence, 'savePreferences').mockImplementation(async (patch) => {
+      stored = { ...stored, ...patch };
+    });
+    const view = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'limits' },
+    });
+    const context = await screen.findByLabelText('Model context limit (tokens)');
+    await vi.waitFor(() => expect(context).toBeEnabled());
+    await user.clear(context);
+    await user.type(context, '64000');
+    view.unmount();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'memory' } });
+    const toggle = await screen.findByLabelText('Use saved memories in chat');
+    await vi.waitFor(() => expect(toggle).toBeEnabled());
+    await user.click(toggle);
+    expect(stored).toEqual({ memoryEnabled: true, contextWindow: 32000 });
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
+  });
+  it('shows feedback after saving memory text', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'saveMemory').mockResolvedValue();
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'memory' } });
+    const input = await screen.findByLabelText('Remember something');
+    await vi.waitFor(() => expect(input).toBeEnabled());
+    await user.type(input, 'Prefer concise answers.');
+    await user.click(screen.getByRole('button', { name: 'Save memory' }));
+    expect(screen.getByText('Saved ✓')).toBeInTheDocument();
+  });
   it('loads saved subagent settings that run on a command tool', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'preferences').mockResolvedValue({
       subagentMaxSteps: 3,
       subagentRunsOn: { tool: 'review' },
     });
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
     const name = await screen.findByLabelText('Command tool name');
     await vi.waitFor(() => expect(name).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Subagents'));
     expect(name).toHaveValue('review');
     expect(screen.getByLabelText('Subagent step limit')).toHaveValue(3);
     expect(screen.getByText(/Sends data off this device/)).toBeVisible();
@@ -123,10 +195,9 @@ describe('memory management', () => {
   it('saves command tools isolation and shows the account-permissions label', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
     const outside = await screen.findByLabelText('Outside the sandbox (asks every time)');
     await vi.waitFor(() => expect(outside).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Subagents'));
     const sandboxed = screen.getByLabelText('Inside the Commands profile');
     expect(screen.getByRole('group', { name: 'Command tools' })).toBeInTheDocument();
     expect(outside).toHaveAttribute('value', 'outside');
@@ -148,35 +219,57 @@ describe('memory management', () => {
     vi.spyOn(persistence, 'savePreferences').mockImplementation(async (patch) => {
       stored = { ...stored, ...patch };
     });
-    const first = render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const first = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'subagents' },
+    });
     const sandboxed = await screen.findByLabelText('Inside the Commands profile');
     await vi.waitFor(() => expect(sandboxed).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Subagents'));
     await user.click(sandboxed);
     await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
     expect(stored.commandToolsIsolation).toBe('sandboxed');
     first.unmount();
 
     // Reopened: the saved choice is shown, and the other saves do not reset it.
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    const second = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'subagents' },
+    });
     const reloaded = await screen.findByLabelText('Inside the Commands profile');
     await vi.waitFor(() => expect(reloaded).toBeEnabled());
     expect(reloaded).toBeChecked();
     expect(screen.queryByText(isolationHint)).not.toBeInTheDocument();
+    second.unmount();
+    const limits = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'limits' },
+    });
+    const limit = await screen.findByLabelText('Model context limit (tokens)');
+    await vi.waitFor(() => expect(limit).toBeEnabled());
+    await user.clear(limit);
+    await user.type(limit, '33000');
     await user.click(screen.getByRole('button', { name: 'Save context limit' }));
-    await user.click(screen.getByText('Advanced · Instructions'));
+    expect(stored.commandToolsIsolation).toBe('sandboxed');
+    limits.unmount();
+    const instructions = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'instructions' },
+    });
+    const instructionFile = await screen.findByLabelText('Instruction file limit (KiB)');
+    await vi.waitFor(() => expect(instructionFile).toBeEnabled());
+    await user.type(screen.getByLabelText('Extra instruction files, one per line'), 'CLAUDE.md');
     await user.click(screen.getByRole('button', { name: 'Save instruction limits' }));
     expect(stored.commandToolsIsolation).toBe('sandboxed');
     expect(stored.instructionMaxFileKib).toBe(8);
+    instructions.unmount();
 
     // Choosing the default again is saved too.
-    await user.click(screen.getByLabelText('Outside the sandbox (asks every time)'));
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
+    const outside = await screen.findByLabelText('Outside the sandbox (asks every time)');
+    await vi.waitFor(() => expect(outside).toBeEnabled());
+    await user.click(outside);
     await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
     expect(stored.commandToolsIsolation).toBe('outside');
   });
   it('loads a saved sandboxed choice', async () => {
     vi.spyOn(persistence, 'preferences').mockResolvedValue({ commandToolsIsolation: 'sandboxed' });
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'subagents' } });
     const sandboxed = await screen.findByLabelText('Inside the Commands profile');
     await vi.waitFor(() => expect(sandboxed).toBeEnabled());
     expect(sandboxed).toBeChecked();
@@ -184,10 +277,9 @@ describe('memory management', () => {
   it('saves instruction limits and extra files only within their ranges', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'instructions' } });
     const file = await screen.findByLabelText('Instruction file limit (KiB)');
     await vi.waitFor(() => expect(file).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Instructions'));
     const total = screen.getByLabelText('Total instruction limit (KiB)');
     const files = screen.getByLabelText('Extra instruction files, one per line');
     expect(file).toHaveValue(8);
@@ -240,10 +332,9 @@ describe('memory management', () => {
       instructionMaxTotalKib: 128,
       instructionExtraFiles: ['CLAUDE.md', 'GEMINI.md'],
     });
-    render(MemoryDialog, { props: { onClose: vi.fn() } });
+    render(MemoryDialog, { props: { onClose: vi.fn(), embedded: true, section: 'instructions' } });
     const file = await screen.findByLabelText('Instruction file limit (KiB)');
     await vi.waitFor(() => expect(file).toBeEnabled());
-    await user.click(screen.getByText('Advanced · Instructions'));
     expect(file).toHaveValue(2);
     expect(screen.getByLabelText('Total instruction limit (KiB)')).toHaveValue(128);
     expect(screen.getByLabelText('Extra instruction files, one per line')).toHaveValue(
