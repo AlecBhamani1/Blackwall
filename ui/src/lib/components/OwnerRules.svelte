@@ -295,8 +295,11 @@
     padding: 10px;
     border: 1px solid var(--border-strong);
     border-radius: 6px;
-    background: var(--bg-elevated);
+    background-color: var(--bg-elevated);
     color: var(--text-primary);
+  }
+  select {
+    padding-right: 30px;
   }
   input {
     min-width: 200px;
