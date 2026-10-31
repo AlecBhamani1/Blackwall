@@ -2,7 +2,8 @@ use super::*;
 use crate::memory::MemoryClient;
 use crate::storage::backup::{backup_name, backups_dir, set_fault, AbortAt, Fault, BACKUPS_DIR};
 use crate::storage::fixtures::{
-    build_v5, golden, master, platform_neutral, v5_sessions, RECALL_QUERIES,
+    build_v5, build_v5_indexed, golden, long_chat, master, platform_neutral, v5_sessions,
+    RECALL_QUERIES,
 };
 use crate::storage::search::search_v6;
 use crate::storage::{RecallQuery, BUSY_TIMEOUT, DATABASE_FILE};
@@ -46,6 +47,7 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         set_fault(&self.0, None);
         set_test_busy_timeout(&self.0, None);
+        set_test_free_disk(&self.0, None);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -231,6 +233,100 @@ fn keys_follow_the_conversion_order_and_a_new_chat_takes_the_next() {
         })
         .unwrap();
     assert_eq!(key, by_key.len() as i64 + 1);
+}
+
+// ---- the VACUUM after the upgrade (R6-3) ----
+
+fn vacuum_owed(db: &LocalStore) -> bool {
+    db.connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key='storage_vacuum_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// (pages, free pages) of the open database.
+fn pages(db: &LocalStore) -> (i64, i64) {
+    let read = |name: &str| -> i64 {
+        db.connection()
+            .pragma_query_value(None, name, |row| row.get(0))
+            .unwrap()
+    };
+    (read("page_count"), read("freelist_count"))
+}
+
+/// Chats big enough that the upgrade frees many pages: their v5 bodies and v5 recall index.
+fn vacuum_chats() -> Vec<Value> {
+    (0..6)
+        .map(|n| long_chat(&format!("vacuum_{n}"), n, 30))
+        .collect()
+}
+
+fn assert_bodies_load(db: &LocalStore, bodies: &[Value]) {
+    for body in bodies {
+        let id = body["id"].as_str().unwrap();
+        assert_eq!(&db.load_json_v6(id).unwrap().unwrap(), body, "{id}");
+    }
+}
+
+#[test]
+fn the_upgrade_vacuums_once_after_its_commit() {
+    let dir = Scratch::new("vacuum-runs");
+    let bodies = vacuum_chats();
+    let v5_size = fs::metadata(build_v5_indexed(&dir, &bodies)).unwrap().len();
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db));
+    assert_eq!(pages(&db).1, 0, "a VACUUM leaves no free page");
+    assert!(fs::metadata(dir.database()).unwrap().len() < v5_size);
+    assert_bodies_load(&db, &bodies);
+    // An upgrade with nothing to back up owes none.
+    let empty = Scratch::new("vacuum-empty");
+    assert!(!vacuum_owed(&open6(&empty).unwrap()));
+}
+
+#[test]
+fn a_vacuum_skipped_for_disk_or_busy_is_owed_to_the_next_open() {
+    let dir = Scratch::new("vacuum-owed");
+    let bodies = vacuum_chats();
+    build_v5_indexed(&dir, &bodies);
+    // Less free disk than the file: the upgrade commits and owes the VACUUM.
+    set_test_free_disk(&dir, Some(0));
+    let db = open6(&dir).unwrap();
+    assert_eq!(user_version(db.connection()).unwrap(), V6);
+    assert!(vacuum_owed(&db));
+    let (before, free) = pages(&db);
+    assert!(free > 0, "the upgrade freed pages");
+    drop(db);
+    // Still too little: the open skips it again, and still opens.
+    let db = open6(&dir).unwrap();
+    assert!(vacuum_owed(&db));
+    assert_eq!(pages(&db), (before, free));
+    drop(db);
+    // Another window is reading: the VACUUM is busy, the open still succeeds, and it stays owed.
+    set_test_free_disk(&dir, None);
+    set_test_busy_timeout(&dir, Some(Duration::from_millis(20)));
+    let reader = Connection::open(dir.database()).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let db = open6(&dir).unwrap();
+    assert!(vacuum_owed(&db));
+    assert_eq!(pages(&db), (before, free));
+    drop(db);
+    drop(reader);
+    // The next open runs it before anything else, once.
+    let db = open6(&dir).unwrap();
+    assert!(!vacuum_owed(&db));
+    let (after, free) = pages(&db);
+    assert_eq!(free, 0);
+    assert!(after < before, "{after} pages, {before} before");
+    assert_bodies_load(&db, &bodies);
+    drop(db);
+    let db = open6(&dir).unwrap();
+    assert_eq!(pages(&db), (after, 0));
 }
 
 #[test]
@@ -964,6 +1060,16 @@ fn a_crash_after_backup_during_convert_or_before_commit_reopens_as_whole_v5_then
                 backup_files(&dir).contains(&"upgrade-state.json".to_owned()),
                 "{name}"
             );
+            // The VACUUM was owed in the same commit, so the crash leaves it for the next open.
+            let owed: bool = Connection::open(dir.database())
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM settings WHERE key='storage_vacuum_pending')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(owed, "{name}");
         } else {
             // Reading the file rolls its hot journal back: the whole v5 database, untouched.
             assert_eq!(version_of(&dir.database()), 5, "{name}");
@@ -974,6 +1080,7 @@ fn a_crash_after_backup_during_convert_or_before_commit_reopens_as_whole_v5_then
 
         let db = open6(&dir).unwrap();
         assert_chats_intact(&db, &sessions);
+        assert!(!vacuum_owed(&db), "{name}");
         drop(db);
         // The next successful open finishes the cleanup: no state file is left, whatever the
         // crash point (after a commit, the v6 open clears it).

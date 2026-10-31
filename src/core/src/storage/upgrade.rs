@@ -9,10 +9,12 @@
 //!    `convert_session_in_tx` (one savepoint each; an invalid chat is set aside, not fatal).
 //! 4. `foreign_key_check`, `user_version=6`, commit. Any SQL or I/O error before the commit rolls
 //!    everything back: the database stays v5 and the error names the backup.
-//! 5. After the commit: `integrity_check`, for detection only (a failure is a notice), then prune.
+//! 5. After the commit: `integrity_check`, for detection only (a failure is a notice), then prune,
+//!    then one `VACUUM`, best effort (R6-3). A VACUUM that cannot run now is left owed, in
+//!    `settings`, and the next open runs it before anything else.
 //!
-//! A database with no data yet takes the same steps without a backup. A v6 open only reads the
-//! version: it never takes the write lock.
+//! A database with no data yet takes the same steps without a backup or a VACUUM. A v6 open only
+//! reads the version and whether a VACUUM is owed: it never takes the write lock otherwise.
 use super::backup::{self, UpgradeState, BACKUPS_DIR, DELETE_BACKUPS_AFTER, MAX_ATTEMPTS};
 use super::chats::{apply_v6_schema, write_tx};
 use super::convert::{convert_session_in_tx, migrate_v6, ConvertOutcome};
@@ -37,6 +39,10 @@ pub(crate) const V6: i64 = 6;
 const NOTICES_KEY: &str = "storage_notices";
 /// The settings key holding when the upgrade committed, in Unix milliseconds.
 const SINCE_KEY: &str = "storage_v6_since";
+/// The settings key present while the post-upgrade VACUUM is still owed (R6-3).
+const VACUUM_PENDING_KEY: &str = "storage_vacuum_pending";
+/// The longest a VACUUM waits for another window's lock before it is left for the next open.
+const VACUUM_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const SET_SETTING: &str = "INSERT INTO settings(key,value) VALUES (?1,?2) \
      ON CONFLICT(key) DO UPDATE SET value=excluded.value";
 const FOREIGN_KEYS_BROKEN: &str =
@@ -178,6 +184,7 @@ pub(super) fn open_v6(
         return Err(StorageError::Invalid(NEWER_VERSION));
     }
     if version == V6 {
+        vacuum_if_pending(directory, &connection, busy);
         finish_interrupted_cleanup(directory, &connection);
         prune_expired_once(directory, &connection);
     } else {
@@ -261,6 +268,12 @@ fn upgrade(directory: &Path, connection: &Connection, retry: bool) -> Result<(),
         }
     };
     let summary = convert_all(directory, &tx, version, millis(now)).map_err(failed)?;
+    // Owed from the commit on, so a crash before it runs still leaves it for the next open. A
+    // database that had no data has nothing to reclaim.
+    if backup.is_some() {
+        tx.execute(SET_SETTING, params![VACUUM_PENDING_KEY, "1"])
+            .map_err(|error| failed(error.into()))?;
+    }
     #[cfg(test)]
     {
         backup::fault(directory, backup::Fault::BeforeCommit).map_err(failed)?;
@@ -441,7 +454,8 @@ fn after_commit(
     backup: Option<&Backup>,
     now: SystemTime,
 ) {
-    if !integrity_ok(directory, connection) {
+    let intact = integrity_ok(directory, connection);
+    if !intact {
         eprintln!("warn: upgrade: the integrity check after the upgrade found a problem");
         let notice = StorageNotice::IntegrityFailed {
             backup: backup.map(|backup| backup.path().display().to_string()),
@@ -457,6 +471,124 @@ fn after_commit(
     if let Err(error) = clean_up(directory, connection, backup, now) {
         eprintln!("warn: upgrade: could not prune the backups: {error:?}");
     }
+    // A database the check found damaged is left exactly as it is, for the owner to restore.
+    if intact {
+        vacuum_if_pending(directory, connection, UPGRADE_BUSY_TIMEOUT);
+    }
+}
+
+/// Runs the VACUUM the upgrade left owed, once, best effort (R6-3). It rewrites the file without
+/// the pages the v5 bodies and the v5 search index freed. It never fails the open:
+/// - busy (another window holds a lock): left owed, for the next open;
+/// - less free disk than the database's size (VACUUM writes a whole copy): left owed and logged;
+/// - any other error: logged and no longer owed, so a damaged file is not retried at every open.
+///
+/// It never runs inside a transaction (SQLite refuses one there anyway). `restore` is the lock
+/// wait the connection goes back to.
+fn vacuum_if_pending(directory: &Path, connection: &Connection, restore: Duration) {
+    let pending = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
+        [VACUUM_PENDING_KEY],
+        |row| row.get::<_, bool>(0),
+    );
+    match pending {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("warn: storage: could not read whether a VACUUM is owed: {error}");
+            return;
+        }
+    }
+    if !connection.is_autocommit() {
+        eprintln!("warn: storage: the VACUUM was not run inside a transaction; left for later");
+        return;
+    }
+    let size = connection
+        .query_row(
+            "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_or(0, |size| u64::try_from(size).unwrap_or(0));
+    if let Some(free) = free_disk(directory) {
+        if free < size {
+            eprintln!(
+                "info: storage: skipped the VACUUM: {free} bytes free, the database is {size} bytes; left for a later open"
+            );
+            return;
+        }
+    }
+    let wait = busy_timeouts(directory).0.min(VACUUM_BUSY_TIMEOUT);
+    let started = std::time::Instant::now();
+    let result = connection
+        .busy_timeout(wait)
+        .and_then(|()| connection.execute_batch("VACUUM"))
+        .map_err(StorageError::from);
+    if let Err(error) = connection.busy_timeout(restore) {
+        eprintln!("warn: storage: could not restore the lock wait after the VACUUM: {error}");
+    }
+    match result {
+        Ok(()) => eprintln!(
+            "info: storage: VACUUM of {size} bytes took {} ms",
+            started.elapsed().as_millis()
+        ),
+        Err(error) if is_busy(&error) => {
+            eprintln!("info: storage: the VACUUM is busy (another window is open); left for the next open");
+            return;
+        }
+        Err(error) => {
+            eprintln!("warn: storage: the VACUUM failed and will not be retried: {error:?}")
+        }
+    }
+    if let Err(error) =
+        connection.execute("DELETE FROM settings WHERE key=?1", [VACUUM_PENDING_KEY])
+    {
+        // Still owed, so the next open runs it again: a second VACUUM only costs time.
+        eprintln!("warn: storage: could not clear the owed VACUUM: {error}");
+    }
+}
+
+/// Bytes free to this user on the data folder's volume, or `None` where it cannot be read.
+/// Windows has no safe call for it (the crate forbids `unsafe`), so there the VACUUM just runs:
+/// it is atomic, and one that runs out of space leaves the database as it was.
+fn free_disk(directory: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = test_free_disk(directory) {
+        return Some(free);
+    }
+    #[cfg(unix)]
+    return rustix::fs::statvfs(directory)
+        .ok()
+        .map(|stat| stat.f_bavail.saturating_mul(stat.f_frsize));
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        None
+    }
+}
+
+#[cfg(test)]
+static TEST_FREE_DISK: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Makes the VACUUM of `directory` see `free` bytes free, or the real figure with `None`.
+/// Test-only and per data folder, like the faults.
+#[cfg(test)]
+pub(crate) fn set_test_free_disk(directory: &Path, free: Option<u64>) {
+    let mut set = TEST_FREE_DISK.lock().unwrap_or_else(|e| e.into_inner());
+    set.retain(|(path, _)| path != directory);
+    if let Some(free) = free {
+        set.push((directory.to_owned(), free));
+    }
+}
+
+#[cfg(test)]
+fn test_free_disk(directory: &Path) -> Option<u64> {
+    TEST_FREE_DISK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(path, _)| path == directory)
+        .map(|(_, free)| *free)
 }
 
 #[cfg_attr(not(test), allow(unused_variables))] // `directory` keys the test faults

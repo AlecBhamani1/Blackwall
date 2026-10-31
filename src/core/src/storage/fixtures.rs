@@ -1012,6 +1012,19 @@ pub(crate) fn build_v5(directory: &Path, bodies: &[Value], version: i64) -> Path
     path
 }
 
+/// Builds a v5 database the way real ones are made: the real v5 open, then `save_session` for each
+/// body, which also fills v5's recall index (`session_messages`, `message_search`). Size
+/// comparisons start from this, never from [`build_v5`], whose file has no index. v5 refuses a
+/// 501st chat, so a real file never holds more than 500.
+pub(crate) fn build_v5_indexed(directory: &Path, bodies: &[Value]) -> PathBuf {
+    let store = LocalStore::open_at(directory, 5).unwrap();
+    for body in bodies {
+        store.save_session(body).unwrap();
+    }
+    assert!(store.message_index_is_current().unwrap());
+    directory.join(DATABASE_FILE)
+}
+
 /// Every schema object and the user version of a database file.
 pub(crate) fn master(database: &Path) -> Value {
     let connection = Connection::open(database).unwrap();
