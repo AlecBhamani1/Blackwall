@@ -309,6 +309,7 @@ export function createChatController(
   const selectedModel = writable(storedModel() || import.meta.env.VITE_BLACKWALL_MODEL || '');
   const endpoint = writable(storedEndpoint());
   const notice = writable('');
+  const folderRequests = writable(0);
   const persistenceError = writable('');
   const preferences = writable<Preferences>({
     contextWindow: 32000,
@@ -801,6 +802,7 @@ export function createChatController(
 
     if (get(agentMode) && !get(workspace)) {
       notice.set('Choose a project folder before starting an agent task.');
+      folderRequests.update((count) => count + 1);
       return false;
     }
 
@@ -1346,6 +1348,7 @@ export function createChatController(
     showContext,
     compact,
     notice,
+    folderRequests: readonly(folderRequests),
     persistenceError,
     preferences,
     savePreferences,

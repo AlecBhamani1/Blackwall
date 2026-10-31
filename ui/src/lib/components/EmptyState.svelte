@@ -4,13 +4,17 @@
   import Icon from './Icon.svelte';
 
   export let connectionState: ConnectionState = 'checking';
+  export let needsFolder = false;
+  export let onChooseFolder: () => void = () => {};
 </script>
 
 <div class="empty-state">
   <div class="empty-mark"><LogoMark size={40} /></div>
   <h1>What can I help with?</h1>
   <p>
-    {#if connectionState === 'ready'}
+    {#if connectionState === 'ready' && needsFolder}
+      Choose a project folder to begin. Agent works only inside the folder you pick.
+    {:else if connectionState === 'ready'}
       Chat with your model. Add a photo or file whenever it helps.
     {:else if connectionState === 'checking'}
       Connecting to your model…
@@ -18,6 +22,9 @@
       Set up a connection to begin. You can still write your message below.
     {/if}
   </p>
+  {#if connectionState === 'ready' && needsFolder}
+    <button class="choose-folder" onclick={onChooseFolder}>Choose a project folder</button>
+  {/if}
   <div class="local-note">
     <Icon name="link" size={13} />
     Chats go to your selected model
@@ -53,6 +60,20 @@
     margin: 10px 0 0;
     color: var(--text-muted);
     font-size: 13px;
+  }
+
+  .choose-folder {
+    margin-top: 16px;
+    padding: 9px 16px;
+    border-radius: var(--radius-md);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .choose-folder:hover {
+    background: var(--accent-hover);
   }
 
   .local-note {

@@ -9,6 +9,8 @@
   export let connectionState: ConnectionState = 'checking';
   export let focusedMessageId: string | undefined = undefined;
   export let showHarnessDemo = false;
+  export let needsFolder = false;
+  export let onChooseFolder: () => void = () => {};
 
   let scroller: HTMLDivElement;
   let followsTail = true;
@@ -40,7 +42,7 @@
 
 <div class="chat-scroll" bind:this={scroller} onscroll={onScroll}>
   {#if messages.length === 0 && !showHarnessDemo}
-    <EmptyState {connectionState} />
+    <EmptyState {connectionState} {needsFolder} {onChooseFolder} />
   {:else}
     <div class="transcript" role="log" aria-label="Conversation" aria-live="polite">
       {#if showHarnessDemo && messages.length === 0}

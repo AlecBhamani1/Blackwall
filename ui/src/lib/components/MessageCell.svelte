@@ -1,6 +1,7 @@
 <script lang="ts">
   import ToolActivity from './ToolActivity.svelte';
   import { copyableMarkdown } from '../copyableMarkdown';
+  import { renderMarkdown } from '../markdown';
   import { messageTimeline } from '../messageTimeline';
   import type { ChatMessage } from '../types';
   import AttachmentTray from './AttachmentTray.svelte';
@@ -9,7 +10,16 @@
 
   export let message: ChatMessage;
   let copied = false;
+  let reasoningOpen = false;
+  let reasoningHtml = '';
+  let renderedReasoning = '';
   $: parts = messageTimeline(message);
+  $: reasoning = message.reasoning ?? '';
+  // Parse the thinking only once it is opened, and only again when its text changes.
+  $: if (reasoningOpen && reasoning !== renderedReasoning) {
+    reasoningHtml = renderMarkdown(reasoning);
+    renderedReasoning = reasoning;
+  }
   $: thoughtSeconds = Math.max(1, Math.round((message.reasoningMs ?? 0) / 1000));
 
   async function copyMessage() {
@@ -36,9 +46,9 @@
       {#if message.content}<div class="user-content">{message.content}</div>{/if}
     {:else}
       {#if message.reasoning}
-        <details class="reasoning">
+        <details class="reasoning" bind:open={reasoningOpen}>
           <summary>Thought for {thoughtSeconds}s</summary>
-          <p>{message.reasoning}</p>
+          <div class="reasoning-body">{@html reasoningHtml}</div>
         </details>
       {/if}
       {#each parts as part (part.id)}
@@ -102,12 +112,33 @@
     cursor: pointer;
     width: fit-content;
   }
-  .reasoning p {
+  .reasoning-body {
     margin: 8px 0 0;
     padding-left: 10px;
     border-left: 2px solid var(--border);
-    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     line-height: 1.6;
+  }
+  .reasoning-body :global(> :first-child) {
+    margin-top: 0;
+  }
+  .reasoning-body :global(> :last-child) {
+    margin-bottom: 0;
+  }
+  .reasoning-body :global(p),
+  .reasoning-body :global(ul),
+  .reasoning-body :global(ol) {
+    margin: 0 0 8px;
+  }
+  .reasoning-body :global(ul),
+  .reasoning-body :global(ol) {
+    padding-left: 20px;
+  }
+  .reasoning-body :global(pre),
+  .reasoning-body :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
   }
   .children {
     padding: 12px;
@@ -302,6 +333,30 @@
     border-left: 2px solid var(--border-strong);
     padding-left: 12px;
     color: var(--text-muted);
+  }
+
+  .markdown :global(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-wrap: normal;
+    margin: 12px 0;
+    border-collapse: collapse;
+  }
+
+  .markdown :global(th),
+  .markdown :global(td) {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .markdown :global(th) {
+    border-bottom-color: var(--border-strong);
+    font-weight: 700;
+  }
+
+  .markdown :global(th:not([align])) {
+    text-align: left;
   }
 
   .markdown :global(.katex-display) {

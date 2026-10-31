@@ -25,7 +25,7 @@
       aria-label={sidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
       onclick={onToggleSidebar}
     >
-      <Icon name="menu" size={18} />
+      <Icon name={sidebarVisible ? 'panel-left-open' : 'panel-left'} size={18} />
     </button>
     {#if !sidebarVisible}
       <div class="compact-brand"><LogoMark size={25} /><span>Blackwall</span></div>

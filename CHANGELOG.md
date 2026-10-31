@@ -195,6 +195,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The model's thinking now renders as Markdown, only when you expand it. Tables in replies get
+  borders, padding and a header rule, and scroll sideways when wide. The sidebar and files toggles
+  are panel icons instead of a menu icon and text. Agent mode with no project folder now leads with
+  a Choose a project folder button, rings the one in the bar, and pulses it when you try to send.
+
 - On the MCP servers screen, a server's command or URL can be edited (a changed command asks for
   approval again), a command shows as a command line instead of a JSON list and accepts quoted
   arguments with spaces, and the secret form stays closed behind Add secret until a server has
