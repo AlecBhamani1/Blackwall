@@ -283,7 +283,7 @@ async fn telemetry(app: &AppHandle) -> Option<blackwall_core::telemetry::Telemet
     Some(telemetry)
 }
 
-/// Settings → Security → Telemetry, as saved by the owner: export settings (header names and
+/// Settings → Privacy & security → Telemetry, as saved by the owner: export settings (header names and
 /// origins only) and usage retention.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

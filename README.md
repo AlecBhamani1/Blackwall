@@ -118,7 +118,7 @@ and manage `.blackwall/project.json` trust. See
 [Subagents](docs/RUNTIME_GUIDE.md#subagents) covers their values and limits. Use `/settings` to
 review settings; changes apply to the next turn and future CLI launches.
 
-Use `bw mcp` or **Settings → AI capabilities → MCP servers** to manage local-command and HTTP
+Use `bw mcp` or **Settings → Agent → MCP servers** to manage local-command and HTTP
 servers and their saved secrets, and **Settings → Agent → Command tools** to manage command tools
 (`claude`, `codex` and `copilot` are suggested). Edit HTTP tools in `tools.json`;
 `bw tools secret <tool> <NAME>` saves an HTTP header value from standard input. The Runtime guide
@@ -165,7 +165,7 @@ privacy.
 
 CLI and desktop Agent tasks discover `AGENTS.md`, with `AGENTS.override.md` taking precedence in
 each directory. Both clients show sources and warnings. Configure extra files and size limits in
-**Memory → Advanced · Instructions** or with `bw config set
+**Settings → Agent → Instructions** or with `bw config set
 instruction-files|instruction-file-kib|instruction-total-kib <value>`. Use `/init` to review a
 starter file before writing it. See [Project instructions](docs/PROJECT_INSTRUCTIONS.md) for
 ordering, nested scopes, defaults, bounds, and approval behavior.

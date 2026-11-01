@@ -49,7 +49,7 @@ automatically.
 
 For an authenticated service, expand **Access key**. The native app tests the key before saving it
 in the platform credential store, scoped to the service origin. An empty setup field preserves the existing key.
-**Settings → Security → Access keys** shows whether a model service or configured relay has a saved key.
+**Settings → Privacy & security → Rules & sandbox → Access keys** shows whether a model service or configured relay has a saved key.
 Choose a saved model service to manage its key without changing the active connection. Connections
 on the same service origin share a key; forgetting one profile does not remove that shared key.
 Replace a model key with **Verify and save key**, or remove a stored key after reviewing the confirmation.
@@ -156,7 +156,7 @@ Finder and macOS screenshot-thumbnail drops still require packaged native accept
 
 ## Budget and compact conversations
 
-Open **Memory → Advanced · Context window** to set the context limit configured in your selected
+Open **Settings → Agent → Limits** to set the context limit configured in your selected
 model service and the output reserve. Settings apply to the selected connection's future requests;
 check the limit when switching models. Defaults are 32,000 context tokens, up to 4,096 generated
 tokens, and automatic compaction off. The browser development UI also saves these controls locally.
@@ -497,7 +497,7 @@ Server names that start with `p-` are reserved for project servers. Blackwall wi
 an existing `mcp.json` entry with such a name is skipped with a warning to rename it; the other
 servers still start.
 
-In the desktop app, **Settings → AI capabilities → MCP servers** lists the servers with enable and
+In the desktop app, **Settings → Agent → MCP servers** lists the servers with enable and
 disable toggles, adds a server from its command line or, with the **Command | URL** switch, from
 its address with header rows that each name a secret, removes one, and saves or removes its secrets through a
 password field. It uses the same validation and credential store as the CLI. **Add server** offers
@@ -534,7 +534,7 @@ sandboxed commands share this computer's network, so they can reach services on 
 (localhost) and your local network. Limiting them to the internet is not available yet.
 
 Command tools are the exception to the profile by default, because a program such as `claude -p`
-needs its own files and network. **Command tools** (Memory → Advanced · Subagents, or
+needs its own files and network. **Command tools** (Settings → Agent → Subagents, or
 `bw config set command-tools-isolation outside|sandboxed`) is `outside` unless you change it, on
 every system including Windows. Only you can set it; a project file cannot. An `outside` tool runs
 in the project folder, without the sandbox, with your account permissions and the cleaned
@@ -738,8 +738,7 @@ and attachments; historical tool-call protocol messages are not replayed across 
 
 ## Subagents
 
-`spawn_agent` hands a focused subtask to a child. Set its limits in **Memory → Advanced ·
-Subagents** or with `bw config set`:
+`spawn_agent` hands a focused subtask to a child. Set its limits in **Settings → Agent → Subagents** or with `bw config set`:
 
 | Setting | `bw config set` | Default |
 | --- | --- | --- |
@@ -804,7 +803,7 @@ A trusted project can lower the step limit and narrow the tools (see
 ## Project instructions
 
 Agent runs read `AGENTS.md` guidance (see [Project instructions](PROJECT_INSTRUCTIONS.md)). Set its
-limits and extra files in **Memory → Advanced · Instructions** or with `bw config set`:
+limits and extra files in **Settings → Agent → Instructions** or with `bw config set`:
 
 | Setting | `bw config set` | Default |
 | --- | --- | --- |
@@ -873,8 +872,7 @@ Trust is saved in `trusted-projects.json` in the data folder as the project's ca
 and the SHA-256 of the file's exact bytes, plus a copy of the file to show later changes. Any edit,
 even whitespace, makes the file untrusted again until you review it. Only the bytes you were shown
 are trusted: if the file changes between showing and trusting, trusting is refused. Untrust a
-project with `bw project untrust` in it, or from **Settings → General → Security → Trusted
-projects**; its deny and ask rules keep applying.
+project with `bw project untrust` in it, or from **Settings → Privacy & security → Rules & sandbox → Trusted projects**; its deny and ask rules keep applying.
 
 Like `policy.json`, the trust list is an ordinary file in your data folder. Anything you let run
 commands as your user, including an agent command you approve, could change it; that is an accepted
@@ -1022,7 +1020,7 @@ and report concrete findings with file paths.
 Names use lowercase letters, numbers, and hyphens, up to 64 characters. A file must be valid UTF-8
 Markdown with YAML frontmatter and fit within the configured maximum skill size. Auto uses 10% of
 the configured context window at four bytes per token, clamped to 32–256 KiB; it never changes with
-server model load state. Set it in **Memory → Advanced · Instructions** or with
+server model load state. Set it in **Settings → Agent → Instructions** or with
 `bw config set max-skill-kib <auto|32-256>`. Malformed skills are reported and skipped. Installed
 skills over a newly lowered limit remain listed and removable, but are skipped with a warning when
 chat context is built.
@@ -1166,14 +1164,13 @@ bw usage --days 14 --json
 bw usage --days 1 --utc  # today in UTC
 ```
 
-Usage metrics are kept for 400 days by default. Choose 30 to 3,650 days or forever in **Settings →
-Security → Telemetry**, or with `bw config set usage-retention-days 90` (or `forever`); older files
+Usage metrics are kept for 400 days by default. Choose 30 to 3,650 days or forever in **Settings → Privacy & security → Telemetry**, or with `bw config set usage-retention-days 90` (or `forever`); older files
 are deleted at the next start.
 
 ## Telemetry export
 
 Send the same traces and usage metrics to an OpenTelemetry collector over OTLP/HTTP. Off by default.
-Set it in **Settings → Security → Telemetry**, or:
+Set it in **Settings → Privacy & security → Telemetry**, or:
 
 ```sh
 bw config set otlp-endpoint https://otel.example.com     # or http://127.0.0.1:4318; off to stop
@@ -1196,7 +1193,7 @@ Langfuse setups.
 
 ## App lock
 
-Enable **App lock** in **Settings → General → Security** with a passphrase of at least 10 characters.
+Enable **App lock** in **Settings → Privacy & security → Lock** with a passphrase of at least 10 characters.
 Blackwall stores a salted Argon2id verifier in the platform credential store. The app locks on reopening, and **Lock now** stops active work and
 sharing after flushing pending conversation saves. Failed attempts incur a short delay, increasing
 after repeated failures. Changing or removing the lock requires the current passphrase. Blackwall

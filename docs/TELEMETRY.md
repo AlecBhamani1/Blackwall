@@ -163,7 +163,7 @@ first 1 MiB of the file is read, and only `desktop` and `cli` markers count.
 ## Retention
 
 Trace files: the newest 200. Metrics files: 400 days by default; set 30 to 3,650 days or forever
-in **Settings → Security → Telemetry** (`usageRetention` in the preferences) or with
+in **Settings → Privacy & security → Telemetry** (`usageRetention` in the preferences) or with
 `bw config set usage-retention-days N|forever`. Files older than the window are deleted when
 telemetry starts, so a shorter window takes effect at the next start. `metrics/recording.jsonl` is
 not a metrics file and is kept.
@@ -174,7 +174,7 @@ Optional, and off until you set an endpoint. Blackwall then sends traces and usa
 OTLP/HTTP receiver: an OpenTelemetry Collector, Grafana Alloy, Jaeger, Langfuse, or a vendor
 endpoint.
 
-**Settings:** **Settings → Security → Telemetry** on the desktop (saved as `telemetryExport` in
+**Settings:** **Settings → Privacy & security → Telemetry** on the desktop (saved as `telemetryExport` in
 the preferences), or `bw config set` for the CLI (saved in the CLI settings; `bw` uses the
 desktop's until you set one of its own):
 

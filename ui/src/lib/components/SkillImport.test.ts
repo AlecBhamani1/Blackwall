@@ -146,8 +146,24 @@ describe('skill import', () => {
       license: 'Apache-2.0',
     });
     const get = vi.spyOn(persistence, 'getSuggestedSkill').mockResolvedValue(download);
-    const { unmount } = render(SkillImport, { props: { onDone: vi.fn(), onCancel: vi.fn() } });
-    expect(await screen.findByText('Saved')).toBeInTheDocument();
+    const remove = vi.fn();
+    const { unmount } = render(SkillImport, {
+      props: {
+        onDone: vi.fn(),
+        onCancel: vi.fn(),
+        installedSkills: [skill('frontend-design')],
+        onRemove: remove,
+      },
+    });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    expect(await screen.findByText('Installed ✓')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Get frontend-design' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Remove frontend-design' }));
+    expect(confirm).toHaveBeenCalledWith('Remove frontend-design?');
+    expect(remove).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole('button', { name: 'Remove frontend-design' }));
+    expect(remove).toHaveBeenCalledWith('frontend-design');
     await user.click(screen.getByRole('button', { name: 'Get playwright' }));
     expect(get).toHaveBeenCalledWith('playwright');
     expect(await screen.findByLabelText('Import playwright')).toBeChecked();

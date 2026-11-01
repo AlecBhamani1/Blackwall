@@ -10,6 +10,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Chat now uses one slim header row, with model and access controls moved into the composer.
+- Settings skills are easier to manage with compact searchable rows, accessible enable switches,
+  visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
+  and a tighter segmented range control.
 
 ### Added
 
@@ -266,6 +269,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is an error with "Try again", not "no keyring".
 
 ### Changed
+
+- Settings skills are easier to manage with compact searchable rows, accessible enable switches,
+  visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
+  and a tighter segmented range control.
 
 - Settings now use a full-page layout with embedded content panes, sticky action footers, save
   feedback, and quieter warning callouts.

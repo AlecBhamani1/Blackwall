@@ -19,6 +19,7 @@
   let creating = false;
   let importing = false;
   let notice = '';
+  let query = '';
   let busy = false;
   let error = '';
   const desktop = persistence.available();
@@ -131,6 +132,12 @@
       busy = false;
     }
   }
+  async function confirmRemove(skill: Skill) {
+    if (window.confirm(`Remove ${skill.name}?`)) await remove(skill);
+  }
+  $: filteredSkills = skills.filter((skill) =>
+    `${skill.name}\n${skill.description}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+  );
   onMount(() => {
     if (embedded) dialog.setAttribute('open', '');
     else dialog.showModal();
@@ -155,6 +162,11 @@
     {#if !desktop}<p>Skills are available in the installed Blackwall desktop app.</p>
     {:else if importing}
       <SkillImport
+        installedSkills={skills}
+        onRemove={(name) => {
+          const skill = skills.find((installed) => installed.name === name);
+          if (skill) void remove(skill);
+        }}
         onCancel={() => {
           importing = false;
           // Some skills may have been imported before one failed.
@@ -206,7 +218,7 @@
               type="button"
               class="delete"
               disabled={busy}
-              onclick={() => editing && remove(editing)}>Delete skill</button
+              onclick={() => editing && confirmRemove(editing)}>Delete skill</button
             >{/if}<span></span><button class="primary" disabled={busy}
             >{busy ? 'Saving…' : 'Save skill'}</button
           >
@@ -289,10 +301,21 @@
           {/each}
         </section>
       {/if}
+      {#if skills.length}<label class="search">
+          <Icon name="search" size={14} />
+          <input
+            type="search"
+            aria-label="Search skills"
+            bind:value={query}
+            placeholder="Search skills"
+          />
+        </label>{/if}
       {#if skills.length === 0}<p class="empty">
           No skills yet. Add a workflow to use in future agent tasks.
+        </p>{:else if filteredSkills.length === 0}<p class="empty">
+          No skills match your search.
         </p>{/if}
-      {#each skills as skill (skill.name)}<article>
+      {#each filteredSkills as skill (skill.name)}<article class="skill-row">
           <div class="body">
             <button
               class="skill"
@@ -301,26 +324,26 @@
                 creating = false;
                 editing = { ...skill };
               }}
-              ><strong>{skill.name}</strong>{#if skill.userOnly}{' '}<span class="typed"
-                  >Runs only when you type /{skill.name}</span
-                >{/if}
-              <p>{skill.description}</p></button
+              ><strong>{skill.name}</strong><span class="description">{skill.description}</span
+              >{#if skill.userOnly}<span class="typed">Typed only</span>{/if}</button
             >
             {#if skill.warning}<p class="warning">{skill.warning}</p>{/if}
             {#if scans[skill.name]}<ScanBadge findings={scans[skill.name]} name={skill.name} />{/if}
           </div>
-          {#if skill.warning}<button
-            class="delete"
-            disabled={busy}
-            aria-label={`Delete ${skill.name}`}
-            onclick={() => remove(skill)}>Delete</button
-          >{:else}<button
+          {#if !skill.warning}<button
+            role="switch"
+            aria-checked={skill.enabled}
             class:enabled={skill.enabled}
-            class="toggle"
+            class="switch"
             disabled={busy}
-            aria-label={`${skill.enabled ? 'Disable' : 'Enable'} ${skill.name}`}
-            onclick={() => toggle(skill)}>{skill.enabled ? 'Enabled' : 'Disabled'}</button
-          >{/if}
+            aria-label={skill.name}
+            onclick={() => toggle(skill)}><span></span></button
+          >{/if}<button
+            class="remove"
+            disabled={busy}
+            aria-label={`Remove ${skill.name}`}
+            onclick={() => confirmRemove(skill)}><Icon name="trash" size={14} /></button
+          >
         </article>{/each}
       <p class="hint">
         Agent runs list enabled skills by name and description and load one when it is relevant.
@@ -429,8 +452,7 @@
   }
   .primary,
   .secondary,
-  .delete,
-  .toggle {
+  .delete {
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     font-size: 11.5px;
@@ -457,16 +479,35 @@
     padding: 16px;
     margin: 10px 0;
   }
+  .skill-row {
+    gap: 8px;
+    padding: 5px 8px;
+    margin: 4px 0;
+    min-height: 36px;
+  }
+  .skill-row:has(.skill:hover),
+  .skill-row:has(.skill:focus-visible) {
+    border-color: var(--border-strong);
+    background: var(--bg-elevated);
+  }
   .body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     flex: 1;
     min-width: 0;
   }
   .skill {
+    flex: 1;
     width: 100%;
     min-width: 0;
     text-align: left;
     background: transparent;
     padding: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
   }
   .skill strong {
     font-size: 13px;
@@ -475,7 +516,19 @@
   .typed {
     color: var(--text-muted);
     font-size: 11px;
-    margin-left: 8px;
+    flex: none;
+    padding: 2px 6px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-elevated);
+  }
+  .description {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   label.check {
     display: flex;
@@ -486,19 +539,57 @@
     width: auto;
     margin: 0;
   }
-  .skill p {
-    color: var(--text-muted);
-    font-size: 12px;
-    line-height: 1.6;
-    margin: 5px 0 0;
+  .switch {
+    position: relative;
+    flex: none;
+    width: 28px;
+    height: 16px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+    background: var(--bg-base);
   }
-  .toggle {
-    color: var(--text-muted);
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
+  .switch span {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: transform 120ms ease;
   }
-  .toggle.enabled {
-    color: var(--ok);
+  .switch.enabled {
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+  .switch.enabled span {
+    background: var(--text-on-accent);
+    transform: translateX(12px);
+  }
+  .remove {
+    flex: none;
+    padding: 4px;
+    background: transparent;
+    color: var(--text-muted);
+  }
+  .remove:hover {
+    color: var(--err);
+  }
+  .search {
+    position: relative;
+    margin: 0 0 8px;
+  }
+  .search :global(svg) {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+  .search input {
+    padding: 8px 10px 8px 30px;
   }
   label {
     display: block;

@@ -45,11 +45,27 @@ describe('usage dialog', () => {
     render(UsageDialog, { props: { onClose: vi.fn() } });
     await screen.findByText('4.82M');
     expect(usage).toHaveBeenLastCalledWith(7);
+    const range = screen.getByRole('group', { name: 'Range' });
+    expect(within(range).getAllByRole('radio')).toHaveLength(5);
+    expect(
+      within(range)
+        .getAllByRole('radio')
+        .filter((option) => option.matches(':checked')),
+    ).toHaveLength(1);
     await user.click(screen.getByRole('radio', { name: '30 days' }));
     expect(usage).toHaveBeenLastCalledWith(30);
     await user.click(screen.getByRole('radio', { name: '7 days' }));
     expect(usage).toHaveBeenLastCalledWith(7);
     expect(screen.getByRole('radio', { name: '7 days' })).toBeChecked();
+  });
+
+  it('uses the inclusive local calendar days since January 1 for YTD', async () => {
+    vi.useFakeTimers({ now: new Date(2026, 9, 31, 18, 30) });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const usage = vi.spyOn(persistence, 'usage').mockResolvedValue(usageFixture());
+    render(UsageDialog, { props: { onClose: vi.fn() } });
+    await user.click(await screen.findByRole('radio', { name: 'Year to date' }));
+    expect(usage).toHaveBeenLastCalledWith(304);
   });
 
   it('shows the empty state text "No usage yet"', async () => {

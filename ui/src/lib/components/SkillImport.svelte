@@ -1,10 +1,17 @@
 <script lang="ts">
   import ScanBadge from './ScanBadge.svelte';
   import { onDestroy, onMount } from 'svelte';
-  import { persistence, type SkillImportCandidate, type SuggestedSkill } from '../persistence';
+  import {
+    persistence,
+    type Skill,
+    type SkillImportCandidate,
+    type SuggestedSkill,
+  } from '../persistence';
   import SettingsFooter from './SettingsFooter.svelte';
   export let onDone: (imported: number) => void;
   export let onCancel: () => void;
+  export let installedSkills: Skill[] = [];
+  export let onRemove: (name: string) => void = () => {};
   let candidates: SkillImportCandidate[] = [];
   let suggested: SuggestedSkill[] = [];
   let selected: Record<string, boolean> = {};
@@ -68,6 +75,13 @@
       getting[skill.name] = false;
     }
   }
+  let removing = '';
+  function removeInstalled(name: string) {
+    if (removing || !window.confirm(`Remove ${name}?`)) return;
+    removing = name;
+    onRemove(name);
+  }
+  $: if (removing && !installedSkills.some((installed) => installed.name === removing)) removing = '';
   function allow(candidate: SkillImportCandidate) {
     allowed[candidate.source] = true;
     selected[candidate.source] = true;
@@ -96,9 +110,6 @@
         // It is saved now, so importing it again needs Replace.
         candidates = candidates.map((item) =>
           item.source === candidate.source ? { ...item, exists: true } : item,
-        );
-        suggested = suggested.map((item) =>
-          item.name === candidate.skill?.name ? { ...item, saved: true } : item,
         );
         replace[candidate.source] = false;
       } catch (cause) {
@@ -160,7 +171,15 @@
             <p>{skill.description}</p>
             <small>{skill.repository} · {skill.license}</small>
           </div>
-          {#if skill.saved}<span class="saved">Saved</span>{:else}<button
+          {#if installedSkills.some((installed) => installed.name === skill.name)}<div
+              class="installed-actions"
+              ><span class="installed">Installed ✓</span><button
+                class="remove-suggestion"
+                aria-label={`Remove ${skill.name}`}
+                disabled={busy || removing === skill.name}
+                onclick={() => removeInstalled(skill.name)}>Remove</button
+              ></div
+            >{:else}<button
               class="secondary"
               aria-label={`Get ${skill.name}`}
               disabled={busy ||
@@ -375,9 +394,24 @@
   .suggested small {
     margin: 0;
   }
-  .saved {
+  .installed-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .installed {
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: var(--text-on-accent);
     font-size: 11.5px;
-    color: var(--ok);
+    font-weight: 600;
+  }
+  .remove-suggestion {
+    padding: 6px 0;
+    background: transparent;
+    color: var(--err);
+    font-size: 11.5px;
   }
   .meta {
     color: var(--text-muted);
