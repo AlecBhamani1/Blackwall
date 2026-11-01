@@ -987,16 +987,67 @@ pub async fn list_mcp_servers(app: AppHandle) -> Result<serde_json::Value, Strin
     })
     .await
 }
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStartResult {
+    tools: usize,
+    error: Option<String>,
+    warning: Option<String>,
+}
+
 #[tauri::command]
 pub async fn add_mcp_server(
     app: AppHandle,
     name: String,
     command: Vec<String>,
-) -> Result<(), String> {
-    with_mcp(&app, move |directory| {
-        blackwall_core::mcp::add_server(directory, &name, command).map(|_| ())
+) -> Result<McpStartResult, String> {
+    crate::auth::require_unlocked(&app).await?;
+    let directory = crate::identity::data_directory(&app)?;
+    let program = command
+        .first()
+        .ok_or("Give this MCP server a command.")?
+        .clone();
+    if !tokio::task::spawn_blocking({
+        let program = program.clone();
+        move || blackwall_core::mcp::program_found(&program)
     })
     .await
+    .map_err(|_| "The MCP task could not finish.")?
+    {
+        return Err(blackwall_core::mcp::missing_program(&program));
+    }
+    let saved = tokio::task::spawn_blocking({
+        let directory = directory.clone();
+        move || blackwall_core::mcp::add_server(&directory, &name, command)
+    })
+    .await
+    .map_err(|_| "The MCP task could not finish.")??;
+    Ok(
+        match blackwall_core::mcp::McpServers::first_start(&directory, &saved).await {
+            Ok((tools, warnings)) => McpStartResult {
+                tools,
+                error: None,
+                warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+            },
+            Err(error) => McpStartResult {
+                tools: 0,
+                error: Some(error),
+                warning: None,
+            },
+        },
+    )
+}
+#[tauri::command]
+pub async fn mcp_runtime_status(app: AppHandle) -> Result<[bool; 2], String> {
+    crate::auth::require_unlocked(&app).await?;
+    tokio::task::spawn_blocking(|| {
+        [
+            blackwall_core::mcp::program_found("npx"),
+            blackwall_core::mcp::program_found("uvx"),
+        ]
+    })
+    .await
+    .map_err(|_| "The MCP task could not finish.".to_owned())
 }
 /// `headers` pairs a header name with the name of a secret saved for this server. Returns the
 /// saved name.

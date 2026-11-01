@@ -102,6 +102,7 @@ fn run() -> Result<(), StartupError> {
             data::test_telemetry,
             data::list_mcp_servers,
             data::add_mcp_server,
+            data::mcp_runtime_status,
             data::add_mcp_http_server,
             data::set_mcp_server_enabled,
             data::set_mcp_endpoint,

@@ -22,7 +22,7 @@
   let url = '';
   let headerRows: { header: string; secret: string }[] = [];
   let suggestion: McpSuggestion | null = null;
-  // Suggestions start with npx, a batch file on Windows, which servers cannot run there.
+  // npx is a batch file on Windows, which MCP servers cannot run there.
   const windows = detectPlatform() === 'windows';
   let secretName = '';
   let secretValue = '';
@@ -31,6 +31,8 @@
   let endpoint = '';
   let busy = false;
   let error = '';
+  let startStatus = '';
+  let runtimes: Record<string, boolean> = {};
   const desktop = persistence.available();
   const UNCLOSED_QUOTE = 'The command has a quote without a closing quote.';
   // Secret fields belong to one server and are cleared whenever the view changes.
@@ -122,6 +124,11 @@
     name = item.name;
     commandLine = item.command.join(' ') + (item.needs ? ' ' : '');
     error = '';
+    if (runtimes[item.runtime] === false) {
+      error = item.runtime === 'npx'
+        ? "Needs Node.js (npx), which isn't on this computer."
+        : "Needs uv (uvx), which isn't on this computer.";
+    }
     if (!item.needs) return;
     await tick();
     commandInput.focus();
@@ -157,17 +164,33 @@
           : 'Add the web address of the server at the end of the command.';
       return;
     }
-    if (
-      await run(
-        () => persistence.addMcpServer(name, words),
-        'This server could not be added.',
-      )
-    ) {
+    if (suggestion && runtimes[suggestion.runtime] === false) {
+      error = suggestion.runtime === 'npx'
+        ? "Needs Node.js (npx), which isn't on this computer."
+        : "Needs uv (uvx), which isn't on this computer.";
+      return;
+    }
+    busy = true;
+    error = '';
+    startStatus = 'Starting… first start can take a minute while the package downloads';
+    try {
+      const result = await persistence.addMcpServer(name, words);
+      await load();
+      if (result.error) {
+        startStatus = '';
+        error = result.error;
+      } else {
+        startStatus = `Ready: ${result.tools} tools${result.warning ? `. ${result.warning}` : ''}`;
+      }
       adding = false;
       suggestion = null;
       name = '';
       commandLine = '';
+    } catch (cause) {
+      startStatus = '';
+      error = typeof cause === 'string' ? cause : 'This server could not be added.';
     }
+    busy = false;
   }
   async function addUrl() {
     const headers = headerRows
@@ -219,10 +242,15 @@
   onMount(() => {
     if (embedded) dialog.setAttribute('open', '');
     else dialog.showModal();
-    if (desktop)
+    if (desktop) {
+      void persistence.mcpRuntimeStatus().then(
+        (found) => (runtimes = { npx: found[0] ?? false, uvx: found[1] ?? false }),
+        () => (runtimes = { npx: false, uvx: false }),
+      );
       void load().catch(
         () => (error = 'Your MCP servers could not be opened. The file has been left in place.'),
       );
+    }
   });
 </script>
 
@@ -242,11 +270,13 @@
       <form onsubmit={add}>
         <h3 class="first">Suggested</h3>
         {#if windows}<p class="hint">
-            Suggested servers start with <code>npx</code>, which Blackwall cannot run on Windows
-            yet. Add a server whose program is an <code>.exe</code> instead.
+            Suggested servers that start with <code>npx</code> cannot run on Windows yet. Add a
+            server whose program Blackwall can launch directly, such as <code>uvx.exe</code>,
+            instead.
           </p>
-        {:else}<div class="suggestions">
-            {#each MCP_SUGGESTIONS as item (item.name)}{@const added = servers.some(
+        {/if}
+        <div class="suggestions">
+            {#each MCP_SUGGESTIONS.filter((item) => !windows || item.runtime !== 'npx') as item (item.name)}{@const added = servers.some(
                 (server) => server.name === item.name,
               )}<button
                 type="button"
@@ -256,16 +286,20 @@
                 aria-pressed={suggestion?.name === item.name}
                 onclick={() => suggest(item)}
                 ><strong>{item.name}</strong><small
-                  >{added ? 'Already added' : item.description}</small
+                  >{added ? 'Already added' : item.description}</small><small
+                  >Runtime: {item.runtime} · {runtimes[item.runtime] === undefined
+                      ? 'Checking…'
+                      : runtimes[item.runtime]
+                        ? 'Found'
+                        : 'Not found'}</small
                 ></button
               >{/each}
           </div>
           <p class="hint">
             Pick one to fill in the form, then review it and choose Add server. The first agent run
-            after adding one downloads that exact version from npm, so it needs a network
+            after adding one downloads that exact version from npm or PyPI, so it needs a network
             connection.
           </p>
-        {/if}
         <div class="modes" role="radiogroup" aria-label="Server type">
           {#each [['command', 'Command'], ['url', 'URL']] as [value, label] (value)}<button
               type="button"
@@ -566,6 +600,7 @@
         run.
       </p>
     {/if}
+    {#if startStatus}<p role="status">{startStatus}</p>{/if}
     {#if error}<p role="alert" class="error">{error}</p>{/if}
   </div>
 </dialog>
