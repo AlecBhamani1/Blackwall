@@ -12,6 +12,18 @@ afterEach(() => {
 });
 
 describe('native chat failure boundary', () => {
+  it('rejects browser web requests before contacting the model or a website', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    await expect(
+      localModelClient.streamChat(
+        { requestId: 'browser-web', model: 'model', messages: [], webEnabled: true },
+        { onDelta: vi.fn() },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('Web access is unavailable in browser mode');
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it('pins Agent requests to the conversation project at the native boundary', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);
@@ -196,6 +208,8 @@ describe('native chat failure boundary', () => {
       listener({ payload: { ...prompt, approvalId: 'a2', offDevice: 'yes', outsideSandbox: 1 } });
       listener({ payload: { ...result, success: true, truncated: true } });
       listener({ payload: { ...result, success: true } });
+      listener({ payload: { ...result, success: false, denied: true } });
+      listener({ payload: { ...result, success: false, denied: 'yes' } });
       listener({ payload: { type: 'turn_complete', requestId: 'sub' } });
       return { requestId: 'sub' };
     });
@@ -214,6 +228,8 @@ describe('native chat failure boundary', () => {
     expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
     expect(onEvent).toHaveBeenCalledWith({ ...result, success: true, truncated: true });
     expect(onEvent).toHaveBeenCalledWith({ ...result, success: true });
+    expect(onEvent).toHaveBeenCalledWith({ ...result, success: false, denied: true });
+    expect(onEvent).toHaveBeenCalledWith({ ...result, success: false });
   });
 
   it('ignores per-call model usage events without breaking the stream', async () => {

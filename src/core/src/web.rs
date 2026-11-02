@@ -1,9 +1,15 @@
 //! Explicitly approved public web reads with DNS pinning, redirect validation, and bounds.
 use crate::{approvals::Approvals, protocol::AgentEvent, tools::ToolError};
-use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
 use serde_json::{json, Value};
 use std::{net::IpAddr, time::Duration};
+
+mod document;
+mod error;
+pub use error::{WebError, WebErrorCategory};
+const MAX_REDIRECTS: usize = 8;
+const MAX_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_CHARS: usize = 32_000;
 
 /// The same public-web capabilities are available to Chat and Agent, without file access.
 pub fn definitions() -> Vec<Value> {
@@ -33,7 +39,16 @@ pub async fn execute(
         "web_search" => search_url(argument("query")?)?,
         _ => return Err(ToolError::Denied),
     };
-    fetch(&url, argument("purpose")?, request_id, approvals, emit).await
+    retrieve(
+        &url,
+        argument("purpose")?,
+        request_id,
+        approvals,
+        emit,
+        call.function.name == "web_search",
+        |url| Box::pin(pinned_client(url)),
+    )
+    .await
 }
 
 pub fn public_address(address: IpAddr) -> bool {
@@ -67,46 +82,102 @@ pub fn public_address(address: IpAddr) -> bool {
     }
 }
 fn checked_url(value: &str) -> Result<Url, ToolError> {
-    let url = Url::parse(value).map_err(|_| ToolError::Arguments)?;
-    if value.len() > 4096
-        || !matches!(url.scheme(), "https" | "http")
+    if value.len() > 4096 {
+        return Err(WebError {
+            category: WebErrorCategory::InvalidUrl,
+            source: String::new(),
+            message: "The page URL exceeds the 4,096-byte limit. Use a shorter public URL.".into(),
+        }
+        .into());
+    }
+    let mut url = Url::parse(value).map_err(|_| WebError {
+        category: WebErrorCategory::InvalidUrl,
+        source: String::new(),
+        message: "The page URL is invalid. Use a complete public HTTP/HTTPS URL.".into(),
+    })?;
+    if !matches!(url.scheme(), "https" | "http")
         || !url.username().is_empty()
         || url.password().is_some()
         || url.host_str().is_none()
         || !matches!(url.port_or_known_default(), Some(80 | 443))
     {
-        return Err(ToolError::Execution("Web tools support public HTTP/HTTPS pages on standard ports, without embedded credentials.".into()));
+        return Err(WebError::new(
+            WebErrorCategory::InvalidUrl,
+            &url,
+            "Use a public HTTP/HTTPS URL on a standard port, without embedded credentials.",
+        )
+        .into());
     }
+    url.set_fragment(None);
     Ok(url)
 }
-async fn pinned_client(url: &Url) -> Result<reqwest::Client, ToolError> {
-    let host = url.host_str().ok_or(ToolError::Arguments)?;
-    let port = url.port_or_known_default().ok_or(ToolError::Arguments)?;
-    let addresses = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| ToolError::Execution("The website address could not be resolved in time.".into()))?
-    .map_err(|_| ToolError::Execution("The website address could not be resolved.".into()))?
-    .collect::<Vec<_>>();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !public_address(address.ip()))
+
+fn validate_literal_address(url: &Url) -> Result<(), WebError> {
+    if url
+        .host_str()
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+        .is_some_and(|ip| !public_address(ip))
     {
-        return Err(ToolError::Execution(
-            "Web tools cannot access local, private, or reserved network addresses.".into(),
+        return Err(private_address_error(url));
+    }
+    Ok(())
+}
+
+fn private_address_error(url: &Url) -> WebError {
+    WebError::new(WebErrorCategory::NetworkPolicy, url,
+        "Web tools cannot access local, private, or reserved network addresses. Use a public source.")
+}
+
+fn validate_addresses(url: &Url, addresses: &[std::net::SocketAddr]) -> Result<(), WebError> {
+    if addresses.is_empty() {
+        return Err(WebError::new(
+            WebErrorCategory::Dns,
+            url,
+            "DNS returned no addresses. Check the hostname or use another source.",
         ));
     }
+    if addresses
+        .iter()
+        .any(|address| !public_address(address.ip()))
+    {
+        return Err(private_address_error(url));
+    }
+    Ok(())
+}
+
+async fn pinned_client(url: &Url) -> Result<reqwest::Client, WebError> {
+    let host = url.host_str().unwrap_or_default();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host.trim_matches(['[', ']']), port)),
+    )
+    .await
+    .map_err(|_| {
+        WebError::new(
+            WebErrorCategory::Dns,
+            url,
+            "DNS resolution timed out. Check the hostname and your network.",
+        )
+    })?
+    .map_err(|_| {
+        WebError::new(
+            WebErrorCategory::Dns,
+            url,
+            "DNS resolution failed. Check the hostname and your network.",
+        )
+    })?
+    .collect::<Vec<_>>();
+    validate_addresses(url, &addresses)?;
     reqwest::Client::builder()
         .no_proxy()
         .resolve_to_addrs(host, &addresses)
         .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|_| ToolError::Execution("The web client could not start.".into()))
+        .map_err(|error| error::transport_error(&error, url))
 }
 
 pub async fn fetch(
@@ -116,9 +187,39 @@ pub async fn fetch(
     approvals: &Approvals,
     emit: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<String, ToolError> {
+    retrieve(value, purpose, request_id, approvals, emit, false, |url| {
+        Box::pin(pinned_client(url))
+    })
+    .await
+}
+
+// The client factory is an internal test seam. Production always uses DNS validation and pinning.
+async fn retrieve<F>(
+    value: &str,
+    purpose: &str,
+    request_id: &str,
+    approvals: &Approvals,
+    emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    search: bool,
+    client_for: F,
+) -> Result<String, ToolError>
+where
+    F: for<'a> Fn(
+        &'a Url,
+    ) -> futures_util::future::BoxFuture<'a, Result<reqwest::Client, WebError>>,
+{
     let mut url = checked_url(value)?;
-    for redirects in 0..=2 {
-        let detail=format!("Read web page\nGET {url}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.");
+    let search_detail = if search {
+        url.query_pairs()
+            .find(|(key, _)| key == "q")
+            .map(|(_, query)| format!("\nSearch query: {query}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut visited = std::collections::HashSet::from([url.to_string()]);
+    for redirects in 0..=MAX_REDIRECTS {
+        let detail = format!("Read web page\nGET {}{search_detail}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.", error::source_url(&url));
         if !approvals
             .request_web(request_id, url.host_str().unwrap_or_default(), detail, emit)
             .await
@@ -126,13 +227,18 @@ pub async fn fetch(
         {
             return Err(ToolError::Denied);
         }
-        let client = pinned_client(&url).await?;
+        validate_literal_address(&url)?;
+        let client = client_for(&url).await?;
         let response = client
             .get(url.clone())
-            .header("User-Agent", "Blackwall/0.1")
+            .header("User-Agent", "Blackwall/0.1 (+public web research)")
+            .header(
+                "Accept",
+                "text/html, text/plain, application/json;q=0.9, */*;q=0.1",
+            )
             .send()
             .await
-            .map_err(|_| ToolError::Execution("The website could not be reached.".into()))?;
+            .map_err(|error| error::transport_error(&error, &url))?;
         if matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY
@@ -141,58 +247,59 @@ pub async fn fetch(
                 | StatusCode::TEMPORARY_REDIRECT
                 | StatusCode::PERMANENT_REDIRECT
         ) {
-            if redirects == 2 {
-                return Err(ToolError::Execution(
-                    "This page redirects too many times.".into(),
-                ));
-            }
-            let next = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or(ToolError::Arguments)?;
-            url = checked_url(url.join(next).map_err(|_| ToolError::Arguments)?.as_str())?;
+            url = redirect_destination(&url, response.headers(), redirects, &mut visited)?;
             continue;
         }
-        if !response.status().is_success() {
-            return Err(ToolError::Execution(format!(
-                "The website returned HTTP {}.",
-                response.status().as_u16()
-            )));
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !(content_type.starts_with("text/") || content_type.starts_with("application/json")) {
-            return Err(ToolError::Execution(
-                "This page is not a supported text document.".into(),
-            ));
-        }
-        let mut bytes = vec![];
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| {
-                ToolError::Execution("The website response was interrupted.".into())
-            })?;
-            if bytes.len() + chunk.len() > 256 * 1024 {
-                return Err(ToolError::Execution(
-                    "The page exceeded the 256 KiB download limit.".into(),
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            ToolError::Execution("The page uses an unsupported text encoding.".into())
-        })?;
-        let clipped: String = text.chars().take(32000).collect();
-        return Ok(format!(
-            "Source: {url}\nUntrusted page content (up to 32,000 characters):\n{clipped}"
-        ));
+        return document::read_response(response, &url, search)
+            .await
+            .map_err(Into::into);
     }
-    Err(ToolError::Arguments)
+    Err(WebError::new(
+        WebErrorCategory::RedirectLimit,
+        &url,
+        "The page exceeded the eight-redirect limit. Use its final public URL.",
+    )
+    .into())
 }
+
+fn redirect_destination(
+    url: &Url,
+    headers: &reqwest::header::HeaderMap,
+    redirects: usize,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<Url, ToolError> {
+    let next = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|value| url.join(value).ok())
+        .ok_or_else(|| {
+            WebError::new(
+                WebErrorCategory::Http,
+                url,
+                "The website sent an invalid redirect. Use another source.",
+            )
+        })?;
+    let next = checked_url(next.as_str())?;
+    validate_literal_address(&next)?;
+    if !visited.insert(next.to_string()) {
+        return Err(WebError::new(
+            WebErrorCategory::RedirectLoop,
+            &next,
+            "The website redirects in a loop. Use another source or a direct page URL.",
+        )
+        .into());
+    }
+    if redirects >= MAX_REDIRECTS {
+        return Err(WebError::new(
+            WebErrorCategory::RedirectLimit,
+            url,
+            "The page exceeded the eight-redirect limit. Use its final public URL.",
+        )
+        .into());
+    }
+    Ok(next)
+}
+
 pub fn search_url(query: &str) -> Result<String, ToolError> {
     if query.trim().is_empty() || query.len() > 1000 {
         return Err(ToolError::Arguments);
@@ -202,6 +309,8 @@ pub fn search_url(query: &str) -> Result<String, ToolError> {
     url.query_pairs_mut().append_pair("q", query);
     Ok(url.to_string())
 }
+#[cfg(test)]
+mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;

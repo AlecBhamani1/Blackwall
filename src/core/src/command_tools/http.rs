@@ -498,6 +498,12 @@ pub(super) async fn run(
         headers.push((header, value));
     }
     let client = reqwest::Client::builder()
+        // Web reads enable decoders in reqwest's shared feature set. Owner HTTP tools keep
+        // their identity-only contract so headers are checked before any decompression.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .no_proxy()
         .redirect(Policy::none())
         .connect_timeout(timeout.min(Duration::from_secs(10)))
@@ -534,10 +540,8 @@ pub(super) async fn run(
             status.as_u16()
         )));
     }
-    // Without a decoder the streamed bytes are the response bytes, so the cap counts what the
-    // model would read. A compressed body could inflate past it, so it is refused. If reqwest's
-    // gzip, brotli, deflate or zstd feature is ever enabled, `http_tool_cap_counts_decompressed_bytes`
-    // in `http/tests.rs` is the guard: it must keep passing with the cap counted after decoding.
+    // This client disables decoders even if another workspace client enables their features.
+    // Refuse compression before reading a body; the 64 KiB cap then counts identity bytes.
     if response
         .headers()
         .get(CONTENT_ENCODING)

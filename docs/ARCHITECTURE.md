@@ -214,6 +214,10 @@ Web access is disabled by default. Every request and redirect needs approval. Th
 proxies and automatic redirects, validates all resolved IPs, pins DNS results, rejects private and
 reserved ranges, and bounds response time and body size. Retrieved content is labeled untrusted.
 The current search implementation uses DuckDuckGo's HTML endpoint and can be unavailable or blocked.
+HTML is extracted into readable text, bounded independently of the decompressed download. Web errors
+carry typed categories and sanitized source diagnostics; the UI distinguishes them from owner
+denials. Browser mode keeps web tools unavailable until a shared-core backend exists. See
+[Web access](WEB_ACCESS.md) for limits, provider/rendering evaluation and verification.
 
 ## Telemetry
 

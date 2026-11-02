@@ -189,6 +189,8 @@ export interface ToolEntry {
   output?: string;
   /** The output was trimmed to fit the command output cap. */
   truncated?: boolean;
+  /** A rule or the owner denied the action before it ran. */
+  denied?: boolean;
   /** Owner-only server details; dropped before a conversation is saved or exported. */
   diagnostics?: ServerDiagnostic[];
   status: 'running' | 'complete' | 'error' | 'stopped';

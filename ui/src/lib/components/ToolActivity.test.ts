@@ -4,6 +4,51 @@ import { describe, expect, it } from 'vitest';
 import ToolActivity from './ToolActivity.svelte';
 
 describe('agent actions', () => {
+  it.each([
+    ['site_denied', 'Website refused access'],
+    ['challenge', 'Website requires human verification'],
+    ['size_limit', 'Page exceeds download limit'],
+    ['tls', 'Secure connection failed'],
+  ])('shows the %s reason and source without opening tool details', (category, label) => {
+    render(ToolActivity, {
+      tools: [
+        {
+          id: 'web',
+          name: 'web_fetch',
+          arguments: '{}',
+          status: 'error',
+          output: JSON.stringify({
+            webError: {
+              category,
+              source: 'https://example.com/page',
+              message: 'Use another public source.',
+            },
+          }),
+        },
+      ],
+    });
+    expect(screen.getByText(`${label}.`)).toBeVisible();
+    expect(screen.getByText('Source: https://example.com/page')).toBeVisible();
+    expect(screen.getByText(/Use another public source\./, { selector: 'p' })).toBeVisible();
+  });
+
+  it('labels owner denial separately and sanitizes its source', () => {
+    render(ToolActivity, {
+      tools: [
+        {
+          id: 'web',
+          name: 'web_fetch',
+          arguments: '{"url":"https://owner:password@example.com/page?token=secret#fragment"}',
+          status: 'error',
+          denied: true,
+          output: 'The operation was denied.',
+        },
+      ],
+    });
+    expect(screen.getByText('Owner or policy denied access.')).toBeVisible();
+    expect(screen.getByText('Source: https://example.com/page')).toBeVisible();
+    expect(screen.getByText(/The request did not run/)).toBeVisible();
+  });
   it("shows a failed server's output and unpassed variables in its details", async () => {
     const user = userEvent.setup();
     const instructions = {

@@ -547,8 +547,8 @@ async fn http_tool_network_rule_matches_resolved_host() {
     std::fs::remove_dir_all(owner).unwrap();
 }
 
-/// The workspace reqwest has no decoders, so bytes as streamed are bytes as decoded. A compressed
-/// body could inflate past the cap, so it is refused outright.
+/// Owner HTTP tools disable decoders even when web reads enable reqwest's shared decoder features.
+/// A compressed body could inflate past the cap, so it is refused outright.
 #[tokio::test]
 async fn http_tool_cap_counts_decompressed_bytes() {
     // 134 bytes of gzip that inflate to 100 KiB.

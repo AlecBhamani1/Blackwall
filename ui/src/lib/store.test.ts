@@ -393,6 +393,7 @@ describe('chat controller', () => {
         toolCallId: 'search-2',
         output: 'Search failed',
         success: false,
+        denied: true,
       });
       callbacks.onEvent?.({
         type: 'tool_result',
@@ -411,7 +412,7 @@ describe('chat controller', () => {
     expect(saved.content).toBe('Searching 🌐.\n\nReading.\n\nAnswer.');
     expect(saved.tools).toMatchObject([
       { contentOffset: 'Searching 🌐.\n\n'.length, output: 'Found pages', status: 'complete' },
-      { contentOffset: 'Searching 🌐.\n\n'.length, status: 'error' },
+      { contentOffset: 'Searching 🌐.\n\n'.length, status: 'error', denied: true },
       { contentOffset: 'Searching 🌐.\n\nReading.\n\n'.length, output: 'Page text' },
     ]);
     const sessionId = get(controller.activeSessionId);
