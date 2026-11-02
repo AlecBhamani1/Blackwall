@@ -29,6 +29,7 @@
   export let executionProfile: ExecutionProfile = 'read-only';
   export let commandNetwork = false;
   export let webEnabled = false;
+  export let webAvailable = true;
   export let workspaceWrite = true;
   export let controlsDisabled = false;
   export let onModelChange: (modelId: string) => void = () => undefined;
@@ -418,12 +419,15 @@
           <label class="compact-control"
             ><input
               type="checkbox"
-              checked={webEnabled}
+              checked={webAvailable && webEnabled}
               onchange={(event) => onWebEnabledChange(event.currentTarget.checked)}
-              disabled={controlsDisabled}
-              title="Enable web searches and page reads. Approval is required unless you have granted reusable web permission."
+              disabled={controlsDisabled || !webAvailable}
+              title={webAvailable
+                ? 'Enable web searches and page reads. Approval is required unless you have granted reusable web permission.'
+                : 'Web access is unavailable in browser mode. Use the Blackwall desktop app.'}
             />Web access</label
           >
+          {#if !webAvailable}<small>Web access requires the desktop app.</small>{/if}
           <button
             class="attach"
             aria-label="Add photos or files"

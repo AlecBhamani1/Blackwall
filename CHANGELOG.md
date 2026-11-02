@@ -15,6 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
+  and follow up to eight validated redirects. Search challenges and website refusals now report
+  actionable failures separately from owner denials. Browser mode clearly marks Web access as
+  unavailable and directs users to the desktop app. See [Web access](docs/WEB_ACCESS.md) for bounds,
+  search-provider evaluation, and the dated smoke matrix.
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.

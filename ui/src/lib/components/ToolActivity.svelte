@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ToolEntry } from '../types';
+  import { webFailure } from '../webFailure';
   import Icon from './Icon.svelte';
   export let historical = false;
   export let tools: ToolEntry[] = [];
@@ -72,7 +73,8 @@
                 />{/if}</span
             ><strong>{labels[tool.name] ?? tool.name}</strong><span class="detail"
               >{detail(tool)}</span
-            ><small>{historical ? 'History · ' : ''}{tool.status}</small></summary
+            ><small>{historical ? 'History · ' : ''}{webFailure(tool)?.label ?? tool.status}</small
+            ></summary
           >
           <div class="tool-content">
             <small>Arguments</small>
@@ -97,6 +99,14 @@
     </div>
   </details>
   {#each tools as tool (tool.id)}
+    {@const failure = webFailure(tool)}
+    {#if failure}
+      <p class="warning">
+        <strong>{failure.label}.</strong>
+        {failure.message}
+        {#if failure.source}<span>Source: {failure.source}</span>{/if}
+      </p>
+    {/if}
     {#each warnings(tool) as warning}
       <p class="warning">{warning}</p>
     {/each}
@@ -184,6 +194,9 @@
     font-size: 11.5px;
     color: var(--err);
     overflow-wrap: anywhere;
+  }
+  .warning span {
+    display: block;
   }
   pre {
     max-height: 300px;

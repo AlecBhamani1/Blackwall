@@ -361,6 +361,11 @@ async function streamBrowserChat(
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
+  if (request.webEnabled) {
+    throw new Error(
+      'Web access is unavailable in browser mode. Open the Blackwall desktop app to search and read public pages.',
+    );
+  }
   const budget = contextBudget(request);
   const source = request.messages.map(toOpenAIMessage);
   let state = await restoreContext(source, request.contextState);
@@ -553,6 +558,7 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       output: event.output,
       success: event.success === true,
       ...(event.truncated === true ? { truncated: true } : {}),
+      ...(event.denied === true ? { denied: true } : {}),
     };
   if (
     type === 'approval_request' &&

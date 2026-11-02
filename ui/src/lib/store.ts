@@ -1011,6 +1011,7 @@ export function createChatController(
                                   ...tool,
                                   output: event.output,
                                   ...(event.truncated ? { truncated: true } : {}),
+                                  ...(event.denied ? { denied: true } : {}),
                                   status: event.success ? 'complete' : 'error',
                                 }
                               : tool,

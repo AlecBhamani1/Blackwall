@@ -381,6 +381,7 @@
                 executionProfile={$executionProfile}
                 commandNetwork={$commandNetwork}
                 webEnabled={$webEnabled}
+                webAvailable={isDesktop()}
                 {workspaceWrite}
                 controlsDisabled={$runState !== 'idle'}
                 onDismissNotice={controller.dismissNotice}

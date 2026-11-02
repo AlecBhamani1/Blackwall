@@ -213,6 +213,8 @@ pub enum ToolError {
     Changed,
     #[error("{0}")]
     Execution(String),
+    #[error("{0}")]
+    Web(#[from] crate::web::WebError),
 }
 impl ToolError {
     /// A stable name for traces, without any tool output.
@@ -225,6 +227,7 @@ impl ToolError {
             Self::Denied => "denied",
             Self::Changed => "changed",
             Self::Execution(_) => "execution",
+            Self::Web(error) => error.category.as_str(),
         }
     }
 }

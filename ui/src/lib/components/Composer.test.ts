@@ -17,6 +17,23 @@ function renderComposer(onSend = vi.fn().mockResolvedValue(true)) {
 }
 
 describe('Composer', () => {
+  it('explains unavailable browser web access and cannot enable it', async () => {
+    const user = userEvent.setup();
+    const onWebEnabledChange = vi.fn();
+    render(Composer, {
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      webAvailable: false,
+      webEnabled: true,
+      onWebEnabledChange,
+    });
+    const web = screen.getByRole('checkbox', { name: 'Web access' });
+    expect(web).toBeDisabled();
+    expect(web).not.toBeChecked();
+    expect(screen.getByText('Web access requires the desktop app.')).toBeVisible();
+    await user.click(web);
+    expect(onWebEnabledChange).not.toHaveBeenCalled();
+  });
   it('holds the model and Chat controls in its footer without the old filler', () => {
     render(Composer, {
       props: {
