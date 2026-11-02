@@ -21,6 +21,10 @@
     approval.outsideSandbox && approval.detail.startsWith(OUTSIDE_NOTE)
       ? approval.detail.slice(OUTSIDE_NOTE.length).replace(/^\n+/, '')
       : approval.detail;
+  $: webAccess =
+    approval.kind === 'network' && !approval.outsideSandbox && !approval.offDevice
+      ? approval.webAccess
+      : undefined;
   $: toolName = approval.tool?.tool.slice(approval.tool.server.length + 2) ?? '';
   $: saved = (
     place === 'project' ? `allow_${scope}_in_project` : `allow_${scope}`
@@ -71,6 +75,24 @@
       >{busy ? 'Sending…' : 'Allow once'}</button
     >
   </div>
+  {#if webAccess}
+    <div class="always">
+      <button class="remember" disabled={busy} onclick={() => decide('allow_web_for_run')}
+        >Allow web access for this run</button
+      >
+      {#if webAccess === 'persistent'}
+        <button class="remember" disabled={busy} onclick={() => decide('allow_web')}
+          >Always allow web access</button
+        >
+      {/if}
+    </div>
+    <small class="note">
+      Covers searches and public page reads across websites. Web access must remain on.
+      {webAccess === 'persistent'
+        ? 'Saved permission applies to future runs and can be revoked in Settings → Privacy & security → Rules & sandbox → Your rules.'
+        : 'Permission ends with this run.'}
+    </small>
+  {/if}
   {#if approval.tool && !approval.outsideSandbox}
     <div class="always">
       <label

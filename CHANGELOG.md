@@ -21,6 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Web request approvals can allow searches and public page reads for the current run or save
+  permission for future runs, including calls written as text. Revoke saved Web access in
+  Settings → Privacy & security → Rules & sandbox → Your rules. Web access must still be on;
+  explicit host rules, DNS/private-network checks and redirect validation continue to apply.
+
 - Settings → Privacy & security → Rules & sandbox now has Your rules: list your allow, ask and
   deny rules in order, add, edit or delete one (saved with the same checks as `policy.json`, other
   rules kept, and a confirmation first when a change loosens them), test a command, path or host

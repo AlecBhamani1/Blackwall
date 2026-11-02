@@ -1,9 +1,5 @@
 //! Explicitly approved public web reads with DNS pinning, redirect validation, and bounds.
-use crate::{
-    approvals::Approvals,
-    protocol::{AgentEvent, ApprovalKind},
-    tools::ToolError,
-};
+use crate::{approvals::Approvals, protocol::AgentEvent, tools::ToolError};
 use futures_util::StreamExt;
 use reqwest::{StatusCode, Url};
 use serde_json::{json, Value};
@@ -124,13 +120,7 @@ pub async fn fetch(
     for redirects in 0..=2 {
         let detail=format!("Read web page\nGET {url}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.");
         if !approvals
-            .request(
-                request_id,
-                ApprovalKind::Network,
-                url.host_str().unwrap_or_default(),
-                detail,
-                emit,
-            )
+            .request_web(request_id, url.host_str().unwrap_or_default(), detail, emit)
             .await
             .map_err(ToolError::Execution)?
         {

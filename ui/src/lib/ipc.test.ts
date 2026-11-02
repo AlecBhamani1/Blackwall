@@ -142,6 +142,40 @@ describe('native chat failure boundary', () => {
     expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'a2' });
   });
 
+  it('preserves structured web permission choices only on network prompts', async () => {
+    Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+    native.listen.mockResolvedValue(native.unlisten);
+    const onEvent = vi.fn();
+    const prompt = { type: 'approval_request', requestId: 'web', kind: 'network', detail: 'd' };
+    native.invoke.mockImplementation(async () => {
+      const listener = native.listen.mock.calls[0][1];
+      listener({ payload: { ...prompt, approvalId: 'run', webAccess: 'run', remember: false } });
+      listener({ payload: { ...prompt, approvalId: 'saved', webAccess: 'persistent' } });
+      listener({ payload: { ...prompt, approvalId: 'bad', webAccess: true } });
+      listener({
+        payload: { ...prompt, approvalId: 'exec', kind: 'exec', webAccess: 'persistent' },
+      });
+      listener({ payload: { type: 'turn_complete', requestId: 'web' } });
+    });
+    await localModelClient.streamChat(
+      { requestId: 'web', model: 'model', messages: [] },
+      { onDelta: vi.fn(), onEvent },
+      new AbortController().signal,
+    );
+    expect(onEvent).toHaveBeenCalledWith({
+      ...prompt,
+      approvalId: 'run',
+      webAccess: 'run',
+      remember: false,
+    });
+    expect(onEvent).toHaveBeenCalledWith({
+      ...prompt,
+      approvalId: 'saved',
+      webAccess: 'persistent',
+    });
+    expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'bad' });
+    expect(onEvent).toHaveBeenCalledWith({ ...prompt, approvalId: 'exec', kind: 'exec' });
+  });
   it('keeps the off-device and outside-sandbox marks on prompts and the trimmed mark on tool results', async () => {
     Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
     native.listen.mockResolvedValue(native.unlisten);
@@ -345,7 +379,9 @@ describe('browser model discovery', () => {
                 { name: 'llama3.2:1b', size: 1 },
               ],
             })
-          : Response.json({ data: [{ id: 'a' }, { id: 'a' }, { id: 'text-embedding-3' }, { id: 'b' }] }),
+          : Response.json({
+              data: [{ id: 'a' }, { id: 'a' }, { id: 'text-embedding-3' }, { id: 'b' }],
+            }),
       ),
     );
     expect((await localModelClient.discoverModels()).map(({ id }) => id)).toEqual([

@@ -844,9 +844,6 @@ impl Agent<'_> {
                             )
                             .await
                         };
-                        if text_calls {
-                            self.approvals.end_text_call(request_id);
-                        }
                         let success = result.is_ok();
                         if let Some(trace) = trace {
                             trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));

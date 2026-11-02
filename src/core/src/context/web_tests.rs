@@ -300,3 +300,46 @@ async fn cancellation_invalidates_pending_web_approvals() {
         .resolve(pending.lock().unwrap().take().unwrap())
         .is_err());
 }
+
+#[tokio::test]
+async fn reusable_web_permission_covers_native_and_text_calls_without_bypassing_ssrf() {
+    for text_calls in [false, true] {
+        let mut first = research(vec![call(
+            "web_fetch",
+            json!({"url":"http://127.0.0.1/one","purpose":"First source"}),
+        )]);
+        first.text_calls = text_calls;
+        let mut second = research(vec![call(
+            "web_fetch",
+            json!({"url":"http://127.0.0.2/two","purpose":"Another source"}),
+        )]);
+        second.text_calls = text_calls;
+        let model = Scripted::new(vec![first, second, answer()]);
+        let approvals = Approvals::default();
+        let events = Mutex::new(vec![]);
+        chat_with_web(&model, "web", run(), &approvals, None, &|event| {
+            decide(&approvals, &event, ApprovalDecision::AllowWebForRun);
+            events.lock().unwrap().push(event);
+        })
+        .await
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ApprovalRequest { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::ToolResult { success: false, output, .. } if output.contains("private"))).count(), 2);
+        let requests = model.requests.lock().unwrap();
+        assert!(requests[1].0.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("private"));
+        assert!(requests[2].0.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("private"));
+    }
+}

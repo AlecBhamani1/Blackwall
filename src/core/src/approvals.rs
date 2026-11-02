@@ -1,7 +1,10 @@
-//! Exact-action approvals tied to a live run. Dropping a wait invalidates its decision handle.
+//! Action and capability approvals tied to a live run. Dropping a wait invalidates its handle.
 use crate::{
     policy::{Decision, Policy, ToolRule},
-    protocol::{AgentEvent, ApprovalDecision, ApprovalKind, ApprovalTool, ResolveApprovalRequest},
+    protocol::{
+        AgentEvent, ApprovalDecision, ApprovalKind, ApprovalTool, ResolveApprovalRequest,
+        WebAccessApproval,
+    },
 };
 use rand::{rand_core::UnwrapErr, rngs::SysRng, Rng};
 use std::{
@@ -11,6 +14,8 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+
+mod web;
 
 /// The most argument bytes a text-written call's prompt shows.
 const MAX_SHOWN_ARGUMENTS: usize = 4 * 1024;
@@ -47,15 +52,14 @@ struct Pending {
     tool: bool,
     /// Whether "allow identical action this run" may be remembered.
     remember: bool,
+    web_access: Option<WebAccessApproval>,
 }
 #[derive(Default)]
 struct Registry {
     pending: HashMap<String, Pending>,
     allowed: HashSet<(String, String)>,
     policies: HashMap<String, Arc<Policy>>,
-    /// Runs whose current text-written web call was just approved; its first network prompt
-    /// is answered by that approval.
-    text_web_calls: HashSet<String>,
+    web_runs: HashSet<String>,
 }
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Registry>>);
@@ -250,6 +254,7 @@ impl Approvals {
                 false,
                 off_device,
                 outside,
+                None,
             )
             .await?
             != ApprovalDecision::Deny;
@@ -314,12 +319,11 @@ impl Approvals {
             .get(request_id)
             .cloned();
         let Some(policy) = policy else {
-            if self.approved_text_call(request_id, kind) {
-                return Ok(true);
-            }
             // Without the owner's data folder there is nowhere to save a rule.
             let answer = self
-                .ask(request_id, kind, None, detail, emit, true, false, false)
+                .ask(
+                    request_id, kind, None, detail, emit, true, false, false, None,
+                )
                 .await?;
             return Ok(answer != ApprovalDecision::Deny);
         };
@@ -335,7 +339,6 @@ impl Approvals {
         let allowed = match decision {
             Decision::Allow => true,
             Decision::Deny => false,
-            Decision::Ask if self.approved_text_call(request_id, kind) => true,
             Decision::Ask => {
                 let detail = match &policy.error {
                     Some(error) => format!("{error}\n\n{detail}"),
@@ -351,6 +354,7 @@ impl Approvals {
                         true,
                         false,
                         false,
+                        None,
                     )
                     .await?;
                 if let Some(tool) = tool.filter(|_| answer != ApprovalDecision::Deny) {
@@ -425,12 +429,9 @@ impl Approvals {
         }
         Ok(Some(saved))
     }
-    /// A tool call the model wrote as text always asks, whatever rules are saved, and the
-    /// answer is never remembered, not even for an identical call later in the run. `kind` is
-    /// what the tool does. The tool's own checks still apply after this. With `covers_request`,
-    /// an approved web call does not ask again for its first request; call
-    /// [`Self::end_text_call`] after it. Owner HTTP tools pass `false`, so the owner still sees
-    /// the prompt with the resolved URL.
+    /// Built-in web calls use their resolved URL's web approval, just like native calls.
+    /// Other text-written calls always ask and cannot be remembered. `covers_request` is
+    /// true only for built-in calls, never for an owner-defined HTTP tool.
     pub async fn confirm_text_call(
         &self,
         request_id: &str,
@@ -440,36 +441,25 @@ impl Approvals {
         arguments: &str,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool, String> {
+        if covers_request
+            && kind == ApprovalKind::Network
+            && matches!(name, "web_fetch" | "web_search")
+        {
+            // The dispatcher has already checked that this built-in tool is offered. Its
+            // validated URL goes through request_web, including policy and SSRF checks.
+            return Ok(true);
+        }
         let detail = format!(
             "The model wrote this tool call as text, so Blackwall asks before running it.\n\nTool: {name}\nArguments: {}",
             clipped(arguments, MAX_SHOWN_ARGUMENTS)
         );
         let allowed = self
-            .ask(request_id, kind, None, detail, emit, false, false, false)
+            .ask(
+                request_id, kind, None, detail, emit, false, false, false, None,
+            )
             .await?
             != ApprovalDecision::Deny;
-        if allowed && covers_request && kind == ApprovalKind::Network {
-            self.0
-                .lock()
-                .map_err(|_| "The approval registry is unavailable.")?
-                .text_web_calls
-                .insert(request_id.to_owned());
-        }
         Ok(allowed)
-    }
-    /// Drop an approved text-written web call's unused approval once the call has finished.
-    pub fn end_text_call(&self, request_id: &str) {
-        if let Ok(mut state) = self.0.lock() {
-            state.text_web_calls.remove(request_id);
-        }
-    }
-    /// Whether a network prompt is already answered by the text-written call that raised it.
-    fn approved_text_call(&self, request_id: &str, kind: ApprovalKind) -> bool {
-        kind == ApprovalKind::Network
-            && self
-                .0
-                .lock()
-                .is_ok_and(|mut state| state.text_web_calls.remove(request_id))
     }
     /// `remember` lets "allow identical action this run" skip later identical prompts.
     /// `off_device` marks a prompt whose data may leave this device, and `outside_sandbox` one
@@ -485,6 +475,7 @@ impl Approvals {
         remember: bool,
         off_device: bool,
         outside_sandbox: bool,
+        web_access: Option<WebAccessApproval>,
     ) -> Result<ApprovalDecision, String> {
         let (sender, receiver) = oneshot::channel();
         let id = format!("approval_{:016x}", UnwrapErr(SysRng).next_u64());
@@ -510,6 +501,7 @@ impl Approvals {
                     sender,
                     tool: tool.is_some(),
                     remember,
+                    web_access,
                 },
             );
         }
@@ -526,6 +518,7 @@ impl Approvals {
             remember,
             off_device,
             outside_sandbox,
+            web_access,
         });
         let decision = tokio::time::timeout(Duration::from_secs(10 * 60), receiver)
             .await
@@ -552,6 +545,17 @@ impl Approvals {
         else {
             return Err("This approval is no longer active.".into());
         };
+        match request.decision {
+            ApprovalDecision::AllowWebForRun if pending.web_access.is_none() => {
+                return Err("This approval cannot grant web access.".into());
+            }
+            ApprovalDecision::AllowWeb
+                if pending.web_access != Some(WebAccessApproval::Persistent) =>
+            {
+                return Err("This approval cannot save web access.".into());
+            }
+            _ => {}
+        }
         let saves_rule = matches!(
             request.decision,
             ApprovalDecision::AllowToolInProject
@@ -582,7 +586,7 @@ impl Approvals {
                 .retain(|_, pending| pending.request_id != request_id);
             state.allowed.retain(|(id, _)| id != request_id);
             state.policies.remove(request_id);
-            state.text_web_calls.remove(request_id);
+            state.web_runs.remove(request_id);
         }
     }
 }
@@ -1061,90 +1065,6 @@ mod tests {
             AgentEvent::ApprovalRequest { remember: true, .. }
         ));
     }
-    #[tokio::test]
-    async fn approved_text_web_call_skips_its_own_network_prompt_once() {
-        let approvals = Approvals::default();
-        let (_, allow) = answer_all(&approvals, ApprovalDecision::Allow);
-        let arguments = r#"{"url":"https://docs.rs"}"#;
-        assert!(approvals
-            .confirm_text_call(
-                "run",
-                ApprovalKind::Network,
-                true,
-                "web_fetch",
-                arguments,
-                &allow
-            )
-            .await
-            .unwrap());
-        assert!(approvals
-            .request(
-                "run",
-                ApprovalKind::Network,
-                "docs.rs",
-                "GET https://docs.rs".into(),
-                &|_| panic!("the approved text call already asked")
-            )
-            .await
-            .unwrap());
-        // The approval covered one request only.
-        let (_, deny) = answer_all(&approvals, ApprovalDecision::Deny);
-        assert!(!approvals
-            .request(
-                "run",
-                ApprovalKind::Network,
-                "docs.rs",
-                "GET https://docs.rs".into(),
-                &deny
-            )
-            .await
-            .unwrap());
-        // An unused approval ends with its call.
-        approvals
-            .confirm_text_call(
-                "run",
-                ApprovalKind::Network,
-                true,
-                "web_fetch",
-                arguments,
-                &allow,
-            )
-            .await
-            .unwrap();
-        approvals.end_text_call("run");
-        assert!(!approvals
-            .request(
-                "run",
-                ApprovalKind::Network,
-                "docs.rs",
-                "GET https://docs.rs".into(),
-                &deny
-            )
-            .await
-            .unwrap());
-        // A denied text call grants nothing.
-        approvals
-            .confirm_text_call(
-                "run",
-                ApprovalKind::Network,
-                true,
-                "web_fetch",
-                arguments,
-                &deny,
-            )
-            .await
-            .unwrap();
-        assert!(!approvals
-            .request(
-                "run",
-                ApprovalKind::Network,
-                "docs.rs",
-                "GET https://docs.rs".into(),
-                &deny
-            )
-            .await
-            .unwrap());
-    }
     #[test]
     fn approving_a_text_call_always_allows_only_once() {
         let approvals = Approvals::default();
@@ -1156,6 +1076,7 @@ mod tests {
                 sender,
                 tool: false,
                 remember: false,
+                web_access: None,
             },
         );
         approvals

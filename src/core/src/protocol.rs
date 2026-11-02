@@ -358,6 +358,10 @@ pub enum ApprovalDecision {
     Allow,
     /// Permit this operation and remember the scoped rule.
     AlwaysAllow,
+    /// Permit built-in web searches and page reads until this run ends.
+    AllowWebForRun,
+    /// Save owner permission for built-in web searches and page reads.
+    AllowWeb,
     /// Refuse this operation.
     Deny,
     /// Permit this MCP tool from now on in this project, saving an owner rule.
@@ -368,6 +372,16 @@ pub enum ApprovalDecision {
     AllowServerInProject,
     /// Permit every tool from this MCP server from now on in every project, saving an owner rule.
     AllowServer,
+}
+
+/// Reusable choices offered only by the built-in public-web request path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAccessApproval {
+    /// No owner data folder is available, so permission can last only this run.
+    Run,
+    /// The owner may also save permission for future runs.
+    Persistent,
 }
 
 /// The MCP tool an approval is for, so the owner can allow it from now on.
@@ -501,8 +515,11 @@ pub enum AgentEvent {
         /// The MCP tool, for approvals that can be saved as an owner rule.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<ApprovalTool>,
+        /// Reusable permission for the two built-in web tools, never arbitrary network tools.
+        #[serde(default, rename = "webAccess", skip_serializing_if = "Option::is_none")]
+        web_access: Option<WebAccessApproval>,
         /// Whether "allow identical action this run" is offered. False for a tool call the
-        /// model wrote as text, which always asks.
+        /// model wrote as text, except built-in web calls use their resolved web approval.
         #[serde(default = "offered", skip_serializing_if = "is_offered")]
         remember: bool,
         /// The action hands data to another program that may send it off this device, such as
@@ -836,6 +853,7 @@ mod tests {
                 remember: true,
                 off_device: false,
                 outside_sandbox: false,
+                web_access: None,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -846,6 +864,7 @@ mod tests {
                 remember: false,
                 off_device: false,
                 outside_sandbox: false,
+                web_access: None,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -856,6 +875,7 @@ mod tests {
                 remember: false,
                 off_device: true,
                 outside_sandbox: true,
+                web_access: None,
             },
             AgentEvent::ApprovalRequest {
                 request_id: "r1".to_owned(),
@@ -869,6 +889,18 @@ mod tests {
                 remember: true,
                 off_device: false,
                 outside_sandbox: false,
+                web_access: None,
+            },
+            AgentEvent::ApprovalRequest {
+                request_id: "r1".to_owned(),
+                approval_id: "web".to_owned(),
+                kind: ApprovalKind::Network,
+                detail: "GET https://example.com".to_owned(),
+                tool: None,
+                remember: false,
+                off_device: false,
+                outside_sandbox: false,
+                web_access: Some(WebAccessApproval::Persistent),
             },
             AgentEvent::SubagentStatus {
                 request_id: "r1".to_owned(),
@@ -928,6 +960,7 @@ mod tests {
             remember: false,
             off_device: false,
             outside_sandbox,
+            web_access: None,
         };
         let marked = serde_json::to_value(event(true)).unwrap();
         assert_eq!(marked["outsideSandbox"], true);

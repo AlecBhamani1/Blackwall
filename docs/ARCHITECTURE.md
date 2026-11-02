@@ -172,7 +172,8 @@ temporary invitations are implemented; they are not permanent guest accounts.
 `core::model` decodes bounded OpenAI-compatible streamed content and fragmented tool calls. It
 keeps `<think>` text and `reasoning` fields apart from the answer (`model/think.rs`) and, only when
 the connection opts in, reads `<tool_call>` blocks written as text (`model/text_tools.rs`); those
-calls always ask. Before a request, the adapter asks `core::connection::served_budget` for the
+calls always ask except built-in web calls, which use the same resolved-URL permission gate as
+native web calls. Before a request, the adapter asks `core::connection::served_budget` for the
 server's loaded context window. `core::agent` runs up to the configured iteration limit (20
 model/tool iterations by default, 1–100) and maps how a run ended to a `RunReason`, which `bw`
 turns into its exit code. File tools use a directory capability selected
@@ -194,7 +195,10 @@ account permissions unless the owner picks `sandboxed`. They always ask: an allo
 the prompt, a deny rule still denies, and the audit records the program that ran.
 
 `core::approvals` binds decisions to an active request and exact action. “Allow identical action this
-run” expires when the run ends. Dropping a pending action invalidates its decision handle.
+run” expires when the run ends. Built-in web requests can instead grant permission for the run
+or save owner permission for future runs. Only the web fetcher uses that capability; it refreshes
+owner rules for revocation without re-reading the run's trusted project settings. Matching host
+ask/deny rules still take precedence. Dropping a pending action invalidates its decision handle.
 `core::subagents` runs children with the owner's `SubagentSettings`: a step limit (eight by default)
 and a subset of the built-in tools (read-only by default), whose edits, commands and web requests go
 through the same `tools::execute`, approvals and policy as the parent's. Children never spawn more

@@ -169,6 +169,7 @@ export type AgentEvent =
       kind: string;
       detail: string;
       tool?: ApprovalTool;
+      webAccess?: 'run' | 'persistent';
       remember?: boolean;
       offDevice?: boolean;
       outsideSandbox?: boolean;
@@ -201,6 +202,8 @@ export interface ApprovalTool {
 export type ApprovalDecision =
   | 'allow'
   | 'always_allow'
+  | 'allow_web_for_run'
+  | 'allow_web'
   | 'deny'
   | 'allow_tool_in_project'
   | 'allow_tool'
@@ -213,7 +216,9 @@ export interface PendingApproval {
   kind: string;
   detail: string;
   tool?: ApprovalTool;
-  /** False for a tool call the model wrote as text: it can only be allowed once. */
+  /** Reusable permission offered only for built-in public-web tools. */
+  webAccess?: 'run' | 'persistent';
+  /** Whether identical-action permission is offered; web tools use webAccess instead. */
   remember?: boolean;
   /** The action hands data to a program that may send it off this device. */
   offDevice?: boolean;

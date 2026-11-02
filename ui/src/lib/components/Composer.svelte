@@ -421,6 +421,7 @@
               checked={webEnabled}
               onchange={(event) => onWebEnabledChange(event.currentTarget.checked)}
               disabled={controlsDisabled}
+              title="Enable web searches and page reads. Approval is required unless you have granted reusable web permission."
             />Web access</label
           >
           <button
