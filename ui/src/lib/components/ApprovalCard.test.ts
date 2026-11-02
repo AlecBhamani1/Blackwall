@@ -114,6 +114,51 @@ describe('action approval', () => {
     await rerender({ approval, onResolve });
     expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
   });
+  it('offers reusable web access for different searches and pages', async () => {
+    const user = userEvent.setup();
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(ApprovalCard, {
+      approval: { ...approval, kind: 'network', remember: false, webAccess: 'persistent' },
+      onResolve,
+    });
+    expect(
+      screen.queryByRole('button', { name: 'Allow identical action this run' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/Covers searches and public page reads across websites/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Allow web access for this run' }));
+    expect(onResolve).toHaveBeenLastCalledWith('allow_web_for_run');
+    await user.click(screen.getByRole('button', { name: 'Always allow web access' }));
+    expect(onResolve).toHaveBeenLastCalledWith('allow_web');
+    expect(screen.getByText(/revoked in Settings/)).toBeVisible();
+  });
+  it('offers only run permission when owner settings are unavailable', () => {
+    render(ApprovalCard, {
+      approval: { ...approval, kind: 'network', remember: false, webAccess: 'run' },
+      onResolve: vi.fn(),
+    });
+    expect(screen.getByRole('button', { name: 'Allow web access for this run' })).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Always allow web access' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/Permission ends with this run/)).toBeVisible();
+  });
+  it('does not offer reusable web permission for other approval categories or policy restrictions', async () => {
+    const { rerender } = render(ApprovalCard, {
+      approval: { ...approval, webAccess: 'persistent' },
+      onResolve: vi.fn(),
+    });
+    expect(
+      screen.queryByRole('button', { name: 'Always allow web access' }),
+    ).not.toBeInTheDocument();
+    await rerender({
+      approval: { ...approval, kind: 'network', remember: false },
+      onResolve: vi.fn(),
+    });
+    expect(
+      screen.queryByRole('button', { name: 'Allow web access for this run' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeVisible();
+  });
   it('offers recovery after a decision cannot be delivered', async () => {
     const user = userEvent.setup();
     const onResolve = vi.fn().mockRejectedValue(new Error('expired'));

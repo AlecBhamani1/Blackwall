@@ -233,8 +233,8 @@ if a window loses its access code, revoke that individual link and create a repl
 Chat mode sends messages and attachments to your selected model. In the desktop app, enable
 **Web access** in either Chat or Agent to let the model search the public web and read text pages.
 Chat needs no project folder and exposes only these two web tools. Web access starts off and resets
-when starting or reopening a conversation. Each request shows its destination and purpose for
-approval; denied, unreachable, and blocked pages return an error the model can explain. Web content
+when starting or reopening a conversation. Requests without reusable permission show their
+destination and purpose for approval; denied, unreachable, and blocked pages return an error the model can explain. Web content
 is untrusted, and local/private network addresses remain blocked. Search uses DuckDuckGo and can
 be unavailable; this is text retrieval rather than an interactive browser. The browser preview and
 guest links do not expose these desktop tools.
@@ -250,7 +250,7 @@ is the authority for file tools; a folder must be selected again after reopening
 | Search files | Literal text search; at most 2,000 entries, 8 MiB scanned, 100 matches |
 | Edit a file | Shows a unified diff; writes only after approval; rejects stale source contents |
 | Run a command | Shows the exact shell command and working folder; requires approval |
-| Read/search the web | Requires the Web access toggle and a separate request approval |
+| Read/search the web | Requires Web access on; approve once, for this run, or save permission |
 | Delegate a subtask | A child with the [subagent tools](#subagents) you allow (read-only by default); never further delegation |
 
 For each proposed change, choose **Deny**, **Allow once**, or **Allow identical action this run**.
@@ -261,6 +261,23 @@ project or every project. It saves an owner rule in `policy.json`, applies it to
 run, and allows the call; if the rule cannot be saved, the call does not run and says why. The
 server's page in **MCP servers** lists these rules and removes them; a removal applies from the next
 run. Removing a server also removes its rules, so a later server with the same name starts asking.
+
+Web approvals offer **Allow web access for this run** and **Always allow web access**.
+Both cover built-in searches and public page reads across different queries, URLs, purposes and
+redirects, including calls written as text. Web access must still be on in the composer. Saved
+permission applies in future runs and can be revoked in **Settings → Privacy & security →
+Rules & sandbox → Your rules**; revocation applies to the next web request, including an active run.
+It is stored as an owner network rule with `"tool":"builtin:web"`, which cannot match an owner
+HTTP tool, shell command or MCP tool. Host ask/deny rules and project restrictions take precedence
+over this permission, including in ordered mode. Invalid policy settings keep asking. Private
+addresses, DNS pinning and redirect checks remain enforced. Before using an older Blackwall version
+that does not recognize this permission, revoke saved Web access; an older version treats a policy
+containing this rule as invalid and asks for approval. Other text-written tools, file changes, shell
+commands and owner HTTP tools keep their existing approvals.
+
+![Web request approval choices](screenshots/web-permission-approval.png)
+
+![Saved web permission in Your rules](screenshots/web-permission-settings.png)
 
 To decide routine actions in advance, add rules to `policy.json` in the Blackwall data folder
 (`~/.blackwall/`). A project can add its own rules too; see [Project settings](#project-settings).
@@ -287,12 +304,15 @@ project. Ask and deny path rules ignore letter case, as the default macOS and Wi
 exception to a later rule; see [ordered rules](#ordered-and-strictest-rules). Actions that no rule
 matches still ask, and denied actions never show a prompt. Commands containing line breaks, `;`, `&`, `|`, backticks, `$`, `(`, `<`, or `>` always ask
 instead of matching an allow rule. Edits inside the data folder always ask, even when the project
-contains it. Rules load when a run starts. If the file is invalid, every action asks and the prompt
+contains it. Rules load when a run starts; built-in web requests refresh owner rules before each
+request while keeping the run's project settings snapshot. If the file is invalid, every action asks and the prompt
 shows the problem. Each rule decision and approval outcome is appended to `policy-audit.jsonl` with
 common credential forms redacted; the log rotates at 1 MiB. Each record's `rule` names the rule that
 decided, as `{"source":"user"|"project","index":N,"mode":"strictest"|"ordered"}` (`index` counts
 from 0 in that file's `rules`), or is `null` when no rule matched and the action asked by default. A
-record for an owner command tool also has `program`, the absolute path of the program it ran;
+built-in web record also has `capability` (`builtin:web`) and `permission` (`once`, `run`,
+`saved`, or `policy`). A record for an owner command tool also has `program`, the absolute path of
+the program it ran;
 `tool`; `isolation` (`outside` or `sandboxed`); `args`, the arguments after the program, redacted
 like the rest, each cut at 1,000 characters, and after 8 KiB in all the rest counted as
 `…(N more args)`; `env`, the names of the variables it was passed

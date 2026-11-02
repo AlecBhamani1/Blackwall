@@ -9,6 +9,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const POLICY_FILE: &str = "policy.json";
+/// Reserved identity for built-in public-web reads. Not a valid owner HTTP tool name.
+pub const WEB_ACCESS_TOOL: &str = "builtin:web";
 const AUDIT_FILE: &str = "policy-audit.jsonl";
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 const MAX_RULES: usize = 200;
@@ -155,7 +157,7 @@ impl RulesFile {
 }
 
 /// One file's rules, each with its position in that file.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Layer {
     source: Source,
     mode: RuleMode,
@@ -365,6 +367,54 @@ impl Policy {
         Self::read(&self.directory, &self.workspace, self.with_project).await
     }
 
+    /// Refresh owner rules for web permission/revocation without re-reading project settings.
+    pub(crate) async fn refresh_web_policy(&self) -> Self {
+        let mut current = Self::read(&self.directory, &self.workspace, false).await;
+        current.layers.extend(
+            self.layers
+                .iter()
+                .filter(|layer| layer.source == Source::Project)
+                .cloned(),
+        );
+        if !self.with_project {
+            for layer in &mut current.layers {
+                layer.rules.retain(|(_, rule)| rule.project.is_none());
+            }
+        }
+        current.ask_all = self.ask_all || current.error.is_some();
+        if self.ask_all {
+            current.error = self.error.clone().or(current.error);
+        }
+        current
+    }
+
+    /// A web grant never overrides a matching host rule, even in ordered mode. Only the
+    /// owner may grant this capability; project restrictions still apply.
+    pub(crate) fn evaluate_web(&self, host: &str) -> Verdict {
+        let host_rule = self.evaluate(ApprovalKind::Network, host);
+        let capability = self.verdict_by_source(&|source, rule| {
+            rule.kind == ApprovalKind::Network
+                && rule.tool.as_deref() == Some(WEB_ACCESS_TOOL)
+                && (source == Source::User || rule.decision != Decision::Allow)
+        });
+        if host_rule.matched.is_some() && host_rule.decision != Decision::Allow {
+            host_rule
+        } else if capability.matched.is_some() && capability.decision != Decision::Allow {
+            capability
+        } else if host_rule.matched.is_some() {
+            host_rule
+        } else {
+            capability
+        }
+    }
+
+    pub(crate) fn offers_web_permission(&self, verdict: Verdict) -> bool {
+        !self.ask_all
+            && self.error.is_none()
+            && verdict.decision == Decision::Ask
+            && verdict.matched.is_none()
+    }
+
     /// The owner's data folder and the run's workspace, for saving a rule from an approval.
     pub fn scope(&self) -> (&Path, &Path) {
         (&self.directory, &self.workspace)
@@ -454,7 +504,7 @@ impl Policy {
         self.verdict(&|rule| {
             rule.kind == ApprovalKind::Network
                 && match rule.tool.as_deref() {
-                    Some(name) => name == tool,
+                    Some(name) => name != WEB_ACCESS_TOOL && name == tool,
                     None => {
                         (!credentialed || rule.decision != Decision::Allow) && matches(rule, host)
                     }
@@ -498,7 +548,35 @@ impl Policy {
     ) {
         let _ = tokio::time::timeout(
             IO_TIMEOUT,
-            self.append(kind, subject, call, decision, allowed, saved, rule),
+            self.append(kind, subject, call, decision, allowed, saved, rule, None),
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_web(
+        &self,
+        host: &str,
+        verdict: Verdict,
+        allowed: bool,
+        saved: bool,
+        permission: &str,
+    ) {
+        let saved = saved.then(|| ToolRule {
+            tool: WEB_ACCESS_TOOL.into(),
+            project: None,
+        });
+        let _ = tokio::time::timeout(
+            IO_TIMEOUT,
+            self.append(
+                ApprovalKind::Network,
+                host,
+                None,
+                verdict.decision,
+                allowed,
+                saved.as_ref(),
+                verdict.matched,
+                Some(permission),
+            ),
         )
         .await;
     }
@@ -513,12 +591,17 @@ impl Policy {
         allowed: bool,
         saved: Option<&ToolRule>,
         rule: Option<MatchedRule>,
+        web_permission: Option<&str>,
     ) {
         let path = &self.audit;
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let mut entry = json!({"time":time,"kind":kind,"subject":redact(subject),"decision":decision,"allowed":allowed,"rule":rule});
+        if let Some(permission) = web_permission {
+            entry["capability"] = json!(WEB_ACCESS_TOOL);
+            entry["permission"] = json!(permission);
+        }
         if let Some(call) = call {
             entry["program"] = json!(call.program.to_string_lossy());
             entry["tool"] = json!(call.tool);
@@ -600,7 +683,7 @@ fn validate(rules: Vec<Rule>) -> Result<Vec<Rule>, String> {
                 .or(rule
                     .tool
                     .as_deref()
-                    .filter(|t| crate::command_tools::valid_name(t))),
+                    .filter(|t| *t == WEB_ACCESS_TOOL || crate::command_tools::valid_name(t))),
             ApprovalKind::Subagent => None,
         };
         let fields = [&rule.command, &rule.path, &rule.host, &rule.tool]
@@ -638,6 +721,24 @@ pub fn allow_tool(directory: &Path, tool: &str, project: Option<&Path>) -> Resul
             file.rules.retain(|saved| saved != &rule);
             file.rules.insert(0, rule);
         } else if !file.rules.contains(&rule) {
+            file.rules.push(rule);
+        }
+    })
+}
+
+/// Save built-in public-web permission without reordering any owner restrictions. Blocking.
+pub fn allow_web(directory: &Path) -> Result<(), String> {
+    let rule = Rule {
+        decision: Decision::Allow,
+        kind: ApprovalKind::Network,
+        tool: Some(WEB_ACCESS_TOOL.into()),
+        command: None,
+        path: None,
+        host: None,
+        project: None,
+    };
+    edit_rules(directory, |file| {
+        if !file.rules.contains(&rule) {
             file.rules.push(rule);
         }
     })

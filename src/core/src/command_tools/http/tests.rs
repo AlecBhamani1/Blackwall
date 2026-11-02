@@ -835,7 +835,6 @@ async fn http_tool_text_call_confirms_as_network_and_still_shows_the_request() {
     )
     .await
     .unwrap();
-    approvals.end_text_call("run");
     let asked = asked.lock().unwrap().clone();
     assert_eq!(asked.len(), 2);
     assert_eq!(asked[0].0, ApprovalKind::Network);

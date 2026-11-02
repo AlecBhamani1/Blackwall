@@ -567,6 +567,10 @@ function normalizeEvent(payload: unknown): AgentEvent | null {
       detail: event.detail,
       kind: event.kind,
       ...approvalTool(event.tool),
+      ...(event.kind === 'network' &&
+      (event.webAccess === 'run' || event.webAccess === 'persistent')
+        ? { webAccess: event.webAccess }
+        : {}),
       ...(event.remember === false ? { remember: false } : {}),
       ...(event.offDevice === true ? { offDevice: true } : {}),
       ...(event.outsideSandbox === true ? { outsideSandbox: true } : {}),

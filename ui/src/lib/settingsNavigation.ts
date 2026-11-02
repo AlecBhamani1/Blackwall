@@ -109,7 +109,8 @@ export const settingsEntries: readonly SettingsEntry[] = [
     desktopOnly: true,
     title: 'Rules & sandbox',
     description: 'Access keys and trusted projects',
-    keywords: 'credentials token password trust project policy sandbox rules',
+    keywords:
+      'credentials token password trust project policy sandbox rules web access permission approve',
   },
   {
     id: 'telemetry',

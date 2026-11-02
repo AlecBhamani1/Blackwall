@@ -721,7 +721,7 @@ async fn chat_traced(
                         attributes,
                     )
                 });
-                // A call written as text always asks first.
+                // Built-in web calls ask at their resolved URL; other text calls ask first.
                 let confirmed = !turn.text_calls
                     || approvals
                         .confirm_text_call(
@@ -739,9 +739,6 @@ async fn chat_traced(
                 } else {
                     Err(crate::tools::ToolError::Denied)
                 };
-                if turn.text_calls {
-                    approvals.end_text_call(request_id);
-                }
                 if let (Some(trace), Some(span)) = (trace, &tool) {
                     trace.record_tool(tool_name, crate::telemetry::ToolOutcome::of(&result));
                     if let Err(error) = &result {

@@ -9,7 +9,11 @@ const rules: OwnerRule[] = [
   { decision: 'allow', kind: 'exec', tool: 'docs', project: '/work/app' },
   { decision: 'ask', kind: 'exec', command: 'git push' },
 ];
-const entry = (time: number, subject: string, rule: PolicyAuditEntry['rule']): PolicyAuditEntry => ({
+const entry = (
+  time: number,
+  subject: string,
+  rule: PolicyAuditEntry['rule'],
+): PolicyAuditEntry => ({
   time,
   kind: 'exec',
   subject,
@@ -43,6 +47,38 @@ describe('Owner rules in Settings', () => {
     expect(screen.getByText(/outside the sandbox/)).toBeInTheDocument();
   });
 
+  it('shows and revokes saved web permission while keeping unrelated rules', async () => {
+    const user = userEvent.setup();
+    const grant: OwnerRule = { decision: 'allow', kind: 'network', tool: 'builtin:web' };
+    const shown = { rules: [...rules, grant] };
+    vi.spyOn(persistence, 'ownerRules').mockResolvedValueOnce(shown).mockResolvedValue({ rules });
+    const save = vi.spyOn(persistence, 'saveOwnerRules').mockResolvedValue(undefined);
+    render(OwnerRules);
+    const panel = within(await screen.findByRole('region', { name: 'Saved web permission' }));
+    expect(panel.getByText(/Reusable web permission is saved/)).toBeVisible();
+    expect(screen.queryByText(/builtin:web/)).not.toBeInTheDocument();
+    await user.click(panel.getByRole('button', { name: 'Revoke saved web access' }));
+    expect(save).toHaveBeenCalledWith(shown, rules);
+    await waitFor(() =>
+      expect(panel.getByText(/No reusable web permission is saved/)).toBeVisible(),
+    );
+    expect(
+      panel.queryByRole('button', { name: 'Revoke saved web access' }),
+    ).not.toBeInTheDocument();
+  });
+  it('keeps saved web permission visible after a failed revocation', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'ownerRules').mockResolvedValue({
+      rules: [{ decision: 'allow', kind: 'network', tool: 'builtin:web' }],
+    });
+    vi.spyOn(persistence, 'saveOwnerRules').mockRejectedValue(
+      'The rules changed. Reload and try again.',
+    );
+    render(OwnerRules);
+    await user.click(await screen.findByRole('button', { name: 'Revoke saved web access' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('The rules changed');
+    expect(screen.getByRole('button', { name: 'Revoke saved web access' })).toBeEnabled();
+  });
   it('adds a rule through the backend and shows the saved list', async () => {
     const user = userEvent.setup();
     const added: OwnerRule = { decision: 'allow', kind: 'file', path: 'src' };
@@ -125,7 +161,9 @@ describe('Owner rules in Settings', () => {
 
   it('closes the editor when a failed save finds the rules changed underneath it', async () => {
     const user = userEvent.setup();
-    vi.spyOn(persistence, 'saveOwnerRules').mockRejectedValue('The rules changed since they were shown.');
+    vi.spyOn(persistence, 'saveOwnerRules').mockRejectedValue(
+      'The rules changed since they were shown.',
+    );
     vi.spyOn(persistence, 'ownerRules')
       .mockResolvedValueOnce({ rules })
       .mockResolvedValue({ rules: [rules[2]] });
@@ -160,7 +198,9 @@ describe('Owner rules in Settings', () => {
     await user.type(tester.getByLabelText('Host'), 'example.com');
     await user.click(tester.getByRole('button', { name: 'Test' }));
     expect(test).toHaveBeenLastCalledWith('network', 'example.com');
-    await waitFor(() => expect(tester.getByRole('status')).toHaveTextContent('ask, no rule matched'));
+    await waitFor(() =>
+      expect(tester.getByRole('status')).toHaveTextContent('ask, no rule matched'),
+    );
     expect(save).not.toHaveBeenCalled();
   });
 

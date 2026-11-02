@@ -40,12 +40,18 @@
   let verdict: RuleVerdict | null = null;
 
   $: rules = saved?.rules ?? [];
+  const WEB_ACCESS_TOOL = 'builtin:web';
+  const isSavedWebAccess = (rule: OwnerRule) =>
+    rule.kind === 'network' && rule.tool === WEB_ACCESS_TOOL && rule.decision === 'allow';
+  $: hasWebAccess = rules.some(isSavedWebAccess);
 
   function message(cause: unknown, fallback: string) {
     return cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : fallback;
   }
   function subject(rule: OwnerRule) {
-    return rule.command ?? rule.path ?? rule.host ?? rule.tool ?? '';
+    return rule.tool === WEB_ACCESS_TOOL && rule.kind === 'network'
+      ? 'Web access (searches and page reads)'
+      : (rule.command ?? rule.path ?? rule.host ?? rule.tool ?? '');
   }
   function describe(rule: OwnerRule) {
     return `${rule.decision} ${rule.kind} ${subject(rule)}${rule.project ? ` (project ${rule.project})` : ''}`;
@@ -140,16 +146,34 @@
       ? 'Ordered: the first matching rule decides.'
       : 'Strictest: deny outranks ask, and ask outranks allow.'}
   </p>
+  <section aria-label="Saved web permission">
+    <h4>Web access</h4>
+    <p>
+      {hasWebAccess ? 'Reusable web permission is saved.' : 'No reusable web permission is saved.'}
+      Enable Web access in the composer to make searches and read public pages. Saved permission skips
+      repeated approvals; explicit ask and deny rules still apply.
+    </p>
+    {#if hasWebAccess}
+      <button disabled={busy} onclick={() => save(rules.filter((rule) => !isSavedWebAccess(rule)))}
+        >Revoke saved web access</button
+      >
+    {/if}
+    <p>
+      Grant permission from a web request: allow it for this run or always allow it. MCP tools have
+      their own tool and server permissions. File changes, shell commands, owner HTTP tools,
+      delegation and other calls written as text keep their existing approvals.
+    </p>
+  </section>
   {#if !rules.length}<p>No rules.</p>{/if}
   <ol>
     {#each rules as rule, index}
       <li>
         <span>{describe(rule)}</span>
-        <button
-          onclick={() => edit(index)}
-          disabled={busy}
-          aria-label={`Edit rule ${index + 1}: ${subject(rule)}`}>Edit</button
-        >
+        {#if !(rule.kind === 'network' && rule.tool === WEB_ACCESS_TOOL)}<button
+            onclick={() => edit(index)}
+            disabled={busy}
+            aria-label={`Edit rule ${index + 1}: ${subject(rule)}`}>Edit</button
+          >{/if}
         <button
           onclick={() => save(rules.filter((_, at) => at !== index))}
           disabled={busy}
@@ -191,10 +215,7 @@
     <div class="row">
       <label
         >Test kind
-        <select
-          bind:value={testKind}
-          onchange={() => ((testValue = ''), (verdict = null))}
-        >
+        <select bind:value={testKind} onchange={() => ((testValue = ''), (verdict = null))}>
           <option value="exec">exec</option>
           <option value="file">file</option>
           <option value="network">network</option>
@@ -218,7 +239,9 @@
         <li>
           <small>{new Date(item.time * 1000).toLocaleString()}</small>
           <span
-            >{item.kind} {item.subject} {item.decision}
+            >{item.kind}
+            {item.subject}
+            {item.decision}
             {item.rule ? `by rule ${item.rule.index + 1}` : 'no rule'}{item.decision === 'ask'
               ? item.allowed
                 ? ', allowed'
