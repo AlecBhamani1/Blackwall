@@ -5,6 +5,22 @@ policy decisions still apply before network access. Browser mode has no shared-c
 its Web access checkbox is disabled with a visible explanation, and its IPC boundary rejects a web
 request before contacting the model. Use the desktop app for research.
 
+In **Chat**, turning on Web access authorizes built-in searches and public page reads for that
+run, including tool calls written as text and validated redirects. No first-request approval or
+saved permission is required. The grant expires on completion, failure or cancellation; a later
+run must still have Web access on. Explicit owner ask/deny rules and invalid-policy prompts still
+apply. **Agent** retains its approval choices and saved web permissions. Neither mode's web grant
+authorizes shell commands, file changes, MCP tools or owner-defined HTTP tools.
+
+Manage command prefixes in **Settings → Privacy & security → Rules & sandbox → Your rules →
+Allowed commands**. For example, allowing `git status` also permits additional arguments, while
+shell chains, substitutions and redirects still require approval. The list uses existing owner
+rules, preserves their order and project scope, and shows all rules below it for evaluation order.
+Command sandbox limits and policy precedence remain in force. Unsandboxed command tools,
+off-device delegation and non-web calls written as text retain their existing approvals.
+
+![Allowed command rules in Settings](screenshots/allowed-commands.png)
+
 ![Browser composer showing unavailable Web access](screenshots/web-access-browser.png)
 
 ## Retrieval and failures
