@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "bw", "core", "relay"]
+members = ["app", "bw", "core", "relay", "browser"]
 resolver = "2"
 
 [workspace.package]

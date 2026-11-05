@@ -343,3 +343,56 @@ async fn reusable_web_permission_covers_native_and_text_calls_without_bypassing_
             .contains("private"));
     }
 }
+
+#[tokio::test]
+async fn configured_api_results_reach_chat_and_agent_without_duckduckgo() {
+    use crate::web::{recovery_tests::fixture, Provider};
+    use std::sync::{atomic::Ordering, Arc};
+    for agent_mode in [false, true] {
+        let (runtime, brave, duck) = fixture(Provider::Brave, false).await;
+        let model = Scripted::new(vec![
+            research(vec![call(
+                "web_search",
+                json!({"query":"owner query","purpose":"research"}),
+            )]),
+            answer(),
+        ]);
+        let approvals = Approvals::default();
+        approvals.set_web_runtime(runtime.clone()).unwrap();
+        if agent_mode {
+            let emit_approvals = approvals.clone();
+            let agent = crate::agent::Agent {
+                backend: &model,
+                workspace: crate::tools::Workspace::open(&runtime.directory).unwrap(),
+                web_enabled: true,
+                approvals: approvals.clone(),
+                emit: Arc::new(move |event| {
+                    decide(&emit_approvals, &event, ApprovalDecision::Allow)
+                }),
+            };
+            agent
+                .run(
+                    "api-agent",
+                    vec![json!({"role":"user","content":"Find sources"})],
+                )
+                .await
+                .unwrap();
+        } else {
+            chat_with_web(&model, "api-chat", run(), &approvals, None, &|event| {
+                decide(&approvals, &event, ApprovalDecision::Allow)
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(brave.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(duck.calls.load(Ordering::SeqCst), 0);
+        assert!(model.requests.lock().unwrap()[1]
+            .0
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Normalized API snippet"))));
+        tokio::fs::remove_dir_all(&runtime.directory).await.unwrap();
+    }
+}

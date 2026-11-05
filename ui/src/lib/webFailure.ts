@@ -19,6 +19,9 @@ const labels: Record<string, string> = {
   size_limit: 'Page exceeds download limit',
   rendering_required: 'Page needs browser rendering',
   search_unavailable: 'Search unavailable',
+  search_authentication: 'Search key needs attention',
+  search_quota: 'Search quota exhausted',
+  renderer_unavailable: 'Browser rendering unavailable',
 };
 
 export function webFailure(
