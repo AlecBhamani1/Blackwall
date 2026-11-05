@@ -30,6 +30,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Settings → Agent → Web access adds Brave API search with a platform-stored key, a disclosed
+  connection check, owner-enabled fallback after DuckDuckGo challenges, and distinct key/quota/
+  rate-limit recovery. Desktop Chat and Agent use the same selected provider.
+- Optional macOS Playwright/Chromium rendering recovers JavaScript-only public pages, with a
+  browser process denied direct network access and bounded resource reads through the existing
+  approval/DNS checks. Tool cards offer rendering drafts, provider setup and opening public sources.
+  Browser installation is explicit and requires Node.js/npm; Linux and Windows report rendering
+  unavailable. See [Web access](docs/WEB_ACCESS.md) for setup, costs, limits and verification.
+
 - Web request approvals can allow searches and public page reads for the current run or save
   permission for future runs, including calls written as text. Revoke saved Web access in
   Settings → Privacy & security → Rules & sandbox → Your rules. Web access must still be on;

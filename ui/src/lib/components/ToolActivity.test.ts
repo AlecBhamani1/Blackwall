@@ -152,3 +152,38 @@ describe('agent actions', () => {
     expect(screen.getByText('Svelte')).toBeVisible();
   });
 });
+
+it('offers native recovery actions and drafts rendering without an immediate fetch', async () => {
+  const { vi } = await import('vitest');
+  const { get } = await import('svelte/store');
+  const { webRenderRequested, webSettingsRequested } = await import('../web');
+  vi.stubGlobal('__TAURI_INTERNALS__', {});
+  try {
+    const user = userEvent.setup();
+    render(ToolActivity, {
+      tools: [
+        {
+          id: 'partial',
+          name: 'web_fetch',
+          arguments: '{"url":"https://example.com/app"}',
+          status: 'error',
+          output: JSON.stringify({
+            webError: {
+              category: 'rendering_required',
+              source: 'https://example.com/app',
+              message: 'Enable optional rendering.',
+            },
+          }),
+        },
+      ],
+    });
+    await user.click(screen.getByRole('button', { name: 'Render page' }));
+    expect(get(webRenderRequested)).toBe('https://example.com/app');
+    await user.click(screen.getByRole('button', { name: 'Web access settings' }));
+    expect(get(webSettingsRequested)).toBe(true);
+  } finally {
+    webRenderRequested.set('');
+    webSettingsRequested.set(false);
+    vi.unstubAllGlobals();
+  }
+});

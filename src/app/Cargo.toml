@@ -11,6 +11,7 @@ repository.workspace = true
 tauri-build.workspace = true
 
 [dependencies]
+blackwall-browser = { path = "../browser", version = "0.1.0" }
 blackwall-core = { workspace = true, features = ["credential-store"] }
 futures-util.workspace = true
 reqwest.workspace = true

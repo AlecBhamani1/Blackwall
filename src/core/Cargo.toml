@@ -16,6 +16,7 @@ cap-std = "4.0.3"
 ego-tree = "0.11.1"
 encoding_rs = "0.8.44"
 futures-util.workspace = true
+httpdate = "1.0.3"
 libc = "0.2.189"
 opentelemetry.workspace = true
 opentelemetry-proto.workspace = true

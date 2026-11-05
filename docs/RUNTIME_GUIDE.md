@@ -235,12 +235,15 @@ Chat mode sends messages and attachments to your selected model. In the desktop 
 Chat needs no project folder and exposes only these two web tools. Web access starts off and resets
 when starting or reopening a conversation. Requests without reusable permission show their
 destination and purpose for approval; denied, unreachable, and blocked pages return an error the model can explain. Web content
-is untrusted, and local/private network addresses remain blocked. Search uses DuckDuckGo and can
-be unavailable; this is text retrieval rather than an interactive browser. The browser preview and
-guest links do not expose these desktop tools.
+is untrusted, and local/private network addresses remain blocked. Settings → Agent → Web access
+selects DuckDuckGo or owner-configured Brave API search and optional, explicitly enabled Brave
+fallback after a DuckDuckGo challenge. On macOS, an optional isolated Chromium renderer can recover
+JavaScript-only public pages; installation and activation are explicit. This is public document
+retrieval with no shared browser login. The browser preview and guest links do not expose these
+desktop tools.
 Browser mode explicitly disables Web access and explains that it requires the desktop app.
 See [Web access](WEB_ACCESS.md) for readable extraction, download limits, failure categories,
-search-provider and browser-rendering evaluation, and the dated public-site smoke matrix.
+provider costs and key setup, isolated rendering and its resource bounds, and the dated smoke matrix.
 
 Agent mode additionally offers
 project tools. Choose **Agent** and select a project using the native folder picker. The chosen folder

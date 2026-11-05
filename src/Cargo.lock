@@ -375,6 +375,7 @@ dependencies = [
 name = "blackwall-app"
 version = "0.1.0"
 dependencies = [
+ "blackwall-browser",
  "blackwall-core",
  "futures-util",
  "reqwest 0.12.28",
@@ -386,6 +387,18 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "blackwall-browser"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "blackwall-core",
+ "futures-util",
+ "rustix",
+ "serde_json",
  "tokio",
 ]
 
@@ -402,6 +415,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "futures-util",
+ "httpdate",
  "keyring",
  "libc",
  "opentelemetry",

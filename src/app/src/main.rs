@@ -13,6 +13,7 @@ mod pairing;
 mod project;
 mod setup;
 mod updates;
+mod web;
 
 use blackwall_core::secrets;
 use commands::AppState;
@@ -45,6 +46,7 @@ fn run() -> Result<(), StartupError> {
     let builder = builder.on_window_event(lifecycle::on_window_event);
     let app = builder
         .setup(|app| {
+            web::initialize(app.handle()).map_err(std::io::Error::other)?;
             // Find bubblewrap now, off the main thread, so the first command doesn't wait for it.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -56,6 +58,12 @@ fn run() -> Result<(), StartupError> {
         })
         .invoke_handler(tauri::generate_handler![
             updates::check_app_update,
+            web::load_web_settings,
+            web::save_web_settings,
+            web::save_search_key,
+            web::check_web_search,
+            web::install_web_browser,
+            web::open_web_source,
             pairing::pairing_status,
             pairing::retry_paired_device,
             pairing::create_pairing,

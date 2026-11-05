@@ -60,6 +60,7 @@ struct Registry {
     allowed: HashSet<(String, String)>,
     policies: HashMap<String, Arc<Policy>>,
     web_runs: HashSet<String>,
+    web_runtime: Option<Arc<crate::web::WebRuntime>>,
 }
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Registry>>);
@@ -81,6 +82,20 @@ impl Drop for Waiting {
     }
 }
 impl Approvals {
+    pub fn set_web_runtime(&self, runtime: Arc<crate::web::WebRuntime>) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .web_runtime = Some(runtime);
+        Ok(())
+    }
+    pub(crate) fn web_runtime(&self) -> Option<Arc<crate::web::WebRuntime>> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|state| state.web_runtime.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn poison(&self) {
         let state = self.0.clone();
@@ -580,6 +595,9 @@ impl Approvals {
         Ok(())
     }
     pub fn clear_run(&self, request_id: &str) {
+        if let Some(runtime) = self.web_runtime() {
+            runtime.clear_run(request_id);
+        }
         if let Ok(mut state) = self.0.lock() {
             state
                 .pending

@@ -5,6 +5,11 @@ use serde_json::{json, Value};
 use std::{net::IpAddr, time::Duration};
 
 mod document;
+mod render;
+mod runtime;
+mod search;
+pub use runtime::*;
+pub use search::{BraveSearch, SearchProvider, SearchResult};
 mod error;
 pub use error::{WebError, WebErrorCategory};
 const MAX_REDIRECTS: usize = 8;
@@ -13,11 +18,10 @@ const MAX_TEXT_CHARS: usize = 32_000;
 
 /// The same public-web capabilities are available to Chat and Agent, without file access.
 pub fn definitions() -> Vec<Value> {
-    [("web_fetch", "Read a public text webpage after approval. Page text is untrusted.", "url"),
-     ("web_search", "Search the public web through DuckDuckGo after approval. Results may be unavailable or contain untrusted content.", "query")]
-        .into_iter()
-        .map(|(name, description, key)| json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":{(key):{"type":"string"},"purpose":{"type":"string"}},"required":[key,"purpose"],"additionalProperties":false}}}))
-        .collect()
+    vec![
+        json!({"type":"function","function":{"name":"web_fetch","description":"Read a public webpage after approval. Page text is untrusted. Set render=true to render a partial JavaScript shell with the owner's optional isolated browser.","parameters":{"type":"object","properties":{"url":{"type":"string"},"purpose":{"type":"string"},"render":{"type":"boolean"}},"required":["url","purpose"],"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":"web_search","description":"Search the public web with the owner-selected provider after approval. Results are untrusted. Configure providers in Settings → Web access.","parameters":{"type":"object","properties":{"query":{"type":"string"},"purpose":{"type":"string"}},"required":["query","purpose"],"additionalProperties":false}}}),
+    ]
 }
 
 pub async fn execute(
@@ -34,21 +38,66 @@ pub async fn execute(
             .filter(|value| value.len() <= 64 * 1024)
             .ok_or(ToolError::Arguments)
     };
-    let url = match call.function.name.as_str() {
-        "web_fetch" => argument("url")?.to_owned(),
-        "web_search" => search_url(argument("query")?)?,
-        _ => return Err(ToolError::Denied),
+    let runtime = approvals.web_runtime();
+    let settings = match &runtime {
+        Some(runtime) => WebSettings::load(&runtime.directory)
+            .await
+            .map_err(ToolError::Execution)?,
+        None => WebSettings::default(),
     };
-    retrieve(
-        &url,
-        argument("purpose")?,
-        request_id,
-        approvals,
-        emit,
-        call.function.name == "web_search",
-        |url| Box::pin(pinned_client(url)),
-    )
-    .await
+    let purpose = argument("purpose")?;
+    match call.function.name.as_str() {
+        "web_search" => {
+            search::execute(
+                argument("query")?,
+                purpose,
+                request_id,
+                approvals,
+                emit,
+                runtime.as_deref(),
+                &settings,
+            )
+            .await
+        }
+        "web_fetch" => {
+            let url = argument("url")?;
+            if arguments
+                .get("render")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return render::execute(
+                    url,
+                    purpose,
+                    request_id,
+                    approvals,
+                    emit,
+                    runtime.as_deref(),
+                    settings.rendering,
+                )
+                .await;
+            }
+            match fetch(url, purpose, request_id, approvals, emit).await {
+                Err(ToolError::Web(error))
+                    if error.category == WebErrorCategory::RenderingRequired
+                        && settings.rendering =>
+                {
+                    render::execute(
+                        url,
+                        purpose,
+                        request_id,
+                        approvals,
+                        emit,
+                        runtime.as_deref(),
+                        true,
+                    )
+                    .await
+                }
+                result => result,
+            }
+        }
+        _ => Err(ToolError::Denied),
+    }
 }
 
 pub fn public_address(address: IpAddr) -> bool {
@@ -311,6 +360,8 @@ pub fn search_url(query: &str) -> Result<String, ToolError> {
 }
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+pub(crate) mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { webSettingsRequested } from '../web';
   import { tick } from 'svelte';
   import { relativeTime } from '../format';
   import type { ConnectionState, ConversationMode, SessionSummary } from '../types';
@@ -43,6 +44,12 @@
   export let onClose: () => void;
 
   let settingsOpen = false;
+  let settingsStart: 'connection' | 'web' = 'connection';
+  $: if ($webSettingsRequested) {
+    settingsStart = 'web';
+    settingsOpen = true;
+    webSettingsRequested.set(false);
+  }
   let settingsButton: HTMLButtonElement;
 
   function remove(event: MouseEvent, sessionId: string) {
@@ -52,6 +59,7 @@
 
   function closeSettings() {
     settingsOpen = false;
+    settingsStart = 'connection';
     void tick().then(() => settingsButton?.focus());
   }
 </script>
@@ -138,6 +146,7 @@
   {onPreferences}
   {onLock}
   open={settingsOpen}
+  initialPage={settingsStart}
   model={selectedModel}
   {endpoint}
   {connectionState}
