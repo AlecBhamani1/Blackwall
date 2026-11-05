@@ -423,7 +423,9 @@
               onchange={(event) => onWebEnabledChange(event.currentTarget.checked)}
               disabled={controlsDisabled || !webAvailable}
               title={webAvailable
-                ? 'Enable web searches and page reads. Approval is required unless you have granted reusable web permission.'
+                ? agentMode
+                  ? 'Enable web searches and page reads. Approval is required unless you have granted reusable web permission.'
+                  : 'Allow web searches and public page reads for this chat run without repeated approvals. Your explicit restrictions still apply.'
                 : 'Web access is unavailable in browser mode. Use the Blackwall desktop app.'}
             />Web access</label
           >

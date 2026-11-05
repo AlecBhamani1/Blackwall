@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Chat's Web access toggle now authorizes built-in searches and public page reads for the run
+  without an extra approval. Explicit ask/deny rules and network validation still apply. Settings
+  → Privacy & security → Rules & sandbox → Your rules adds an Allowed commands section to add,
+  edit and remove command prefixes using the existing policy and sandbox checks.
 - Chat now uses one slim header row, with model and access controls moved into the composer.
 - Settings skills are easier to manage with compact searchable rows, accessible enable switches,
   visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range

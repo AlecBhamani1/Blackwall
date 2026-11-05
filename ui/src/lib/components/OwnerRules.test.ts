@@ -97,6 +97,68 @@ describe('Owner rules in Settings', () => {
     expect(screen.queryByLabelText('Path')).not.toBeInTheDocument();
   });
 
+  it('adds an allowed command without changing existing rules or their order', async () => {
+    const user = userEvent.setup();
+    const added: OwnerRule = { decision: 'allow', kind: 'exec', command: 'git status' };
+    const shown = { mode: 'ordered' as const, rules };
+    vi.spyOn(persistence, 'ownerRules').mockResolvedValue(shown);
+    const save = vi.spyOn(persistence, 'saveOwnerRules').mockImplementation(async () => {
+      vi.spyOn(persistence, 'ownerRules').mockResolvedValue({ ...shown, rules: [...rules, added] });
+    });
+    render(OwnerRules);
+    const commands = within(await screen.findByRole('region', { name: 'Allowed commands' }));
+    expect(commands.getByText('No allowed commands.')).toBeVisible();
+    await user.click(commands.getByRole('button', { name: 'Add allowed command' }));
+    expect(screen.getByLabelText('Decision')).toHaveValue('allow');
+    expect(screen.getByLabelText('Kind')).toHaveValue('exec');
+    await user.type(screen.getByLabelText('Command', { selector: 'form input' }), 'git status');
+    await user.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(save).toHaveBeenCalledWith(shown, [...rules, added]);
+    expect(await commands.findByText('git status', { selector: 'li code' })).toBeVisible();
+  });
+
+  it('edits and removes only the selected allowed command, preserving its project scope', async () => {
+    const user = userEvent.setup();
+    const allowed: OwnerRule = {
+      decision: 'allow',
+      kind: 'exec',
+      command: 'npm test',
+      project: '/work/app',
+    };
+    const shown = { rules: [rules[0], allowed, rules[2]] };
+    vi.spyOn(persistence, 'ownerRules').mockResolvedValue(shown);
+    const save = vi.spyOn(persistence, 'saveOwnerRules').mockResolvedValue();
+    render(OwnerRules);
+    const commands = within(await screen.findByRole('region', { name: 'Allowed commands' }));
+    expect(commands.getAllByRole('listitem')).toHaveLength(1);
+    expect(commands.getByText(/project \/work\/app/)).toBeVisible();
+    await user.click(commands.getByRole('button', { name: 'Edit allowed command: npm test' }));
+    const input = screen.getByLabelText('Command', { selector: 'form input' });
+    await user.clear(input);
+    await user.type(input, 'npm run check');
+    await user.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(save).toHaveBeenLastCalledWith(shown, [
+      rules[0],
+      { ...allowed, command: 'npm run check' },
+      rules[2],
+    ]);
+    await user.click(commands.getByRole('button', { name: 'Remove allowed command: npm test' }));
+    expect(save).toHaveBeenLastCalledWith(shown, [rules[0], rules[2]]);
+  });
+
+  it('keeps a rejected allowed command visible for correction', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'saveOwnerRules').mockRejectedValue('The command is invalid.');
+    render(OwnerRules);
+    await user.click(await screen.findByRole('button', { name: 'Add allowed command' }));
+    await user.type(screen.getByLabelText('Command', { selector: 'form input' }), 'git status; rm');
+    await user.click(screen.getByRole('button', { name: 'Save rule' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('The command is invalid.');
+    expect(screen.getByLabelText('Command', { selector: 'form input' })).toHaveValue(
+      'git status; rm',
+    );
+  });
+
   it('edits one rule and keeps its other fields', async () => {
     const user = userEvent.setup();
     const save = vi.spyOn(persistence, 'saveOwnerRules').mockResolvedValue();

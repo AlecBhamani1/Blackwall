@@ -44,6 +44,9 @@
   const isSavedWebAccess = (rule: OwnerRule) =>
     rule.kind === 'network' && rule.tool === WEB_ACCESS_TOOL && rule.decision === 'allow';
   $: hasWebAccess = rules.some(isSavedWebAccess);
+  $: allowedCommands = rules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => rule.kind === 'exec' && rule.decision === 'allow' && rule.command);
 
   function message(cause: unknown, fallback: string) {
     return cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : fallback;
@@ -92,6 +95,9 @@
   }
   function add() {
     draft = { index: null, decision: 'ask', kind: 'exec', field: 'command', value: '' };
+  }
+  function addAllowedCommand() {
+    draft = { index: null, decision: 'allow', kind: 'exec', field: 'command', value: '' };
   }
   function edit(index: number) {
     const rule = rules[index];
@@ -150,8 +156,9 @@
     <h4>Web access</h4>
     <p>
       {hasWebAccess ? 'Reusable web permission is saved.' : 'No reusable web permission is saved.'}
-      Enable Web access in the composer to make searches and read public pages. Saved permission skips
-      repeated approvals; explicit ask and deny rules still apply.
+      In Chat, enabling Web access in the composer authorizes searches and public page reads for that
+      run. In Agent, saved permission skips repeated approvals. Explicit ask and deny rules still apply
+      in both modes.
     </p>
     {#if hasWebAccess}
       <button disabled={busy} onclick={() => save(rules.filter((rule) => !isSavedWebAccess(rule)))}
@@ -164,6 +171,35 @@
       delegation and other calls written as text keep their existing approvals.
     </p>
   </section>
+  <section aria-label="Allowed commands">
+    <h4>Allowed commands</h4>
+    <p>
+      These commands can run in Agent without an approval prompt. Enter a command prefix such as
+      <code>git status</code> or <code>npm test</code>; extra arguments are allowed, but shell
+      chains, substitutions and redirects still ask. Rules and the selected command sandbox still
+      apply. Unsandboxed command tools, off-device delegation and calls written as text still ask.
+    </p>
+    {#if !allowedCommands.length}<p>No allowed commands.</p>{/if}
+    <ul>
+      {#each allowedCommands as { rule, index }}
+        <li>
+          <span><code>{rule.command}</code>{rule.project ? ` (project ${rule.project})` : ''}</span>
+          <button
+            onclick={() => edit(index)}
+            disabled={busy}
+            aria-label={`Edit allowed command: ${rule.command}`}>Edit</button
+          >
+          <button
+            onclick={() => save(rules.filter((_, at) => at !== index))}
+            disabled={busy}
+            aria-label={`Remove allowed command: ${rule.command}`}>Remove</button
+          >
+        </li>
+      {/each}
+    </ul>
+    <button onclick={addAllowedCommand} disabled={busy}>Add allowed command</button>
+  </section>
+  <h4>All rules, in evaluation order</h4>
   {#if !rules.length}<p>No rules.</p>{/if}
   <ol>
     {#each rules as rule, index}
