@@ -219,7 +219,10 @@ async fn failures_are_specific_and_challenges_never_become_results() {
         WebErrorCategory::SearchUnavailable
     );
     let results = server.fetch("/results", true).await.unwrap();
-    assert!(results.contains("A useful result\nhttps://example.com/article"));
+    assert!(
+        results.contains("\"title\":\"A useful result\"")
+            && results.contains("\"url\":\"https://example.com/article\"")
+    );
     assert!(!results.contains("127.0.0.1"));
 }
 

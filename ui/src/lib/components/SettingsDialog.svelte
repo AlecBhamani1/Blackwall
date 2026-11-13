@@ -10,6 +10,7 @@
   } from '../updates';
   import LockSettings from './LockSettings.svelte';
   import CredentialSettings from './CredentialSettings.svelte';
+  import WebSettings from './WebSettings.svelte';
   import TelemetrySettings from './TelemetrySettings.svelte';
   import TrustedProjects from './TrustedProjects.svelte';
   import OwnerRules from './OwnerRules.svelte';
@@ -42,6 +43,7 @@
   export let onLock: () => Promise<void> = async () => {};
   export let onSetup: () => void = () => {};
   export let open = false;
+  export let initialPage: SettingsPage = 'connection';
   export let model = '';
   export let endpoint = '';
   export let connectionState: ConnectionState = 'checking';
@@ -394,7 +396,7 @@
     previouslyOpen = open;
     if (open) {
       copied = false;
-      selectedSetting = 'connection';
+      selectedSetting = initialPage;
       settingsQuery = '';
       endpointDraft = endpoint;
       previousEndpoint = endpoint;
@@ -862,6 +864,7 @@
             </details>
           {/if}
         {/if}
+          {#if selectedSetting === 'web'}<WebSettings />{/if}
           {#if selectedSetting === 'telemetry'}<TelemetrySettings />{/if}
           {#if selectedSetting === 'lock'}<LockSettings {onLock} />{/if}
           {#if selectedSetting === 'memory'}<MemoryDialog

@@ -23,6 +23,9 @@ pub enum WebErrorCategory {
     SizeLimit,
     RenderingRequired,
     SearchUnavailable,
+    SearchAuthentication,
+    SearchQuota,
+    RendererUnavailable,
 }
 
 impl WebErrorCategory {
@@ -46,6 +49,9 @@ impl WebErrorCategory {
             Self::SizeLimit => "size_limit",
             Self::RenderingRequired => "rendering_required",
             Self::SearchUnavailable => "search_unavailable",
+            Self::SearchAuthentication => "search_authentication",
+            Self::SearchQuota => "search_quota",
+            Self::RendererUnavailable => "renderer_unavailable",
         }
     }
 }

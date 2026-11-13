@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { ToolEntry } from '../types';
+  import { webClient, webRenderRequested, webSettingsRequested } from '../web';
+  import { isDesktop } from '../setup';
   import { webFailure } from '../webFailure';
   import Icon from './Icon.svelte';
   export let historical = false;
@@ -26,6 +28,25 @@
     web_search: 'Search the web',
     spawn_agent: 'Delegate task',
   };
+  let recoveryError = '';
+  function pageUrl(tool: ToolEntry): string {
+    if (tool.name !== 'web_fetch') return '';
+    try {
+      const url = new URL(JSON.parse(tool.arguments).url);
+      return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+        ? url.href
+        : '';
+    } catch {
+      return '';
+    }
+  }
+  async function openSource(url: string) {
+    try {
+      await webClient.open(url);
+    } catch {
+      recoveryError = 'The source could not be opened in your browser.';
+    }
+  }
   // Startup warnings, such as an MCP server that did not start, are shown without expanding.
   function warnings(tool: ToolEntry): string[] {
     if (tool.name !== 'project_instructions') return [];
@@ -107,13 +128,41 @@
         {#if failure.source}<span>Source: {failure.source}</span>{/if}
       </p>
     {/if}
+    {#if isDesktop() && (failure || (tool.name === 'web_fetch' && tool.status === 'complete'))}
+      <div class="web-recovery">
+        {#if failure}<button onclick={() => webSettingsRequested.set(true)}
+            >Web access settings</button
+          >{/if}
+        {#if pageUrl(tool)}
+          {#if tool.status === 'complete' || failure?.label === 'Page needs browser rendering'}
+            <button onclick={() => webRenderRequested.set(pageUrl(tool))}>Render page</button>
+          {/if}
+          <button onclick={() => openSource(pageUrl(tool))}>Open source in browser</button>
+        {/if}
+      </div>
+    {/if}
     {#each warnings(tool) as warning}
       <p class="warning">{warning}</p>
     {/each}
   {/each}
+  {#if recoveryError}<p role="alert">{recoveryError}</p>{/if}
 </div>
 
 <style>
+  .web-recovery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .web-recovery button {
+    padding: 5px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 11px;
+  }
   .tool-activity {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

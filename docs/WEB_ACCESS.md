@@ -57,49 +57,138 @@ Transport diagnostics classify the underlying cause without echoing raw errors o
 Owner HTTP command tools explicitly disable automatic decoders and retain their identity-only,
 64 KiB response contract despite reqwest's shared decoder features.
 
-## Search-provider evaluation
+## Search setup and recovery
 
-DuckDuckGo HTML remains the default, credential-free provider. A search succeeds only when actual
-result links can be extracted; a 200/202 interstitial is never passed along as successful results.
-Challenge detection uses interstitial titles, challenge forms and Cloudflare's `cf-mitigated`
-header. Ordinary articles mentioning challenges or including Cloudflare JavaScript detection
-scripts are not by themselves treated as challenge pages. Detection is heuristic, not a promise to
-recognize every site's interstitial. No usable result links means explicit `search_unavailable`,
-including when the provider has no matches or changes its HTML. Results expose up to ten titles
-and public URL candidates; fetching a candidate still requires DNS and policy validation.
+Open **Settings → Agent → Web access**. Both desktop Chat and Agent read the same owner settings
+before each tool call. Existing installations retain DuckDuckGo, with paid fallback and browser
+rendering disabled. Settings contain provider choices only; Brave keys stay in the platform
+credential store and are bound to the fixed Brave API origin.
 
-There is deliberately no automatic cross-provider fallback: silently forwarding a query to another
-company changes its disclosure and can create costs. A supported API is a better next provider
-than another scraping endpoint. The evaluated candidate is [Brave Search API](https://api-dashboard.search.brave.com/documentation/quickstart),
-which uses an owner-provided `X-Subscription-Token` and an activated plan. This change does not add a
-Brave account, credentials, billing, or a built-in API integration. An owner can configure a search
-MCP server in **Agent** today, review its data disclosure and provider charges, and store its
-credentials through the existing credential-store flow. Desktop Chat's built-in web tools do not
-automatically acquire Agent's MCP tools.
+![Native Web access provider settings](screenshots/web-access-settings.png)
 
-A future built-in provider interface should return normalized title/URL/snippet results and typed
-unavailable/rate-limited failures. Select it explicitly in Settings, store its key in the platform
-credential store, and show query disclosure and potential provider charges before activation.
-Send the credential only to the fixed provider origin; never forward it on redirects or to result
-pages. Missing/revoked credentials and 429 responses must fail explicitly, with no paid retries or
-implicit fallback. No API smoke was performed without an owner-configured account.
+Choose **Brave Web Search API**, save an owner-provided key, and use **Check Brave connection**.
+The button discloses its fixed query, `Blackwall connection check`, and possible plan charges before
+sending it. A [Brave account and activated plan](https://api-dashboard.search.brave.com/documentation/quickstart)
+are required; Blackwall does not create an account or include provider credits. Keys are write-only
+through IPC: the UI receives their presence, never their saved value. Removing a key leaves the
+provider selection intact and subsequent searches explain how to replace it or select DuckDuckGo.
 
-## Browser-rendering evaluation
+Brave returns up to ten normalized title/URL/snippet results through the `SearchProvider` boundary.
+The API credential goes only in a sensitive `X-Subscription-Token` header to the fixed HTTPS origin.
+API requests use public DNS pinning, verified TLS, direct connections, a 30-second timeout and a
+2 MiB decompressed response bound. Redirects are refused. Provider error bodies and headers are
+never echoed to the model. Missing/revoked keys, quota exhaustion, rate limits, timeouts and
+unavailable results have separate actionable outcomes. Retry-After seconds/dates and exhausted
+Brave rate-limit reset windows suppress subsequent calls until the window expires. There are no
+automatic paid retries.
 
-A headless browser could render public JavaScript-dependent pages, but adds a browser binary,
-patching responsibility and resource cost. Its subrequests, redirects, WebSockets and DNS would
-all need the same public-network boundary; validating only the top-level URL would weaken SSRF
-protection. Reusing the owner's ordinary browser would also disclose cookies and account identity.
-A remote renderer would disclose URLs and page data to another operator and may incur charges.
+DuckDuckGo remains a credential-free choice. Interstitials never count as search results. After a
+challenge, its HTML endpoint is blocked for the rest of that run, including different queries.
+**Allow Brave fallback** permits exactly the configured alternate after a challenge, with the
+query disclosure, cost notice and Brave host's normal permission checks. Without that owner choice,
+search stops and the tool card offers **Web access settings**. Provider selection never overrides
+host denials or silently grants access to an additional company. An MCP search server remains an
+independent Agent capability; Chat does not acquire Agent's MCP tools automatically.
 
-No browser binary, remote rendering service, login session or challenge-solving dependency is
-introduced here. Empty static shells report `rendering_required`; a login/challenge asks for
-another public source. [Cloudflare's challenge documentation](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/)
-describes browser evaluation and possible human interaction; rendering alone does not guarantee
-access. An eventual optional renderer needs explicit owner activation, an isolated session, bounded
-CPU/download/output/time, subrequest enforcement and a useful login/human-interaction failure.
-The browser UI should only enable Web access once it has an authenticated, owner-controlled
-adapter to the shared core runtime, rather than arbitrary browser-side website fetches.
+## Optional browser rendering
+
+On macOS, **Install browser** explicitly downloads the app-supported Playwright version and its
+matching Chromium revision into the owner's application data directory (`browser/`). Node.js 22+
+and npm must be available on the app's PATH. The adapter pins Playwright **1.64.1**. Browser updates
+are deliberate: after updating Blackwall, use **Install / repair browser** for the supported
+revision. No browser is downloaded at app startup or while fetching a page. An incomplete, missing
+or outdated runtime produces `renderer_unavailable` with setup guidance.
+
+![Native isolated rendering settings](screenshots/web-access-rendering.png)
+
+Enable rendering and save settings to allow a single render attempt when HTTP extraction reports
+`rendering_required`. Static pages keep the HTTP fast path. **Render page** below a successful web
+result or an empty-shell failure drafts an explicit `web_fetch` request with `render=true` in the
+composer, preserving existing draft text. Review/send the draft to ask the model to render a
+partial shell that static extraction considered readable. Web access, renderer activation and
+normal approvals still apply. This is a request through the model, rather than an immediate
+out-of-band fetch.
+
+The framework-free core defines the renderer and resource-broker interfaces. The separate
+`blackwall-browser` crate owns the Playwright process and dependency installation. Each render
+starts a fresh nonpersistent Chromium context. It never attaches to the owner's normal browser,
+passes model/provider credentials, imports cookies/storage, or continues a challenged/login session.
+The rendered DOM uses the same title/source extraction, challenge detection, untrusted-content
+label and 32,000-character output cap as HTTP. Password forms report authentication; human
+verification stays a challenge. Detection remains heuristic and cannot guarantee every site's
+interstitial will be recognized.
+
+### Browser network and resource scope
+
+The entire Node/Chromium process tree runs under macOS `sandbox-exec` with **all network access
+denied**. Chromium CDP Fetch intercepts initial and redirected requests, including frame resources.
+This is the boundary against route/worker/WebSocket escape paths; interception alone is
+not the security boundary. Every allowed GET is fulfilled over bounded stdio by Rust's public-web
+HTTP broker. The broker validates URL schemes/ports/credentials, rejects all private/reserved or
+mixed DNS answers, pins validated addresses for that connection, refuses automatic redirects and
+rechecks destination hosts. Each browser redirect chain is limited to eight hops, with loop
+detection. Browser headers, cookies, authorization and referrers are never copied.
+
+Each resource host (including frames, scripts, styles and fetch/XHR) and each redirect uses the
+existing host permission rules. A reusable Web approval permits these public resource reads only
+where host rules permit it; an explicit host denial remains binding. Resources can disclose page
+URLs/query data to additional public hosts, as the rendering approval and Settings explain.
+Downloads, uploads/non-GET methods, unsupported schemes, service/shared/dedicated workers,
+WebSockets, images and fonts are disabled. Missing styling/assets or blocked resources can limit
+some applications; this is intentionally a public document reader.
+
+Only one render or browser installation runs at a time. Rendering is limited to 30 seconds,
+100 requests, **20 MiB per resource**, **48 MiB total decompressed traffic**, a 2 MiB rendered DOM
+and 32,000 text characters. Network service work shares the render deadline. Cancellation, timeout
+and completion kill the owned process group, including Chromium children; the adapter prevents
+Playwright from detaching them into another process group. Linux and Windows currently report
+isolated rendering unavailable; there is no fallback to an unsandboxed browser.
+
+**Open source in browser** is an explicit owner action. It can help a person inspect a blocked
+source; it does not make that browser's authenticated content readable by Blackwall. Use another
+public source if automation stops. There is no human takeover/session-sharing design in this change.
+
+## Verification — 2026-11-05
+
+Offline tests cover selected API results through scripted Chat and Agent; a single DuckDuckGo
+challenge and owner-selected/denied fallback; API normalization, key/quota/rate-limit failures,
+redirect credential isolation, Retry-After parsing and output bounds; rendered challenge/login
+failures, resource/private URL rejection, mixed/rebound DNS validation, cross-host resource denial,
+cookie/header isolation, traffic/request caps and disabled/unavailable rendering.
+
+An explicitly installed Chromium also passed offline integration fixtures for JavaScript-generated
+tables, cross-origin scripts/fetches/frames, blocked workers/WebSockets/uploads, fresh storage,
+cancellation, concurrency release, redirect loops/eight-hop limits, DOM/request bounds and timed
+JavaScript waits. A separate OS test verifies an unintercepted descendant
+connection cannot reach a local listener under the same sandbox profile. Browser tests require
+explicit installation and do not download binaries during the normal suite:
+
+```sh
+cargo run --manifest-path src/Cargo.toml -p blackwall-browser --example probe -- /absolute/disposable/data --install
+BLACKWALL_BROWSER_TEST_DIR=/absolute/disposable/data/browser cargo test --manifest-path src/Cargo.toml -p blackwall-browser --test isolation -- --include-ignored --test-threads=1
+```
+
+The public probe runs the production core + renderer + resource broker, bypassing only interactive
+approval with an explicit allow-for-run decision. It starts no model. On November 5:
+
+| Public source | Result |
+| --- | --- |
+| `https://example.com/` | Static HTTP; readable title/text, 231 total characters |
+| [HELM MMLU](https://crfm.stanford.edu/helm/mmlu/latest/) | HTTP shell recovered by Chromium; 1,018 total characters with benchmark description and leaderboard model/score pairs |
+
+HELM needed a roughly 16 MiB decompressed benchmark JSON response. The initial 8 MiB resource cap
+rejected it; the final 20 MiB resource / 48 MiB total limits returned useful table text. These are
+bounded observations, not a promise of universal website access. Native Settings was checked with
+a disposable app data directory: provider and fallback defaults, browser installation/repair,
+activation/save and missing-key setup state. Screenshots above are from that native window.
+A native model-driven read was attempted using the required remote test model. It produced no
+tool call before cancellation; the UI returned to idle with “Response stopped.” That attempt is
+inconclusive and is not counted as a desktop research success. After switching to the owner-selected
+Strata service, two model-catalog connection attempts timed out, including a direct five-second
+TCP connection check. Live model verification remains blocked on that service; no fallback model
+was used after the switch.
+No Brave key was configured for the smoke; paid live API success remains unverified. Scripted
+API fixtures cover successful search in both modes without contacting DuckDuckGo.
 
 ## Verification — 2026-11-02
 

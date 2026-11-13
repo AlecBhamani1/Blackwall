@@ -78,7 +78,7 @@ fn challenge(url: &Url, search: bool) -> WebError {
         Category::Challenge,
         url,
         if search {
-            "The search provider returned a human-verification challenge, not search results. Search is unavailable for this request. Use a known public URL with web_fetch or an owner-configured search MCP server; do not retry the challenge automatically."
+            "The search provider returned a human-verification challenge, not search results. Search is unavailable for this request. Select Brave or enable its fallback in Settings → Web access, or use a known public URL with web_fetch; do not retry the challenge automatically."
         } else {
             "The website requires human verification or a browser challenge. Web reads cannot complete it. Use another public source; approval cannot bypass this restriction."
         },
@@ -239,7 +239,7 @@ fn extract_html(text: &str, url: &Url, search: bool) -> Result<(String, String),
         .join("\n");
     if output.trim().is_empty() {
         return Err(WebError::new(Category::RenderingRequired, url,
-            "The page has no readable static text. It may need JavaScript or login. Browser rendering is unavailable; use a public static version or another source."));
+            "The page has no readable static text. It may need JavaScript or login. Enable optional rendering in Settings → Web access, then use Render page; alternatively use a public static source."));
     }
     Ok((title, output))
 }
@@ -252,7 +252,7 @@ fn extract_search(document: &Html, url: &Url) -> Result<String, WebError> {
             "Search results could not be parsed.",
         )
     })?;
-    let mut output = String::new();
+    let mut results = Vec::new();
     for link in document.select(&selector).take(10) {
         let Some(href) = link
             .value()
@@ -283,11 +283,36 @@ fn extract_search(document: &Html, url: &Url) -> Result<String, WebError> {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        output.push_str(&format!("{}\n{}\n\n", title, source_url(&target)));
+        let snippet = link
+            .ancestors()
+            .filter_map(scraper::ElementRef::wrap)
+            .find(|element| element.value().classes().any(|class| class == "result"))
+            .and_then(|element| {
+                Selector::parse(".result__snippet")
+                    .ok()
+                    .and_then(|selector| {
+                        element
+                            .select(&selector)
+                            .next()
+                            .map(|snippet| snippet.text().collect::<String>())
+                    })
+            })
+            .unwrap_or_default();
+        results.push(super::SearchResult {
+            title: title.chars().take(300).collect(),
+            url: source_url(&target),
+            snippet: snippet.chars().take(1500).collect(),
+        });
     }
-    if output.is_empty() {
+    if results.is_empty() {
         return Err(WebError::new(Category::SearchUnavailable, url,
             "The search provider returned no usable result links. It may have no matches or its response format may have changed. Use a known public URL or an owner-configured search MCP server."));
     }
-    Ok(output)
+    serde_json::to_string(&results).map_err(|_| {
+        WebError::new(
+            Category::SearchUnavailable,
+            url,
+            "Search results could not be encoded.",
+        )
+    })
 }

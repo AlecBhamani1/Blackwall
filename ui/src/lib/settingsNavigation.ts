@@ -2,6 +2,7 @@ import type { ComponentProps } from 'svelte';
 import type Icon from './components/Icon.svelte';
 
 export type SettingsPage =
+  | 'web'
   | 'connection'
   | 'updates'
   | 'limits'
@@ -35,6 +36,15 @@ export type SettingsEntry = {
 };
 
 export const settingsEntries: readonly SettingsEntry[] = [
+  {
+    id: 'web',
+    group: 'Agent',
+    icon: 'external-link',
+    desktopOnly: true,
+    title: 'Web access',
+    description: 'Search providers and isolated browser rendering',
+    keywords: 'search brave duckduckgo api key javascript render browser network research',
+  },
   {
     id: 'connection',
     group: 'General',
