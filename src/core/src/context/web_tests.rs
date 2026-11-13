@@ -110,8 +110,93 @@ fn decide(approvals: &Approvals, event: &AgentEvent, decision: ApprovalDecision)
     }
 }
 
+struct OwnerPolicy(std::path::PathBuf);
+impl OwnerPolicy {
+    fn new(rules: Value) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("blackwall-chat-web-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("policy.json"), rules.to_string()).unwrap();
+        Self(path)
+    }
+}
+impl Drop for OwnerPolicy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[tokio::test]
-async fn web_chat_approves_then_blocks_private_hosts_and_resumes_tool_history() {
+async fn web_toggle_preserves_explicit_ask_and_invalid_policy_prompts() {
+    for invalid in [false, true] {
+        let policy = OwnerPolicy::new(json!({"rules":[{
+            "decision":"ask", "kind":"network", "host":"127.0.0.1"
+        }]}));
+        if invalid {
+            std::fs::write(policy.0.join("policy.json"), "invalid").unwrap();
+        }
+        let model = Scripted::new(vec![
+            research(vec![call(
+                "web_fetch",
+                json!({"url":"http://127.0.0.1/","purpose":"Read"}),
+            )]),
+            answer(),
+        ]);
+        let approvals = Approvals::default();
+        let prompted = Mutex::new(false);
+        chat_with_web(
+            &model,
+            "ask",
+            run(),
+            &approvals,
+            Some(&policy.0),
+            &|event| {
+                if let AgentEvent::ApprovalRequest { web_access, .. } = &event {
+                    assert_eq!(*web_access, None);
+                    *prompted.lock().unwrap() = true;
+                }
+                decide(&approvals, &event, ApprovalDecision::Deny);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(*prompted.lock().unwrap());
+        assert!(
+            model.requests.lock().unwrap()[1].0.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("denied")
+        );
+    }
+}
+
+#[tokio::test]
+async fn chat_toggle_permission_is_cleared_after_completion_and_error() {
+    for fail in [false, true] {
+        let model = Scripted::new(vec![if fail {
+            research(vec![call(
+                "web_fetch",
+                json!({"url":"file:///etc/passwd","purpose":"Read"}),
+            )])
+        } else {
+            answer()
+        }]);
+        let approvals = Approvals::default();
+        let mut context = run();
+        context.budget.max_iterations = 1;
+        let result = chat_with_web(&model, "cleanup", context, &approvals, None, &|_| {}).await;
+        assert_eq!(result.is_err(), fail);
+        assert!(!approvals
+            .request_web("cleanup", "example.com", "read".into(), &|event| {
+                decide(&approvals, &event, ApprovalDecision::Deny);
+            })
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn web_chat_autoapproves_then_blocks_private_hosts_and_resumes_tool_history() {
     // Approval must not bypass SSRF protection; this makes no HTTP request.
     let model = Scripted::new(vec![
         research(vec![call(
@@ -125,7 +210,7 @@ async fn web_chat_approves_then_blocks_private_hosts_and_resumes_tool_history() 
     let initial = run();
     let mut source = initial.source.clone();
     let result = chat_with_web(&model, "web", initial, &approvals, None, &|event| {
-        decide(&approvals, &event, ApprovalDecision::Allow);
+        assert!(!matches!(event, AgentEvent::ApprovalRequest { .. }));
         events.lock().unwrap().push(event);
     })
     .await
@@ -144,7 +229,7 @@ async fn web_chat_approves_then_blocks_private_hosts_and_resumes_tool_history() 
         .unwrap()
         .contains("private"));
     let events = events.lock().unwrap();
-    assert!(events
+    assert!(!events
         .iter()
         .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
     assert!(events
@@ -171,6 +256,9 @@ async fn web_chat_approves_then_blocks_private_hosts_and_resumes_tool_history() 
 
 #[tokio::test]
 async fn denied_search_returns_an_error_to_the_model_without_network_access() {
+    let policy = OwnerPolicy::new(json!({"rules":[{
+        "decision":"deny", "kind":"network", "host":"html.duckduckgo.com"
+    }]}));
     let model = Scripted::new(vec![
         research(vec![call(
             "web_search",
@@ -179,9 +267,16 @@ async fn denied_search_returns_an_error_to_the_model_without_network_access() {
         answer(),
     ]);
     let approvals = Approvals::default();
-    chat_with_web(&model, "deny", run(), &approvals, None, &|event| {
-        decide(&approvals, &event, ApprovalDecision::Deny)
-    })
+    chat_with_web(
+        &model,
+        "deny",
+        run(),
+        &approvals,
+        Some(&policy.0),
+        &|event| {
+            assert!(!matches!(event, AgentEvent::ApprovalRequest { .. }));
+        },
+    )
     .await
     .unwrap();
     let requests = model.requests.lock().unwrap();
@@ -263,6 +358,9 @@ async fn research_stops_at_the_iteration_limit_without_completing_the_turn() {
 
 #[tokio::test]
 async fn cancellation_invalidates_pending_web_approvals() {
+    let policy = OwnerPolicy::new(json!({"rules":[{
+        "decision":"ask", "kind":"network", "host":"example.com"
+    }]}));
     let model = Scripted::new(vec![research(vec![call(
         "web_fetch",
         json!({"url":"https://example.com/","purpose":"Read example"}),
@@ -288,7 +386,7 @@ async fn cancellation_invalidates_pending_web_approvals() {
         "cancel",
         run(),
         &approvals,
-        None,
+        Some(&policy.0),
         &emit,
     ));
     tokio::select! {
@@ -299,11 +397,18 @@ async fn cancellation_invalidates_pending_web_approvals() {
     assert!(approvals
         .resolve(pending.lock().unwrap().take().unwrap())
         .is_err());
+    assert!(!approvals
+        .request_web("cancel", "other.example", "read".into(), &|event| {
+            decide(&approvals, &event, ApprovalDecision::Deny);
+        })
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
-async fn reusable_web_permission_covers_native_and_text_calls_without_bypassing_ssrf() {
+async fn web_toggle_covers_native_and_text_calls_without_bypassing_ssrf() {
     for text_calls in [false, true] {
+        let policy = OwnerPolicy::new(json!({"rules":[]}));
         let mut first = research(vec![call(
             "web_fetch",
             json!({"url":"http://127.0.0.1/one","purpose":"First source"}),
@@ -317,10 +422,17 @@ async fn reusable_web_permission_covers_native_and_text_calls_without_bypassing_
         let model = Scripted::new(vec![first, second, answer()]);
         let approvals = Approvals::default();
         let events = Mutex::new(vec![]);
-        chat_with_web(&model, "web", run(), &approvals, None, &|event| {
-            decide(&approvals, &event, ApprovalDecision::AllowWebForRun);
-            events.lock().unwrap().push(event);
-        })
+        chat_with_web(
+            &model,
+            "web",
+            run(),
+            &approvals,
+            Some(&policy.0),
+            &|event| {
+                assert!(!matches!(event, AgentEvent::ApprovalRequest { .. }));
+                events.lock().unwrap().push(event);
+            },
+        )
         .await
         .unwrap();
         let events = events.lock().unwrap();
@@ -329,7 +441,7 @@ async fn reusable_web_permission_covers_native_and_text_calls_without_bypassing_
                 .iter()
                 .filter(|event| matches!(event, AgentEvent::ApprovalRequest { .. }))
                 .count(),
-            1
+            0
         );
         assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::ToolResult { success: false, output, .. } if output.contains("private"))).count(), 2);
         let requests = model.requests.lock().unwrap();

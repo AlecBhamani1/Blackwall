@@ -521,7 +521,8 @@ pub async fn chat(
     chat_inner(backend, request_id, run, None, emit).await
 }
 
-/// Opt-in public web research, with no workspace, project instructions, or other agent tools.
+/// Opt-in public web research. Enabling it authorizes built-in searches and page reads for
+/// this run, subject to owner restrictions. No workspace or other agent tools are exposed.
 pub async fn chat_with_web(
     backend: &dyn ModelBackend,
     request_id: &str,
@@ -543,6 +544,9 @@ pub async fn chat_with_web(
             .await
             .map_err(ContextError::Approval)?;
     }
+    approvals
+        .allow_web_for_run(request_id)
+        .map_err(ContextError::Approval)?;
     chat_inner(backend, request_id, run, Some(approvals), emit).await
 }
 

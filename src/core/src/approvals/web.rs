@@ -2,6 +2,17 @@
 use super::*;
 
 impl Approvals {
+    /// The owner's Web access toggle authorizes built-in research for this run. Host rules,
+    /// invalid policies and URL/address validation still apply to every request and redirect.
+    pub(crate) fn allow_web_for_run(&self, request_id: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "The approval registry is unavailable.")?
+            .web_runs
+            .insert(request_id.into());
+        Ok(())
+    }
+
     /// Called only by the built-in fetcher, for each validated URL including redirects.
     pub(crate) async fn request_web(
         &self,

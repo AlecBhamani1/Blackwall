@@ -118,9 +118,9 @@ export const settingsEntries: readonly SettingsEntry[] = [
     icon: 'shield',
     desktopOnly: true,
     title: 'Rules & sandbox',
-    description: 'Access keys and trusted projects',
+    description: 'Allowed commands, permissions, access keys, and trusted projects',
     keywords:
-      'credentials token password trust project policy sandbox rules web access permission approve',
+      'credentials token password trust project policy sandbox rules web access permission approve autoapprove allowed commands',
   },
   {
     id: 'telemetry',

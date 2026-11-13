@@ -145,18 +145,14 @@ async fn persistent_permission_survives_restart_and_revocation_applies_to_active
 }
 
 #[tokio::test]
-async fn run_grant_does_not_persist_or_authorize_other_capabilities() {
+async fn toggle_grant_does_not_persist_or_authorize_other_capabilities() {
     let fixture = Fixture::new();
     let approvals = fixture.approvals().await;
-    approvals
-        .request_web(
-            "run",
-            "docs.rs",
-            "first".into(),
-            &answer(&approvals, ApprovalDecision::AllowWebForRun),
-        )
+    approvals.allow_web_for_run("run").unwrap();
+    assert!(approvals
+        .request_web("run", "docs.rs", "first".into(), &never)
         .await
-        .unwrap();
+        .unwrap());
     let deny = answer(&approvals, ApprovalDecision::Deny);
     assert!(!approvals
         .request_http_tool("run", "lookup", "docs.rs", false, "http tool".into(), &deny)
