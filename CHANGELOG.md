@@ -22,6 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Web page approval prompts now show the full request URL, including its query string, so data
   placed in a link is visible before you approve the request. URLs too long to show in full
   (over 2,048 characters) are refused instead of being partly hidden.
+- Approval prompts ignore input for a moment when they appear, so a click or Enter meant for the
+  previous prompt cannot answer the next one. Several waiting approvals are shown one after another
+  instead of the latest replacing the others, prompts stay visible while connection setup is open,
+  and an expired prompt is removed instead of showing an error that the next prompt inherits.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as

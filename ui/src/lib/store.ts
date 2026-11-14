@@ -42,6 +42,8 @@ const ENDPOINT_STORAGE_KEY = 'blackwall.endpoint.v1';
 const CONTEXT_STORAGE_KEY = 'blackwall.context-preferences.v1';
 const CONNECTIONS_STORAGE_KEY = 'blackwall.connections.v1';
 const MAX_SAVED_SESSIONS = 30;
+// The backend's answer when an approval expired or its run ended (approvals.rs `resolve`).
+const APPROVAL_GONE = 'This approval is no longer active.';
 
 function canUseStorage(): boolean {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
@@ -245,7 +247,9 @@ export function createChatController(
       workspace: get(agentMode) ? get(workspace) || undefined : undefined,
     };
   }
-  const approval = writable<PendingApproval | null>(null);
+  // The backend can wait on several approvals at once; show them one at a time, oldest first.
+  const approvals = writable<PendingApproval[]>([]);
+  const approval = derived(approvals, ($approvals) => $approvals[0] ?? null);
   async function chooseWorkspace() {
     if (get(sessionLocked) || get(runState) !== 'idle' || !get(agentMode)) return;
     const navigation = sessionNavigation;
@@ -271,8 +275,14 @@ export function createChatController(
   async function resolveApproval(decision: ApprovalDecision) {
     const pending = get(approval);
     if (!pending) return;
-    await agentClient.resolve(pending, decision);
-    if (get(approval)?.approvalId === pending.approvalId) approval.set(null);
+    try {
+      await agentClient.resolve(pending, decision);
+    } catch (error) {
+      // An expired or cancelled approval can never succeed, so drop it instead of retrying.
+      if ((error instanceof Error ? error.message : String(error)) !== APPROVAL_GONE) throw error;
+      notice.set('That approval expired before your answer arrived, so the action did not run.');
+    }
+    approvals.update((current) => current.filter((item) => item.approvalId !== pending.approvalId));
   }
   async function exportConversation() {
     if (!get(messages).length) return;
@@ -833,7 +843,7 @@ export function createChatController(
     }
 
     const generation = ++runGeneration;
-    approval.set(null);
+    approvals.set([]);
     runState.set('preparing');
     notice.set('');
 
@@ -970,7 +980,11 @@ export function createChatController(
                       : message,
                   ),
                 );
-              if (event.type === 'approval_request') approval.set(event);
+              if (event.type === 'approval_request')
+                approvals.update((current) => [
+                  ...current.filter((item) => item.approvalId !== event.approvalId),
+                  event,
+                ]);
               if (event.type === 'turn_complete' && event.reasoning)
                 messages.update((current) =>
                   current.map((message) =>
@@ -1094,7 +1108,7 @@ export function createChatController(
       } finally {
         if (generation === runGeneration && !destroyed) {
           if (activeRequest === controller) activeRequest = null;
-          approval.set(null);
+          approvals.set([]);
           runState.set('idle');
           saveCurrentSession();
         }
@@ -1108,7 +1122,7 @@ export function createChatController(
     if (compacting) notice.set('Compaction stopped. Previous context retained.');
     compacting = false;
     runGeneration += 1;
-    approval.set(null);
+    approvals.set([]);
     activeRequest?.abort();
     activeRequest = null;
     messages.update((current) =>
@@ -1298,7 +1312,7 @@ export function createChatController(
     contextState.set(undefined);
     contextReport.set(undefined);
     sessions.set([]);
-    approval.set(null);
+    approvals.set([]);
     workspace.set('');
     agentMode.set(false);
     webEnabled.set(false);

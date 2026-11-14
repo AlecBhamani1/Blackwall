@@ -333,6 +333,11 @@
       {/if}
       <section class="conversation-pane" aria-label="Blackwall chat">
         {#if setupOpen}
+          <!-- A run can keep going while setup is open; its approvals must stay answerable. -->
+          {#if $approval}<ApprovalCard
+              approval={$approval}
+              onResolve={controller.resolveApproval}
+            />{/if}
           <ConnectionSetup
             connections={$preferences.connections ?? []}
             onForget={controller.forgetConnection}
