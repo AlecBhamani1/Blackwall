@@ -385,6 +385,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Deleting the app lock's passphrase from the keychain no longer opens a locked Blackwall. The lock
+  screen says the passphrase is missing and offers **Try again** or, after confirmation, **Reset**,
+  which erases this device's conversations, memories, backups and run traces, keeps settings,
+  connections and saved keys, and opens without a lock.
 - A deny `file` rule now blocks reading, listing, and searching its path, not just editing it, so
   `deny file .env` keeps the agent out of `.env`. Listings, searches, and `/review` leave denied
   files out, and the audit log names the rule as it does for a denied edit.

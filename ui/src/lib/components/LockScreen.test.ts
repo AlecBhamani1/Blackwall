@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { KEYRING_NEEDED } from '../auth';
+import { KEYRING_NEEDED, LOCK_MISSING } from '../auth';
 import LockScreen from './LockScreen.svelte';
 describe('app lock', () => {
   it('clears the passphrase immediately after submission', async () => {
@@ -59,5 +59,41 @@ describe('app lock', () => {
     expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Try again' }));
     expect(retry).toHaveBeenCalledOnce();
+  });
+  it('offers try again or a confirmed reset when the lock passphrase is missing', async () => {
+    const retry = vi.fn();
+    const reset = vi.fn().mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(LockScreen, {
+      props: { lockMissing: true, onUnlock: vi.fn(), onRetry: retry, onReset: reset },
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(LOCK_MISSING);
+    expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
+    expect(screen.queryByText('Checking your app lock…')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(retry).toHaveBeenCalledOnce();
+    // Reset asks first, and cancelling erases nothing.
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(reset).not.toHaveBeenCalled();
+    expect(screen.getByText(/erases this device's conversations, history and saved memories/)).toBeVisible();
+    expect(screen.queryByText(/recovered/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Settings, connections and saved keys stay/)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('button', { name: 'Erase and reset' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await user.click(screen.getByRole('button', { name: 'Erase and reset' }));
+    expect(reset).toHaveBeenCalledOnce();
+  });
+  it('shows a failed reset without opening the app', () => {
+    render(LockScreen, {
+      props: {
+        lockMissing: true,
+        error: 'The app lock marker could not be updated in your data folder.',
+        onUnlock: vi.fn(),
+        onRetry: vi.fn(),
+      },
+    });
+    expect(screen.getByText(/could not be updated/)).toBeVisible();
+    expect(screen.queryByLabelText('Passphrase')).not.toBeInTheDocument();
   });
 });

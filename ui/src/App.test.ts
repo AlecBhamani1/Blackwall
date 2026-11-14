@@ -18,7 +18,7 @@ vi.mock('./lib/ipc', async (importOriginal) => ({
 }));
 import App from './App.svelte';
 import { localModelClient } from './lib/ipc';
-import { KEYRING_NEEDED } from './lib/auth';
+import { KEYRING_NEEDED, LOCK_MISSING } from './lib/auth';
 
 let saved: Map<string, SessionSummary>;
 beforeEach(() => {
@@ -545,4 +545,40 @@ it('shows the real error after a keyring retry fails instead of the keyring mess
   expect(await screen.findByText(failure)).toBeVisible();
   expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled();
   expect(screen.queryByText(KEYRING_NEEDED)).not.toBeInTheDocument();
+});
+
+it('stays locked when the lock passphrase is missing and opens only after a confirmed reset', async () => {
+  const user = userEvent.setup();
+  const fallback = native.invoke.getMockImplementation();
+  let reset = false;
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === 'reset_missing_lock') {
+      reset = true;
+      return {
+        locked: false,
+        enabled: false,
+        keyring: true,
+        keyringNeeded: false,
+        lockMissing: false,
+      };
+    }
+    if (command === 'auth_status' && !reset)
+      return {
+        locked: true,
+        enabled: true,
+        keyring: true,
+        keyringNeeded: false,
+        lockMissing: true,
+      };
+    return fallback?.(command, args);
+  });
+  render(App);
+  expect(await screen.findByText(LOCK_MISSING)).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText(LOCK_MISSING)).toBeVisible();
+  expect(native.invoke).not.toHaveBeenCalledWith('list_sessions', expect.anything());
+  await user.click(screen.getByRole('button', { name: 'Reset' }));
+  await user.click(screen.getByRole('button', { name: 'Erase and reset' }));
+  await waitFor(() => expect(screen.queryByText(LOCK_MISSING)).not.toBeInTheDocument());
+  expect(native.invoke).toHaveBeenCalledWith('reset_missing_lock');
 });

@@ -18,7 +18,7 @@ use std::{
 
 /// The schema version of the v6 chat store.
 pub(crate) const V6: i64 = 6;
-const BACKUPS_DIR: &str = "backups";
+pub(super) const BACKUPS_DIR: &str = "backups";
 const MAX_BACKUPS: u32 = 3;
 /// How long an opener waits for another window's upgrade (800 large chats took 13 s).
 const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);

@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 const LOCK_ACCOUNT: &str = "passphrase-v1";
 pub(crate) const KEYRING_NEEDED: &str = "Blackwall needs the system keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet), then try again.";
+pub(crate) const LOCK_MISSING: &str = "Your lock passphrase is missing from the keychain.";
 #[derive(Default)]
 struct Inner {
     initialized: bool,
@@ -15,6 +16,7 @@ struct Inner {
     hash: Option<String>,
     keyring: bool,
     keyring_needed: bool,
+    lock_missing: bool,
     failures: u8,
     retry_after: Option<Instant>,
 }
@@ -31,15 +33,18 @@ pub struct AuthStatus {
     pub keyring: bool,
     #[serde(rename = "keyringNeeded")]
     pub keyring_needed: bool,
+    #[serde(rename = "lockMissing")]
+    pub lock_missing: bool,
 }
 impl Inner {
     fn status(&self) -> AuthStatus {
         AuthStatus {
             locked: !self.unlocked,
             // A stored lock the keyring cannot show us is still a lock.
-            enabled: self.hash.is_some() || self.keyring_needed,
+            enabled: self.hash.is_some() || self.keyring_needed || self.lock_missing,
             keyring: self.keyring,
             keyring_needed: self.keyring_needed,
+            lock_missing: self.lock_missing,
         }
     }
 }
@@ -51,9 +56,13 @@ enum LockRead {
 }
 #[derive(Debug, PartialEq)]
 enum Startup {
-    Open { keyring: bool },
+    Open {
+        keyring: bool,
+    },
     Locked(String),
     KeyringNeeded,
+    /// The marker records a lock, but the keyring has no verifier for it.
+    LockMissing,
     Retry(String),
 }
 
@@ -112,8 +121,36 @@ impl AuthState {
         if inner.keyring_needed {
             return Err(KEYRING_NEEDED.into());
         }
+        if inner.lock_missing {
+            return Err(LOCK_MISSING.into());
+        }
         check(&mut inner, passphrase).await?;
         inner.unlocked = true;
+        Ok(inner.status())
+    }
+    /// Erases conversations and history, then opens without a lock. Only for a missing lock:
+    /// the lock is a UI gate, so without its verifier nothing else can prove the owner.
+    async fn reset_missing_lock(
+        &self,
+        directory: std::path::PathBuf,
+    ) -> Result<AuthStatus, String> {
+        let mut inner = self.0.lock().await;
+        if !inner.lock_missing {
+            return Err("Blackwall can only be reset when its lock passphrase is missing.".into());
+        }
+        tokio::task::spawn_blocking(move || {
+            blackwall_core::storage::LocalStore::erase_history(&directory)
+                .map_err(|error| error.to_string())?;
+            remove_marker(&directory, LOCK_MARKER).map_err(|_| MARKER_ERROR.to_string())?;
+            write_marker(&directory, NO_LOCK_MARKER).map_err(|_| MARKER_ERROR.to_string())
+        })
+        .await
+        .map_err(|_| "Blackwall could not finish the reset.")??;
+        inner.lock_missing = false;
+        inner.hash = None;
+        inner.unlocked = true;
+        inner.keyring = true;
+        inner.initialized = true;
         Ok(inner.status())
     }
     #[cfg(test)]
@@ -221,6 +258,9 @@ fn resolve(read: LockRead, directory: &Path) -> Startup {
             }
             Startup::Locked(hash)
         }
+        // A recorded lock whose verifier is gone stays shut: deleting one keychain item must
+        // not open the app.
+        LockRead::Missing if file_exists(directory, LOCK_MARKER, true) => Startup::LockMissing,
         LockRead::Missing => {
             // Best effort: if either fails, a later keyring-less launch waits for the keyring.
             let _ = remove_marker(directory, LOCK_MARKER);
@@ -259,7 +299,16 @@ pub async fn auth_status(
             Startup::Retry(message) => return Err(message),
             Startup::KeyringNeeded => {
                 inner.keyring_needed = true;
+                inner.lock_missing = false;
                 inner.keyring = false;
+                inner.unlocked = false;
+                inner.hash = None;
+                return Ok(inner.status());
+            }
+            Startup::LockMissing => {
+                inner.lock_missing = true;
+                inner.keyring_needed = false;
+                inner.keyring = true;
                 inner.unlocked = false;
                 inner.hash = None;
                 return Ok(inner.status());
@@ -276,6 +325,7 @@ pub async fn auth_status(
             }
         }
         inner.keyring_needed = false;
+        inner.lock_missing = false;
         inner.initialized = true;
     }
     Ok(inner.status())
@@ -348,6 +398,14 @@ pub async fn set_passphrase(
     .map_err(|_| "The app lock could not be saved.")??;
     inner.hash = hash;
     Ok(inner.status())
+}
+#[tauri::command]
+pub async fn reset_missing_lock(
+    app: AppHandle,
+    state: State<'_, AuthState>,
+) -> Result<AuthStatus, String> {
+    let directory = crate::identity::data_directory(&app)?;
+    state.reset_missing_lock(directory).await
 }
 #[tauri::command]
 pub async fn lock_app(app: AppHandle, state: State<'_, AuthState>) -> Result<AuthStatus, String> {
@@ -506,12 +564,91 @@ mod tests {
         );
         assert!(present(&directory, LOCK_MARKER));
         assert!(!present(&directory, NO_LOCK_MARKER));
+        // The lock was recorded, so its missing verifier keeps the app shut.
+        assert_eq!(resolve(LockRead::Missing, &directory), Startup::LockMissing);
+        assert!(present(&directory, LOCK_MARKER));
+        assert!(!present(&directory, NO_LOCK_MARKER));
+        std::fs::remove_file(directory.join(LOCK_MARKER)).unwrap();
         assert_eq!(
             resolve(LockRead::Missing, &directory),
             Startup::Open { keyring: true }
         );
         assert!(!present(&directory, LOCK_MARKER));
         assert!(present(&directory, NO_LOCK_MARKER));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn missing_lock_stays_shut_when_the_marker_cannot_be_checked() {
+        let directory = data_folder("missing-unknown");
+        std::fs::write(directory.join(LOCK_MARKER), b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = resolve(LockRead::Missing, &directory);
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(result, Startup::LockMissing);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[tokio::test]
+    async fn missing_lock_refuses_unlock_and_reset_erases_history_then_opens() {
+        let directory = data_folder("reset");
+        let store = blackwall_core::storage::LocalStore::open(&directory).unwrap();
+        store
+            .save_session(&serde_json::json!({"id":"session_one","title":"Private","updatedAt":1,"messages":[{"role":"user","content":"secret","attachments":[]}]}))
+            .unwrap();
+        store.save_setting("preferences", "{}").unwrap();
+        drop(store);
+        std::fs::write(directory.join(LOCK_MARKER), b"").unwrap();
+        let _ = std::fs::remove_file(directory.join(NO_LOCK_MARKER));
+        let state = AuthState::default();
+        {
+            let mut inner = state.0.lock().await;
+            inner.lock_missing = true;
+            inner.keyring = true;
+        }
+        let status = state.0.lock().await.status();
+        assert!(status.locked && status.enabled && status.lock_missing);
+        assert_eq!(
+            state.unlock("anything".into()).await.err().as_deref(),
+            Some(LOCK_MISSING)
+        );
+        assert!(state.ensure_unlocked().await.is_err());
+        let status = state.reset_missing_lock(directory.clone()).await.unwrap();
+        assert!(!status.locked && !status.enabled && !status.lock_missing);
+        state.ensure_unlocked().await.unwrap();
+        assert!(!present(&directory, LOCK_MARKER));
+        assert!(present(&directory, NO_LOCK_MARKER));
+        let store = blackwall_core::storage::LocalStore::open(&directory).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.setting("preferences").unwrap().as_deref(), Some("{}"));
+        drop(store);
+        // Once reset, the state is no longer a missing lock, so it cannot erase again.
+        assert!(state.reset_missing_lock(directory.clone()).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[tokio::test]
+    async fn reset_is_refused_unless_the_lock_is_missing() {
+        let directory = data_folder("reset-refused");
+        let store = blackwall_core::storage::LocalStore::open(&directory).unwrap();
+        store
+            .save_session(&serde_json::json!({"id":"session_one","title":"Kept","updatedAt":1,"messages":[{"role":"user","content":"kept","attachments":[]}]}))
+            .unwrap();
+        drop(store);
+        std::fs::write(directory.join(LOCK_MARKER), b"").unwrap();
+        // Locked with a verifier, unlocked, and waiting for the keyring all refuse.
+        let locked = AuthState::default();
+        locked.0.lock().await.hash = Some("h".into());
+        let needs_keyring = AuthState::default();
+        needs_keyring.0.lock().await.keyring_needed = true;
+        for state in [locked, AuthState::unlocked_for_test(), needs_keyring] {
+            assert!(state.reset_missing_lock(directory.clone()).await.is_err());
+        }
+        assert!(present(&directory, LOCK_MARKER));
+        let store = blackwall_core::storage::LocalStore::open(&directory).unwrap();
+        assert_eq!(store.list_sessions().unwrap().len(), 1);
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
