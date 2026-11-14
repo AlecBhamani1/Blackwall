@@ -868,6 +868,9 @@ mod tests {
         repo.commit();
         // The parent repository owns (and removes) the submodule directory.
         let sub = std::mem::ManuallyDrop::new(Repo(repo.0.join("sub")));
+        // The clone has no identity of its own; CI has no global one either.
+        sub.git(&["config", "user.email", "fixture@example.invalid"]);
+        sub.git(&["config", "user.name", "Fixture"]);
         let marker = repo.0.join("filter-ran");
         let touch = format!("touch {}", marker.display());
         sub.git(&["config", "filter.sub.clean", &touch]);
