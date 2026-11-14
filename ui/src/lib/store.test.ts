@@ -532,6 +532,48 @@ describe('chat controller', () => {
     expect(get(controller.approval)).toBeNull();
   });
 
+  it('queues concurrent approvals and drops one that is no longer active', async () => {
+    const resolve = vi
+      .spyOn(agentClient, 'resolve')
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce('This approval is no longer active.')
+      .mockRejectedValueOnce('The approval registry is unavailable.');
+    const client = mockClient();
+    client.streamChat = vi.fn((request, callbacks) => {
+      for (const approvalId of ['first', 'second', 'third'])
+        callbacks.onEvent?.({
+          type: 'approval_request',
+          requestId: request.requestId,
+          approvalId,
+          kind: 'exec',
+          detail: approvalId,
+        });
+      return new Promise<void>(() => {});
+    });
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('Delegate three reviews', []);
+    await vi.waitFor(() => expect(get(controller.approval)?.approvalId).toBe('first'));
+    await controller.resolveApproval('allow');
+    expect(get(controller.approval)?.approvalId).toBe('second');
+    await controller.resolveApproval('allow');
+    expect(get(controller.notice)).toMatch(/expired/);
+    expect(get(controller.approval)?.approvalId).toBe('third');
+    await expect(controller.resolveApproval('deny')).rejects.toBe(
+      'The approval registry is unavailable.',
+    );
+    expect(get(controller.approval)?.approvalId).toBe('third');
+    expect(resolve.mock.calls.map(([pending]) => pending.approvalId)).toEqual([
+      'first',
+      'second',
+      'third',
+    ]);
+    controller.stop();
+    expect(get(controller.approval)).toBeNull();
+    resolve.mockRestore();
+    controller.destroy();
+  });
+
   it('does not send whitespace or send while disconnected', async () => {
     const client = mockClient();
     const controller = createChatController(client);

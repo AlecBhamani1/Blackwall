@@ -36,8 +36,10 @@ Each hop has a five-second DNS timeout, a five-second connection timeout, and a 
 timeout. Responses are limited to 2 MiB **after decompression**, counted while streaming rather than
 trusting Content-Length. gzip, Brotli, and deflate are supported. The model receives at most 32,000
 characters of text, with a trim notice, source URL and title. Source and diagnostic URLs omit query
-strings, fragments and embedded credentials. The actual request still includes its query; search
-approvals show the query separately so the owner can review what will be sent.
+strings, fragments and embedded credentials. Approval prompts show each request's full URL,
+including its query, so the owner can review what will be sent; a URL longer than 2,048 characters
+is refused before any prompt or request rather than shown in part. Search approvals also show the
+decoded query separately.
 
 HTML extraction prefers article/main content, decodes entities, normalizes whitespace and removes
 scripts, styles, templates, navigation and explicitly hidden elements. It does not execute

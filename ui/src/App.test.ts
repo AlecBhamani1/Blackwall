@@ -574,3 +574,30 @@ it('locks even when saves fail and warns on the lock screen', async () => {
   expect(screen.getByRole('alert')).toHaveTextContent('not saved before locking');
   expect(screen.queryByText('Unsaved secret')).not.toBeInTheDocument();
 });
+
+it('keeps a pending approval answerable while connection setup is open', async () => {
+  const user = userEvent.setup();
+  vi.mocked(localModelClient.streamChat).mockImplementationOnce(
+    (request: ChatRequest, callbacks: StreamCallbacks) => {
+      callbacks.onEvent?.({
+        type: 'approval_request',
+        requestId: request.requestId,
+        approvalId: 'approval',
+        kind: 'exec',
+        detail: 'git status',
+      });
+      return new Promise<void>(() => {});
+    },
+  );
+  render(App);
+  const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await screen.findByRole('combobox', { name: 'Model' });
+  await user.type(input, 'Check the repository{Enter}');
+  await screen.findByRole('region', { name: 'Action needs your approval' });
+  await user.click(screen.getByRole('button', { name: 'Open settings' }));
+  await user.click(screen.getByRole('button', { name: /Model connection/ }));
+  await user.click(screen.getByRole('button', { name: 'Set up a connection' }));
+  expect(screen.getByRole('region', { name: 'Action needs your approval' })).toHaveTextContent(
+    'git status',
+  );
+});

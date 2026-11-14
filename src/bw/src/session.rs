@@ -647,6 +647,7 @@ async fn execute(
     let mut answer = String::new();
     let mut snapshot = None;
     let mut pending: Option<ResolveApprovalRequest> = None;
+    let mut prompted: Option<u64> = None;
     let mut denied = 0_u32;
     let mut usage = TokenUsage::default();
     let run = async {
@@ -655,9 +656,9 @@ async fn execute(
                 biased;
                 _ = tokio::signal::ctrl_c() => break Err(Failure::new(RunReason::Interrupted, "Task stopped. You can continue this conversation.")),
                 line = async {
-                    match input.as_deref_mut() {
-                        Some(input) => input.read().await,
-                        None => Ok(None),
+                    match (input.as_deref_mut(), prompted) {
+                        (Some(input), Some(generation)) => input.read_answer(generation).await,
+                        _ => Ok(None),
                     }
                 }, if pending.is_some() => {
                     match line {
@@ -673,7 +674,10 @@ async fn execute(
                 event = incoming.recv() => if let Some(event) = event {
                     count_usage(&event, &request_id, &mut usage);
                     count_denied(&event, &mut denied);
+                    let prompt = matches!(event, AgentEvent::ApprovalRequest { .. });
                     render_event(event, &mut answer, &mut pending, &mut snapshot, json);
+                    // Only a line typed after the prompt is shown may answer it.
+                    if prompt { prompted = input.as_deref().map(Input::discard_type_ahead); }
                     // Nobody can answer a prompt in a headless run, so it is denied at once.
                     if let Some(request) = pending.take_if(|_| json) {
                         if let Err(error) = approvals.resolve(request) { eprintln!("bw: {error}"); }
