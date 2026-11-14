@@ -2,13 +2,15 @@
 //! converts, or nothing changes.
 //!
 //! The backup is `backups/blackwall-backup-1.sqlite3`, then `-2`, then `-3`, made with SQLite's
-//! backup API. Blackwall never deletes one. With all three there, the upgrade does not run and
-//! the open fails with [`StorageError::BackupsFull`] until the owner removes one.
+//! backup API. Each attempt copies to `backups/blackwall-upgrading.sqlite3`, replacing what an
+//! earlier failed or killed attempt left there, and only a finished upgrade moves its copy to a
+//! slot. Blackwall never deletes a slot. With all three there, the upgrade does not run and the
+//! open fails with [`StorageError::BackupsFull`] until the owner removes one.
 
 use super::chats::{apply_v6_schema, write_tx};
 use super::convert::convert_session;
 use super::{LocalStore, StorageError, BUSY_TIMEOUT, DATABASE_FILE};
-use rusqlite::{backup::NO_PROGRESS, Connection, OpenFlags, MAIN_DB};
+use rusqlite::{backup::NO_PROGRESS, Connection, OpenFlags, Transaction, MAIN_DB};
 use serde_json::Value;
 use std::{
     fs,
@@ -20,6 +22,8 @@ use std::{
 pub(crate) const V6: i64 = 6;
 const BACKUPS_DIR: &str = "backups";
 const MAX_BACKUPS: u32 = 3;
+/// Where an upgrade copies the database before it finishes.
+const PENDING_BACKUP: &str = "blackwall-upgrading.sqlite3";
 /// How long an opener waits for another window's upgrade (800 large chats took 13 s).
 const UPGRADE_BUSY_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -54,25 +58,17 @@ pub(super) fn open_v6(
                 [version],
                 |row| row.get(0),
             )?;
-            if let Some(directory) = directory.filter(|_| has_data) {
-                back_up(directory)?;
+            let backup = match directory.filter(|_| has_data) {
+                Some(directory) => Some(back_up(directory)?),
+                None => None,
+            };
+            convert(tx, version)?;
+            if let Some((copy, slot)) = backup {
+                fs::rename(copy, slot)?;
             }
-            LocalStore::legacy_schema(&tx, version)?;
-            apply_v6_schema(&tx)?;
-            let ids: Vec<String> = tx
-                .prepare("SELECT id FROM sessions")?
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            for id in ids {
-                let body: String =
-                    tx.query_row("SELECT body FROM sessions WHERE id=?1", [&id], |row| {
-                        row.get(0)
-                    })?;
-                convert_session(&tx, &serde_json::from_str::<Value>(&body)?)?;
-            }
-            tx.pragma_update(None, "user_version", V6)?;
+        } else {
+            tx.commit()?;
         }
-        tx.commit()?;
         if version < V6 {
             // Hand back the space the old copies used (1.3 GB of v5 history becomes 0.56 GB). A
             // failure here (no room for the temporary copy) only leaves the file larger.
@@ -83,34 +79,55 @@ pub(super) fn open_v6(
     Ok(LocalStore { connection })
 }
 
-/// Copies the database to the first free backup slot. The caller holds the writer lock, which
-/// SQLite's backup cannot read through, so a second, read-only connection makes the copy.
-fn back_up(directory: &Path) -> Result<PathBuf, StorageError> {
+/// Converts the chats of a database at `version` to v6 in `tx`, then commits.
+fn convert(tx: Transaction<'_>, version: i64) -> Result<(), StorageError> {
+    LocalStore::legacy_schema(&tx, version)?;
+    apply_v6_schema(&tx)?;
+    let ids: Vec<String> = tx
+        .prepare("SELECT id FROM sessions")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in ids {
+        let body: String = tx.query_row("SELECT body FROM sessions WHERE id=?1", [&id], |row| {
+            row.get(0)
+        })?;
+        convert_session(&tx, &serde_json::from_str::<Value>(&body)?)?;
+    }
+    tx.pragma_update(None, "user_version", V6)?;
+    Ok(tx.commit()?)
+}
+
+/// Copies the database to the pending backup, and returns it with the first free slot. The caller
+/// holds the writer lock, which SQLite's backup cannot read through, so a second, read-only
+/// connection makes the copy.
+fn back_up(directory: &Path) -> Result<(PathBuf, PathBuf), StorageError> {
     let folder = directory.join(BACKUPS_DIR);
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&folder)?;
-    let target = (1..=MAX_BACKUPS)
+    let slot = (1..=MAX_BACKUPS)
         .map(|n| folder.join(format!("blackwall-backup-{n}.sqlite3")))
         .find(|path| fs::symlink_metadata(path).is_err())
         .ok_or(StorageError::BackupsFull)?;
+    // An earlier attempt's copy, whole or partial, is of this same unconverted database.
+    let target = folder.join(PENDING_BACKUP);
+    match fs::remove_file(&target) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     let source = Connection::open_with_flags(
         directory.join(DATABASE_FILE),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    if let Err(error) = source.backup(MAIN_DB, &target, NO_PROGRESS) {
-        // A partial copy must not take a slot.
-        let _ = fs::remove_file(&target);
-        return Err(error.into());
-    }
+    source.backup(MAIN_DB, &target, NO_PROGRESS)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
     }
-    Ok(target)
+    Ok((target, slot))
 }
 
 #[cfg(test)]
@@ -296,6 +313,86 @@ pub(crate) mod tests {
             Err(StorageError::Invalid(message)) if message == super::super::convert::NOT_CONVERTED
         ));
         assert_eq!(v5_rows(&directory.join(DATABASE_FILE)), as_v5(&chats));
+        // A failed attempt takes no slot, so retries keep showing the real error.
+        for _ in 0..MAX_BACKUPS {
+            assert!(matches!(
+                LocalStore::open(&directory),
+                Err(StorageError::Invalid(_))
+            ));
+        }
+        assert!(!directory
+            .join(BACKUPS_DIR)
+            .join("blackwall-backup-1.sqlite3")
+            .exists());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    const KILLED_CHILD: &str = "BLACKWALL_TEST_KILLED_UPGRADE";
+
+    /// Run by `an_upgrade_killed_after_its_backup_takes_no_slot` as a child process.
+    #[test]
+    fn killed_upgrade_child() {
+        if let Some(directory) = std::env::var_os(KILLED_CHILD) {
+            let _ = LocalStore::open(Path::new(&directory));
+        }
+    }
+
+    #[test]
+    fn an_upgrade_killed_after_its_backup_takes_no_slot() {
+        let chat = &v5_chats()[0];
+        let directory = v5_folder("killed", std::slice::from_ref(chat));
+        let backups = directory.join(BACKUPS_DIR);
+        // Whether a whole copy was written since `started`.
+        let backed_up = |started| {
+            fs::read_dir(&backups).into_iter().flatten().any(|entry| {
+                let path = entry.unwrap().path();
+                fs::metadata(&path).is_ok_and(|m| m.modified().unwrap() >= started)
+                    && Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .and_then(|copy| {
+                            copy.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+                        })
+                        .is_ok_and(|count: i64| count == 1)
+            })
+        };
+        for _ in 0..=MAX_BACKUPS {
+            // An open reader keeps the upgrade from committing, so it is killed after its backup.
+            let reader = Connection::open(directory.join(DATABASE_FILE)).unwrap();
+            reader.execute_batch("BEGIN").unwrap();
+            let _: i64 = reader
+                .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            let started = std::time::SystemTime::now();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::upgrade::tests::killed_upgrade_child",
+                    "--test-threads=1",
+                ])
+                .env(KILLED_CHILD, &directory)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !backed_up(started)
+                && child.try_wait().unwrap().is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            drop(reader);
+        }
+        assert_eq!(
+            v5_rows(&directory.join(DATABASE_FILE)),
+            as_v5(std::slice::from_ref(chat))
+        );
+        LocalStore::open(&directory).unwrap();
+        assert_eq!(version(&directory.join(DATABASE_FILE)), V6);
+        let slot = |n: u32| backups.join(format!("blackwall-backup-{n}.sqlite3"));
+        assert_eq!(v5_rows(&slot(1)), as_v5(std::slice::from_ref(chat)));
+        assert!(!slot(2).exists());
+        assert!(!backups.join(PENDING_BACKUP).exists());
         fs::remove_dir_all(&directory).unwrap();
     }
 
