@@ -27,6 +27,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
+- `/review` no longer runs Git filter commands (`filter.<name>.clean`/`smudge`/`process`) from the
+  repository's or a submodule's config, reviews only the agent's project directory instead of the
+  whole enclosing repository, and honors the owner's global `core.excludesFile` when listing
+  untracked files.
 
 ### Added
 
