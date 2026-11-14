@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 pub(crate) struct Exchanges {
     entries: HashMap<String, Exchange>,
     /// A deployment-wide rate cap also works behind a TLS proxy without trusting spoofable IP headers.
+    /// Only invitation creation, revocation and failed lookups/credentials are charged, so junk
+    /// traffic cannot lock authenticated hosts and devices out of their own exchanges.
     requests: VecDeque<u64>,
 }
 struct Exchange {
@@ -86,13 +88,34 @@ impl Exchanges {
         self.requests.push_back(now);
         Ok(())
     }
+    /// Charges a rejected request; past the budget it is reported as busy instead.
+    fn refuse(&mut self, error: RelayApiError) -> RelayApiError {
+        self.limit().err().unwrap_or(error)
+    }
     fn get(&mut self, id: &str) -> Result<&mut Exchange, RelayApiError> {
-        self.limit()?;
-        self.entries.get_mut(id).ok_or_else(|| {
-            RelayApiError::not_found(
+        let now = unix_epoch_millis();
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        if !self.entries.contains_key(id) {
+            return Err(self.refuse(RelayApiError::not_found(
                 "This pairing invitation expired or was cancelled. Create a new invitation.",
-            )
-        })
+            )));
+        }
+        self.entries
+            .get_mut(id)
+            .ok_or_else(|| RelayApiError::not_found("This pairing invitation expired."))
+    }
+    fn host(&mut self, id: &str, key: &str) -> Result<&mut Exchange, RelayApiError> {
+        if let Err(error) = authorize_host(self.get(id)?, key) {
+            return Err(self.refuse(error));
+        }
+        self.get(id)
+    }
+    fn candidate(&mut self, id: &str, key: &str) -> Result<&mut Exchange, RelayApiError> {
+        let candidate = self.get(id)?.candidate.as_ref();
+        if !candidate.is_some_and(|candidate| verifies(&candidate.salt, &candidate.hash, key)) {
+            return Err(self.refuse(RelayApiError::unauthorized("Device credential is invalid.")));
+        }
+        self.get(id)
     }
 }
 impl Exchange {
@@ -170,8 +193,7 @@ async fn host_status(
     headers: HeaderMap,
 ) -> Result<Response, RelayApiError> {
     let mut exchanges = state.pairing.lock().await;
-    let exchange = exchanges.get(&id)?;
-    authorize_host(exchange, bearer(&headers))?;
+    let exchange = exchanges.host(&id, bearer(&headers))?;
     Ok(no_store(Json(exchange.progress()).into_response()))
 }
 async fn cancel(
@@ -180,8 +202,7 @@ async fn cancel(
     headers: HeaderMap,
 ) -> Result<Response, RelayApiError> {
     let mut exchanges = state.pairing.lock().await;
-    let exchange = exchanges.get(&id)?;
-    authorize_host(exchange, bearer(&headers))?;
+    let exchange = exchanges.host(&id, bearer(&headers))?;
     if exchange.state == "approved" {
         return Err(error("Remove the approved device to revoke its access."));
     }
@@ -210,9 +231,9 @@ async fn join(
     }
     if !verifies(&exchange.offer.salt, &exchange.offer.hash, bearer(&headers)) {
         exchange.failures += 1;
-        return Err(RelayApiError::unauthorized(
+        return Err(exchanges.refuse(RelayApiError::unauthorized(
             "The pairing invitation key is invalid.",
-        ));
+        )));
     }
     if !matches!(exchange.state.as_str(), "waiting" | "review") {
         return Err(error("This invitation is no longer accepting a computer."));
@@ -236,14 +257,7 @@ async fn result(
     headers: HeaderMap,
 ) -> Result<Response, RelayApiError> {
     let mut exchanges = state.pairing.lock().await;
-    let exchange = exchanges.get(&id)?;
-    let candidate = exchange
-        .candidate
-        .as_ref()
-        .ok_or_else(|| RelayApiError::unauthorized("No computer has requested this pairing."))?;
-    if !verifies(&candidate.salt, &candidate.hash, bearer(&headers)) {
-        return Err(RelayApiError::unauthorized("Device credential is invalid."));
-    }
+    let exchange = exchanges.candidate(&id, bearer(&headers))?;
     Ok(no_store(Json(exchange.progress()).into_response()))
 }
 async fn cancel_candidate(
@@ -252,14 +266,7 @@ async fn cancel_candidate(
     headers: HeaderMap,
 ) -> Result<Response, RelayApiError> {
     let mut exchanges = state.pairing.lock().await;
-    let exchange = exchanges.get(&id)?;
-    let candidate = exchange
-        .candidate
-        .as_ref()
-        .ok_or_else(|| RelayApiError::unauthorized("No pairing candidate."))?;
-    if !verifies(&candidate.salt, &candidate.hash, bearer(&headers)) {
-        return Err(RelayApiError::unauthorized("Invalid candidate credential."));
-    }
+    let exchange = exchanges.candidate(&id, bearer(&headers))?;
     if exchange.state == "approved" {
         return Err(error(
             "This device was already approved. Remove its saved connection.",
@@ -278,8 +285,7 @@ async fn approve(
         return Err(error("Invalid paired address."));
     }
     let mut exchanges = state.pairing.lock().await;
-    let exchange = exchanges.get(&id)?;
-    authorize_host(exchange, bearer(&headers))?;
+    let exchange = exchanges.host(&id, bearer(&headers))?;
     if exchange.candidate.as_ref() != Some(&approval.candidate)
         || !matches!(exchange.state.as_str(), "review" | "approved")
     {
@@ -294,8 +300,7 @@ async fn approve(
     {
         return Err(error("This invitation has already paired a computer."));
     }
-    // Use the same live-session lock order as registration/revocation.
-    let _sessions = state.sessions.write().await;
+    // No live session uses this address yet, so the claim needs no session lock.
     let ownership = state.ownership.clone();
     let session_id = approval.session_id.clone();
     let key = bearer(&headers).to_owned();
@@ -326,18 +331,32 @@ async fn revoke(
     if !valid_secret(&id, "bws_") || !valid_secret(bearer(&headers), "bwh_") {
         return Err(error("Invalid device revocation."));
     }
-    state.pairing.lock().await.limit()?;
-    let mut sessions = state.sessions.write().await;
     let ownership = state.ownership.clone();
     let session_id = id.clone();
     let key = bearer(&headers).to_owned();
-    // Reserve-and-revoke also handles removal before the first successful tunnel registration.
-    tokio::task::spawn_blocking(move || ownership.revoke(&session_id, &key))
+    // The owner of a known address is never charged, so junk traffic cannot block revocation.
+    let revoked = tokio::task::spawn_blocking(move || ownership.revoke_existing(&session_id, &key))
         .await
-        .map_err(|_| error("Revocation storage is unavailable."))?
-        .map_err(|_| RelayApiError::unauthorized("Device revocation could not be authorized."))?;
-    let previous = sessions.remove(&id);
-    drop(sessions);
+        .map_err(|_| error("Revocation storage is unavailable."))?;
+    let denied = || RelayApiError::unauthorized("Device revocation could not be authorized.");
+    match revoked {
+        Ok(true) => {}
+        Ok(false) => {
+            state.pairing.lock().await.limit()?;
+            let ownership = state.ownership.clone();
+            let session_id = id.clone();
+            let key = bearer(&headers).to_owned();
+            // Reserve-and-revoke also handles removal before the first tunnel registration.
+            tokio::task::spawn_blocking(move || ownership.revoke(&session_id, &key))
+                .await
+                .map_err(|_| error("Revocation storage is unavailable."))?
+                .map_err(|_| denied())?;
+        }
+        Err(_) => return Err(state.pairing.lock().await.refuse(denied())),
+    }
+    // Bump only after the durable write so a racing registration retries its claim.
+    state.revocations.fetch_add(1, Ordering::SeqCst);
+    let previous = state.sessions.write().await.remove(&id);
     if let Some(previous) = previous {
         previous
             .disconnect("This paired computer was removed by its owner.")
@@ -387,5 +406,82 @@ mod tests {
         assert!(exchanges.limit().is_err());
         exchanges.requests.clear();
         exchanges.limit().unwrap();
+    }
+    #[test]
+    fn junk_requests_cannot_exhaust_the_budget_for_authenticated_parties() {
+        let mut exchanges = Exchanges::default();
+        let id = secret("bwp_");
+        let host = secret("bwh_");
+        let (salt, hash) = digest(&secret("bwi_"));
+        let device = secret("bw1_");
+        let (device_salt, device_hash) = digest(&device);
+        exchanges.entries.insert(
+            id.clone(),
+            Exchange {
+                offer: PairingOffer {
+                    version: 1,
+                    id: id.clone(),
+                    host_name: "Home".into(),
+                    model: "model".into(),
+                    salt,
+                    hash,
+                },
+                host_digest: host_digest(&id, &host),
+                expires_at: unix_epoch_millis() + 60_000,
+                candidate: Some(PairingCandidate {
+                    id: secret("bwd_"),
+                    name: "Laptop".into(),
+                    salt: device_salt,
+                    hash: device_hash,
+                }),
+                failures: 0,
+                state: "review".into(),
+                session_id: None,
+            },
+        );
+        for _ in 0..1200 {
+            assert!(exchanges.get(&secret("bwp_")).is_err());
+        }
+        let busy = |error: RelayApiError| error.status == StatusCode::TOO_MANY_REQUESTS;
+        assert!(exchanges.get(&secret("bwp_")).is_err_and(busy));
+        assert!(exchanges.host(&id, "bwh_wrong").is_err_and(busy));
+        assert!(exchanges.candidate(&id, "bw1_wrong").is_err_and(busy));
+        for _ in 0..10 {
+            exchanges.host(&id, &host).unwrap();
+            exchanges.candidate(&id, &device).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn junk_lookups_cannot_block_an_owner_from_revoking_a_device() {
+        let state = RelayState {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            config: RelayConfig::default(),
+            ownership: Arc::new(OwnershipStore::memory()),
+            pairing: Arc::new(tokio::sync::Mutex::new(Exchanges::default())),
+            revocations: Arc::new(AtomicU64::new(0)),
+            reserved: Arc::new(AtomicUsize::new(0)),
+        };
+        let device = secret("bws_");
+        let owner = secret("bwh_");
+        state.ownership.claim(&device, &owner).unwrap();
+        for _ in 0..1200 {
+            assert!(state.pairing.lock().await.get(&secret("bwp_")).is_err());
+        }
+        let headers = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, format!("Bearer {key}").parse().unwrap());
+            headers
+        };
+        let busy = |error: RelayApiError| error.status == StatusCode::TOO_MANY_REQUESTS;
+        let attempt =
+            |id: String, key: String| revoke(State(state.clone()), Path(id), headers(&key));
+        assert!(attempt(device.clone(), secret("bwh_"))
+            .await
+            .is_err_and(busy));
+        assert!(attempt(secret("bws_"), secret("bwh_"))
+            .await
+            .is_err_and(busy));
+        attempt(device.clone(), owner.clone()).await.unwrap();
+        assert!(state.ownership.claim(&device, &owner).is_err());
     }
 }

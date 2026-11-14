@@ -17,8 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Settings skills are easier to manage with compact searchable rows, accessible enable switches,
   visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
   and a tighter segmented range control.
+- **Breaking for relay operators:** `blackwall-relay` now refuses to start when
+  `BLACKWALL_RELAY_BIND` is not a loopback address and `BLACKWALL_RELAY_TOKEN` is unset or empty.
+  Set `BLACKWALL_RELAY_TOKEN` to a long random secret on the relay, and give the same value to
+  sharing hosts. Without it anyone could register sessions or create pairing invitations and use up
+  the permanent address ledger. The `deploy/relay` Compose setup already requires the token;
+  loopback-only development relays may still run without one.
 ### Fixed
 
+- The relay no longer pauses guest traffic while it saves a new address to disk, and a host
+  refused because the relay is full no longer reserves an address. Its pairing request limit now
+  counts only new invitations, failed lookups or credentials, and revocations of unknown
+  addresses. Junk requests can no longer block an authenticated host or device from checking
+  pairing status or results, or an owner from revoking a device.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
