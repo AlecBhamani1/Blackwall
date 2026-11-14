@@ -32,7 +32,14 @@ fn run() -> Result<(), StartupError> {
     identity::configure_acceptance_webviews(context.config_mut());
     #[cfg(target_os = "macos")]
     lifecycle::adopt_login_path();
+    let dev_url = context.config().build.dev_url.clone();
     let builder = tauri::Builder::default()
+        // Backstop for page content: webviews may only navigate within the app itself.
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("navigation-guard")
+                .on_navigation(move |_, url| is_app_url(url, dev_url.as_ref()))
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -172,6 +179,16 @@ fn run() -> Result<(), StartupError> {
     Ok(())
 }
 
+/// The bundled UI's own origins; the dev server is trusted only in debug builds.
+fn is_app_url(url: &tauri::Url, dev_url: Option<&tauri::Url>) -> bool {
+    let bundled = match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => url.host_str() == Some("tauri.localhost"),
+        _ => false,
+    };
+    bundled || (cfg!(debug_assertions) && dev_url.is_some_and(|dev| dev.origin() == url.origin()))
+}
+
 #[derive(Debug, Error)]
 enum StartupError {
     #[error("{0}")]
@@ -180,4 +197,50 @@ enum StartupError {
     ModelClient(#[from] reqwest::Error),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_url;
+    use tauri::Url;
+
+    fn allowed(url: &str, dev: Option<&str>) -> bool {
+        let dev = dev.map(|dev| Url::parse(dev).unwrap());
+        is_app_url(&Url::parse(url).unwrap(), dev.as_ref())
+    }
+
+    #[test]
+    fn navigation_stays_on_the_app() {
+        for url in [
+            "tauri://localhost/",
+            "tauri://localhost/index.html#chat",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/settings",
+        ] {
+            assert!(allowed(url, None), "{url}");
+        }
+        for url in [
+            "https://evil.example/unlock",
+            "http://localhost/",
+            "https://tauri.localhost.evil.example/",
+            "tauri://evil/",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<p>x</p>",
+            "about:blank",
+        ] {
+            assert!(!allowed(url, None), "{url}");
+        }
+    }
+
+    #[test]
+    fn dev_server_is_only_trusted_in_debug_builds() {
+        let dev = Some("http://127.0.0.1:1420");
+        assert_eq!(
+            allowed("http://127.0.0.1:1420/", dev),
+            cfg!(debug_assertions)
+        );
+        assert!(!allowed("http://127.0.0.1:1421/", dev));
+        assert!(!allowed("http://127.0.0.1:1420/", None));
+    }
 }
