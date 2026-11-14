@@ -27,6 +27,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
+- The macOS sandbox now protects configured extra instruction files (and their leading folders)
+  from sandboxed writes; denies `~/.git-credentials`, `~/.docker`, `~/.kube` and shell histories;
+  and keeps local Unix sockets closed when network access is on, so sandboxed commands can no
+  longer reach Docker, `ssh-agent` or other socket-based services.
 
 ### Added
 
