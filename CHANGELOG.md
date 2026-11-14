@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Web page approval prompts now show the full request URL, including its query string, so data
+  placed in a link is visible before you approve the request. URLs too long to show in full
+  (over 2,048 characters) are refused instead of being partly hidden.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
@@ -27,6 +30,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
+- `/review` no longer runs Git filter commands (`filter.<name>.clean`/`smudge`/`process`) from the
+  repository's or a submodule's config, reviews only the agent's project directory instead of the
+  whole enclosing repository, and honors the owner's global `core.excludesFile` when listing
+  untracked files.
 - In an interactive `bw` terminal on macOS and Linux, lines typed or pasted before an approval
   prompt appears, including `/` commands, are discarded instead of answering it. On Windows,
   only lines `bw` has already read are discarded. Piped input still answers prompts in order.
