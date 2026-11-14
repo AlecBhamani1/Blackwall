@@ -3217,7 +3217,8 @@ else:
             use std::os::unix::fs::PermissionsExt;
             // Only locations the profile lets the sandbox read, and only executables there.
             let readable = ["/opt/homebrew", "/usr"];
-            let directories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+            // `/usr/bin/python3` is Apple's developer-tools shim; its real runtime lives elsewhere.
+            let directories = ["/opt/homebrew/bin", "/usr/local/bin"];
             for (program, script) in [
                 (
                     "python3",
