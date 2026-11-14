@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Lock now always locks, even when recent changes failed to save or a save hangs. The lock
+  screen warns that changes were not saved; after unlocking, the unsaved conversation comes back
+  with a retry banner so it can still be saved or exported.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as

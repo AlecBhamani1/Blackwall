@@ -546,3 +546,31 @@ it('shows the real error after a keyring retry fails instead of the keyring mess
   expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled();
   expect(screen.queryByText(KEYRING_NEEDED)).not.toBeInTheDocument();
 });
+
+it('locks even when saves fail and warns on the lock screen', async () => {
+  const user = userEvent.setup();
+  const fallback = native.invoke.getMockImplementation();
+  let locked = false;
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command === 'save_session') throw new Error('disk full');
+    if (command === 'lock_app') {
+      locked = true;
+      return { locked: true, enabled: true, keyring: true, keyringNeeded: false };
+    }
+    if (command === 'auth_status')
+      return { locked, enabled: true, keyring: true, keyringNeeded: false };
+    return fallback?.(command, args);
+  });
+  render(App);
+  const input = await screen.findByRole('textbox', { name: 'Message Blackwall' });
+  await screen.findByRole('combobox', { name: 'Model' });
+  await user.type(input, 'Unsaved secret{Enter}');
+  expect(await screen.findByText(/could not be saved/)).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Open settings' }));
+  await user.click(screen.getByRole('button', { name: /^Lock/ }));
+  await user.click(screen.getByRole('button', { name: 'Lock now' }));
+  expect(await screen.findByLabelText('Passphrase')).toBeVisible();
+  expect(locked).toBe(true);
+  expect(screen.getByRole('alert')).toHaveTextContent('not saved before locking');
+  expect(screen.queryByText('Unsaved secret')).not.toBeInTheDocument();
+});
