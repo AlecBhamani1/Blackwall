@@ -34,6 +34,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repository's or a submodule's config, reviews only the agent's project directory instead of the
   whole enclosing repository, and honors the owner's global `core.excludesFile` when listing
   untracked files.
+- In an interactive `bw` terminal on macOS and Linux, lines typed or pasted before an approval
+  prompt appears, including `/` commands, are discarded instead of answering it. On Windows,
+  only lines `bw` has already read are discarded. Piped input still answers prompts in order.
 
 ### Added
 
