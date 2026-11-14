@@ -19,6 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Pairing: when a joining computer cannot save an approved pairing (for example, no keyring), the
+  status page shows a warning instead of failing, and Cancel now clears the request, even offline.
+  One host device that fails to restore no longer hides the other paired devices or fails actions
+  on them.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
