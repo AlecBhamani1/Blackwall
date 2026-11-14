@@ -27,6 +27,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
+- In an interactive `bw` terminal on macOS and Linux, lines typed or pasted before an approval
+  prompt appears, including `/` commands, are discarded instead of answering it. On Windows,
+  only lines `bw` has already read are discarded. Piped input still answers prompts in order.
 
 ### Added
 
