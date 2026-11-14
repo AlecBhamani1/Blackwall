@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Web page approval prompts now show the full request URL, including its query string, so data
+  placed in a link is visible before you approve the request. URLs too long to show in full
+  (over 2,048 characters) are refused instead of being partly hidden.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
