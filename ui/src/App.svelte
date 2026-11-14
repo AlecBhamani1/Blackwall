@@ -113,10 +113,13 @@
     if (authBusy) return;
     authBusy = true;
     try {
-      await controller.suspend();
+      const saved = await controller.suspend();
       booted = false;
       stopPairing();
       authStatus.set(await authClient.lock());
+      if (!saved)
+        lockError =
+          'Some recent changes were not saved before locking. Unlock to get the conversation back, then retry saving or export it.';
     } catch (cause) {
       const message = authError(cause);
       if (!booted) await initializeApp();

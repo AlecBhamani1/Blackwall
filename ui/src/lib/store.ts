@@ -42,6 +42,7 @@ const ENDPOINT_STORAGE_KEY = 'blackwall.endpoint.v1';
 const CONTEXT_STORAGE_KEY = 'blackwall.context-preferences.v1';
 const CONNECTIONS_STORAGE_KEY = 'blackwall.connections.v1';
 const MAX_SAVED_SESSIONS = 30;
+const LOCK_SAVE_WAIT_MS = 2000;
 // The backend's answer when an approval expired or its run ended (approvals.rs `resolve`).
 const APPROVAL_GONE = 'This approval is no longer active.';
 
@@ -333,22 +334,50 @@ export function createChatController(
   const pendingWrites: Array<() => Promise<void>> = [];
   let drainingWrites = false;
   let writeFailed = false;
+  // Bumped when a hung drain is abandoned so its late result cannot touch the queue.
+  let drainRun = 0;
+  // A drain abandoned at lock whose native write may still land; newer writes wait for it.
+  let abandonedWrite: Promise<void> | undefined;
+  // An unsaved conversation kept off screen while locked and restored after unlock.
+  let heldSession:
+    | {
+        id: string;
+        summary?: SessionSummary;
+        messages: ChatMessage[];
+        contextState?: ContextState;
+        contextReport?: ContextReport;
+        workspace: string;
+        agentMode: boolean;
+      }
+    | undefined;
+  function failWrites() {
+    writeFailed = true;
+    persistenceError.set(
+      'Your latest changes could not be saved. Check disk space and folder permissions, then retry. Keep Blackwall open to retry saving or export this conversation.',
+    );
+  }
   async function drainWrites() {
+    const run = ++drainRun;
     drainingWrites = true;
     try {
+      const prior = abandonedWrite;
+      if (prior) {
+        // Until it settles the error stays up; a late older snapshot must not overwrite newer ones.
+        await prior;
+        if (abandonedWrite === prior) abandonedWrite = undefined;
+        if (run !== drainRun) return;
+      }
       while (pendingWrites.length) {
         await pendingWrites[0]();
+        if (run !== drainRun) return;
         pendingWrites.shift();
       }
       writeFailed = false;
       persistenceError.set('');
     } catch {
-      writeFailed = true;
-      persistenceError.set(
-        'Your latest changes could not be saved. Check disk space and folder permissions, then retry. Keep Blackwall open to retry saving or export this conversation.',
-      );
+      if (run === drainRun) failWrites();
     } finally {
-      drainingWrites = false;
+      if (run === drainRun) drainingWrites = false;
     }
   }
   function queueWrite(operation: () => Promise<void>) {
@@ -375,7 +404,21 @@ export function createChatController(
           storage.preferences(),
         ]);
         if (destroyed) return;
-        sessions.set(savedSessions);
+        const held = heldSession;
+        heldSession = undefined;
+        sessions.set(
+          held?.summary
+            ? [held.summary, ...savedSessions.filter((item) => item.id !== held.summary?.id)]
+            : savedSessions,
+        );
+        if (held) {
+          messages.set(held.messages);
+          contextState.set(held.contextState);
+          contextReport.set(held.contextReport);
+          workspace.set(held.workspace);
+          agentMode.set(held.agentMode);
+          activeSessionId.set(held.id);
+        }
         const connections =
           savedPreferences.connections === undefined && !savedPreferences.endpoint
             ? undefined
@@ -427,7 +470,7 @@ export function createChatController(
                 }
               : {}),
           });
-        persistenceError.set('');
+        if (!writeFailed) persistenceError.set('');
       } catch {
         persistenceError.set(
           'Your saved conversations could not be opened. Existing data has been left in place. Restart Blackwall after checking disk space and folder permissions.',
@@ -624,7 +667,7 @@ export function createChatController(
         ? preferred
         : deferModel
           ? ''
-          : catalog[0]?.id ?? '';
+          : (catalog[0]?.id ?? '');
       selectedModel.set(choice);
       if (configuredEndpoint) {
         const normalized = normalizeEndpoint(configuredEndpoint);
@@ -1298,15 +1341,38 @@ export function createChatController(
       closeRecall();
     }
   }
-  async function suspend(): Promise<void> {
+  async function suspend(): Promise<boolean> {
     closeRecall();
     stop();
     connectionAttempt += 1;
     sessionNavigation += 1;
-    await saves;
-    if (pendingWrites.length)
-      throw new Error('Retry saving or export your conversation before locking Blackwall.');
-    releaseMessagePreviews(get(messages));
+    // Lock even if saves fail or hang: a slow disk must not keep the conversation on screen.
+    let waited: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      saves,
+      new Promise<void>((resolve) => (waited = setTimeout(resolve, LOCK_SAVE_WAIT_MS))),
+    ]);
+    clearTimeout(waited);
+    if (drainingWrites) {
+      // Give up on the hung save; Retry re-runs it after unlock.
+      drainRun += 1;
+      drainingWrites = false;
+      abandonedWrite = saves;
+      saves = Promise.resolve();
+      failWrites();
+    }
+    const saved = pendingWrites.length === 0;
+    if (!saved && get(messages).length) {
+      heldSession = {
+        id: get(activeSessionId),
+        summary: get(sessions).find((item) => item.id === get(activeSessionId)),
+        messages: get(messages),
+        contextState: get(contextState),
+        contextReport: get(contextReport),
+        workspace: get(workspace),
+        agentMode: get(agentMode),
+      };
+    } else releaseMessagePreviews(get(messages));
     focusedMessageId.set(undefined);
     messages.set([]);
     contextState.set(undefined);
@@ -1324,6 +1390,7 @@ export function createChatController(
     connectionState.set('checking');
     storageReady = !native;
     storageInitialization = null;
+    return saved;
   }
 
   function destroy(): void {
@@ -1332,6 +1399,7 @@ export function createChatController(
     destroyed = true;
     connectionAttempt += 1;
     releaseMessagePreviews(get(messages));
+    if (heldSession) releaseMessagePreviews(heldSession.messages);
   }
 
   return {

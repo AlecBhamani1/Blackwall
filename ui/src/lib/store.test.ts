@@ -1139,15 +1139,128 @@ describe('native conversation persistence', () => {
     expect(get(controller.persistenceError)).toBe('');
     expect(get(controller.sessions)).toEqual([]);
   });
-  it('retains unsaved content if locking would discard it', async () => {
+  it('locks when saves fail, then restores the conversation for retry and export', async () => {
     const storage = await nativeStorage();
     storage.save.mockRejectedValue(new Error('disk full'));
     const controller = createChatController(mockClient(), storage);
+    const { agentClient } = await import('./agent');
+    const exported = vi.spyOn(agentClient, 'export').mockResolvedValue(true);
     await controller.initialize();
     await controller.send('Do not lose this', []);
     await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
-    await expect(controller.suspend()).rejects.toThrow('before locking');
+    const id = get(controller.activeSessionId);
+    await expect(controller.suspend()).resolves.toBe(false);
+    expect(get(controller.messages)).toEqual([]);
+    expect(get(controller.sessions)).toEqual([]);
+    await controller.initialize();
+    expect(get(controller.persistenceError)).toContain('could not be saved');
+    expect(get(controller.activeSessionId)).toBe(id);
     expect(get(controller.messages)[0].content).toBe('Do not lose this');
+    expect(get(controller.sessions).map((session) => session.id)).toEqual([id]);
+    await controller.exportConversation();
+    expect(exported).toHaveBeenCalledWith(expect.objectContaining({ id }));
+    storage.save.mockClear();
+    storage.save.mockResolvedValue(undefined);
+    await controller.retryPersistence();
+    expect(storage.save).toHaveBeenCalledWith(expect.objectContaining({ id }));
+    expect(get(controller.persistenceError)).toBe('');
+    exported.mockRestore();
+    controller.destroy();
+  });
+  it('locks past a hung save and lets retry recover after unlock', async () => {
+    const storage = await nativeStorage();
+    const controller = createChatController(mockClient(), storage);
+    await controller.initialize();
+    type Snapshot = { messages: Array<{ content: string; status?: string }> };
+    const signature = (session: Snapshot) =>
+      JSON.stringify(session.messages.map((m) => [m.content, m.status]));
+    const commits: string[] = [];
+    let finishHung!: () => void;
+    let hungSnapshot = '';
+    storage.save.mockImplementationOnce(
+      (session: Snapshot) =>
+        new Promise<void>(
+          (resolve) =>
+            (finishHung = () => {
+              hungSnapshot = signature(session);
+              commits.push(hungSnapshot);
+              resolve();
+            }),
+        ),
+    );
+    await controller.send('Hung save', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    const id = get(controller.activeSessionId);
+    vi.useFakeTimers();
+    try {
+      const locked = controller.suspend();
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(locked).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(get(controller.messages)).toEqual([]);
+    await controller.initialize();
+    expect(get(controller.persistenceError)).toContain('could not be saved');
+    expect(get(controller.messages)[0].content).toBe('Hung save');
+    // The abandoned save is still in flight natively: retry must let it land before newer snapshots.
+    storage.save.mockClear();
+    storage.save.mockImplementation(async (session: Snapshot) => {
+      commits.push(signature(session));
+    });
+    const retried = controller.retryPersistence();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(storage.save).not.toHaveBeenCalled();
+    expect(get(controller.persistenceError)).toContain('could not be saved');
+    finishHung();
+    await retried;
+    expect(commits[0]).toBe(hungSnapshot);
+    expect(commits.at(-1)).toBe(signature({ messages: get(controller.messages) }));
+    expect(commits.at(-1)).not.toBe(hungSnapshot);
+    expect(storage.save).toHaveBeenLastCalledWith(expect.objectContaining({ id }));
+    expect(get(controller.persistenceError)).toBe('');
+    storage.save.mockClear();
+    await controller.send('After recovery', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    await vi.waitFor(() =>
+      expect(storage.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          id,
+          messages: expect.arrayContaining([
+            expect.objectContaining({ content: 'After recovery' }),
+          ]),
+        }),
+      ),
+    );
+    controller.destroy();
+  });
+  it('keeps retry reporting while a save abandoned at lock never settles', async () => {
+    const storage = await nativeStorage();
+    const controller = createChatController(mockClient(), storage);
+    await controller.initialize();
+    storage.save.mockImplementationOnce(() => new Promise<void>(() => {}));
+    await controller.send('Stuck forever', []);
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    vi.useFakeTimers();
+    try {
+      const locked = controller.suspend();
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(locked).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    await controller.initialize();
+    storage.save.mockClear();
+    storage.save.mockResolvedValue(undefined);
+    let settled = false;
+    void controller.retryPersistence().then(() => (settled = true));
+    void controller.retryPersistence();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    expect(storage.save).not.toHaveBeenCalled();
+    expect(get(controller.persistenceError)).toContain('could not be saved');
+    expect(get(controller.messages)[0].content).toBe('Stuck forever');
+    controller.destroy();
   });
   it('keeps a failed save visible and exportable when starting a new chat', async () => {
     const storage = await nativeStorage();
