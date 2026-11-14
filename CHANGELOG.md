@@ -19,6 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Trace redaction with content capture on now also removes PEM private keys, single-quoted
+  `'key': 'value'` pairs, repeats of secrets whose line ended in a comma, and bare OpenAI,
+  Anthropic, GitHub and Slack tokens that match those providers' formats. Trace metadata
+  such as operation and tool names is no longer blanked when untrusted content labels it a secret;
+  content attributes can still be scrubbed of such a value.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
