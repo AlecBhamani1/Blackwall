@@ -19,6 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Approval prompts ignore input for a moment when they appear, so a click or Enter meant for the
+  previous prompt cannot answer the next one. Several waiting approvals are shown one after another
+  instead of the latest replacing the others, prompts stay visible while connection setup is open,
+  and an expired prompt is removed instead of showing an error that the next prompt inherits.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
