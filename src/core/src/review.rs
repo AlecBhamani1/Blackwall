@@ -84,8 +84,8 @@ fn git_environment(command: &mut Command, path: &Path) {
         );
 }
 
-/// Dropping this future kills the Git child. Neither output pipe can grow unbounded.
-async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
+/// Git with the fixed environment and read-only options; `arguments` may begin with `-c` pairs.
+fn git_command(path: &Path, arguments: &[&str]) -> Command {
     let mut command = Command::new("git");
     git_environment(&mut command, path);
     command
@@ -102,6 +102,70 @@ async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    command
+}
+
+/// Repository config can name `filter.<name>.clean`/`smudge`/`process` commands that Git runs
+/// while reading the working tree. Every filter the config defines is emptied (and made optional)
+/// for each Git child; config keys go through `GIT_CONFIG_KEY_<n>`, so no name needs quoting.
+async fn git(path: &Path, arguments: &[&str]) -> Result<Vec<u8>, ReviewError> {
+    let keys = output(git_command(
+        path,
+        &["config", "-z", "--name-only", "--list"],
+    ))
+    .await?;
+    let filters = keys
+        .split(|b| *b == 0)
+        .filter_map(|key| key.strip_prefix(b"filter."))
+        .filter_map(|rest| Some(&rest[..rest.iter().rposition(|b| *b == b'.')?]))
+        .map(|name| std::str::from_utf8(name).map_err(|_| ReviewError::Git))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut command = git_command(path, arguments);
+    let mut count = 0;
+    for name in filters {
+        for (variable, value) in [
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        ] {
+            command
+                .env(
+                    format!("GIT_CONFIG_KEY_{count}"),
+                    format!("filter.{name}.{variable}"),
+                )
+                .env(format!("GIT_CONFIG_VALUE_{count}"), value);
+            count += 1;
+        }
+    }
+    command.env("GIT_CONFIG_COUNT", count.to_string());
+    output(command).await
+}
+
+/// The owner's `core.excludesFile`, read from their global config (or `global`) only. Every other
+/// Git child reads no global config.
+async fn owner_excludes_file(path: &Path, global: Option<&Path>) -> Option<String> {
+    let mut command = git_command(
+        path,
+        &[
+            "config",
+            "--global",
+            "--includes",
+            "--path",
+            "--get",
+            "core.excludesFile",
+        ],
+    );
+    match global {
+        Some(global) => command.env("GIT_CONFIG_GLOBAL", global),
+        None => command.env_remove("GIT_CONFIG_GLOBAL"),
+    };
+    let file = String::from_utf8(output(command).await.ok()?).ok()?;
+    Some(file.strip_suffix('\n').unwrap_or(&file).to_owned()).filter(|file| !file.is_empty())
+}
+
+/// Dropping this future kills the Git child. Neither output pipe can grow unbounded.
+async fn output(mut command: Command) -> Result<Vec<u8>, ReviewError> {
     let mut child = command.spawn().map_err(|_| ReviewError::Git)?;
     let mut stdout = child
         .stdout
@@ -156,13 +220,33 @@ impl ReviewSnapshot {
         target: &ReviewTarget,
         policy: Option<&Policy>,
     ) -> Result<Self, ReviewError> {
-        let root = git(path, &["rev-parse", "--show-toplevel"]).await?;
+        Self::collect_with(path, target, policy, None).await
+    }
+
+    /// `global` replaces the owner's global Git config when reading `core.excludesFile`.
+    async fn collect_with(
+        path: &Path,
+        target: &ReviewTarget,
+        policy: Option<&Policy>,
+        global: Option<&Path>,
+    ) -> Result<Self, ReviewError> {
+        let workspace = Workspace::open(path).map_err(|_| ReviewError::Git)?;
+        let root = git(&workspace.path, &["rev-parse", "--show-toplevel"]).await?;
         let root = std::str::from_utf8(&root).map_err(|_| ReviewError::Git)?;
         // Git appends exactly one newline; spaces/newlines in the directory are significant.
         let root = root.strip_suffix('\n').ok_or(ReviewError::Git)?;
-        let workspace = Workspace::open(Path::new(root)).map_err(|_| ReviewError::Git)?;
+        // The project must sit inside Git's worktree; `core.worktree` cannot point elsewhere.
+        let root = std::fs::canonicalize(root).map_err(|_| ReviewError::Git)?;
+        if !workspace.path.starts_with(&root) {
+            return Err(ReviewError::Git);
+        }
+        // `--relative` keeps every diff to the project, even inside a larger repository.
+        // `--ignore-submodules=dirty` keeps Git out of submodule working trees (a child `git
+        // status` there could run the submodule's own filters); gitlink commits still show.
         let mut arguments = vec![
             "diff",
+            "--relative",
+            "--ignore-submodules=dirty",
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
@@ -189,6 +273,7 @@ impl ReviewSnapshot {
                 // diff-tree --root handles root commits; merge commits compare to first parent.
                 arguments = vec![
                     "diff-tree",
+                    "--relative",
                     "--root",
                     "--no-commit-id",
                     "-r",
@@ -235,7 +320,7 @@ impl ReviewSnapshot {
         if unborn {
             let staged_names = git(
                 &workspace.path,
-                &["diff", "--cached", "--name-only", "-z", "--"],
+                &["diff", "--cached", "--relative", "--name-only", "-z", "--"],
             )
             .await?;
             for name in staged_names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
@@ -277,6 +362,8 @@ impl ReviewSnapshot {
             let mut staged = vec![
                 "diff",
                 "--cached",
+                "--relative",
+                "--ignore-submodules=dirty",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-color",
@@ -291,11 +378,15 @@ impl ReviewSnapshot {
         }
         let mut omitted = Vec::new();
         if matches!(target, ReviewTarget::Uncommitted) {
-            let untracked = git(
-                &workspace.path,
-                &["ls-files", "--others", "--exclude-standard", "-z", "--"],
-            )
-            .await?;
+            // Every other Git child reads no global config, so the owner's ignore file is passed on.
+            let excludes = owner_excludes_file(&workspace.path, global)
+                .await
+                .map(|file| format!("core.excludesFile={file}"));
+            let mut untracked = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+            if let Some(excludes) = &excludes {
+                untracked.splice(..0, ["-c", excludes.as_str()]);
+            }
+            let untracked = git(&workspace.path, &untracked).await?;
             let files = untracked
                 .split(|b| *b == 0)
                 .filter(|p| !p.is_empty())
@@ -717,6 +808,166 @@ mod tests {
             assert!(!repo.0.join(marker).exists());
         }
         assert!(snapshot.diff.contains("+after"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repository_filters_never_run() {
+        let repo = Repo::new();
+        repo.write("file", "before\n");
+        repo.commit();
+        let marker = repo.0.join("filter-ran");
+        let touch = format!("touch {}", marker.display());
+        for (key, value) in [
+            ("filter.fixture.clean", touch.as_str()),
+            ("filter.fixture.process", touch.as_str()),
+            ("filter.fixture.required", "true"),
+            ("filter.dotted.name.clean", touch.as_str()),
+        ] {
+            repo.git(&["config", key, value]);
+        }
+        repo.write(".gitattributes", "file filter=fixture\n");
+        fs::write(
+            repo.0.join(".git/info/attributes"),
+            "* filter=dotted.name\n",
+        )
+        .unwrap();
+        repo.write("file", "after, a longer line\n");
+        for target in [
+            ReviewTarget::Uncommitted,
+            ReviewTarget::Commit("HEAD".into()),
+        ] {
+            ReviewSnapshot::collect(&repo.0, &target, None)
+                .await
+                .unwrap();
+        }
+        let snapshot = ReviewSnapshot::collect(&repo.0, &ReviewTarget::Uncommitted, None)
+            .await
+            .unwrap();
+        assert!(snapshot.diff.contains("+after, a longer line"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn submodule_filters_never_run() {
+        let module = Repo::new();
+        module.write("file", "before\n");
+        module.commit();
+        let repo = Repo::new();
+        repo.write("file", "before\n");
+        repo.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            module.0.to_str().unwrap(),
+            "sub",
+        ]);
+        repo.commit();
+        // The parent repository owns (and removes) the submodule directory.
+        let sub = std::mem::ManuallyDrop::new(Repo(repo.0.join("sub")));
+        // The clone has no identity of its own; CI has no global one either.
+        sub.git(&["config", "user.email", "fixture@example.invalid"]);
+        sub.git(&["config", "user.name", "Fixture"]);
+        let marker = repo.0.join("filter-ran");
+        let touch = format!("touch {}", marker.display());
+        sub.git(&["config", "filter.sub.clean", &touch]);
+        sub.git(&["config", "filter.sub.process", &touch]);
+        sub.write(".gitattributes", "* filter=sub\n");
+        // Same size, new content: only a content check (through the filter) can see the change.
+        sub.write("file", "after!\n");
+        repo.write("file", "after\n");
+        let result = ReviewSnapshot::collect(&repo.0, &ReviewTarget::Uncommitted, None).await;
+        assert!(!marker.exists());
+        let snapshot = result.unwrap();
+        assert!(snapshot.diff.contains("+after"), "{}", snapshot.diff);
+        // A committed gitlink change is still evidence.
+        fs::remove_file(sub.0.join(".gitattributes")).unwrap();
+        sub.commit();
+        let snapshot = ReviewSnapshot::collect(&repo.0, &ReviewTarget::Uncommitted, None)
+            .await
+            .unwrap();
+        assert!(
+            snapshot.diff.contains("Subproject commit"),
+            "{}",
+            snapshot.diff
+        );
+    }
+
+    #[tokio::test]
+    async fn review_stays_inside_the_project_directory() {
+        let repo = Repo::new();
+        fs::create_dir(repo.0.join("project")).unwrap();
+        repo.write("outside", "before\n");
+        repo.write("project/inside", "before\n");
+        repo.commit();
+        repo.write("outside", "outside evidence\n");
+        repo.write("project/inside", "inside evidence\n");
+        repo.write("untracked-outside", "outside untracked\n");
+        repo.write("project/untracked", "inside untracked\n");
+        let project = repo.0.join("project");
+        let snapshot = ReviewSnapshot::collect(&project, &ReviewTarget::Uncommitted, None)
+            .await
+            .unwrap();
+        assert!(
+            snapshot.diff.contains("+inside evidence"),
+            "{}",
+            snapshot.diff
+        );
+        assert!(snapshot.diff.contains("1: inside untracked"));
+        assert!(!snapshot.diff.contains("outside"), "{}", snapshot.diff);
+        assert_eq!(
+            snapshot.paths,
+            BTreeSet::from(["inside".to_owned(), "untracked".to_owned()])
+        );
+        repo.commit();
+        let snapshot =
+            ReviewSnapshot::collect(&project, &ReviewTarget::Commit("HEAD".into()), None)
+                .await
+                .unwrap();
+        assert!(snapshot.diff.contains("+inside evidence"));
+        assert!(!snapshot.diff.contains("outside"), "{}", snapshot.diff);
+        // A `core.worktree` elsewhere cannot redirect the review away from the project.
+        let elsewhere = repo.0.with_extension("worktree");
+        fs::create_dir(&elsewhere).unwrap();
+        repo.git(&["config", "core.worktree", elsewhere.to_str().unwrap()]);
+        let result = ReviewSnapshot::collect(&repo.0, &ReviewTarget::Uncommitted, None).await;
+        fs::remove_dir(elsewhere).unwrap();
+        assert!(matches!(result, Err(ReviewError::Git)));
+    }
+
+    #[tokio::test]
+    async fn owner_global_excludes_file_still_applies() {
+        let repo = Repo::new();
+        repo.write("file", "before\n");
+        repo.commit();
+        repo.write("local.env", "TOKEN=globally ignored\n");
+        repo.write("notes.txt", "visible\n");
+        let owner = repo.0.join("owner");
+        fs::create_dir(&owner).unwrap();
+        fs::write(owner.join("ignore"), "*.env\nowner/\n").unwrap();
+        let global = owner.join("gitconfig");
+        let mut config = String::from("[core]\n\texcludesFile = ");
+        config.push_str(
+            &owner
+                .join("ignore")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+        );
+        fs::write(&global, config + "\n").unwrap();
+        let snapshot =
+            ReviewSnapshot::collect_with(&repo.0, &ReviewTarget::Uncommitted, None, Some(&global))
+                .await
+                .unwrap();
+        assert!(snapshot.diff.contains("1: visible"), "{}", snapshot.diff);
+        assert!(
+            !snapshot.diff.contains("globally ignored"),
+            "{}",
+            snapshot.diff
+        );
     }
 
     #[tokio::test]
