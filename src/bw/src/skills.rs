@@ -317,6 +317,8 @@ mod tests {
     }
 
     #[test]
+    // Windows file names cannot contain control characters, so this attack needs Unix.
+    #[cfg(unix)]
     fn store_warnings_about_escaped_file_names_are_filtered() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
