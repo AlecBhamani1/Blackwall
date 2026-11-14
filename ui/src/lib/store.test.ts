@@ -560,6 +560,24 @@ describe('chat controller', () => {
       content: 'Response stopped.',
     });
   });
+  it('does not send a stopped-reply placeholder back to the model', async () => {
+    const client = mockClient();
+    client.streamChat = vi.fn(
+      (_request, _callbacks, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new DOMException('Stopped', 'AbortError')));
+        }),
+    );
+    const controller = createChatController(client);
+    await controller.initialize();
+    await controller.send('First', []);
+    controller.stop();
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    client.streamChat = vi.fn().mockResolvedValue(undefined);
+    await controller.send('Second', []);
+    const request = vi.mocked(client.streamChat).mock.calls[0][0];
+    expect(request.messages.map((message) => message.content)).toEqual(['First', 'Second']);
+  });
   it('remembers the selected model separately for each named connection', async () => {
     const client = mockClient();
     client.discoverModels = vi.fn().mockResolvedValue([
@@ -1106,6 +1124,71 @@ describe('native conversation persistence', () => {
     await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
     await expect(controller.suspend()).rejects.toThrow('before locking');
     expect(get(controller.messages)[0].content).toBe('Do not lose this');
+  });
+  it('refuses to restart for an update while a task runs or a save is pending', async () => {
+    const storage = await nativeStorage();
+    storage.save.mockRejectedValue(new Error('disk full'));
+    const client = mockClient();
+    let finish = () => {};
+    client.streamChat = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const controller = createChatController(client, storage);
+    await controller.initialize();
+    await controller.send('Still working', []);
+    await expect(controller.prepareForRestart()).rejects.toThrow('Stop the current task');
+    finish();
+    await vi.waitFor(() => expect(get(controller.runState)).toBe('idle'));
+    await expect(controller.prepareForRestart()).rejects.toThrow('Retry saving');
+    storage.save.mockResolvedValue(undefined);
+    await controller.retryPersistence();
+    await expect(controller.prepareForRestart()).resolves.toBeUndefined();
+    client.streamChat = vi.fn().mockResolvedValue(undefined);
+    expect(await controller.send('Started during the download', [])).toBe(false);
+    expect(client.streamChat).not.toHaveBeenCalled();
+    controller.releaseRestart();
+    expect(await controller.send('After a failed install', [])).toBe(true);
+  });
+  it('keeps conversations unchanged while an update installs so relaunch cannot undo a delete', async () => {
+    const storage = await nativeStorage();
+    const saved = { id: 'saved', title: 'Saved', updatedAt: 1, messages: [] };
+    storage.list.mockResolvedValue([saved]);
+    const controller = createChatController(mockClient(), storage);
+    await controller.initialize();
+    await controller.send('Current', []);
+    await vi.waitFor(() => expect(storage.save).toHaveBeenCalled());
+    await controller.prepareForRestart();
+    storage.save.mockClear();
+    const active = get(controller.activeSessionId);
+    controller.removeSession('saved');
+    controller.removeSession(active);
+    expect(await controller.newChat()).toBe(false);
+    await controller.openSession('saved');
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(storage.save).not.toHaveBeenCalled();
+    expect(storage.load).not.toHaveBeenCalled();
+    expect(get(controller.sessions).map((session) => session.id)).toContain('saved');
+    expect(get(controller.activeSessionId)).toBe(active);
+    expect(get(controller.notice)).toBe('Blackwall is installing an update.');
+    controller.releaseRestart();
+    controller.removeSession('saved');
+    await vi.waitFor(() => expect(storage.remove).toHaveBeenCalledWith('saved'));
+  });
+  it('updates preferences already saved by a settings page without saving them again', async () => {
+    const storage = await nativeStorage();
+    const controller = createChatController(mockClient(), storage);
+    await controller.initialize();
+    storage.savePreferences.mockClear();
+    controller.savePreferences({ commandToolsIsolation: 'sandboxed' }, true);
+    expect(get(controller.preferences).commandToolsIsolation).toBe('sandboxed');
+    controller.savePreferences({ memoryEnabled: true });
+    await vi.waitFor(() =>
+      expect(storage.savePreferences).toHaveBeenCalledWith({ memoryEnabled: true }),
+    );
+    expect(storage.savePreferences.mock.calls).toEqual([[{ memoryEnabled: true }]]);
   });
   it('keeps a failed save visible and exportable when starting a new chat', async () => {
     const storage = await nativeStorage();

@@ -5,12 +5,17 @@ import { appUpdateClient, createAppUpdateController } from './updates';
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
+  relaunch: vi.fn(),
+  steps: [] as string[],
   resources: [] as Array<{ rid: number; close: ReturnType<typeof vi.fn> }>,
 }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }));
+vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: native.relaunch }));
 vi.mock('@tauri-apps/plugin-updater', () => ({
   Update: class {
     close = vi.fn().mockResolvedValue(undefined);
+    download = vi.fn(async () => void native.steps.push('download'));
+    install = vi.fn(async () => void native.steps.push('install'));
     constructor(metadata: { rid: number }) {
       Object.assign(this, metadata);
       native.resources.push(this as unknown as (typeof native.resources)[number]);
@@ -55,6 +60,50 @@ describe('app update controller', () => {
     await controller.installUpdate();
     expect(client.install).toHaveBeenCalledOnce();
     expect(get(controller.progress)).toEqual({ downloadedBytes: 100, totalBytes: 100 });
+  });
+
+  it('does not install when the app is not ready to restart', async () => {
+    const client = mockClient();
+    client.check = vi.fn().mockResolvedValue({ currentVersion: '0.1.0', version: '0.1.4' });
+    const controller = createAppUpdateController(client);
+    await controller.initialize();
+
+    const release = vi.fn();
+    await controller.installUpdate({
+      prepare: async () => {
+        throw new Error('Stop the current task before updating.');
+      },
+      release,
+    });
+
+    expect(client.install).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    expect(get(controller.state)).toBe('available');
+    expect(get(controller.error)).toBe('Stop the current task before updating.');
+  });
+
+  it('re-checks readiness after the download and releases the app if install fails', async () => {
+    const client = mockClient();
+    client.check = vi.fn().mockResolvedValue({ currentVersion: '0.1.0', version: '0.1.4' });
+    client.install = vi.fn(async (_onProgress, beforeInstall) => {
+      await beforeInstall?.();
+    });
+    const controller = createAppUpdateController(client);
+    await controller.initialize();
+    const prepare = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(
+        new Error('Retry saving or export your conversation before updating.'),
+      );
+    const release = vi.fn();
+
+    await controller.installUpdate({ prepare, release });
+
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledOnce();
+    expect(get(controller.state)).toBe('available');
+    expect(get(controller.error)).toContain('Retry saving');
   });
 
   it('keeps update failures inside the settings status', async () => {
@@ -161,6 +210,60 @@ describe('update channels', () => {
     expect(get(controller.error)).toContain('could not save');
     expect(get(controller.state)).toBe('error');
     storage.mockRestore();
+  });
+
+  it('re-checks readiness between the native download and install', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    native.steps.length = 0;
+    native.invoke.mockResolvedValue({ rid: 7, currentVersion: '0.1.0', version: '0.1.4' });
+    await appUpdateClient.check('stable');
+    const blocked = vi.fn(async () => {
+      native.steps.push('check');
+      throw new Error('Stop the current task before updating.');
+    });
+    await expect(appUpdateClient.install(vi.fn(), blocked)).rejects.toThrow('Stop the current');
+    expect(native.steps).toEqual(['download', 'check']);
+    expect(native.relaunch).not.toHaveBeenCalled();
+
+    native.steps.length = 0;
+    await appUpdateClient.install(vi.fn(), async () => void native.steps.push('check'));
+    expect(native.steps).toEqual(['download', 'check', 'install']);
+    expect(native.relaunch).toHaveBeenCalledOnce();
+    native.invoke.mockReset();
+  });
+
+  it('freezes settings saves from the start of an install until relaunch', async () => {
+    const { persistence } = await import('./persistence');
+    const { createChatController } = await import('./store');
+    let finishSave = () => {};
+    native.invoke.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    const inFlight = persistence.savePreferences({ memoryEnabled: true });
+    const chat = createChatController();
+    let ready = false;
+    const preparing = chat.prepareForRestart().then(() => (ready = true));
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(ready).toBe(false);
+    await expect(persistence.savePreferences({ memoryEnabled: false })).rejects.toBe(
+      'Blackwall is installing an update.',
+    );
+    chat.savePreferences({ contextWindow: 64000 });
+    expect(get(chat.preferences).contextWindow).not.toBe(64000);
+    finishSave();
+    await inFlight;
+    await preparing;
+    expect(native.invoke).toHaveBeenCalledOnce();
+
+    chat.releaseRestart();
+    native.invoke.mockResolvedValue(undefined);
+    await persistence.savePreferences({ memoryEnabled: false });
+    expect(native.invoke).toHaveBeenCalledTimes(2);
+    chat.destroy();
+    native.invoke.mockReset();
   });
 
   it('routes native checks by channel and closes resources from out-of-order replies', async () => {

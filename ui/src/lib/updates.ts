@@ -86,7 +86,10 @@ export const appUpdateClient = {
     };
   },
 
-  async install(onProgress: (progress: AppUpdateProgress) => void): Promise<void> {
+  async install(
+    onProgress: (progress: AppUpdateProgress) => void,
+    beforeInstall?: () => Promise<void>,
+  ): Promise<void> {
     if (!pendingUpdate) throw new Error('Check for updates before installing.');
     let downloadedBytes = 0;
     let totalBytes: number | undefined;
@@ -102,7 +105,10 @@ export const appUpdateClient = {
       }
     };
 
-    await pendingUpdate.downloadAndInstall(handleEvent);
+    await pendingUpdate.download(handleEvent);
+    // The download can take a while; re-check that restarting is still safe.
+    await beforeInstall?.();
+    await pendingUpdate.install();
     await pendingUpdate.close();
     pendingUpdate = null;
     const { relaunch } = await import('@tauri-apps/plugin-process');
@@ -173,14 +179,19 @@ export function createAppUpdateController(client: AppUpdateClient = appUpdateCli
     await checkForUpdates();
   }
 
-  async function installUpdate(): Promise<void> {
+  async function installUpdate(restart?: {
+    prepare: () => Promise<void>;
+    release: () => void;
+  }): Promise<void> {
     if (get(state) !== 'available') return;
     state.set('downloading');
     error.set('');
     progress.set({ downloadedBytes: 0 });
     try {
-      await client.install((next) => progress.set(next));
+      await restart?.prepare();
+      await client.install((next) => progress.set(next), restart?.prepare);
     } catch (cause) {
+      restart?.release();
       error.set(errorMessage(cause));
       state.set(get(update) ? 'available' : 'error');
     }

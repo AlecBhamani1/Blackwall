@@ -19,6 +19,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Saving command tool isolation or the memory toggle in Settings updates the Rules page's sandbox
+  statement without a restart.
+- Installing an app update is refused while a task is running or a conversation save has failed,
+  and is checked again after the download. From the start of the install until relaunch, new tasks,
+  starting, opening or deleting conversations, and settings saves are blocked, and saves already
+  under way finish first.
+- A reply stopped before any text arrived is no longer sent back to the model as "Response stopped.".
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
