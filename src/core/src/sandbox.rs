@@ -723,9 +723,10 @@ fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
 (allow process-exec process-fork)
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
-; Block session/group escape through both direct syscalls and posix_spawn attributes.
+; Block direct session/group escape (setpgid, setsid). posix_spawn stays allowed for Node and
+; Python; cancellation stops its detached children by walking descendants.
 ; Darwin syscall numbers are stable on supported Intel and Apple Silicon macOS.
-(deny syscall-unix (syscall-number 82) (syscall-number 147) (syscall-number 244))
+(deny syscall-unix (syscall-number 82) (syscall-number 147))
 (allow sysctl-read)
 (allow file-read-metadata)
 (allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt/homebrew") (subpath "/Library/Apple") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
@@ -3140,8 +3141,8 @@ else:
                     .unwrap();
                 assert!(result.ends_with("-1"), "{escape}: {result}");
             }
-            // posix_spawn can change group/session inside the kernel without calling setsid.
-            // Exercise that distinct escape path with a small native fixture.
+            // posix_spawn can still start a child in a new group or session. Cancelling the run
+            // must also stop that child while its spawner is alive.
             let source = project.workspace.path.join("spawn.c");
             std::fs::write(&source, include_str!("../tests/fixtures/sandbox_spawn.c")).unwrap();
             let status = std::process::Command::new("/usr/bin/cc")
@@ -3151,8 +3152,102 @@ else:
                 .status()
                 .unwrap();
             assert!(status.success());
-            project.run("./spawn-probe").await.unwrap();
-            assert!(!project.workspace.path.join("escaped-spawn").exists());
+            let mut run = Box::pin(project.run("./spawn-probe"));
+            let path = |name: &str| project.workspace.path.join(name);
+            tokio::select! {
+                result = &mut run => panic!("command ended before cancellation: {result:?}"),
+                _ = async {
+                    for _ in 0..200 {
+                        if ["spawned", "tried-setsid", "tried-setpgroup"]
+                            .iter()
+                            .all(|name| path(name).exists())
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("detached children never started");
+                } => {}
+            }
+            let pids = std::fs::read_to_string(path("spawned")).unwrap();
+            let pids: Vec<&str> = pids.split(' ').collect();
+            let state = |pid: &str| {
+                let output = std::process::Command::new("/bin/ps")
+                    .args(["-o", "pgid=,stat=", "-p", pid])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            };
+            // Both children lead their own group, apart from the spawner's; the first also leads
+            // a new session.
+            let parent_group = state(pids[0]).split_whitespace().next().unwrap().to_owned();
+            for (pid, session) in [(pids[1], true), (pids[2], false)] {
+                let state = state(pid);
+                let mut fields = state.split_whitespace();
+                assert_eq!(fields.next(), Some(pid), "{state}");
+                assert_ne!(pid, parent_group);
+                assert_eq!(fields.next().unwrap().contains('s'), session, "{state}");
+            }
+            drop(run);
+            for pid in &pids[1..] {
+                let mut seen = state(pid);
+                for _ in 0..100 {
+                    if seen.is_empty() || seen.ends_with('Z') {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    seen = state(pid);
+                }
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", pid])
+                    .status();
+                assert!(
+                    seen.is_empty() || seen.ends_with('Z'),
+                    "{pid} survived: {seen}"
+                );
+            }
+            for mode in ["setsid", "setpgroup"] {
+                assert!(!project.root.join(format!("outside-{mode}")).exists());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_profiles_allow_node_and_python_child_processes() {
+            let project = Project::new(ExecutionProfile::ReadOnly);
+            use std::os::unix::fs::PermissionsExt;
+            // Only locations the profile lets the sandbox read, and only executables there.
+            let readable = ["/opt/homebrew", "/usr"];
+            let directories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+            for (program, script) in [
+                (
+                    "python3",
+                    "-c 'import subprocess; print(subprocess.run([\"/bin/echo\", \"child-ok\"], capture_output=True, text=True).stdout)'",
+                ),
+                (
+                    "node",
+                    "-e 'console.log(require(\"child_process\").execFileSync(\"/bin/echo\", [\"child-ok\"]).toString())'",
+                ),
+            ] {
+                let found = directories.iter().find_map(|directory| {
+                    let path = Path::new(directory).join(program);
+                    let real = std::fs::canonicalize(&path).ok()?;
+                    let executable = real.metadata().ok()?.permissions().mode() & 0o111 != 0;
+                    (executable && readable.iter().any(|root| real.starts_with(root)))
+                        .then_some(path)
+                });
+                let Some(program) = found else {
+                    eprintln!("skipped {program}: no executable in {directories:?}");
+                    continue;
+                };
+                let output = project
+                    .run(&format!("'{}' {script}", program.display()))
+                    .await;
+                assert!(
+                    output.as_deref().is_ok_and(|text| text.contains("child-ok")),
+                    "{}: {output:?}",
+                    program.display()
+                );
+            }
         }
 
         #[tokio::test]

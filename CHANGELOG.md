@@ -24,6 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
   unavailable and directs users to the desktop app. See [Web access](docs/WEB_ACCESS.md) for bounds,
   search-provider evaluation, and the dated smoke matrix.
+- Restricted macOS commands can start Node and Homebrew Python child processes again. Stop,
+  cancellation and timeouts, and stopping an MCP server, also look for children started in a new
+  session or group and kill them. The search is bounded, so a child started after it, or one whose
+  parent already exited, can survive; it stays sandboxed.
+  See [Runtime guide](docs/RUNTIME_GUIDE.md).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
