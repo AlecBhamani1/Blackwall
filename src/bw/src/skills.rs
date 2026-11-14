@@ -1,5 +1,6 @@
 //! Owner review of learned skill proposals, and imports from other harnesses. These never call a
 //! model.
+use crate::project::safe;
 use blackwall_core::{
     skill_import, skill_suggest,
     skills::{SkillError, SkillStore},
@@ -33,11 +34,11 @@ pub async fn run(directory: &Path, args: &[String]) -> Result<(), String> {
                 if let Some(warning) = entry.warning {
                     println!("{} — {warning}", entry.skill.name);
                 } else {
-                    println!("{} — {}", entry.skill.name, entry.skill.description);
+                    println!("{} — {}", entry.skill.name, safe(&entry.skill.description));
                 }
             }
             for warning in warnings {
-                eprintln!("Skill: {warning}");
+                eprintln!("{}", warning_line("Skill", &warning));
             }
         }
         "remove" if args.len() == 2 => {
@@ -47,7 +48,7 @@ pub async fn run(directory: &Path, args: &[String]) -> Result<(), String> {
         "pending" if args.len() <= 1 => {
             let (proposals, warnings) = store.proposals().map_err(|e| e.to_string())?;
             for warning in warnings {
-                eprintln!("Skill proposal: {warning}");
+                eprintln!("{}", warning_line("Skill proposal", &warning));
             }
             if proposals.is_empty() {
                 println!("No pending skill proposals. Type /learn after a task to propose one.");
@@ -85,31 +86,36 @@ pub async fn run(directory: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Print a candidate with its license, bundled files, scan result, and conversion notes.
-fn describe(candidate: &skill_import::ImportCandidate) {
+/// A store warning for stderr. Warnings can quote file names from the skills folder.
+fn warning_line(label: &str, warning: &str) -> String {
+    format!("{label}: {}", safe(warning))
+}
+
+/// A candidate with its license, bundled files, scan result, and conversion notes. Skill text
+/// comes from third parties, so it is filtered before it reaches the terminal.
+fn describe(candidate: &skill_import::ImportCandidate) -> String {
     let Some(skill) = &candidate.skill else {
-        println!(
+        return safe(&format!(
             "{}: {}",
             candidate.source,
             candidate.error.as_deref().unwrap_or("Not a skill.")
-        );
-        return;
+        ));
     };
     let saved = if candidate.exists {
         " (a skill with this name is saved)"
     } else {
         ""
     };
-    println!(
+    let mut text = format!(
         "{} [{}] {}{saved}\n  {}",
         skill.name, candidate.origin, skill.description, candidate.source
     );
     if let Some(license) = &candidate.license {
-        println!("  License: {license}");
+        text.push_str(&format!("\n  License: {license}"));
     }
     if !candidate.files.is_empty() {
-        println!(
-            "  Bundled files ({}): {}",
+        text.push_str(&format!(
+            "\n  Bundled files ({}): {}",
             candidate.files.len(),
             candidate
                 .files
@@ -118,12 +124,15 @@ fn describe(candidate: &skill_import::ImportCandidate) {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
-    println!("{}", scan_summary(&candidate.findings));
+    let mut text = safe(&text);
+    text.push('\n');
+    text.push_str(&scan_summary(&candidate.findings));
     for note in &candidate.notes {
-        println!("  {note}");
+        text.push_str(&format!("\n  {}", safe(note)));
     }
+    text
 }
 
 /// Import one candidate, printing the outcome. Returns whether it was imported.
@@ -178,7 +187,7 @@ fn scan_summary(findings: &[blackwall_core::skill_scan::Finding]) -> String {
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .unwrap_or_default(),
-            finding.file,
+            safe(&finding.file),
             finding.line,
             finding.reason,
             crate::memory::visible(&finding.excerpt)
@@ -219,7 +228,7 @@ fn import(store: &SkillStore, args: &[String]) -> Result<(), String> {
     }
     let mut imported = 0;
     for candidate in &found {
-        describe(candidate);
+        println!("{}", describe(candidate));
         if !paths.is_empty() && import_one(store, candidate, replace, allow) {
             imported += 1;
         }
@@ -271,7 +280,7 @@ async fn get(store: &SkillStore, args: &[String]) -> Result<(), String> {
     skill_import::mark(store, &mut found);
     let candidate = found.first();
     if let Some(candidate) = candidate {
-        describe(candidate);
+        println!("{}", describe(candidate));
         import_one(store, candidate, replace, allow);
     }
     skill_suggest::discard(&source);
@@ -281,6 +290,55 @@ async fn get(store: &SkillStore, args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_strips_terminal_escapes_from_skill_text() {
+        let hidden = "\u{1b}[8m";
+        let candidate = skill_import::ImportCandidate {
+            origin: "Chosen".into(),
+            source: format!("/tmp/{hidden}x/SKILL.md"),
+            skill: Some(blackwall_core::skills::Skill {
+                name: "review-diff".into(),
+                description: format!("Review changes.{hidden}"),
+                body: "Read the diff.".into(),
+                enabled: true,
+                user_only: false,
+            }),
+            error: None,
+            notes: vec![format!("Converted.{hidden}")],
+            exists: false,
+            files: vec![format!("{hidden}notes.md")],
+            license: Some(format!("MIT{hidden}")),
+            findings: Vec::new(),
+        };
+        let text = describe(&candidate);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("Review changes.[8m") && text.contains("Scan: no issues found"));
+    }
+
+    #[test]
+    fn store_warnings_about_escaped_file_names_are_filtered() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "blackwall-skill-warnings-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".proposals")).unwrap();
+        std::fs::write(root.join("\u{1b}[8m.md"), "hidden").unwrap();
+        std::fs::write(root.join(".proposals/\u{1b}[8m.json"), "{}").unwrap();
+        let store = SkillStore::open_with_limit(&root, 32).unwrap();
+        let (_, listed) = store.list().unwrap();
+        let (_, pending) = store.proposals().unwrap();
+        assert!(listed[0].contains('\u{1b}') && pending[0].contains('\u{1b}'));
+        for warning in listed.iter().chain(&pending) {
+            let line = warning_line("Skill", warning);
+            assert!(!line.contains('\u{1b}') && line.contains("[8m"), "{line:?}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn import_keeps_saved_skills_unless_replacing() {

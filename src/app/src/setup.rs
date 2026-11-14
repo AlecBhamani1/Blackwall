@@ -5,7 +5,9 @@ use blackwall_core::{
 };
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::auth::AuthState;
 
 #[derive(Default)]
 pub struct SetupState {
@@ -21,8 +23,13 @@ struct ProgressEvent {
 }
 
 #[tauri::command]
-pub async fn discover_local_services() -> Vec<LocalService> {
-    connection::discover_local_services().await
+pub async fn discover_local_services(app: AppHandle) -> Result<Vec<LocalService>, String> {
+    discover(app.state::<AuthState>().inner()).await
+}
+
+async fn discover(auth: &AuthState) -> Result<Vec<LocalService>, String> {
+    auth.ensure_unlocked().await?;
+    Ok(connection::discover_local_services().await)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -36,8 +43,17 @@ pub struct DetectedServer {
 /// Which server answers at `endpoint`, and the context window it serves `model` with. The probe
 /// sends no credentials.
 #[tauri::command]
-pub async fn detect_server(endpoint: String, model: String) -> Result<DetectedServer, String> {
-    let endpoint = connection::normalize_endpoint(&endpoint).map_err(|e| e.to_string())?;
+pub async fn detect_server(
+    app: AppHandle,
+    endpoint: String,
+    model: String,
+) -> Result<DetectedServer, String> {
+    detect(app.state::<AuthState>().inner(), &endpoint, &model).await
+}
+
+async fn detect(auth: &AuthState, endpoint: &str, model: &str) -> Result<DetectedServer, String> {
+    auth.ensure_unlocked().await?;
+    let endpoint = connection::normalize_endpoint(endpoint).map_err(|e| e.to_string())?;
     let (kind, context_window) = connection::detect_endpoint(&endpoint, model.trim()).await;
     Ok(DetectedServer {
         kind,
@@ -89,11 +105,25 @@ const SANDBOX_DOCS: &str =
     "https://github.com/AlecBhamani1/Blackwall/blob/main/docs/RUNTIME_GUIDE.md#linux-sandbox";
 
 #[tauri::command]
-pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result<(), String> {
-    let target = match kind.as_str() {
+pub async fn open_setup_link(
+    app: AppHandle,
+    kind: String,
+    invitation: Option<String>,
+) -> Result<(), String> {
+    open_link(
+        app.state::<AuthState>().inner(),
+        &kind,
+        invitation.as_deref(),
+    )
+    .await
+}
+
+async fn open_link(auth: &AuthState, kind: &str, invitation: Option<&str>) -> Result<(), String> {
+    auth.ensure_unlocked().await?;
+    let target = match kind {
         "download" => OLLAMA_DOWNLOAD.to_owned(),
         "sandbox-docs" => SANDBOX_DOCS.to_owned(),
-        "invitation" => connection::validate_invitation(invitation.as_deref().unwrap_or_default())
+        "invitation" => connection::validate_invitation(invitation.unwrap_or_default())
             .map_err(|_| {
                 "Paste the complete invitation link from Blackwall, including its access key."
             })?
@@ -138,5 +168,24 @@ pub async fn open_setup_link(kind: String, invitation: Option<String>) -> Result
         Ok(())
     } else {
         Err("Your browser could not be opened. Open this link in your browser instead.".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn locked_app_does_not_probe_or_open_links() {
+        // A default auth state is locked until startup settles it.
+        let locked = AuthState::default();
+        let refused = |result: Result<(), String>| result.is_err_and(|e| e.contains("Unlock"));
+        assert!(refused(discover(&locked).await.map(drop)));
+        assert!(refused(
+            detect(&locked, "http://127.0.0.1:9", "model")
+                .await
+                .map(drop)
+        ));
+        assert!(refused(open_link(&locked, "download", None).await));
     }
 }
