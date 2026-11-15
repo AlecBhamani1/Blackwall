@@ -37,9 +37,10 @@ cargo run --release --manifest-path src/Cargo.toml --package blackwall-relay
 ```
 
 Put a TLS reverse proxy that supports WebSocket upgrades in front of `127.0.0.1:8787`. Public relay
-URLs must use HTTPS; plain HTTP is accepted only for loopback development. The relay token is
-optional at the process level, but a public deployment should always set one so strangers cannot
-register sessions and consume relay capacity.
+URLs must use HTTPS; plain HTTP is accepted only for loopback development. The relay refuses to
+start without `BLACKWALL_RELAY_TOKEN` unless `BLACKWALL_RELAY_BIND` is a loopback address
+(`127.0.0.0/8` or `[::1]`). Hosts must present the token to register sessions and create pairing
+invitations, so strangers cannot consume relay capacity.
 
 ## Verify a relay image locally
 
@@ -288,7 +289,10 @@ approved exchanges from ambiguous state.
 
 Pairing API version 1 is exposed under `/v1/pairing`, with a capability endpoint for older-relay
 detection. Limits are 4 KiB request bodies, 256 exchanges, five wrong invitation guesses, and 1,200
-exchange requests per minute across the deployment. The global cap works behind a TLS proxy without
-trusting client-supplied address headers; public operators still need suitable edge abuse controls.
+exchange requests per minute across the deployment. Authenticated status/result requests and an
+owner's revocation of a known address are not charged. The global cap works behind a TLS proxy
+without trusting client-supplied address headers; public operators still need suitable edge abuse
+controls. Creating an invitation requires the registration token, which a non-loopback relay
+always has.
 The desktop stores at most 20 device records and hosts at most four active/pending pairings. Removed
 relay reservations remain within the permanent 100,000-address ledger capacity.

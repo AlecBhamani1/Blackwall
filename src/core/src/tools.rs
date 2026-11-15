@@ -702,7 +702,7 @@ pub async fn execute(
 
 #[cfg(unix)]
 struct ProcessGroup(u32);
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         // Fixed executable and numeric process-group argument, never model-provided shell syntax.
@@ -712,6 +712,207 @@ impl Drop for ProcessGroup {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+#[cfg(target_os = "macos")]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + CLEANUP_LIMIT;
+        // An empty group has nothing left to walk from or kill: a detached child of a member that
+        // already exited belongs to launchd. This keeps a finished command at one cheap check.
+        if signal(Some(self.0), "-0", &[], deadline) == Some(false) {
+            return;
+        }
+        let found = stop_descendants(
+            || process_snapshot(deadline),
+            |pids| {
+                signal(Some(self.0), "-STOP", pids, deadline);
+            },
+            self.0,
+        );
+        kill_stopped(self.0, &found, signal);
+    }
+}
+/// How long cleanup may look for descendants before killing what it found.
+#[cfg(target_os = "macos")]
+const CLEANUP_LIMIT: Duration = Duration::from_secs(2);
+/// The limit for the kill, and for each fallback kill when that fails.
+#[cfg(any(target_os = "macos", test))]
+const KILL_LIMIT: Duration = Duration::from_secs(1);
+/// Fallback kills signal at most this many processes each, so one stuck `kill` strands few.
+#[cfg(any(target_os = "macos", test))]
+const KILL_BATCH: usize = 8;
+/// Kill `group` and the stopped processes `found` outside it, each attempt with its own limit. If
+/// the single kill cannot run in time, retry the group and small batches so none stays stopped.
+#[cfg(any(target_os = "macos", test))]
+fn kill_stopped(
+    group: u32,
+    found: &[u32],
+    mut signal: impl FnMut(Option<u32>, &str, &[u32], std::time::Instant) -> Option<bool>,
+) {
+    let deadline = || std::time::Instant::now() + KILL_LIMIT;
+    if signal(Some(group), "-KILL", found, deadline()).is_some() {
+        return;
+    }
+    signal(Some(group), "-KILL", &[], deadline());
+    for batch in found.chunks(KILL_BATCH) {
+        signal(None, "-KILL", batch, deadline());
+    }
+}
+/// Signal `group` and `pids` with fixed executable and numeric arguments, never model-provided
+/// shell syntax. `None` when `kill` could not run in time; otherwise whether every target existed.
+#[cfg(target_os = "macos")]
+fn signal(
+    group: Option<u32>,
+    signal: &str,
+    pids: &[u32],
+    deadline: std::time::Instant,
+) -> Option<bool> {
+    let mut args = vec![signal.to_owned(), "--".to_owned()];
+    args.extend(group.map(|group| format!("-{group}")));
+    args.extend(pids.iter().map(u32::to_string));
+    bounded("/bin/kill", &args, deadline).map(|(success, _)| success)
+}
+/// Run a fixed system tool, killing it at `deadline` so cleanup never hangs on it.
+#[cfg(target_os = "macos")]
+fn bounded(
+    program: &str,
+    args: &[String],
+    deadline: std::time::Instant,
+) -> Option<(bool, Vec<u8>)> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_end(&mut output);
+        }
+        let _ = send.send(output);
+    });
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    let output = receive.recv_timeout(remaining()).ok();
+    let status = loop {
+        match child.try_wait() {
+            Ok(None) if !remaining().is_zero() => std::thread::sleep(Duration::from_millis(5)),
+            Ok(status) => break status,
+            Err(_) => break None,
+        }
+    };
+    match (status, output) {
+        (Some(status), Some(output)) => Some((status.success(), output)),
+        _ => {
+            // Reap off this thread: a helper that ignores the kill must not hold up cleanup.
+            let _ = child.kill();
+            std::thread::spawn(move || child.wait());
+            None
+        }
+    }
+}
+/// A process identified by its ID and start time, so a reused ID is not mistaken for it.
+#[cfg(any(target_os = "macos", test))]
+type Process = (u32, String);
+/// One `ps` row: the process, its parent ID and its group ID.
+#[cfg(any(target_os = "macos", test))]
+type Row = (Process, u32, u32);
+#[cfg(target_os = "macos")]
+fn process_snapshot(deadline: std::time::Instant) -> Option<Vec<Row>> {
+    let args = ["-axo", "pid=,ppid=,pgid=,lstart="].map(str::to_owned);
+    let (true, listing) = bounded("/bin/ps", &args, deadline)? else {
+        return None;
+    };
+    let rows = String::from_utf8_lossy(&listing)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let mut number = || fields.next()?.parse().ok();
+            let (pid, parent, group) = (number()?, number()?, number()?);
+            Some(((pid, fields.collect::<Vec<_>>().join(" ")), parent, group))
+        })
+        .collect();
+    Some(rows)
+}
+/// Bounds the walk when descendants keep spawning faster than they are stopped.
+#[cfg(any(target_os = "macos", test))]
+const WALK_ROUNDS: usize = 16;
+/// macOS lets a command posix_spawn a child into a new session or group. Stop the group and every
+/// descendant found by parent links, walking again after each stop. Returns the IDs to kill
+/// besides the group: the descendants outside it in the last snapshot. Discovery is bounded
+/// (`WALK_ROUNDS` snapshots, and the caller's deadline), so a child spawned after the last
+/// snapshot can survive, as can one whose parent already exited, which belongs to launchd.
+///
+/// Expansion only starts from the group and from processes whose ID and start time still match.
+/// A stopped process cannot exit by itself, so its ID stays its own until the kill. The residual
+/// race: a process that exits between a snapshot and the stop sent from it can have its ID reused
+/// in that gap, and `ps` start times have one-second resolution.
+#[cfg(any(target_os = "macos", test))]
+fn stop_descendants(
+    mut snapshot: impl FnMut() -> Option<Vec<Row>>,
+    mut stop: impl FnMut(&[u32]),
+    group: u32,
+) -> Vec<u32> {
+    let mut stopped = std::collections::BTreeSet::new();
+    let mut last = Vec::new();
+    for round in 0..=WALK_ROUNDS {
+        // When `ps` fails or times out, kill the last snapshot's descendants: every stopped
+        // process that still existed then, and a stopped process cannot exit by itself.
+        let Some(rows) = snapshot() else { break };
+        let found = descendants(group, &rows, &stopped);
+        // The group signal already reaches its members, so only processes outside it are listed.
+        let outside = |process: &&Process| {
+            !rows
+                .iter()
+                .any(|(row, _, pgid)| row == *process && *pgid == group)
+        };
+        last = found
+            .iter()
+            .filter(outside)
+            .map(|process| process.0)
+            .collect();
+        let fresh: Vec<&Process> = found.difference(&stopped).collect();
+        if fresh.is_empty() || round == WALK_ROUNDS {
+            break;
+        }
+        let fresh: Vec<u32> = fresh
+            .into_iter()
+            .filter(outside)
+            .map(|process| process.0)
+            .collect();
+        stop(&fresh);
+        stopped.extend(found);
+    }
+    last
+}
+/// The members of `group`, still-running `known` processes, and all their descendants in `rows`.
+#[cfg(any(target_os = "macos", test))]
+fn descendants(
+    group: u32,
+    rows: &[Row],
+    known: &std::collections::BTreeSet<Process>,
+) -> std::collections::BTreeSet<Process> {
+    let mut found: std::collections::BTreeSet<Process> = rows
+        .iter()
+        .filter(|(process, _, pgid)| *pgid == group || known.contains(process))
+        .map(|(process, _, _)| process.clone())
+        .collect();
+    loop {
+        let children: Vec<Process> = rows
+            .iter()
+            .filter(|(process, parent, _)| {
+                !found.contains(process) && found.iter().any(|known| known.0 == *parent)
+            })
+            .map(|(process, _, _)| process.clone())
+            .collect();
+        if children.is_empty() {
+            return found;
+        }
+        found.extend(children);
     }
 }
 #[cfg(unix)]
@@ -900,10 +1101,12 @@ pub(crate) fn search_path() -> Option<std::ffi::OsString> {
 /// the program and its descendants, like a finished or cancelled shell command.
 #[cfg(any(unix, windows))]
 pub(crate) struct ServerProcess {
-    #[cfg(unix)]
-    _child: tokio::process::Child,
+    // Fields drop in order: the group walk must run while the server is alive, before
+    // `kill_on_drop` kills it and launchd adopts its detached children.
     #[cfg(unix)]
     _group: ProcessGroup,
+    #[cfg(unix)]
+    _child: tokio::process::Child,
     #[cfg(windows)]
     _child: Box<dyn process_wrap::tokio::ChildWrapper>,
 }
@@ -1269,6 +1472,153 @@ pub(crate) async fn run_with_input(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    fn row(pid: u32, start: &str, parent: u32, group: u32) -> Row {
+        ((pid, start.to_owned()), parent, group)
+    }
+
+    #[test]
+    fn descendant_walk_skips_a_reused_process_id() {
+        // Process 30 was stopped as a detached child; its ID now belongs to an unrelated process.
+        let known = [(30, "old".to_owned())].into();
+        let rows = [
+            row(10, "a", 1, 10),
+            row(20, "a", 10, 20),
+            row(30, "new", 1, 30),
+            row(31, "a", 30, 30),
+        ];
+        let found = descendants(10, &rows, &known);
+        assert_eq!(
+            found
+                .into_iter()
+                .map(|process| process.0)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
+    }
+
+    #[test]
+    fn descendant_walk_kills_what_appears_after_the_last_stop() {
+        // Each snapshot shows one more detached child, so the walk never settles.
+        let mut snapshots = 0;
+        let mut stops = 0;
+        let found = stop_descendants(
+            || {
+                snapshots += 1;
+                Some(
+                    (0..snapshots)
+                        .map(|i| row(100 + i, "a", if i == 0 { 1 } else { 99 + i }, 100 + i))
+                        .collect(),
+                )
+            },
+            |_| stops += 1,
+            100,
+        );
+        assert_eq!(stops, WALK_ROUNDS);
+        assert_eq!(snapshots, WALK_ROUNDS as u32 + 1);
+        assert_eq!(found.last(), Some(&(100 + WALK_ROUNDS as u32)));
+    }
+
+    #[test]
+    fn descendant_walk_kills_stopped_processes_when_ps_fails() {
+        let mut snapshots = 0;
+        let found = stop_descendants(
+            || {
+                snapshots += 1;
+                (snapshots == 1).then(|| vec![row(10, "a", 1, 10), row(20, "a", 10, 20)])
+            },
+            |_| {},
+            10,
+        );
+        // The group member 10 is covered by the group signal.
+        assert_eq!(found, [20]);
+    }
+
+    #[test]
+    fn failed_kill_falls_back_so_no_stopped_process_is_left() {
+        let found: Vec<u32> = (100..120).collect();
+        let mut calls = Vec::new();
+        kill_stopped(7, &found, |group, signal, pids, _| {
+            calls.push((group, signal.to_owned(), pids.to_vec()));
+            // The single kill of everything times out; the fallback kills succeed.
+            (calls.len() > 1).then_some(true)
+        });
+        assert_eq!(calls[1], (Some(7), "-KILL".to_owned(), Vec::new()));
+        let mut killed: Vec<u32> = Vec::new();
+        for (group, signal, pids) in &calls[2..] {
+            assert_eq!((group, signal.as_str()), (&None, "-KILL"));
+            assert!(pids.len() <= KILL_BATCH);
+            killed.extend(pids);
+        }
+        assert_eq!(killed, found);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cleanup_helpers_give_up_at_their_deadline() {
+        // A helper that closes its output early must still be bounded while it keeps running.
+        for args in [["-c", "sleep 5"], ["-c", "exec >&-; sleep 5"]] {
+            let started = std::time::Instant::now();
+            let result = bounded(
+                "/bin/sh",
+                &args.map(str::to_owned),
+                started + Duration::from_millis(100),
+            );
+            assert!(result.is_none());
+            assert!(started.elapsed() < Duration::from_secs(2), "{args:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn dropping_a_server_kills_its_detached_children() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-server-{:016x}",
+            UnwrapErr(SysRng).next_u64()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = "use POSIX; if (fork() == 0) { POSIX::setsid(); open(my $f, '>', 'child'); \
+            print $f $$; close($f); sleep 30; exit } sleep 30";
+        let env = crate::child_env::from_process(crate::child_env::Scope::Owner, &directory, &[]);
+        let streams = spawn_server(
+            &directory,
+            Path::new("/usr/bin/perl"),
+            &["-e".to_owned(), script.to_owned()],
+            &env,
+            &[],
+        )
+        .unwrap();
+        let mut child = String::new();
+        for _ in 0..200 {
+            child = std::fs::read_to_string(directory.join("child")).unwrap_or_default();
+            if !child.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!child.is_empty(), "the detached child never started");
+        drop(streams);
+        let alive = || {
+            let status = std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &child])
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            !status.trim().is_empty() && !status.trim().starts_with('Z')
+        };
+        for _ in 0..100 {
+            if !alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let survived = alive();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &child])
+            .status();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(!survived, "detached server child {child} survived");
+    }
+
     #[cfg(windows)]
     #[test]
     fn child_current_dir_only_simplifies_safe_verbatim_drive_paths() {

@@ -74,6 +74,43 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
     (base, task)
 }
 #[tokio::test]
+async fn creating_an_invitation_requires_the_configured_token() {
+    let (base, server) = server().await;
+    let client = Client::new();
+    let (salt, hash) = digest(&secret("bwi_"));
+    let offer = PairingOffer {
+        version: 1,
+        id: secret("bwp_"),
+        host_name: "Home Mac".into(),
+        model: "paired-model".into(),
+        salt,
+        hash,
+    };
+    for token in [None, Some("wrong-operator")] {
+        let mut request = client
+            .post(format!("{base}/v1/pairing"))
+            .bearer_auth(secret("bwh_"))
+            .json(&offer);
+        if let Some(token) = token {
+            request = request.header("x-blackwall-relay-token", token);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    // Nothing was stored by the refused attempts, so the token holder can still use the id.
+    let created = call(
+        &client,
+        &base,
+        "",
+        Method::POST,
+        &secret("bwh_"),
+        Some(json!(offer)),
+    )
+    .await;
+    assert!(created.status().is_success());
+    server.abort();
+}
+#[tokio::test]
 async fn pairing_requires_exact_host_consent_and_exchange_cannot_be_reused() {
     let (base, server) = server().await;
     let client = Client::new();

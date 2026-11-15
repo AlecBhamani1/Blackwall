@@ -433,3 +433,94 @@ async fn a_silent_host_is_disconnected_and_its_owner_can_reconnect() {
         200
     );
 }
+
+fn spawn_relay(bind: &str, directory: &std::path::Path, token: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_blackwall-relay"))
+        .env("BLACKWALL_RELAY_BIND", bind)
+        .env("BLACKWALL_RELAY_DATA_DIR", directory)
+        .env("BLACKWALL_RELAY_TOKEN", token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn public_bind_without_a_registration_token_refuses_to_start() {
+    let directory =
+        std::env::temp_dir().join(format!("blackwall-public-{}", rand::random::<u64>()));
+    for bind in ["0.0.0.0:0", "[::]:0"] {
+        let mut child = spawn_relay(bind, &directory, "  ");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("relay started on {bind} without a registration token");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stderr = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
+        assert!(!status.success());
+        assert!(
+            stderr.contains("BLACKWALL_RELAY_TOKEN must be set"),
+            "{stderr}"
+        );
+    }
+    assert!(!directory.exists(), "refused relay must not create storage");
+}
+
+#[tokio::test]
+async fn loopback_relay_starts_without_a_registration_token() {
+    let relay = RelayProcess::new();
+    let mut child = spawn_relay(&relay.address.to_string(), &relay.directory, "");
+    let client = reqwest::Client::new();
+    let healthy = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if client
+                .get(format!("{}/health", relay.url()))
+                .send()
+                .await
+                .is_ok()
+            {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        healthy,
+        Ok(true),
+        "loopback relay must start without a token"
+    );
+}
+
+#[tokio::test]
+async fn registration_without_the_configured_token_is_rejected() {
+    let mut relay = RelayProcess::new();
+    relay.start().await;
+    for token in [None, Some("wrong-registration-token".to_owned())] {
+        let (_socket, reply) = register(
+            relay.address,
+            RelayRegistration {
+                relay_token: token,
+                ..registration()
+            },
+        )
+        .await;
+        assert!(matches!(reply, RelayToHost::Error { .. }), "{reply:?}");
+    }
+    // The rejected attempts reserved nothing: the token holder still gets the address.
+    let (_host, reply) = register(relay.address, registration()).await;
+    assert_eq!(reply, RelayToHost::Registered);
+}

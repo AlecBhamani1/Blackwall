@@ -272,7 +272,7 @@ fn secret_seen_late_is_scrubbed_from_earlier_exported_spans() {
     trace.event(
         &early,
         "approval_requested",
-        vec![("blackwall.approval.kind".into(), json!("latesecret77"))],
+        vec![("blackwall.note".into(), json!("latesecret77"))],
     );
     trace.end(&early, None);
     let late = trace.begin(
@@ -290,6 +290,32 @@ fn secret_seen_late_is_scrubbed_from_earlier_exported_spans() {
     let body = trace_body(&directory);
     assert!(!body.contains("latesecret77"), "{body}");
     assert!(body.contains("Use [redacted] here."), "{body}");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn untrusted_content_cannot_scrub_metadata() {
+    let directory = folder();
+    let telemetry = start(&directory, true);
+    let trace = telemetry.run("poison", Mode::Agent);
+    let root = trace.root();
+    let span = trace.begin(
+        &root,
+        "execute_tool read_file",
+        1,
+        vec![
+            ("gen_ai.operation.name".into(), json!("execute_tool")),
+            (
+                "gen_ai.tool.call.result".into(),
+                json!(trace.clip("token: execute_tool")),
+            ),
+        ],
+    );
+    trace.end(&span, None);
+    trace.finish(RunOutcome::Complete);
+    telemetry.flush();
+    let body = trace_body(&directory);
+    assert!(body.contains(r#""stringValue":"execute_tool""#), "{body}");
     std::fs::remove_dir_all(directory).unwrap();
 }
 

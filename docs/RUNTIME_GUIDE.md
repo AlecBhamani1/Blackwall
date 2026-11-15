@@ -558,6 +558,8 @@ read-only with command network disabled. Desktop selections reset when switching
 CLI selections persist. Old saved settings acquire the safe defaults. With command network on,
 sandboxed commands share this computer's network, so they can reach services on this computer
 (localhost) and your local network. Limiting them to the internet is not available yet.
+On macOS, local Unix sockets stay closed even with command network on, so sandboxed commands
+cannot reach Docker, `ssh-agent` or other socket-based services on this computer.
 
 Command tools are the exception to the profile by default, because a program such as `claude -p`
 needs its own files and network. **Command tools** (Settings → Agent → Subagents, or
@@ -599,9 +601,13 @@ Windows uses Windows PowerShell.
 
 Output remains bounded and the command time limit defaults to two minutes. **Stop**, cancellation,
 and timeouts terminate the process group or Windows Job Object. Restricted macOS commands cannot
-create a new process group/session to escape cleanup: direct `setpgid`/`setsid` calls and
-`posix_spawn` are denied. Programs must use fork/exec for subprocesses; programs that require
-`posix_spawn` will fail inside restricted profiles. The profile covers shell and owner-defined
+call `setpgid`/`setsid` directly. They can use `posix_spawn`, which Node and Python need, including
+its new-session and new-group flags; those children stay in the sandbox. On macOS, cleanup stops
+the group and every descendant found from it, walks again after each stop, then kills what it
+found. Discovery is bounded (16 rounds, two seconds): a child spawned after the final snapshot can
+survive, and so can a detached child whose spawning process already exited, because it belongs to
+`launchd` (the double-fork limit). A survivor keeps the same sandbox restrictions and runs until
+it exits. The profile covers shell and owner-defined
 command tools when they are `sandboxed`; separately configured MCP servers retain their own account
 permissions and approvals.
 

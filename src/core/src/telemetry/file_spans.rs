@@ -265,8 +265,8 @@ fn scrub_value(value: &mut Value, scrubber: &Scrubber) {
 /// limit, or `None`. The body is the request serialized, so both exporters send the same data.
 ///
 /// Content capture off: only metadata keys survive and failure messages carry only the error
-/// class. Content capture on: every string is scrubbed of the run's secrets, and content keys are
-/// dropped from the whole run if it would otherwise pass the size limit.
+/// class. Content capture on: every non-metadata string is scrubbed of the run's secrets, and
+/// content keys are dropped from the whole run if it would otherwise pass the size limit.
 pub(super) fn finish_run(
     run: &RunState,
     mut spans: Vec<SpanData>,
@@ -278,11 +278,14 @@ pub(super) fn finish_run(
     let scrubber = Scrubber::new(secrets);
     for span in &mut spans {
         if run.content {
-            for pair in &mut span.attributes {
+            // Metadata holds Blackwall's own identifiers, never content, so untrusted text that
+            // names one as a secret (`token: execute_tool`) cannot blank it from the trace.
+            let content = |pair: &&mut KeyValue| !names::METADATA_KEYS.contains(&pair.key.as_str());
+            for pair in span.attributes.iter_mut().filter(content) {
                 scrub_value(&mut pair.value, &scrubber);
             }
             for event in &mut span.events.events {
-                for pair in &mut event.attributes {
+                for pair in event.attributes.iter_mut().filter(content) {
                     scrub_value(&mut pair.value, &scrubber);
                 }
             }
