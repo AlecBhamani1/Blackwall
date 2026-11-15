@@ -127,3 +127,29 @@ $x^2$`);
     expect(render(String.raw`$\foo$`).querySelector('.katex')).toBeNull();
   });
 });
+
+describe('Markdown sanitizing', () => {
+  it('removes raw form controls but keeps task-list checkboxes', () => {
+    const node = render(
+      '- [x] done\n\n<input type="password" placeholder="API key"><button>Unlock</button>' +
+        '<textarea>key</textarea><select><option>a</option></select>',
+    );
+    const inputs = node.querySelectorAll('input');
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].type).toBe('checkbox');
+    expect(inputs[0].disabled).toBe(true);
+    expect(node.querySelector('button, textarea, select')).toBeNull();
+  });
+
+  it('only lets HTML anchors carry links', () => {
+    const node = render(
+      '[ok](https://example.com/) <math href="https://evil.example/m"><mi>x</mi></math>' +
+        '<svg><a href="https://evil.example/s"><text>s</text></a>' +
+        '<a xlink:href="https://evil.example/x"><text>x</text></a></svg>',
+    );
+    const links = [...node.querySelectorAll('[href], [*|href]')];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toBeInstanceOf(HTMLAnchorElement);
+    expect(node.innerHTML).not.toContain('evil.example');
+  });
+});

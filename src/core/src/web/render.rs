@@ -31,7 +31,8 @@ impl Broker<'_> {
             )
             .into());
         }
-        if !self.approvals.request_web(self.request_id, url.host_str().unwrap_or_default(), format!("Load browser resource\nGET {}\n\nThis host receives a credential-free request for the rendered page. Each resource host and redirect uses your web permission rules. Scripts, frames and fetches may contact additional public hosts. Cookies, authentication, uploads, workers and WebSockets are disabled.", error::source_url(&url)), self.emit).await.map_err(ToolError::Execution)? { return Err(ToolError::Denied); }
+        let shown = error::prompt_url(&url)?;
+        if !self.approvals.request_web(self.request_id, url.host_str().unwrap_or_default(), format!("Load browser resource\nGET {shown}\n\nThis host receives a credential-free request for the rendered page. Each resource host and redirect uses your web permission rules. Scripts, frames and fetches may contact additional public hosts. Cookies, authentication, uploads, workers and WebSockets are disabled."), self.emit).await.map_err(ToolError::Execution)? { return Err(ToolError::Denied); }
         #[cfg(test)]
         let client = match &self.client {
             Some(client) => client.clone(),
@@ -139,7 +140,8 @@ pub(super) async fn execute(
     let renderer = runtime
         .and_then(|runtime| runtime.renderer.as_ref())
         .ok_or_else(|| renderer_unavailable(value))?;
-    if !approvals.request_web(request_id, url.host_str().unwrap_or_default(), format!("Render public page\nGET {}\nPurpose: {purpose}\n\nExecute untrusted JavaScript in an isolated browser. Resource hosts and redirects each use your web permission rules. No browser login or ambient credentials are shared. Rendering is limited to 30 seconds, 100 requests and 48 MiB. A human-verification challenge will still require another source.", error::source_url(&url)), emit).await.map_err(ToolError::Execution)? { return Err(ToolError::Denied); }
+    let shown = error::prompt_url(&url)?;
+    if !approvals.request_web(request_id, url.host_str().unwrap_or_default(), format!("Render public page\nGET {shown}\nPurpose: {purpose}\n\nExecute untrusted JavaScript in an isolated browser. Resource hosts and redirects each use your web permission rules. No browser login or ambient credentials are shared. Rendering is limited to 30 seconds, 100 requests and 48 MiB. A human-verification challenge will still require another source."), emit).await.map_err(ToolError::Execution)? { return Err(ToolError::Denied); }
     let broker = Broker {
         approvals,
         request_id,
