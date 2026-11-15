@@ -26,10 +26,15 @@ async fn run() -> Result<(), StartupError> {
             value: bind_value,
             source,
         })?;
+    let registration_token = environment_value("BLACKWALL_RELAY_TOKEN");
+    // Without a token anyone could fill the permanent address ledger and pending invitations.
+    if registration_token.is_none() && !bind.ip().is_loopback() {
+        return Err(StartupError::MissingToken { bind });
+    }
     let listener = TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
     let config = RelayConfig {
-        registration_token: environment_value("BLACKWALL_RELAY_TOKEN"),
+        registration_token,
         ..RelayConfig::default()
     };
     let directory = environment_value("BLACKWALL_RELAY_DATA_DIR")
@@ -56,6 +61,11 @@ enum StartupError {
         value: String,
         source: std::net::AddrParseError,
     },
+    #[error(
+        "BLACKWALL_RELAY_TOKEN must be set to a long random secret when BLACKWALL_RELAY_BIND \
+         ({bind}) is not a loopback address"
+    )]
+    MissingToken { bind: SocketAddr },
     #[error("relay listener failed: {0}")]
     Io(#[from] std::io::Error),
 }

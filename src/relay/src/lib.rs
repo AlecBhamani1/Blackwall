@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -83,6 +83,10 @@ struct RelayState {
     config: RelayConfig,
     ownership: Arc<OwnershipStore>,
     pairing: Arc<tokio::sync::Mutex<pairing::Exchanges>>,
+    /// Bumped after every durable revocation; see [`register_session`].
+    revocations: Arc<AtomicU64>,
+    /// Session slots held by registrations still writing their ownership claim.
+    reserved: Arc<AtomicUsize>,
 }
 
 struct RelaySession {
@@ -112,7 +116,7 @@ struct ResponseMetadata {
 /// Builds an ephemeral relay for tests and embedded development. Production uses
 /// [`app_with_storage`] so public address ownership survives process restarts.
 pub fn app(config: RelayConfig) -> Router {
-    build_app(config, OwnershipStore::memory())
+    build_app(config, Arc::new(OwnershipStore::memory()))
 }
 
 /// Opens durable ownership storage before accepting traffic; never falls back to memory.
@@ -120,15 +124,20 @@ pub fn app_with_storage(
     config: RelayConfig,
     directory: &std::path::Path,
 ) -> Result<Router, OwnershipError> {
-    Ok(build_app(config, OwnershipStore::open(directory)?))
+    Ok(build_app(
+        config,
+        Arc::new(OwnershipStore::open(directory)?),
+    ))
 }
 
-fn build_app(config: RelayConfig, ownership: OwnershipStore) -> Router {
+fn build_app(config: RelayConfig, ownership: Arc<OwnershipStore>) -> Router {
     let state = RelayState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         config,
-        ownership: Arc::new(ownership),
+        ownership,
         pairing: Arc::new(tokio::sync::Mutex::new(pairing::Exchanges::default())),
+        revocations: Arc::new(AtomicU64::new(0)),
+        reserved: Arc::new(AtomicUsize::new(0)),
     };
     Router::new()
         .merge(pairing::routes())
@@ -197,7 +206,7 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
     let (host_tx, mut host_rx) = mpsc::channel(HOST_QUEUE_CAPACITY);
     let session = Arc::new(RelaySession {
         host_key: registration.host_key.clone(),
-        model: registration.model,
+        model: registration.model.clone(),
         salt,
         key_hash,
         expires_at_ms: registration.expires_at_ms,
@@ -206,43 +215,9 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
         pending: StdMutex::new(HashMap::new()),
         in_flight: Arc::new(Semaphore::new(2)),
     });
-    let replaced = {
-        let mut sessions = state.sessions.write().await;
-        if let Some(existing) = sessions.get(&registration.session_id) {
-            if !constant_time_text_eq(&existing.host_key, &registration.host_key) {
-                drop(sessions);
-                let _send_result = send_socket_protocol(
-                    &mut socket,
-                    &RelayToHost::Error {
-                        message: "session identifier is already registered".to_owned(),
-                    },
-                )
-                .await;
-                return;
-            }
-        } else if sessions.len() >= state.config.max_sessions {
-            drop(sessions);
-            let _send_result = send_socket_protocol(
-                &mut socket,
-                &RelayToHost::Error {
-                    message: "relay session capacity has been reached".to_owned(),
-                },
-            )
-            .await;
-            return;
-        }
-        let ownership = Arc::clone(&state.ownership);
-        let owner_id = registration.session_id.clone();
-        let owner_key = registration.host_key.clone();
-        // Serialize claims with live-session insertion, but perform disk I/O off the runtime.
-        let claim =
-            tokio::task::spawn_blocking(move || ownership.claim(&owner_id, &owner_key)).await;
-        if !matches!(claim, Ok(Ok(()))) {
-            drop(sessions);
-            let message = match claim {
-                Ok(Err(OwnershipError::Invalid(message))) => message,
-                _ => "relay ownership storage is unavailable",
-            };
+    let replaced = match register_session(&state, &registration, &session).await {
+        Ok(replaced) => replaced,
+        Err(message) => {
             let _send_result = send_socket_protocol(
                 &mut socket,
                 &RelayToHost::Error {
@@ -252,7 +227,6 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
             .await;
             return;
         }
-        sessions.insert(registration.session_id.clone(), Arc::clone(&session))
     };
     if let Some(previous) = replaced {
         previous
@@ -331,6 +305,87 @@ async fn handle_host(mut socket: WebSocket, state: RelayState) {
     };
     session.disconnect(reason).await;
     remove_session(&state, &registration.session_id, &session).await;
+}
+
+/// Claims durable ownership without holding the live-session lock across disk writes, so guest
+/// traffic keeps flowing. A session slot is reserved first, so a registration refused for capacity
+/// never writes a durable claim. A revocation that lands between the claim and the insert bumps
+/// the revocation counter; the claim is then retried and observes the revoked row.
+async fn register_session(
+    state: &RelayState,
+    registration: &RelayRegistration,
+    session: &Arc<RelaySession>,
+) -> Result<Option<Arc<RelaySession>>, &'static str> {
+    let slot = {
+        let sessions = state.sessions.write().await;
+        let reserved = state.reserved.load(Ordering::SeqCst);
+        let capacity = state.config.max_sessions.saturating_sub(reserved);
+        admit_session(&sessions, registration, capacity)?;
+        let new = !sessions.contains_key(&registration.session_id);
+        SlotReservation::new(new.then(|| Arc::clone(&state.reserved)))
+    };
+    for _attempt in 0..3 {
+        let revocations = state.revocations.load(Ordering::SeqCst);
+        let ownership = Arc::clone(&state.ownership);
+        let owner_id = registration.session_id.clone();
+        let owner_key = registration.host_key.clone();
+        match tokio::task::spawn_blocking(move || ownership.claim(&owner_id, &owner_key)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(OwnershipError::Invalid(message))) => return Err(message),
+            _ => return Err("relay ownership storage is unavailable"),
+        }
+        let mut sessions = state.sessions.write().await;
+        let others = state
+            .reserved
+            .load(Ordering::SeqCst)
+            .saturating_sub(slot.held());
+        let capacity = state.config.max_sessions.saturating_sub(others);
+        admit_session(&sessions, registration, capacity)?;
+        if state.revocations.load(Ordering::SeqCst) == revocations {
+            let replaced = sessions.insert(registration.session_id.clone(), Arc::clone(session));
+            // Hand the slot to the live session before other registrations can count it twice.
+            drop(slot);
+            return Ok(replaced);
+        }
+    }
+    Err("relay ownership changed during registration; try again")
+}
+
+/// Releases a reserved session slot when registration finishes, whatever the outcome.
+struct SlotReservation(Option<Arc<AtomicUsize>>);
+
+impl SlotReservation {
+    fn new(counter: Option<Arc<AtomicUsize>>) -> Self {
+        if let Some(counter) = &counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        Self(counter)
+    }
+    fn held(&self) -> usize {
+        usize::from(self.0.is_some())
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.0 {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn admit_session(
+    sessions: &HashMap<String, Arc<RelaySession>>,
+    registration: &RelayRegistration,
+    max_sessions: usize,
+) -> Result<(), &'static str> {
+    match sessions.get(&registration.session_id) {
+        Some(existing) if !constant_time_text_eq(&existing.host_key, &registration.host_key) => {
+            Err("session identifier is already registered")
+        }
+        None if sessions.len() >= max_sessions => Err("relay session capacity has been reached"),
+        _ => Ok(()),
+    }
 }
 
 async fn receive_registration(socket: &mut WebSocket) -> Result<RelayRegistration, String> {
@@ -1232,6 +1287,148 @@ mod tests {
         assert_eq!(manager.list().await.len(), 3);
         manager.stop().await;
         assert!(manager.list().await.is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn slow_ownership_storage_does_not_stall_guest_traffic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(OwnershipStore::memory());
+        let router = build_app(RelayConfig::default(), Arc::clone(&store));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let guest_key = "bw1_test-slow-storage-key";
+        let salt = [5_u8; 32];
+        let registration = |id: u8| HostToRelay::Register {
+            registration: RelayRegistration {
+                protocol_version: 1,
+                session_id: format!("bws_{}", URL_SAFE_NO_PAD.encode([id; 32])),
+                host_key: format!("bwh_{}", URL_SAFE_NO_PAD.encode([id; 32])),
+                relay_token: None,
+                model: "slow-model".into(),
+                guest_key_salt: URL_SAFE_NO_PAD.encode(salt),
+                guest_key_hash: URL_SAFE_NO_PAD.encode(salted_key_hash(&salt, guest_key)),
+                expires_at_ms: unix_epoch_millis() + 60_000,
+            },
+        };
+        let host_url = format!("ws://{address}/v1/host/connect");
+        let connect = |id: u8| {
+            let host_url = host_url.clone();
+            async move {
+                let (mut host, _) = connect_async(&host_url).await.unwrap();
+                let message = serde_json::to_string(&registration(id)).unwrap();
+                host.send(ClientMessage::Text(message.into()))
+                    .await
+                    .unwrap();
+                host
+            }
+        };
+        let mut first = connect(1).await;
+        assert_eq!(next_protocol(&mut first).await, RelayToHost::Registered);
+
+        // Hold the ownership store busy, as a slow synchronous disk write would.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = std::thread::spawn(move || {
+            let _guard = store.lock_for_test();
+            locked_tx.send(()).unwrap();
+            let _released = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        locked_rx.await.unwrap();
+        let mut second = connect(2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let models_url = format!(
+            "http://{address}/s/bws_{}/v1/models",
+            URL_SAFE_NO_PAD.encode([1_u8; 32])
+        );
+        let request = reqwest::Client::new()
+            .get(models_url)
+            .bearer_auth(guest_key);
+        let response = tokio::time::timeout(Duration::from_secs(2), request.send()).await;
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        assert_eq!(
+            response
+                .expect("guest traffic stalled behind a registration")
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(next_protocol(&mut second).await, RelayToHost::Registered);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn registrations_refused_for_capacity_never_reserve_an_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(OwnershipStore::memory());
+        let config = RelayConfig {
+            max_sessions: 1,
+            ..RelayConfig::default()
+        };
+        let router = build_app(config, Arc::clone(&store));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let id = |n: u8| format!("bws_{}", URL_SAFE_NO_PAD.encode([n; 32]));
+        let key = |n: u8| format!("bwh_{}", URL_SAFE_NO_PAD.encode([n; 32]));
+        let host_url = format!("ws://{address}/v1/host/connect");
+        let connect = |n: u8| {
+            let host_url = host_url.clone();
+            let registration = HostToRelay::Register {
+                registration: RelayRegistration {
+                    protocol_version: 1,
+                    session_id: id(n),
+                    host_key: key(n),
+                    relay_token: None,
+                    model: "model".into(),
+                    guest_key_salt: URL_SAFE_NO_PAD.encode([n; 32]),
+                    guest_key_hash: URL_SAFE_NO_PAD.encode([n; 32]),
+                    expires_at_ms: unix_epoch_millis() + 60_000,
+                },
+            };
+            async move {
+                let (mut host, _) = connect_async(&host_url).await.unwrap();
+                let message = serde_json::to_string(&registration).unwrap();
+                host.send(ClientMessage::Text(message.into()))
+                    .await
+                    .unwrap();
+                host
+            }
+        };
+
+        // Keep both registrations in flight past the first capacity check.
+        let blocker_store = Arc::clone(&store);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = std::thread::spawn(move || {
+            let _guard = blocker_store.lock_for_test();
+            locked_tx.send(()).unwrap();
+            let _released = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        locked_rx.await.unwrap();
+        let mut first = connect(1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut second = connect(2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+
+        let outcomes = [
+            (1, next_protocol(&mut first).await),
+            (2, next_protocol(&mut second).await),
+        ];
+        let accepted = outcomes
+            .iter()
+            .filter(|(_, outcome)| *outcome == RelayToHost::Registered)
+            .count();
+        assert_eq!(accepted, 1, "{outcomes:?}");
+        for (n, outcome) in outcomes {
+            if outcome != RelayToHost::Registered {
+                assert!(
+                    !store.revoke_existing(&id(n), &key(n)).unwrap(),
+                    "a refused registration left a permanent address reservation"
+                );
+            }
+        }
         server.abort();
     }
     #[tokio::test]
