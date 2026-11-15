@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { ApprovalDecision, PendingApproval } from '../types';
   export let approval: PendingApproval;
   export let onResolve: (decision: ApprovalDecision) => Promise<void>;
@@ -7,13 +8,26 @@
   // MCP approvals can be saved as an owner rule for one tool or the whole server.
   let scope: 'tool' | 'server' = 'tool';
   let place: 'project' | 'everywhere' = 'project';
+  // A new approval ignores input briefly, so a click or Enter meant for the previous one cannot
+  // answer it unread.
+  const DWELL_MS = 600;
+  let ready = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let card: HTMLElement | undefined;
   // A new approval starts from the narrowest choice, even when the card is reused.
   let shown = '';
   $: if (approval.approvalId !== shown) {
     shown = approval.approvalId;
     scope = 'tool';
     place = 'project';
+    error = '';
+    ready = false;
+    clearTimeout(timer);
+    timer = setTimeout(() => (ready = true), DWELL_MS);
+    if (document.activeElement instanceof HTMLElement && card?.contains(document.activeElement))
+      document.activeElement.blur();
   }
+  onDestroy(() => clearTimeout(timer));
   const OUTSIDE_NOTE =
     'Runs outside the sandbox with your account permissions. It can run code from this project and use your files and network.';
   // The label already says it, so the details do not repeat it; the event keeps it for others.
@@ -30,7 +44,7 @@
     place === 'project' ? `allow_${scope}_in_project` : `allow_${scope}`
   ) as ApprovalDecision;
   async function decide(decision: ApprovalDecision) {
-    if (busy) return;
+    if (busy || !ready) return;
     busy = true;
     error = '';
     try {
@@ -43,7 +57,7 @@
   }
 </script>
 
-<section class="approval" aria-label="Action needs your approval">
+<section bind:this={card} class="approval" aria-label="Action needs your approval">
   <div class="title">
     <span></span><strong
       >{approval.kind === 'file'
@@ -66,22 +80,22 @@
     <pre>{shownDetail}</pre>
   </div>
   <div class="actions">
-    <button class="deny" disabled={busy} onclick={() => decide('deny')}>Deny</button><span
+    <button class="deny" disabled={busy || !ready} onclick={() => decide('deny')}>Deny</button><span
     ></span>{#if approval.remember !== false && !approval.outsideSandbox}<button
         class="remember"
-        disabled={busy}
+        disabled={busy || !ready}
         onclick={() => decide('always_allow')}>Allow identical action this run</button
-      >{/if}<button class="allow" disabled={busy} onclick={() => decide('allow')}
+      >{/if}<button class="allow" disabled={busy || !ready} onclick={() => decide('allow')}
       >{busy ? 'Sending…' : 'Allow once'}</button
     >
   </div>
   {#if webAccess}
     <div class="always">
-      <button class="remember" disabled={busy} onclick={() => decide('allow_web_for_run')}
+      <button class="remember" disabled={busy || !ready} onclick={() => decide('allow_web_for_run')}
         >Allow web access for this run</button
       >
       {#if webAccess === 'persistent'}
-        <button class="remember" disabled={busy} onclick={() => decide('allow_web')}
+        <button class="remember" disabled={busy || !ready} onclick={() => decide('allow_web')}
           >Always allow web access</button
         >
       {/if}
@@ -107,7 +121,9 @@
             >in every project</option
           ></select
         ></label
-      ><button class="remember" disabled={busy} onclick={() => decide(saved)}>Always allow</button>
+      ><button class="remember" disabled={busy || !ready} onclick={() => decide(saved)}
+        >Always allow</button
+      >
     </div>
     <small class="note">Saved as an owner rule. Remove it in MCP servers.</small>
   {/if}

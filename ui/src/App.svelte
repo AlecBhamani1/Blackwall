@@ -125,10 +125,13 @@
     if (authBusy) return;
     authBusy = true;
     try {
-      await controller.suspend();
+      const saved = await controller.suspend();
       booted = false;
       stopPairing();
       authStatus.set(await authClient.lock());
+      if (!saved)
+        lockError =
+          'Some recent changes were not saved before locking. Unlock to get the conversation back, then retry saving or export it.';
     } catch (cause) {
       const message = authError(cause);
       if (!booted) await initializeApp();
@@ -347,6 +350,11 @@
       {/if}
       <section class="conversation-pane" aria-label="Blackwall chat">
         {#if setupOpen}
+          <!-- A run can keep going while setup is open; its approvals must stay answerable. -->
+          {#if $approval}<ApprovalCard
+              approval={$approval}
+              onResolve={controller.resolveApproval}
+            />{/if}
           <ConnectionSetup
             connections={$preferences.connections ?? []}
             onForget={controller.forgetConnection}

@@ -19,11 +19,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a tighter segmented range control.
 ### Fixed
 
+- Web page approval prompts now show the full request URL, including its query string, so data
+  placed in a link is visible before you approve the request. URLs too long to show in full
+  (over 2,048 characters) are refused instead of being partly hidden.
+- Approval prompts ignore input for a moment when they appear, so a click or Enter meant for the
+  previous prompt cannot answer the next one. Several waiting approvals are shown one after another
+  instead of the latest replacing the others, prompts stay visible while connection setup is open,
+  and an expired prompt is removed instead of showing an error that the next prompt inherits.
+- Links in responses no longer navigate the Blackwall window: public HTTP/HTTPS links open in your
+  browser and other links are ignored. Responses can no longer draw text fields, buttons or menus.
+- Lock now always locks, even when recent changes failed to save or a save hangs. The lock
+  screen warns that changes were not saved; after unlocking, the unsaved conversation comes back
+  with a retry banner so it can still be saved or exported.
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
   unavailable and directs users to the desktop app. See [Web access](docs/WEB_ACCESS.md) for bounds,
   search-provider evaluation, and the dated smoke matrix.
+- Restricted macOS commands can start Node and Homebrew Python child processes again. Stop,
+  cancellation and timeouts, and stopping an MCP server, also look for children started in a new
+  session or group and kill them. The search is bounded, so a child started after it, or one whose
+  parent already exited, can survive; it stays sandboxed.
+  See [Runtime guide](docs/RUNTIME_GUIDE.md).
 - MCP server suggestions now show whether their npx or uvx runtime is installed, include the
   official Python git, time and fetch servers, refuse missing runtimes before saving, and allow
   120 seconds for the first package download while showing startup progress.
@@ -31,6 +48,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repository's or a submodule's config, reviews only the agent's project directory instead of the
   whole enclosing repository, and honors the owner's global `core.excludesFile` when listing
   untracked files.
+- In an interactive `bw` terminal on macOS and Linux, lines typed or pasted before an approval
+  prompt appears, including `/` commands, are discarded instead of answering it. On Windows,
+  only lines `bw` has already read are discarded. Piped input still answers prompts in order.
+- The macOS sandbox now protects configured extra instruction files (and their leading folders)
+  from sandboxed writes; denies `~/.git-credentials`, `~/.docker`, `~/.kube` and shell histories;
+  and keeps local Unix sockets closed when network access is on, so sandboxed commands can no
+  longer reach Docker, `ssh-agent` or other socket-based services.
+- While the app is locked, the setup commands that look for local model servers, probe a server
+  address and open setup links in the browser now refuse until it is unlocked.
+- `bw skills` filters terminal control characters out of a skill's description, license, file
+  names, source path and notes, and out of warnings that quote file names in the skills folder,
+  so a skill cannot hide its own scan warnings.
+- An MCP server secret saved with an empty value no longer garbles that server's output and tools.
 
 ### Added
 

@@ -4,7 +4,10 @@ use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
 use axum::{body::Body, http::Response, routing::get, Router};
 use std::{
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 fn gzip(bytes: &[u8]) -> Vec<u8> {
@@ -51,6 +54,7 @@ async fn fixture(uri: axum::http::Uri) -> Response<Body> {
         "/loop" => { status = 302; location = Some("/loop#fragment".into()); vec![] }
         "/private" => { status = 302; location = Some("http://127.0.0.1/secret".into()); vec![] }
         "/credentials" => { status = 302; location = Some("https://owner:secret@example.com/".into()); vec![] }
+        "/long-redirect" => { status = 302; location = Some(format!("http://other.test/plain?pad={}&secret=data", "a".repeat(2048))); vec![] }
         "/other-host" => { status = 302; location = Some("http://other.test/plain".into()); vec![] }
         "/slow" => { tokio::time::sleep(Duration::from_millis(100)).await; b"slow".to_vec() }
         _ if path.starts_with("/redirect/") => {
@@ -244,7 +248,7 @@ async fn every_redirect_requires_permission_and_denials_never_send() {
                 ..
             } = event
             {
-                assert!(!detail.contains("secret") && !detail.contains("#private"));
+                assert!(!detail.contains("#private"));
                 sources.lock().unwrap().push(detail);
                 let decision = if sources.lock().unwrap().len() == 1 {
                     ApprovalDecision::Allow
@@ -268,7 +272,85 @@ async fn every_redirect_requires_permission_and_denials_never_send() {
     )
     .await;
     assert!(matches!(result, Err(ToolError::Denied)));
-    assert_eq!(sources.lock().unwrap().len(), 2);
+    let sources = sources.lock().unwrap();
+    assert_eq!(sources.len(), 2);
+    // The owner must see the exact query that will leave the machine.
+    assert!(sources[0].contains("GET http://fixture.test/other-host?token=secret\n"));
+    assert!(sources[1].contains("GET http://other.test/plain\n"));
+}
+
+#[test]
+fn approval_urls_show_queries_escaped() {
+    let url = Url::parse("https://evil.example/c?d=line1\nline2%0A\u{202e}x#frag").unwrap();
+    assert_eq!(
+        error::prompt_url(&url).unwrap(),
+        "https://evil.example/c?d=line1line2%0A%E2%80%AEx"
+    );
+}
+
+#[tokio::test]
+async fn urls_too_long_to_show_in_full_are_refused_before_approval_or_network() {
+    let server = Server::new().await;
+    // A padded query must never push sent data out of the owner's view.
+    let long = format!(
+        "http://fixture.test/plain?pad={}&secret=data",
+        "a".repeat(2048)
+    );
+    let approvals = Approvals::default();
+    let prompts = AtomicUsize::new(0);
+    let clients = AtomicUsize::new(0);
+    let result = retrieve(
+        &long,
+        "read",
+        "long",
+        &approvals,
+        &|event| {
+            prompts.fetch_add(1, Ordering::SeqCst);
+            allow(&approvals, event);
+        },
+        false,
+        |_| {
+            clients.fetch_add(1, Ordering::SeqCst);
+            let client = server.client.clone();
+            Box::pin(async move { Ok(client) })
+        },
+    )
+    .await;
+    assert_eq!(category(result.unwrap_err()), WebErrorCategory::InvalidUrl);
+    assert_eq!(
+        (
+            prompts.load(Ordering::SeqCst),
+            clients.load(Ordering::SeqCst)
+        ),
+        (0, 0)
+    );
+
+    // A redirect hop to an over-long URL is refused before its prompt and request too.
+    let result = retrieve(
+        "http://fixture.test/long-redirect",
+        "read",
+        "long-redirect",
+        &approvals,
+        &|event| {
+            prompts.fetch_add(1, Ordering::SeqCst);
+            allow(&approvals, event);
+        },
+        false,
+        |_| {
+            clients.fetch_add(1, Ordering::SeqCst);
+            let client = server.client.clone();
+            Box::pin(async move { Ok(client) })
+        },
+    )
+    .await;
+    assert_eq!(category(result.unwrap_err()), WebErrorCategory::InvalidUrl);
+    assert_eq!(
+        (
+            prompts.load(Ordering::SeqCst),
+            clients.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
 }
 
 #[test]
