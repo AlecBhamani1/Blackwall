@@ -360,6 +360,25 @@ export function utcOffsetMinutes(): number {
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(name, args);
 }
+// An app update freezes settings saves until relaunch so none can start or be cut off mid-write.
+let preferencesFrozen = false;
+const preferenceSaves = new Set<Promise<void>>();
+function savePreferences(preferences: Preferences): Promise<void> {
+  if (preferencesFrozen) return Promise.reject('Blackwall is installing an update.');
+  const save = command<void>('save_preferences', { preferences });
+  const settled = save.catch(() => undefined);
+  preferenceSaves.add(settled);
+  void settled.then(() => preferenceSaves.delete(settled));
+  return save;
+}
+/** Blocks new settings saves and resolves once every started save has settled. */
+export async function freezePreferenceSaves(): Promise<void> {
+  preferencesFrozen = true;
+  await Promise.all(preferenceSaves);
+}
+export function thawPreferenceSaves(): void {
+  preferencesFrozen = false;
+}
 export const persistence = {
   available: isDesktop,
   list: () => command<SessionSummary[]>('list_sessions'),
@@ -369,7 +388,7 @@ export const persistence = {
   remove: (id: string) => command<void>('delete_session', { id }),
   migrate: (sessions: SessionSummary[]) => command<void>('migrate_sessions', { sessions }),
   preferences: () => command<Preferences>('load_preferences'),
-  savePreferences: (preferences: Preferences) => command<void>('save_preferences', { preferences }),
+  savePreferences,
   skills: () =>
     command<{
       skills: Skill[];

@@ -17,6 +17,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Settings skills are easier to manage with compact searchable rows, accessible enable switches,
   visible removal controls, and installed suggested-skill actions; Usage adds a year-to-date range
   and a tighter segmented range control.
+- **Breaking for relay operators:** `blackwall-relay` now refuses to start when
+  `BLACKWALL_RELAY_BIND` is not a loopback address and `BLACKWALL_RELAY_TOKEN` is unset or empty.
+  Set `BLACKWALL_RELAY_TOKEN` to a long random secret on the relay, and give the same value to
+  sharing hosts. Without it anyone could register sessions or create pairing invitations and use up
+  the permanent address ledger. The `deploy/relay` Compose setup already requires the token;
+  loopback-only development relays may still run without one.
 ### Fixed
 
 - Web page approval prompts now show the full request URL, including its query string, so data
@@ -31,6 +37,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Lock now always locks, even when recent changes failed to save or a save hangs. The lock
   screen warns that changes were not saved; after unlocking, the unsaved conversation comes back
   with a retry banner so it can still be saved or exported.
+- The relay no longer pauses guest traffic while it saves a new address to disk, and a host
+  refused because the relay is full no longer reserves an address. Its pairing request limit now
+  counts only new invitations, failed lookups or credentials, and revocations of unknown
+  addresses. Junk requests can no longer block an authenticated host or device from checking
+  pairing status or results, or an owner from revoking a device.
+- Trace redaction with content capture on now also removes PEM private keys, single-quoted
+  `'key': 'value'` pairs, repeats of secrets whose line ended in a comma, and bare OpenAI,
+  Anthropic, GitHub and Slack tokens that match those providers' formats. Trace metadata
+  such as operation and tool names is no longer blanked when untrusted content labels it a secret;
+  content attributes can still be scrubbed of such a value.
+- Pairing: when a joining computer cannot save an approved pairing (for example, no keyring), the
+  status page shows a warning instead of failing, and Cancel now clears the request, even offline.
+  One host device that fails to restore no longer hides the other paired devices or fails actions
+  on them.
+- Saving command tool isolation or the memory toggle in Settings updates the Rules page's sandbox
+  statement without a restart.
+- Installing an app update is refused while a task is running or a conversation save has failed,
+  and is checked again after the download. From the start of the install until relaunch, new tasks,
+  starting, opening or deleting conversations, and settings saves are blocked, and saves already
+  under way finish first.
+- A reply stopped before any text arrived is no longer sent back to the model as "Response stopped.".
 - Web reads extract readable HTML with source titles, accept pages up to 2 MiB after decompression,
   and follow up to eight validated redirects. Search challenges and website refusals now report
   actionable failures separately from owner denials. Browser mode clearly marks Web access as
@@ -61,6 +88,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names, source path and notes, and out of warnings that quote file names in the skills folder,
   so a skill cannot hide its own scan warnings.
 - An MCP server secret saved with an empty value no longer garbles that server's output and tools.
+- An upgrade of an older chat database that fails or is killed no longer takes a backup slot: each
+  attempt copies to `backups/blackwall-upgrading.sqlite3`, which moves to a slot only once the
+  upgrade finishes, so repeated attempts cannot fill the three slots and hide the real error.
+- The skill import safety scan now checks text files that contain invalid UTF-8 instead of
+  silently skipping them.
+- Rule edits from the desktop app and `bw` now take a cross-process lock on `policy.json`, so
+  simultaneous saves cannot drop a rule.
 
 ### Added
 

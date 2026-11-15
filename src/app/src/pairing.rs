@@ -42,6 +42,8 @@ struct ClientRequest {
     key: String,
     candidate: PairingCandidate,
     expires_at: u64,
+    /// The host approved this request but this computer could not save it.
+    unsaved_approval: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -289,76 +291,144 @@ impl PairingState {
         }
     }
 }
-async fn reconcile(
+/// Restore or finish one host device. Errors are scoped to this device.
+async fn reconcile_host(
     state: &PairingState,
     app: &AppHandle,
     inner: &mut Inner,
+    device: &mut PairedDevice,
     warnings: &mut Vec<String>,
-) -> Result<Vec<DeviceStatus>, String> {
-    let mut result = Vec::new();
-    for mut device in devices(app).await? {
-        if device.role == "host" {
-            if device.state == "revoking" {
+) -> Result<(), String> {
+    if device.state == "revoking" {
+        state
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&device.id);
+        if let Some(tunnel) = inner.tunnels.remove(&device.id) {
+            tunnel.stop().await;
+        }
+        let key = crate::credentials::read_pair_key("host", &device.endpoint()).await?;
+        if let Some(key) = key {
+            match request(
+                &device.relay_url,
+                &format!("/devices/{}", device.id),
+                reqwest::Method::DELETE,
+                &key,
+                None,
+                relay_token(&device.relay_url).await?,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let mut revoked = device.clone();
+                    revoked.state = "revoked".into();
+                    match save(app, revoked.clone()).await {
+                        Ok(()) => *device = revoked,
+                        Err(error) => warnings.push(error),
+                    }
+                }
+                Err(_) => warnings.push(format!(
+                    "Removal of {} is pending. Keep Blackwall open and reconnect to the relay.",
+                    device.name
+                )),
+            }
+        } else {
+            warnings.push(format!(
+                "The removal key for {} is missing. Restore its entry in {} to finish revocation.",
+                device.name,
+                crate::secrets::STORE
+            ));
+        }
+    }
+    if device.state == "active" && !inner.tunnels.contains_key(&device.id) {
+        if let Some(key) = crate::credentials::read_pair_key("host", &device.endpoint()).await? {
+            let model_key = model_key(app, device.upstream.as_deref().unwrap_or("")).await?;
+            let tunnel = ShareHub::new();
+            tunnel
+                .start_paired(
+                    device,
+                    key,
+                    model_key,
+                    relay_token(&device.relay_url).await?,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            state
+                .1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(device.id.clone(), tunnel.clone());
+            if let Err(error) = crate::auth::require_unlocked(app).await {
                 state
                     .1
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&device.id);
-                if let Some(tunnel) = inner.tunnels.remove(&device.id) {
-                    tunnel.stop().await;
-                }
-                let key = crate::credentials::read_pair_key("host", &device.endpoint()).await?;
-                if let Some(key) = key {
-                    match request(&device.relay_url, &format!("/devices/{}", device.id), reqwest::Method::DELETE, &key, None, relay_token(&device.relay_url).await?).await {
-                        Ok(_) => {
-                            let mut revoked = device.clone();
-                            revoked.state = "revoked".into();
-                            match save(app, revoked.clone()).await {
-                                Ok(()) => device = revoked,
-                                Err(error) => warnings.push(error),
-                            }
-                        }
-                        Err(_) => warnings.push(format!("Removal of {} is pending. Keep Blackwall open and reconnect to the relay.", device.name)),
-                    }
-                } else {
-                    warnings.push(format!("The removal key for {} is missing. Restore its entry in {} to finish revocation.", device.name, crate::secrets::STORE));
-                }
+                tunnel.stop().await;
+                return Err(error);
             }
-            if device.state == "active" && !inner.tunnels.contains_key(&device.id) {
-                if let Some(key) =
-                    crate::credentials::read_pair_key("host", &device.endpoint()).await?
-                {
-                    let model_key =
-                        model_key(app, device.upstream.as_deref().unwrap_or("")).await?;
-                    let tunnel = ShareHub::new();
-                    tunnel
-                        .start_paired(
-                            &device,
-                            key,
-                            model_key,
-                            relay_token(&device.relay_url).await?,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    state
-                        .1
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(device.id.clone(), tunnel.clone());
-                    if let Err(error) = crate::auth::require_unlocked(app).await {
-                        state
-                            .1
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&device.id);
-                        tunnel.stop().await;
-                        return Err(error);
-                    }
-                    inner.tunnels.insert(device.id.clone(), tunnel);
-                } else {
-                    warnings.push(format!("The saved host key for {} is missing. Remove this device and pair it again.", device.name));
-                }
-            }
+            inner.tunnels.insert(device.id.clone(), tunnel);
+        } else {
+            warnings.push(format!(
+                "The saved host key for {} is missing. Remove this device and pair it again.",
+                device.name
+            ));
+        }
+    }
+    Ok(())
+}
+/// Record one device's failure so the others still load; locking still stops everything.
+async fn isolate_device_error(
+    device: &PairedDevice,
+    outcome: Result<(), String>,
+    unlocked: impl std::future::Future<Output = Result<(), String>>,
+    failures: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    if let Err(error) = outcome {
+        unlocked.await?;
+        failures.push((
+            device.id.clone(),
+            format!("{} needs attention. {error}", device.name),
+        ));
+    }
+    Ok(())
+}
+/// Only the device being acted on fails the action; others appear as status warnings.
+fn failure_for(failures: Vec<(String, String)>, id: &str) -> Result<(), String> {
+    failures
+        .into_iter()
+        .find(|(device, _)| device == id)
+        .map_or(Ok(()), |(_, error)| Err(error))
+}
+async fn restore(
+    state: &PairingState,
+    app: &AppHandle,
+    inner: &mut Inner,
+    id: &str,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    reconcile(state, app, inner, &mut Vec::new(), &mut failures).await?;
+    failure_for(failures, id)
+}
+async fn reconcile(
+    state: &PairingState,
+    app: &AppHandle,
+    inner: &mut Inner,
+    warnings: &mut Vec<String>,
+    failures: &mut Vec<(String, String)>,
+) -> Result<Vec<DeviceStatus>, String> {
+    let mut result = Vec::new();
+    for mut device in devices(app).await? {
+        if device.role == "host" {
+            let outcome = reconcile_host(state, app, inner, &mut device, warnings).await;
+            isolate_device_error(
+                &device,
+                outcome,
+                crate::auth::require_unlocked(app),
+                failures,
+            )
+            .await?;
         }
         let mut display_state = device.state.clone();
         let online = if let Some(tunnel) = inner.tunnels.get(&device.id) {
@@ -382,6 +452,37 @@ async fn reconcile(
     }
     Ok(result)
 }
+async fn save_approved(
+    store: &impl lifecycle::DeviceStore,
+    client: &ClientRequest,
+    value: &PairingProgress,
+) -> Result<PairedDevice, String> {
+    let id = value
+        .session_id
+        .clone()
+        .filter(|id| valid_secret(id, "bws_"))
+        .ok_or("The relay returned an invalid paired address.")?;
+    let candidate = value
+        .candidate
+        .clone()
+        .ok_or("Missing approved computer.")?;
+    if !verifies(&candidate.salt, &candidate.hash, &client.key) {
+        return Err("The approved device credential does not match this computer.".into());
+    }
+    let device = PairedDevice {
+        id,
+        role: "client".into(),
+        name: value.host_name.clone(),
+        relay_url: client.relay.clone(),
+        model: value.model.clone(),
+        upstream: None,
+        salt: candidate.salt,
+        hash: candidate.hash,
+        state: "active".into(),
+    };
+    lifecycle::save_client(store, &device, &client.key).await?;
+    Ok(device)
+}
 #[tauri::command]
 pub async fn pairing_status(
     app: AppHandle,
@@ -390,7 +491,10 @@ pub async fn pairing_status(
     let mut inner = state.0.lock().await;
     crate::auth::require_unlocked(&app).await?;
     let mut warnings = Vec::new();
-    let mut device_status = reconcile(&state, &app, &mut inner, &mut warnings).await?;
+    let mut failures = Vec::new();
+    let mut device_status =
+        reconcile(&state, &app, &mut inner, &mut warnings, &mut failures).await?;
+    warnings.extend(failures.into_iter().map(|(_, error)| error));
     let host = if let Some(host) = &inner.host {
         if host.expires_at <= now() {
             None
@@ -413,6 +517,7 @@ pub async fn pairing_status(
     {
         inner.host = None;
     }
+    let mut unsaved_approval = false;
     let client = if let Some(client) = &inner.client {
         if client.expires_at <= now() {
             None
@@ -420,47 +525,32 @@ pub async fn pairing_status(
             match progress(&client.relay, &client.id, "result", &client.key).await {
                 Ok(mut value) => {
                     if value.state == "approved" {
-                        let id = value
-                            .session_id
-                            .clone()
-                            .filter(|id| valid_secret(id, "bws_"))
-                            .ok_or("The relay returned an invalid paired address.")?;
-                        let candidate = value
-                            .candidate
-                            .clone()
-                            .ok_or("Missing approved computer.")?;
-                        if !verifies(&candidate.salt, &candidate.hash, &client.key) {
-                            return Err(
-                                "The approved device credential does not match this computer."
-                                    .into(),
-                            );
+                        match save_approved(&NativeDeviceStore(&app), client, &value).await {
+                            Ok(device) => {
+                                device_status.retain(|saved| saved.id != device.id);
+                                device_status.push(DeviceStatus {
+                                    endpoint: device.endpoint(),
+                                    id: device.id,
+                                    role: device.role,
+                                    name: device.name,
+                                    model: device.model,
+                                    state: device.state,
+                                    online: false,
+                                });
+                                value.state = "saved".into();
+                                Some(value)
+                            }
+                            Err(error) => {
+                                unsaved_approval = true;
+                                warnings.push(format!(
+                                    "The host approved this computer, but the pairing could not be saved. {error} Cancel this pairing and ask the host to remove this computer."
+                                ));
+                                None
+                            }
                         }
-                        let device = PairedDevice {
-                            id,
-                            role: "client".into(),
-                            name: value.host_name.clone(),
-                            relay_url: client.relay.clone(),
-                            model: value.model.clone(),
-                            upstream: None,
-                            salt: candidate.salt,
-                            hash: candidate.hash,
-                            state: "active".into(),
-                        };
-                        lifecycle::save_client(&NativeDeviceStore(&app), &device, &client.key)
-                            .await?;
-                        device_status.retain(|saved| saved.id != device.id);
-                        device_status.push(DeviceStatus {
-                            endpoint: device.endpoint(),
-                            id: device.id,
-                            role: device.role,
-                            name: device.name,
-                            model: device.model,
-                            state: device.state,
-                            online: false,
-                        });
-                        value.state = "saved".into();
+                    } else {
+                        Some(value)
                     }
-                    Some(value)
                 }
                 Err(error) => {
                     warnings.push(error);
@@ -471,6 +561,9 @@ pub async fn pairing_status(
     } else {
         None
     };
+    if let Some(client) = inner.client.as_mut().filter(|_| unsaved_approval) {
+        client.unsaved_approval = true;
+    }
     if inner
         .client
         .as_ref()
@@ -652,6 +745,7 @@ pub async fn join_pairing(
             key,
             candidate: candidate.clone(),
             expires_at: now() + PAIRING_LIFETIME_MS,
+            unsaved_approval: false,
         });
         candidate
     };
@@ -725,7 +819,7 @@ pub async fn approve_pairing(
             &host.key,
             Some(json!(PairingApproval {
                 candidate,
-                session_id: id
+                session_id: id.clone()
             })),
             None,
         )
@@ -734,8 +828,34 @@ pub async fn approve_pairing(
         .map_err(String::from)
     })
     .await?;
-    reconcile(&state, &app, &mut inner, &mut Vec::new()).await?;
+    restore(&state, &app, &mut inner, &id).await?;
     crate::auth::require_unlocked(&app).await
+}
+/// The relay refuses to cancel an approved request, so a client that could not save its approval
+/// forgets the request locally, even offline; the host removes the computer from its devices.
+async fn cancel_client(client: &ClientRequest) -> Result<(), String> {
+    if client.unsaved_approval {
+        return Ok(());
+    }
+    let result = request(
+        &client.relay,
+        &format!("/{}/result", client.id),
+        reqwest::Method::DELETE,
+        &client.key,
+        None,
+        None,
+    )
+    .await;
+    if let Err(error) = result {
+        if !error.already_cancelled(true)
+            && !progress(&client.relay, &client.id, "result", &client.key)
+                .await
+                .is_ok_and(|value| value.state == "approved")
+        {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 #[tauri::command]
 pub async fn cancel_pairing(
@@ -770,20 +890,7 @@ pub async fn cancel_pairing(
         inner.host = None;
     } else if role == "client" {
         if let Some(client) = inner.client.as_ref() {
-            let result = request(
-                &client.relay,
-                &format!("/{}/result", client.id),
-                reqwest::Method::DELETE,
-                &client.key,
-                None,
-                None,
-            )
-            .await;
-            if let Err(error) = result {
-                if !error.already_cancelled(true) {
-                    return Err(error.into());
-                }
-            }
+            cancel_client(client).await?;
         }
         inner.client = None;
     } else {
@@ -814,7 +921,7 @@ pub async fn remove_paired_device(
         if let Some(tunnel) = inner.tunnels.remove(&id) {
             tunnel.stop().await;
         }
-        reconcile(&state, &app, &mut inner, &mut Vec::new()).await?;
+        restore(&state, &app, &mut inner, &id).await?;
     }
     Ok(())
 }
@@ -845,7 +952,7 @@ pub async fn retry_paired_device(
     if let Some(tunnel) = inner.tunnels.remove(&id) {
         tunnel.stop().await;
     }
-    reconcile(&state, &app, &mut inner, &mut Vec::new()).await?;
+    restore(&state, &app, &mut inner, &id).await?;
     Ok(())
 }
 
@@ -911,6 +1018,114 @@ mod tests {
         assert!(!task.is_finished());
         drop(held);
         task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn one_failed_device_is_reported_without_hiding_the_rest_unless_locked() {
+        let device = |id: &str, name: &str| PairedDevice {
+            id: id.into(),
+            role: "host".into(),
+            name: name.into(),
+            relay_url: "https://relay.test".into(),
+            model: "test".into(),
+            upstream: None,
+            salt: String::new(),
+            hash: String::new(),
+            state: "active".into(),
+        };
+        let (desk, laptop) = (device("bws_desk", "Desk"), device("bws_laptop", "Laptop"));
+        let mut failures = Vec::new();
+        isolate_device_error(&desk, Ok(()), async { Ok(()) }, &mut failures)
+            .await
+            .unwrap();
+        isolate_device_error(
+            &laptop,
+            Err("Keychain unavailable.".into()),
+            async { Ok(()) },
+            &mut failures,
+        )
+        .await
+        .unwrap();
+        let message = "Laptop needs attention. Keychain unavailable.";
+        assert_eq!(failures, [("bws_laptop".to_owned(), message.to_owned())]);
+        // An action on the healthy device succeeds; one on the broken device reports it.
+        assert_eq!(failure_for(failures.clone(), "bws_desk"), Ok(()));
+        assert_eq!(
+            failure_for(failures.clone(), "bws_laptop"),
+            Err(message.into())
+        );
+        let locked = isolate_device_error(
+            &laptop,
+            Err("Keychain unavailable.".into()),
+            async { Err("Blackwall is locked.".into()) },
+            &mut failures,
+        )
+        .await;
+        assert_eq!(locked.unwrap_err(), "Blackwall is locked.");
+        assert_eq!(failures.len(), 1);
+    }
+
+    /// Serve a relay that refuses to cancel and reports `state` for the request.
+    async fn refusing_relay(state: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = vec![0; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let response = if buffer[..read].starts_with(b"DELETE") {
+                    "HTTP/1.1 400 Bad Request\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                        .to_owned()
+                } else {
+                    let body = json!({
+                        "state": state, "hostName": "Host", "model": "test", "expiresAt": 0,
+                        "candidate": null, "confirmation": null, "sessionId": null,
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn approved_client_that_could_not_save_can_still_cancel() {
+        let key = secret("bwd_");
+        let (salt, hash) = digest(&key);
+        let request = |relay: String, unsaved_approval| ClientRequest {
+            relay,
+            id: secret("bwp_"),
+            key: key.clone(),
+            candidate: PairingCandidate {
+                id: secret("bwd_"),
+                name: "Client".into(),
+                salt: salt.clone(),
+                hash: hash.clone(),
+            },
+            expires_at: now() + 60_000,
+            unsaved_approval,
+        };
+        cancel_client(&request(refusing_relay("approved").await, false))
+            .await
+            .unwrap();
+        assert!(
+            cancel_client(&request(refusing_relay("review").await, false))
+                .await
+                .is_err()
+        );
+        // Offline after a failed save: the local request still clears.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let offline = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        assert!(cancel_client(&request(offline.clone(), false))
+            .await
+            .is_err());
+        cancel_client(&request(offline, true)).await.unwrap();
     }
     #[test]
     fn uncertain_responses_keep_credentials_but_rejected_new_requests_can_retry() {

@@ -11,7 +11,9 @@ import { normalizeEndpoint, connectionHelp } from './setup';
 import { connectionName, connectionProfiles, MAX_CONNECTIONS } from './connections';
 import { agentClient } from './agent';
 import {
+  freezePreferenceSaves,
   persistence,
+  thawPreferenceSaves,
   type ConnectionProfile,
   type Persistence,
   type Preferences,
@@ -43,6 +45,7 @@ const CONTEXT_STORAGE_KEY = 'blackwall.context-preferences.v1';
 const CONNECTIONS_STORAGE_KEY = 'blackwall.connections.v1';
 const MAX_SAVED_SESSIONS = 30;
 const LOCK_SAVE_WAIT_MS = 2000;
+const RESTART_SAVE_WAIT_MS = 10000;
 // The backend's answer when an approval expired or its run ended (approvals.rs `resolve`).
 const APPROVAL_GONE = 'This approval is no longer active.';
 
@@ -185,9 +188,17 @@ function sessionTitle(messages: ChatMessage[]): string {
   return source.length > 42 ? `${source.slice(0, 41).trimEnd()}…` : source;
 }
 
+// Shown when a reply is stopped before any text arrives; never sent back as the model's words.
+const STOPPED_PLACEHOLDER = 'Response stopped.';
+
 function asModelMessages(messages: ChatMessage[]): ModelMessage[] {
   return messages
-    .filter((message) => message.status !== 'error' && message.status !== 'sending')
+    .filter(
+      (message) =>
+        message.status !== 'error' &&
+        message.status !== 'sending' &&
+        !(message.status === 'stopped' && message.content === STOPPED_PLACEHOLDER),
+    )
     .map((message) => ({
       role: message.role,
       content: message.content,
@@ -328,6 +339,7 @@ export function createChatController(
     ...(!native ? { ...storedContextPreferences(), ...storedConnections() } : {}),
   });
   let storageReady = !native;
+  let restarting = false;
   let storageInitialization: Promise<void> | null = null;
   let saves = Promise.resolve();
   let sessionNavigation = 0;
@@ -479,10 +491,16 @@ export function createChatController(
     })();
     await storageInitialization;
   }
-  function savePreferences(next: Preferences) {
+  /** `saved` means the caller already wrote `next` natively; only the in-memory store changes. */
+  function blockedByRestart(): boolean {
+    if (restarting) notice.set('Blackwall is installing an update.');
+    return restarting;
+  }
+  function savePreferences(next: Preferences, saved = false) {
+    if (blockedByRestart()) return;
     preferences.update((current) => {
       const merged = { ...current, ...next };
-      if (native && storageReady) queueWrite(() => storage.savePreferences(next));
+      if (native && storageReady && !saved) queueWrite(() => storage.savePreferences(next));
       if (!native && canUseStorage()) {
         try {
           window.localStorage.setItem(
@@ -543,7 +561,8 @@ export function createChatController(
       notice.set('Connect your model endpoint before compacting.');
       return false;
     }
-    if (get(runState) !== 'idle' || !get(messages).length || writeFailed) return false;
+    if (get(runState) !== 'idle' || !get(messages).length || writeFailed || restarting)
+      return false;
     const generation = ++runGeneration;
     const controller = new AbortController();
     activeRequest = controller;
@@ -838,6 +857,7 @@ export function createChatController(
       return true;
     }
     if (pending.length === 0 && content === '/compact') return compact();
+    if (blockedByRestart()) return false;
     if (writeFailed) {
       notice.set('Retry saving or export this conversation before continuing.');
       return false;
@@ -1119,7 +1139,7 @@ export function createChatController(
             message.id === assistantId
               ? {
                   ...message,
-                  content: message.content || (stopped ? 'Response stopped.' : ''),
+                  content: message.content || (stopped ? STOPPED_PLACEHOLDER : ''),
                   status: stopped ? 'stopped' : 'error',
                   tools: message.tools?.map((tool) =>
                     tool.status === 'running'
@@ -1179,7 +1199,7 @@ export function createChatController(
                   ? { ...child, state: 'interrupted', summary: 'Stopped with the parent task.' }
                   : child,
               ),
-              content: message.content || 'Response stopped.',
+              content: message.content || STOPPED_PLACEHOLDER,
               tools: message.tools?.map((tool) =>
                 tool.status === 'running' ? { ...tool, status: 'stopped' } : tool,
               ),
@@ -1194,6 +1214,7 @@ export function createChatController(
   async function newChat(
     mode: ConversationMode = get(agentMode) ? 'agent' : 'chat',
   ): Promise<boolean> {
+    if (blockedByRestart()) return false;
     const currentWorkspace = get(workspace);
     const navigation = ++sessionNavigation;
     stop();
@@ -1226,7 +1247,7 @@ export function createChatController(
   }
 
   async function openSession(sessionId: string, fromRecall = false): Promise<void> {
-    if (sessionId === get(activeSessionId)) return;
+    if (sessionId === get(activeSessionId) || blockedByRestart()) return;
     let session = get(fromRecall ? sessions : visibleSessions).find(
       (item) => item.id === sessionId,
     );
@@ -1305,6 +1326,7 @@ export function createChatController(
   }
 
   function removeSession(sessionId: string): void {
+    if (blockedByRestart()) return;
     sessionNavigation += 1;
     if (sessionId === get(activeSessionId)) {
       stop();
@@ -1340,6 +1362,34 @@ export function createChatController(
       focusedMessageId.set(get(messages)[index]?.id);
       closeRecall();
     }
+  }
+  // The update restarts the app, so a running task or an unsaved change would be lost. New tasks,
+  // conversation changes and settings saves stay blocked until releaseRestart() in case the
+  // install fails.
+  async function prepareForRestart(): Promise<void> {
+    if (get(runState) !== 'idle') throw new Error('Stop the current task before updating.');
+    restarting = true;
+    await freezePreferenceSaves();
+    // A hung save must not hold the update forever; the caller releases the restart on error.
+    const deadline = Date.now() + RESTART_SAVE_WAIT_MS;
+    while (drainingWrites) {
+      if (Date.now() >= deadline)
+        throw new Error(
+          'Saving is taking too long. Retry saving or export your conversation before updating.',
+        );
+      let waited: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        saves,
+        new Promise<void>((resolve) => (waited = setTimeout(resolve, 250))),
+      ]);
+      clearTimeout(waited);
+    }
+    if (pendingWrites.length)
+      throw new Error('Retry saving or export your conversation before updating.');
+  }
+  function releaseRestart(): void {
+    restarting = false;
+    thawPreferenceSaves();
   }
   async function suspend(): Promise<boolean> {
     closeRecall();
@@ -1457,6 +1507,8 @@ export function createChatController(
     dismissNotice,
     destroy,
     suspend,
+    prepareForRestart,
+    releaseRestart,
     retryPersistence,
   };
 }

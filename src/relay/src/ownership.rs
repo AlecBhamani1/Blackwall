@@ -90,15 +90,32 @@ impl OwnershipStore {
         Ok(Self(Mutex::new(Backend::Disk(connection))))
     }
 
+    #[cfg(test)]
+    pub(crate) fn lock_for_test(&self) -> std::sync::MutexGuard<'_, impl Sized> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Reserve before acknowledging registration. Retain ownership after expiry too:
     /// an old public URL must not become an address for somebody else's computer.
     pub(crate) fn claim(&self, id: &str, key: &str) -> Result<(), OwnershipError> {
-        self.update(id, key, false)
+        self.update(id, key, false, true).map(drop)
     }
     pub(crate) fn revoke(&self, id: &str, key: &str) -> Result<(), OwnershipError> {
-        self.update(id, key, true)
+        self.update(id, key, true, true).map(drop)
     }
-    fn update(&self, id: &str, key: &str, revoke: bool) -> Result<(), OwnershipError> {
+    /// Revokes only an existing reservation; `Ok(false)` means the address is unknown.
+    pub(crate) fn revoke_existing(&self, id: &str, key: &str) -> Result<bool, OwnershipError> {
+        self.update(id, key, true, false)
+    }
+    fn update(
+        &self,
+        id: &str,
+        key: &str,
+        revoke: bool,
+        reserve: bool,
+    ) -> Result<bool, OwnershipError> {
         let digest: [u8; 32] = Sha256::new()
             .chain_update(b"blackwall-relay-owner-v1\0")
             .chain_update(id.as_bytes())
@@ -120,7 +137,10 @@ impl OwnershipStore {
                         ));
                     }
                     *revoked |= revoke;
-                    return Ok(());
+                    return Ok(true);
+                }
+                if !reserve {
+                    return Ok(false);
                 }
                 check_capacity(owners.len())?;
                 owners.insert(id.to_owned(), (digest, revoke));
@@ -147,7 +167,10 @@ impl OwnershipStore {
                             .execute("UPDATE owners SET revoked=1 WHERE session_id=?1", [id])?;
                     }
                     transaction.commit()?;
-                    return Ok(());
+                    return Ok(true);
+                }
+                if !reserve {
+                    return Ok(false);
                 }
                 let count: u32 =
                     transaction.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
@@ -159,7 +182,7 @@ impl OwnershipStore {
                 transaction.commit()?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 

@@ -60,6 +60,8 @@ it('manages settings sections on one page and returns focus after closing Settin
   await user.click(within(pane).getByRole('button', { name: 'Save context limit' }));
   expect(onPreferences).toHaveBeenCalledWith(
     expect.objectContaining({ contextWindow: 8193, maxIterations: 30 }),
+    // Not saved by the dialog outside the desktop app, so the store writes it once.
+    false,
   );
 
   await user.keyboard('{Escape}');
