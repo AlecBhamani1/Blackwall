@@ -255,6 +255,8 @@ impl LocalStore {
                 "SELECT id, body FROM paired_devices",
                 &mut devices,
             )?;
+            // Windows cannot rename over a file that is still open.
+            drop(old);
         }
         // The browser's old saved chats must not be imported back into the new database.
         settings.retain(|(key, _)| key != "legacy_sessions_migrated");
@@ -283,7 +285,11 @@ impl LocalStore {
         }
         transaction.commit()?;
         drop(store);
-        fs::File::open(staging.join(DATABASE_FILE))?.sync_all()?;
+        // Windows needs write access to flush a file.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(staging.join(DATABASE_FILE))?
+            .sync_all()?;
         // A leftover journal of the old database must not be applied to the new one.
         for suffix in ["-journal", "-wal", "-shm"] {
             match fs::remove_file(directory.join(format!("{DATABASE_FILE}{suffix}"))) {
