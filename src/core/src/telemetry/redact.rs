@@ -1,6 +1,6 @@
-//! Redaction carried over unchanged from the original trace writer: secret-looking JSON keys,
-//! `name: value` lines, quoted pairs inside text, and the audit-log patterns. Values removed here
-//! are remembered so the processor can scrub repeats from the whole run.
+//! Trace redaction: secret-looking JSON keys, `name: value` lines, quoted pairs inside text, PEM
+//! private keys, API tokens with a known prefix and shape, and the audit-log patterns. Values
+//! removed here are remembered so the processor can scrub repeats from the whole run.
 use serde_json::{json, Value};
 
 pub(super) const MAX_TEXT: usize = 4096;
@@ -47,27 +47,28 @@ fn strings(value: &Value, found: &mut Vec<String>) {
     }
 }
 
-/// Length of a JSON string body up to its closing quote, honouring escapes.
-fn closing_quote(text: &str) -> Option<usize> {
+/// Length of a quoted string body up to its closing `quote`, honouring escapes.
+fn closing_quote(text: &str, quote: char) -> Option<usize> {
     let mut escaped = false;
     for (index, c) in text.char_indices() {
         match c {
             _ if escaped => escaped = false,
             '\\' => escaped = true,
-            '"' => return Some(index),
+            _ if c == quote => return Some(index),
             _ => {}
         }
     }
     None
 }
 
-/// Redact `"secretName": value` pairs inside text, such as JSON quoted in a model answer.
-fn redact_quoted_pairs(text: &str, found: &mut Vec<String>) -> String {
+/// Redact `"secretName": value` and `'secretName': value` pairs inside text, such as JSON or a
+/// Python dict quoted in a model answer.
+fn redact_quoted_pairs(text: &str, quote: char, found: &mut Vec<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find('"') {
+    while let Some(start) = rest.find(quote) {
         let after = &rest[start + 1..];
-        let Some(end) = closing_quote(after) else {
+        let Some(end) = closing_quote(after, quote) else {
             break;
         };
         let key = &after[..end];
@@ -79,8 +80,8 @@ fn redact_quoted_pairs(text: &str, found: &mut Vec<String>) -> String {
         if !secret_name(key) || value.starts_with(['{', '[']) {
             continue;
         }
-        let length = match value.strip_prefix('"') {
-            Some(body) => closing_quote(body).map_or(value.len(), |end| end + 2),
+        let length = match value.strip_prefix(quote) {
+            Some(body) => closing_quote(body, quote).map_or(value.len(), |end| end + 2),
             None => value
                 .find([',', '}', ']', ' ', '\t'])
                 .unwrap_or(value.len()),
@@ -88,22 +89,139 @@ fn redact_quoted_pairs(text: &str, found: &mut Vec<String>) -> String {
         if length == 0 {
             continue;
         }
-        if let Some(body) = value[..length].strip_prefix('"') {
-            let body = body.strip_suffix('"').unwrap_or(body);
+        if let Some(body) = value[..length].strip_prefix(quote) {
+            let body = body.strip_suffix(quote).unwrap_or(body);
             // Keep the decoded form too, as the trace stores text JSON-escaped.
-            found
-                .push(serde_json::from_str(&format!("\"{body}\"")).unwrap_or_else(|_| body.into()));
+            found.push(match quote {
+                '"' => serde_json::from_str(&format!("\"{body}\"")).unwrap_or_else(|_| body.into()),
+                _ => body.into(),
+            });
         }
         out.push_str(&rest[..rest.len() - value.len()]);
-        out.push_str("\"[redacted]\"");
+        out.push_str(&format!("{quote}[redacted]{quote}"));
         rest = &value[length..];
     }
     out.push_str(rest);
     out
 }
 
-/// Audit redaction plus `name: value` lines, as in YAML and `.env`-style files.
+/// Prefixes of well-known API tokens. A match also needs the tail after the prefix to have the
+/// provider's shape (see [`token_shape`]), so names such as `sk-learn` are kept.
+const TOKEN_PREFIXES: [&str; 9] = [
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+];
+
+/// Whether `tail`, the token characters after `prefix`, looks like a real token rather than a name.
+fn token_shape(prefix: &str, tail: &str) -> bool {
+    let has = |test: fn(&u8) -> bool| tail.bytes().any(|b| test(&b));
+    let alphanumeric = tail.bytes().all(|b| b.is_ascii_alphanumeric());
+    match prefix {
+        // OpenAI and Anthropic keys mix cases; others are long lowercase hex. Hyphenated
+        // lowercase names such as `sk-documentation-example-2026` are neither.
+        "sk-" => {
+            tail.len() >= 32
+                && has(u8::is_ascii_digit)
+                && has(u8::is_ascii_lowercase)
+                && (alphanumeric || has(u8::is_ascii_uppercase))
+        }
+        // 22 base62 characters, `_`, then 59 more.
+        "github_pat_" => tail
+            .split_once('_')
+            .is_some_and(|(id, secret)| base62(id, 22) && base62(secret, 59)),
+        // Slack: numeric team and user IDs, then a long alphanumeric secret.
+        "xoxb-" | "xoxp-" => {
+            let parts: Vec<&str> = tail.split('-').collect();
+            parts.len() >= 3
+                && parts[..parts.len() - 1]
+                    .iter()
+                    .all(|id| id.len() >= 8 && id.bytes().all(|b| b.is_ascii_digit()))
+                && parts[parts.len() - 1].len() >= 24
+                && parts[parts.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric())
+        }
+        // GitHub `gh?_` tokens: exactly 36 base62 characters, which may be letters only.
+        _ => base62(tail, 36),
+    }
+}
+
+fn base62(text: &str, length: usize) -> bool {
+    text.len() == length && text.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// Redact bare API tokens with a known prefix, wherever they appear.
+fn redact_tokens(text: &str, found: &mut Vec<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((start, prefix)) = TOKEN_PREFIXES
+        .iter()
+        .filter_map(|prefix| rest.find(prefix).map(|at| (at, prefix)))
+        .min()
+    {
+        let after = &rest[start + prefix.len()..];
+        let tail = after.find(|c| !token_char(c)).unwrap_or(after.len());
+        let token = &rest[start..start + prefix.len() + tail];
+        // No word-boundary check: the shape alone decides, so `KEY_ghp_…` is caught too.
+        if token_shape(prefix, &after[..tail]) {
+            out.push_str(&rest[..start]);
+            out.push_str("[redacted]");
+            found.push(token.to_owned());
+        } else {
+            out.push_str(&rest[..start + prefix.len()]);
+            rest = &rest[start + prefix.len()..];
+            continue;
+        }
+        rest = &rest[start + token.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact PEM private key blocks, from `-----BEGIN … PRIVATE KEY-----` to the matching end line
+/// or, if it is missing, the end of the text.
+fn redact_private_keys(text: &str, found: &mut Vec<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN ") {
+        let label_start = start + "-----BEGIN ".len();
+        let label = rest[label_start..]
+            .find("-----")
+            .map(|end| &rest[label_start..label_start + end])
+            .filter(|label| label.ends_with("PRIVATE KEY") && !label.contains('\n'));
+        let Some(label) = label else {
+            out.push_str(&rest[..label_start]);
+            rest = &rest[label_start..];
+            continue;
+        };
+        let footer = format!("-----END {label}-----");
+        let end = rest[start..]
+            .find(&footer)
+            .map_or(rest.len(), |at| start + at + footer.len());
+        out.push_str(&rest[..start]);
+        out.push_str("[redacted]");
+        found.push(rest[start..end].to_owned());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Audit redaction plus `name: value` lines, as in YAML and `.env`-style files, private keys, and
+/// bare API tokens.
 fn redact_lines(text: &str, found: &mut Vec<String>) -> String {
+    let text = redact_tokens(&redact_private_keys(text, found), found);
     text.lines()
         .map(|line| match line.split_once(':') {
             Some((name, value))
@@ -115,11 +233,14 @@ fn redact_lines(text: &str, found: &mut Vec<String>) -> String {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) =>
             {
-                found.push(value.trim().trim_matches('"').to_owned());
+                // A trailing comma ends a JSON or YAML item; it is not part of the value.
+                let value = value.trim().trim_end_matches(',').trim_end();
+                found.push(value.trim_matches(['"', '\'']).to_owned());
                 format!("{name}: [redacted]")
             }
             _ => {
-                let line = redact_quoted_pairs(line, found);
+                let line = redact_quoted_pairs(line, '"', found);
+                let line = redact_quoted_pairs(&line, '\'', found);
                 let redacted = crate::policy::redact_text(&line);
                 // Remember what audit redaction removed, so repeats elsewhere are caught too.
                 for (before, after) in line.split_whitespace().zip(redacted.split_whitespace()) {
@@ -235,6 +356,13 @@ mod tests {
             yaml,
             "name: demo\npassword: [redacted]\n\"api_key\": [redacted]"
         );
+        let mut found = vec![];
+        let listing = clip(
+            "{\n  \"api_key\": \"sk-abc\",\n  'password': 'hunter2', x: 1\n}",
+            &mut found,
+        );
+        assert_eq!(found, ["sk-abc", "hunter2"]);
+        assert!(!listing.contains("hunter2"), "{listing}");
         let answer = clip(
             r#"Contents: ```{"service":"demo","apiKey":"s\"4","port":80,"token": 5}``` done"#,
             &mut vec![],
@@ -243,5 +371,60 @@ mod tests {
             answer,
             r#"Contents: ```{"service":"demo","apiKey":"[redacted]","port":80,"token": "[redacted]"}``` done"#
         );
+    }
+
+    #[test]
+    fn clip_redacts_private_keys_and_bare_tokens() {
+        // Token-shaped fixtures are assembled at runtime so no complete fake key or token
+        // appears literally in source (keeps secret scanners and push protection quiet).
+        let armor = |label: &str| format!("-----{label}-----");
+        let mut found = vec![];
+        let pem = format!(
+            "{}\nMIIEpAIBAAKCAQEA\n{}",
+            armor("BEGIN RSA PRIVATE KEY"),
+            armor("END RSA PRIVATE KEY")
+        );
+        let text = clip(&format!("key:\n{pem}\ndone"), &mut found);
+        assert_eq!(text, "key:\n[redacted]\ndone");
+        assert_eq!(found, [pem]);
+        let escaped = clip(
+            &format!(r#"{{"note":"{}\nAAAA"}}"#, armor("BEGIN PRIVATE KEY")),
+            &mut vec![],
+        );
+        assert_eq!(escaped, r#"{"note":"[redacted]"}"#);
+        // Real shapes: OpenAI project key, a letters-only GitHub token embedded after `_`,
+        // and a DeepSeek-style hex key.
+        let (sk, gh, git, xox) = ("sk", "gh", "git", "xox");
+        let openai = format!("{sk}-proj-Ab3dEfGhIjKlMnOpQrStUvWxYz012345");
+        let github = format!("{gh}p_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ");
+        let hex = format!("{sk}-0123456789abcdef0123456789abcdef");
+        let slack = format!("{xox}b-1234567890-9876543210987-AbCdEfGhIjKlMnOpQrStUvWx");
+        let pat = format!(
+            "{git}hub_pat_{}_{}",
+            "A1".repeat(11),
+            "b2C".repeat(19) + "d3"
+        );
+        let mut found = vec![];
+        let text = clip(
+            &format!("use {openai}, GH_TOKEN_{github}; {hex} {slack} {pat}"),
+            &mut found,
+        );
+        assert_eq!(
+            text,
+            "use [redacted], GH_TOKEN_[redacted]; [redacted] [redacted] [redacted]"
+        );
+        assert_eq!(found, [openai, github, hex, slack, pat]);
+        // Names that only resemble tokens are kept and not remembered for the run.
+        let mut found = vec![];
+        let prose = format!(
+            "{sk}-learn, {sk}-documentation-example-2026-and-more, ask-0123456789abcdefghij, \
+             {gh}p_short1234567890abcdefghij, {xox}b-documentation-example-2026, \
+             {xox}p-your-workspace-token-goes-here, {gh}p_thisisalongdocumentationplaceholdervalue, \
+             {git}hub_pat_this_is_a_documentation_placeholder_for_the_new_fine_grained_token_format_here_too, \
+             gl{}-documentation-example-2026",
+            "pat"
+        );
+        assert_eq!(clip(&prose, &mut found), prose);
+        assert!(found.is_empty(), "{found:?}");
     }
 }
