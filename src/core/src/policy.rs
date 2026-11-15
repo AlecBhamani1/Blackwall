@@ -979,6 +979,8 @@ fn read_file(directory: &Path) -> Result<RulesFile, String> {
 
 /// Serializes rule edits in this process, so two saves cannot both read the old file.
 static EDITS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes rule edits across processes, such as the desktop app and `bw`.
+const EDIT_LOCK: &str = ".policy.lock";
 
 fn edit_rules(directory: &Path, change: impl FnOnce(&mut RulesFile)) -> Result<(), String> {
     try_edit_rules(directory, |file| {
@@ -994,6 +996,8 @@ fn try_edit_rules(
     let _edit = EDITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _editing =
+        lock_owner_file(directory, EDIT_LOCK).map_err(|_| "The policy file could not be saved.")?;
     let mut file = read_file(directory)?;
     let before = file.rules.len();
     change(&mut file)?;
@@ -1724,6 +1728,29 @@ mod tests {
             }
         });
         assert_eq!(tool_rules(&directory).unwrap().len(), 8);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn saves_wait_for_another_process_editing_the_rules() {
+        let directory =
+            std::env::temp_dir().join(format!("blackwall-lock-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // Another process (the desktop app or `bw`) holds the edit lock.
+        let lock = lock_owner_file(&directory, EDIT_LOCK).unwrap();
+        let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+        let save_directory = directory.clone();
+        let handle = std::thread::spawn(move || {
+            saved_tx.send(allow_web(&save_directory)).unwrap();
+        });
+        assert!(saved_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(!directory.join(POLICY_FILE).exists());
+        drop(lock);
+        saved_rx.recv().unwrap().unwrap();
+        handle.join().unwrap();
+        assert!(directory.join(POLICY_FILE).exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
