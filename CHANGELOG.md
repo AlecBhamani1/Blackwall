@@ -77,6 +77,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names, source path and notes, and out of warnings that quote file names in the skills folder,
   so a skill cannot hide its own scan warnings.
 - An MCP server secret saved with an empty value no longer garbles that server's output and tools.
+- An upgrade of an older chat database that fails or is killed no longer takes a backup slot: each
+  attempt copies to `backups/blackwall-upgrading.sqlite3`, which moves to a slot only once the
+  upgrade finishes, so repeated attempts cannot fill the three slots and hide the real error.
+- The skill import safety scan now checks text files that contain invalid UTF-8 instead of
+  silently skipping them.
+- Rule edits from the desktop app and `bw` now take a cross-process lock on `policy.json`, so
+  simultaneous saves cannot drop a rule.
 
 ### Added
 
