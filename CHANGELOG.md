@@ -50,6 +50,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from sandboxed writes; denies `~/.git-credentials`, `~/.docker`, `~/.kube` and shell histories;
   and keeps local Unix sockets closed when network access is on, so sandboxed commands can no
   longer reach Docker, `ssh-agent` or other socket-based services.
+- While the app is locked, the setup commands that look for local model servers, probe a server
+  address and open setup links in the browser now refuse until it is unlocked.
+- `bw skills` filters terminal control characters out of a skill's description, license, file
+  names, source path and notes, and out of warnings that quote file names in the skills folder,
+  so a skill cannot hide its own scan warnings.
+- An MCP server secret saved with an empty value no longer garbles that server's output and tools.
 
 ### Added
 

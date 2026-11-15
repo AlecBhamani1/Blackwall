@@ -1160,9 +1160,13 @@ fn start_process(
 }
 
 fn redact(text: String, secrets: &[String]) -> String {
-    secrets.iter().fold(text, |text, secret| {
-        text.replace(secret.as_str(), "[redacted]")
-    })
+    // An empty value would match between every character.
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text, |text, secret| {
+            text.replace(secret.as_str(), "[redacted]")
+        })
 }
 
 /// Secret names are environment variable names: uppercase letters, digits, and `_`.
@@ -1300,6 +1304,15 @@ fn validate_for(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_secret_redacts_nothing() {
+        let secrets = vec![String::new(), "token".into()];
+        assert_eq!(
+            redact("read_file token".into(), &secrets),
+            "read_file [redacted]"
+        );
+    }
     use crate::protocol::{ApprovalDecision, ResolveApprovalRequest};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
