@@ -558,6 +558,8 @@ read-only with command network disabled. Desktop selections reset when switching
 CLI selections persist. Old saved settings acquire the safe defaults. With command network on,
 sandboxed commands share this computer's network, so they can reach services on this computer
 (localhost) and your local network. Limiting them to the internet is not available yet.
+On macOS, local Unix sockets stay closed even with command network on, so sandboxed commands
+cannot reach Docker, `ssh-agent` or other socket-based services on this computer.
 
 Command tools are the exception to the profile by default, because a program such as `claude -p`
 needs its own files and network. **Command tools** (Settings → Agent → Subagents, or

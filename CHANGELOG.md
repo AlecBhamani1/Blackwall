@@ -46,6 +46,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In an interactive `bw` terminal on macOS and Linux, lines typed or pasted before an approval
   prompt appears, including `/` commands, are discarded instead of answering it. On Windows,
   only lines `bw` has already read are discarded. Piped input still answers prompts in order.
+- The macOS sandbox now protects configured extra instruction files (and their leading folders)
+  from sandboxed writes; denies `~/.git-credentials`, `~/.docker`, `~/.kube` and shell histories;
+  and keeps local Unix sockets closed when network access is on, so sandboxed commands can no
+  longer reach Docker, `ssh-agent` or other socket-based services.
 
 ### Added
 
