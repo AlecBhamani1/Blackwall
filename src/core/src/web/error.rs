@@ -91,6 +91,26 @@ pub(super) fn source_url(url: &Url) -> String {
     source.to_string()
 }
 
+/// Approval prompts show the exact request target, query included, so the owner can see what
+/// leaves the machine. `Url` serialization percent-encodes controls and non-ASCII. A URL too long
+/// to show in full is refused rather than truncated, so no sent byte is hidden from the owner.
+pub(super) fn prompt_url(url: &Url) -> Result<String, WebError> {
+    const LIMIT: usize = 2048;
+    let mut target = url.clone();
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    target.set_fragment(None);
+    let target = target.to_string();
+    if target.chars().count() > LIMIT {
+        return Err(WebError::new(
+            WebErrorCategory::InvalidUrl,
+            url,
+            "The request URL exceeds 2,048 characters and cannot be shown in full for approval. Use a shorter public URL.",
+        ));
+    }
+    Ok(target)
+}
+
 pub(super) fn transport_error(error: &reqwest::Error, url: &Url) -> WebError {
     // Inspect the cause chain for classification only: reqwest's display includes request URLs.
     let mut cause: Option<&(dyn Error + 'static)> = error.source();
