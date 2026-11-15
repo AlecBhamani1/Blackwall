@@ -262,7 +262,11 @@
       }}
       onConfigureEndpoint={controller.configureEndpoint}
       onCheckForUpdates={updateController.checkForUpdates}
-      onInstallUpdate={updateController.installUpdate}
+      onInstallUpdate={() =>
+        updateController.installUpdate({
+          prepare: controller.prepareForRestart,
+          release: controller.releaseRestart,
+        })}
       onClose={() => (sidebarVisible = false)}
     />
 

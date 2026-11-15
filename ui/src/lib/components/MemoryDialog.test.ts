@@ -217,6 +217,30 @@ describe('memory management', () => {
     expect(stored).toEqual({ memoryEnabled: true, contextWindow: 32000 });
     expect(screen.getByText('Saved ✓')).toBeInTheDocument();
   });
+  it('reports saved isolation and memory settings to the app preferences', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(persistence, 'savePreferences').mockResolvedValue();
+    const onPreferences = vi.fn();
+    const view = render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'subagents', onPreferences },
+    });
+    const sandboxed = await screen.findByLabelText('Inside the Commands profile');
+    await vi.waitFor(() => expect(sandboxed).toBeEnabled());
+    await user.click(sandboxed);
+    await user.click(screen.getByRole('button', { name: 'Save subagent settings' }));
+    expect(onPreferences).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commandToolsIsolation: 'sandboxed' }),
+      true,
+    );
+    view.unmount();
+    render(MemoryDialog, {
+      props: { onClose: vi.fn(), embedded: true, section: 'memory', onPreferences },
+    });
+    const toggle = await screen.findByLabelText('Use saved memories in chat');
+    await vi.waitFor(() => expect(toggle).toBeEnabled());
+    await user.click(toggle);
+    expect(onPreferences).toHaveBeenLastCalledWith({ memoryEnabled: true }, true);
+  });
   it('shows feedback after saving memory text', async () => {
     const user = userEvent.setup();
     vi.spyOn(persistence, 'saveMemory').mockResolvedValue();

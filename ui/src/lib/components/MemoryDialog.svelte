@@ -17,15 +17,8 @@
   import SettingsFooter from './SettingsFooter.svelte';
   import { platform } from '../platform';
   export let contextPreferences: Preferences = {};
-  export let onPreferences: (preferences: {
-    memoryEnabled: boolean;
-    contextWindow: number;
-    outputTokens: number;
-    autoCompact: boolean;
-    maxIterations: number;
-    commandTimeoutSeconds: number;
-    maxOutputBytes: number;
-  }) => void = () => {};
+  // `saved` tells the app the change is already written, so it only updates its copy.
+  export let onPreferences: (preferences: Preferences, saved?: boolean) => void = () => {};
   export let onClose: () => void;
   export let embedded = false;
   export let section: 'memory' | 'limits' | 'subagents' | 'instructions' = 'memory';
@@ -128,12 +121,14 @@
     busy = true;
     error = '';
     try {
-      await persistence.savePreferences({
+      const saved: Preferences = {
         subagentMaxSteps: Number(subagentMaxSteps),
         subagentTools,
         subagentRunsOn: subagentRunsOn === 'local' ? 'local' : { tool: subagentTool },
         commandToolsIsolation,
-      });
+      };
+      await persistence.savePreferences(saved);
+      onPreferences(saved, true);
       savedSubagents = subagentsState;
       showSaved();
     } catch (cause) {
@@ -286,15 +281,18 @@
           commandTimeoutSeconds: Number(commandTimeoutSeconds),
           maxOutputBytes: Number(maxOutputBytes),
         });
-      onPreferences({
-        memoryEnabled: enabled,
-        contextWindow: Number(contextWindow),
-        outputTokens: Number(outputTokens),
-        autoCompact,
-        maxIterations: Number(maxIterations),
-        commandTimeoutSeconds: Number(commandTimeoutSeconds),
-        maxOutputBytes: Number(maxOutputBytes),
-      });
+      onPreferences(
+        {
+          memoryEnabled: enabled,
+          contextWindow: Number(contextWindow),
+          outputTokens: Number(outputTokens),
+          autoCompact,
+          maxIterations: Number(maxIterations),
+          commandTimeoutSeconds: Number(commandTimeoutSeconds),
+          maxOutputBytes: Number(maxOutputBytes),
+        },
+        desktop,
+      );
       savedLimits = limitsState;
       showSaved();
     } catch {
@@ -308,6 +306,7 @@
     error = '';
     try {
       if (desktop) await persistence.savePreferences({ memoryEnabled: enabled });
+      onPreferences({ memoryEnabled: enabled }, desktop);
       showSaved();
     } catch {
       error = 'This setting could not be saved. Try again.';
