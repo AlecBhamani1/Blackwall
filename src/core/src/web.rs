@@ -268,7 +268,8 @@ where
     };
     let mut visited = std::collections::HashSet::from([url.to_string()]);
     for redirects in 0..=MAX_REDIRECTS {
-        let detail = format!("Read web page\nGET {}{search_detail}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.", error::source_url(&url));
+        let shown = error::prompt_url(&url)?;
+        let detail = format!("Read web page\nGET {shown}{search_detail}\nPurpose: {purpose}\n\nThe website receives your request and network address. Page contents are treated as untrusted information.");
         if !approvals
             .request_web(request_id, url.host_str().unwrap_or_default(), detail, emit)
             .await

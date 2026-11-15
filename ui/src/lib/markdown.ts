@@ -4,6 +4,13 @@ import 'katex/dist/katex.min.css';
 import { Marked } from 'marked';
 import { mathExtensions, type MathToken } from './mathMarkdown';
 
+const purify = DOMPurify();
+// Only HTML anchors may link, so the app's link guard sees every link (MathML and SVG can too).
+purify.addHook('uponSanitizeAttribute', (node, data) => {
+  const link = data.attrName === 'href' || data.attrName === 'xlink:href';
+  if (link && !(node instanceof HTMLAnchorElement)) data.keepAttr = false;
+});
+
 export function renderMarkdown(source: string): string {
   const math = new Map<string, MathToken>();
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
@@ -21,12 +28,28 @@ export function renderMarkdown(source: string): string {
   const html = marked.parse(source, { async: false }) as string;
   const template = document.createElement('template');
   template.content.append(
-    DOMPurify.sanitize(html, {
-      FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed', 'form'],
+    purify.sanitize(html, {
+      // Model text must not draw controls that imitate Blackwall prompts.
+      FORBID_TAGS: [
+        'style',
+        'script',
+        'iframe',
+        'object',
+        'embed',
+        'form',
+        'button',
+        'textarea',
+        'select',
+      ],
       FORBID_ATTR: ['style'],
       RETURN_DOM_FRAGMENT: true,
     }),
   );
+  // GFM task lists render disabled checkboxes; every other input is removed.
+  for (const input of template.content.querySelectorAll('input')) {
+    if (input.type === 'checkbox') input.disabled = true;
+    else input.remove();
+  }
 
   // Only library-generated math may retain layout styles. Unpredictable slots prevent
   // source HTML from impersonating math; all source markup is sanitized first.
