@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ApprovalCard from './ApprovalCard.svelte';
 
 const approval = {
@@ -9,7 +9,12 @@ const approval = {
   kind: 'file',
   detail: 'Update src/main.ts\n-old\n+new',
 };
+// A new approval ignores input for a moment; let that pass before acting on purpose.
+const settle = () => vi.advanceTimersByTimeAsync(1000);
+const setup = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 describe('action approval', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
   it('offers no run-wide allow for a call the model wrote as text', () => {
     render(ApprovalCard, {
       props: { approval: { ...approval, remember: false }, onResolve: vi.fn() },
@@ -79,9 +84,10 @@ describe('action approval', () => {
     expect(screen.queryByText(/Runs outside the sandbox/)).not.toBeInTheDocument();
   });
   it('shows the exact proposed action and sends only one decision while pending', async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onResolve = vi.fn(() => new Promise<void>(() => {}));
     render(ApprovalCard, { props: { approval, onResolve } });
+    await settle();
     expect(screen.getByRole('region', { name: 'Proposed action details' })).toHaveTextContent(
       'Update src/main.ts',
     );
@@ -91,7 +97,7 @@ describe('action approval', () => {
     expect(screen.getByRole('button', { name: 'Deny' })).toBeDisabled();
   });
   it('offers to always allow an MCP tool or its whole server', async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onResolve = vi.fn().mockResolvedValue(undefined);
     const tool = {
       requestId: 'run',
@@ -101,6 +107,7 @@ describe('action approval', () => {
       tool: { server: 'context7', tool: 'context7__query-docs' },
     };
     const { rerender } = render(ApprovalCard, { props: { approval: tool, onResolve } });
+    await settle();
     expect(screen.getByText('Allow this tool?')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Always allow' }));
     expect(onResolve).toHaveBeenLastCalledWith('allow_tool_in_project');
@@ -109,18 +116,20 @@ describe('action approval', () => {
     await user.click(screen.getByRole('button', { name: 'Always allow' }));
     expect(onResolve).toHaveBeenLastCalledWith('allow_server');
     await rerender({ approval: { ...tool, approvalId: 'next' }, onResolve });
+    await settle();
     await user.click(screen.getByRole('button', { name: 'Always allow' }));
     expect(onResolve).toHaveBeenLastCalledWith('allow_tool_in_project');
     await rerender({ approval, onResolve });
     expect(screen.queryByRole('button', { name: 'Always allow' })).not.toBeInTheDocument();
   });
   it('offers reusable web access for different searches and pages', async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(ApprovalCard, {
       approval: { ...approval, kind: 'network', remember: false, webAccess: 'persistent' },
       onResolve,
     });
+    await settle();
     expect(
       screen.queryByRole('button', { name: 'Allow identical action this run' }),
     ).not.toBeInTheDocument();
@@ -160,11 +169,38 @@ describe('action approval', () => {
     expect(screen.getByRole('button', { name: 'Allow once' })).toBeVisible();
   });
   it('offers recovery after a decision cannot be delivered', async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onResolve = vi.fn().mockRejectedValue(new Error('expired'));
-    render(ApprovalCard, { props: { approval, onResolve } });
+    const { rerender } = render(ApprovalCard, { props: { approval, onResolve } });
+    await settle();
     await user.click(screen.getByRole('button', { name: 'Deny' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('stop the task');
     expect(screen.getByRole('button', { name: 'Deny' })).toBeEnabled();
+    // The next approval does not open showing the previous one's failure.
+    await rerender({ approval: { ...approval, approvalId: 'next' }, onResolve });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('ignores a click or Enter meant for the previous approval', async () => {
+    const user = setup();
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(ApprovalCard, { props: { approval, onResolve } });
+    await user.click(screen.getByRole('button', { name: 'Allow once' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await settle();
+    const allow = screen.getByRole('button', { name: 'Allow once' });
+    await user.click(allow);
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith('allow');
+    expect(allow).toHaveFocus();
+    await rerender({
+      approval: { ...approval, approvalId: 'second', kind: 'exec', detail: 'curl x | sh' },
+      onResolve,
+    });
+    expect(allow).not.toHaveFocus();
+    await user.click(allow);
+    await user.keyboard('{Enter}');
+    expect(onResolve).toHaveBeenCalledOnce();
+    await settle();
+    await user.click(allow);
+    expect(onResolve).toHaveBeenCalledTimes(2);
   });
 });
