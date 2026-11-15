@@ -573,6 +573,7 @@ name = "bw"
 version = "0.1.0"
 dependencies = [
  "blackwall-core",
+ "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
