@@ -262,7 +262,9 @@ and gates native data/model/tool commands. Locking cancels registered runs/downl
 active shares; the UI flushes saves before clearing its conversation state. It does not encrypt the
 SQLite database or protect against the same user account reading files or using `bw`. Native dialogs
 recheck lock state after selection. Actions already accepted before a lock may finish; the lock is
-not a filesystem or process isolation boundary.
+not a filesystem or process isolation boundary. A folder marked `app-lock-enabled` whose verifier is
+missing from the keyring stays locked; the only way past it is `reset_missing_lock`, which erases
+conversations, memories, backups and traces before opening without a lock.
 
 ## Not built yet
 

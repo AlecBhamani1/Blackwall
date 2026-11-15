@@ -66,7 +66,7 @@
       if (isDesktop()) {
         const status = await authClient.status();
         authStatus.set(status);
-        authInitialized = !status.keyringNeeded;
+        authInitialized = !status.keyringNeeded && !status.lockMissing;
         if (status.locked) return;
       }
       booted = true;
@@ -90,7 +90,7 @@
       lockError = authError(cause);
       if (!booted) {
         // A failed read settles nothing, so show its error rather than an earlier state.
-        authStatus.update((status) => ({ ...status, keyringNeeded: false }));
+        authStatus.update((status) => ({ ...status, keyringNeeded: false, lockMissing: false }));
         authInitialized = false;
       }
     } finally {
@@ -102,6 +102,18 @@
     lockError = '';
     try {
       authStatus.set(await authClient.unlock(passphrase));
+      await initializeApp();
+    } catch (cause) {
+      lockError = authError(cause);
+    } finally {
+      authBusy = false;
+    }
+  }
+  async function resetMissingLock() {
+    authBusy = true;
+    lockError = '';
+    try {
+      authStatus.set(await authClient.resetMissingLock());
       await initializeApp();
     } catch (cause) {
       lockError = authError(cause);
@@ -227,8 +239,10 @@
     error={lockError}
     initialized={authInitialized}
     keyringNeeded={$authStatus.keyringNeeded}
+    lockMissing={$authStatus.lockMissing}
     onUnlock={unlock}
     onRetry={initializeApp}
+    onReset={resetMissingLock}
   />
 {:else}
   <div class="app-shell" inert={authBusy} aria-busy={authBusy}>

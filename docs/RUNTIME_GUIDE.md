@@ -1239,6 +1239,12 @@ keyring to open this data folder. Start your keyring (GNOME Keyring or KWallet),
 keyring prompt you dismiss counts as an error, not as no keyring. Without a keyring you cannot set a
 lock in the desktop app.
 
+If a folder is marked `app-lock-enabled` but the keyring has no passphrase for it, Blackwall stays
+locked and shows "Your lock passphrase is missing from the keychain." **Try again** reads the
+keyring again and asks for the passphrase if it is back. **Reset**, after a confirmation, erases this
+device's conversations, memories, database backups and run traces, keeps settings, paired devices,
+connections and keychain secrets, and opens without a lock; you can then set a new one.
+
 This is an access control for the desktop app, meant for someone at your unlocked screen. It does
 not encrypt the database, attachments, skills, or exports, and does not stop the same user account
 from reading them or using the CLI. Disk encryption (FileVault, BitLocker, or LUKS) protects the

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { KEYRING_NEEDED } from '../auth';
+  import { KEYRING_NEEDED, LOCK_MISSING } from '../auth';
   import LogoMark from './LogoMark.svelte';
   export let loading = false;
   export let error = '';
@@ -8,6 +8,9 @@
   export let onRetry: () => Promise<void>;
   export let initialized = false;
   export let keyringNeeded = false;
+  export let lockMissing = false;
+  export let onReset: () => Promise<void> = async () => {};
+  let confirmingReset = false;
   let passphrase = '';
   let input: HTMLInputElement | undefined;
   async function focusPassphrase(node: HTMLInputElement) {
@@ -34,6 +37,28 @@
     {#if keyringNeeded}
       <p role="alert">{KEYRING_NEEDED}</p>
       <button disabled={loading} onclick={onRetry}>Try again</button>
+    {:else if lockMissing}
+      <p role="alert">{LOCK_MISSING}</p>
+      {#if confirmingReset}
+        <p>
+          Reset erases this device's conversations, history and saved memories, including their
+          backups and run traces. Settings, connections and saved keys stay.
+        </p>
+        <div class="actions">
+          <button class="danger" disabled={loading} onclick={onReset}>Erase and reset</button>
+          <button class="secondary" disabled={loading} onclick={() => (confirmingReset = false)}
+            >Cancel</button
+          >
+        </div>
+      {:else}
+        <div class="actions">
+          <button disabled={loading} onclick={onRetry}>Try again</button>
+          <button class="secondary" disabled={loading} onclick={() => (confirmingReset = true)}
+            >Reset</button
+          >
+        </div>
+      {/if}
+      {#if error}<p class="error" role="alert">{error}</p>{/if}
     {:else if initialized}
       <p>Enter your passphrase to open your conversations.</p>
       <form onsubmit={unlock}>
@@ -112,6 +137,19 @@
   }
   p + button {
     margin-top: 12px;
+  }
+  .actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .secondary {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    border: 1px solid var(--border-strong);
+  }
+  .danger {
+    background: var(--err);
   }
   button:disabled {
     opacity: 0.5;

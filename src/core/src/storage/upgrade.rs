@@ -20,7 +20,7 @@ use std::{
 
 /// The schema version of the v6 chat store.
 pub(crate) const V6: i64 = 6;
-const BACKUPS_DIR: &str = "backups";
+pub(super) const BACKUPS_DIR: &str = "backups";
 const MAX_BACKUPS: u32 = 3;
 /// Where an upgrade copies the database before it finishes.
 const PENDING_BACKUP: &str = "blackwall-upgrading.sqlite3";

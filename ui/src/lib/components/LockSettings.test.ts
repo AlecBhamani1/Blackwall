@@ -3,7 +3,13 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { authStatus, NO_KEYRING_NOTE } from '../auth';
 import LockSettings from './LockSettings.svelte';
 vi.mock('../setup', () => ({ isDesktop: () => true }));
-const status = { locked: false, enabled: false, keyring: true, keyringNeeded: false };
+const status = {
+  locked: false,
+  enabled: false,
+  keyring: true,
+  keyringNeeded: false,
+  lockMissing: false,
+};
 afterEach(() => authStatus.set({ ...status, locked: true }));
 it('shows and focuses a lock failure in settings and permits an explicit retry', async () => {
   authStatus.set({ ...status, enabled: true });

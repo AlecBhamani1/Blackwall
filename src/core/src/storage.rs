@@ -10,6 +10,8 @@ pub const DATABASE_FILE: &str = "blackwall.sqlite3";
 pub const LOCK_MARKER: &str = "app-lock-enabled";
 /// Empty, non-secret file in the data folder: this data has no app lock.
 pub const NO_LOCK_MARKER: &str = "app-lock-disabled";
+/// Where `erase_history` writes the new database before renaming it over the old one.
+const ERASE_STAGING_DIR: &str = "erase-staging";
 const MAX_SESSION_BYTES: usize = 48 * 1024 * 1024;
 const MAX_SESSIONS: i64 = 500;
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,6 +217,99 @@ impl LocalStore {
     }
     pub fn delete_session(&self, id: &str) -> Result<(), StorageError> {
         self.delete_chat(id)
+    }
+    /// Erases every conversation and saved memory, the upgrade backups and the run traces, and
+    /// starts a new database. Settings and paired devices are copied over without opening the old
+    /// database as a store, so an old or unconvertible history cannot block the erase.
+    pub fn erase_history(directory: &Path) -> Result<(), StorageError> {
+        let path = directory.join(DATABASE_FILE);
+        let (mut settings, mut devices) = (Vec::new(), Vec::new());
+        if fs::symlink_metadata(&path).is_ok() {
+            let old =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            old.busy_timeout(BUSY_TIMEOUT)?;
+            if old.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
+                > upgrade::V6
+            {
+                return Err(StorageError::Invalid(
+                    "This data was created by a newer Blackwall version. Update the app to open it.",
+                ));
+            }
+            let rows = |table: &str, sql: &str, into: &mut Vec<(String, String)>| {
+                let exists: bool = old.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    let mut query = old.prepare(sql)?;
+                    for row in query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+                        into.push(row?);
+                    }
+                }
+                Ok::<_, StorageError>(())
+            };
+            rows("settings", "SELECT key, value FROM settings", &mut settings)?;
+            rows(
+                "paired_devices",
+                "SELECT id, body FROM paired_devices",
+                &mut devices,
+            )?;
+            // Windows cannot rename over a file that is still open.
+            drop(old);
+        }
+        // The browser's old saved chats must not be imported back into the new database.
+        settings.retain(|(key, _)| key != "legacy_sessions_migrated");
+        settings.push(("legacy_sessions_migrated".into(), "true".into()));
+        // The new database is written and synced beside the old one, then renamed over it, so
+        // the kept settings and devices are never only in memory. History goes after.
+        let staging = directory.join(ERASE_STAGING_DIR);
+        let remove_dir = |folder: &Path| match fs::remove_dir_all(folder) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+        remove_dir(&staging)?;
+        let store = Self::open(&staging)?;
+        let transaction = store.connection.unchecked_transaction()?;
+        for (key, value) in &settings {
+            transaction.execute(
+                "INSERT INTO settings(key,value) VALUES (?1,?2)",
+                [key, value],
+            )?;
+        }
+        for (id, body) in &devices {
+            transaction.execute(
+                "INSERT INTO paired_devices(id,body) VALUES (?1,?2)",
+                [id, body],
+            )?;
+        }
+        transaction.commit()?;
+        drop(store);
+        // Windows needs write access to flush a file.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(staging.join(DATABASE_FILE))?
+            .sync_all()?;
+        // A leftover journal of the old database must not be applied to the new one.
+        for suffix in ["-journal", "-wal", "-shm"] {
+            match fs::remove_file(directory.join(format!("{DATABASE_FILE}{suffix}"))) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into())
+                }
+                _ => {}
+            }
+        }
+        fs::rename(staging.join(DATABASE_FILE), &path)?;
+        #[cfg(unix)]
+        fs::File::open(directory)?.sync_all()?;
+        for folder in [
+            ERASE_STAGING_DIR,
+            upgrade::BACKUPS_DIR,
+            crate::trace::TRACE_DIRECTORY,
+        ] {
+            remove_dir(&directory.join(folder))?;
+        }
+        Ok(())
     }
     pub fn migrate_sessions(&mut self, sessions: &[Value]) -> Result<(), StorageError> {
         convert::migrate_v6(self, sessions)
@@ -701,6 +796,129 @@ mod tests {
         drop(LocalStore::open(&locked).unwrap());
         assert!(!locked.join(NO_LOCK_MARKER).exists());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn erase_history_removes_conversations_memories_backups_and_traces_but_keeps_settings() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-erase-{}",
+            crate::pairing::secret("bwd_")
+        ));
+        let mut store = LocalStore::open(&directory).unwrap();
+        store.save_session(&session("session_one")).unwrap();
+        store
+            .save_memory(&MemoryEntry {
+                id: "memory_one".into(),
+                content: "remembered secret".into(),
+                updated_at: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_setting("preferences", r#"{"model":"kept"}"#)
+            .unwrap();
+        drop(store);
+        for folder in [upgrade::BACKUPS_DIR, crate::trace::TRACE_DIRECTORY] {
+            fs::create_dir_all(directory.join(folder)).unwrap();
+            fs::write(directory.join(folder).join("old"), b"retained bytes").unwrap();
+        }
+        LocalStore::erase_history(&directory).unwrap();
+        assert!(!directory.join(upgrade::BACKUPS_DIR).exists());
+        assert!(!directory.join(crate::trace::TRACE_DIRECTORY).exists());
+        let raw = fs::read(directory.join(DATABASE_FILE)).unwrap();
+        for text in ["retained bytes", "remembered secret"] {
+            assert!(!raw.windows(text.len()).any(|w| w == text.as_bytes()));
+        }
+        let store = LocalStore::open(&directory).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert!(store.memories("").unwrap().is_empty());
+        let indexed: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM chat_search", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 0);
+        assert_eq!(
+            store.setting("preferences").unwrap().as_deref(),
+            Some(r#"{"model":"kept"}"#)
+        );
+        // The browser's old saved chats are not imported back.
+        let mut store = store;
+        store
+            .migrate_sessions(&[session("session_browser")])
+            .unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        drop(store);
+        // Nothing left to erase is not an error.
+        LocalStore::erase_history(&directory).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn erase_history_keeps_settings_when_removing_history_fails() {
+        let directory = std::env::temp_dir().join(format!(
+            "blackwall-erase-fail-{}",
+            crate::pairing::secret("bwd_")
+        ));
+        let store = LocalStore::open(&directory).unwrap();
+        store.save_session(&session("session_one")).unwrap();
+        store
+            .save_setting("preferences", r#"{"model":"kept"}"#)
+            .unwrap();
+        drop(store);
+        // A file where the backups folder should be: removing history fails after the new
+        // database is in place.
+        fs::write(directory.join(upgrade::BACKUPS_DIR), b"not a folder").unwrap();
+        assert!(LocalStore::erase_history(&directory).is_err());
+        let store = LocalStore::open(&directory).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(
+            store.setting("preferences").unwrap().as_deref(),
+            Some(r#"{"model":"kept"}"#)
+        );
+        drop(store);
+        // A failed attempt leaves nothing that blocks the next one.
+        fs::remove_file(directory.join(upgrade::BACKUPS_DIR)).unwrap();
+        LocalStore::erase_history(&directory).unwrap();
+        assert!(!directory.join(ERASE_STAGING_DIR).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn erase_history_does_not_need_an_old_history_to_upgrade() {
+        // A v5 chat that does not convert, with every backup slot taken: opening refuses.
+        let mut bad = v5_chats()[0].clone();
+        bad["contextState"]["transcript"][0]["ref"] = json!(0);
+        let directory = upgrade::tests::v5_folder("erase", &[bad]);
+        let old = Connection::open(directory.join(DATABASE_FILE)).unwrap();
+        old.execute_batch(
+            "INSERT INTO settings VALUES ('preferences','{\"model\":\"kept\"}');
+            INSERT INTO paired_devices VALUES ('device_one','{\"kept\":true}');",
+        )
+        .unwrap();
+        drop(old);
+        fs::create_dir_all(directory.join(upgrade::BACKUPS_DIR)).unwrap();
+        for n in 1..=3 {
+            fs::write(
+                directory
+                    .join(upgrade::BACKUPS_DIR)
+                    .join(format!("blackwall-backup-{n}.sqlite3")),
+                b"old history",
+            )
+            .unwrap();
+        }
+        assert!(LocalStore::open(&directory).is_err());
+        LocalStore::erase_history(&directory).unwrap();
+        assert!(!directory.join(upgrade::BACKUPS_DIR).exists());
+        let store = LocalStore::open(&directory).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(
+            store.setting("preferences").unwrap().as_deref(),
+            Some(r#"{"model":"kept"}"#)
+        );
+        let device: String = store
+            .connection
+            .query_row("SELECT body FROM paired_devices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(device, r#"{"kept":true}"#);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn session_lifecycle_retains_attachment_contents() {

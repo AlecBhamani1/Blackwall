@@ -82,6 +82,7 @@ fn run() -> Result<(), StartupError> {
             auth::unlock_app,
             auth::set_passphrase,
             auth::lock_app,
+            auth::reset_missing_lock,
             agent_commands::choose_workspace,
             agent_commands::restore_workspace,
             agent_commands::browse_workspace,
