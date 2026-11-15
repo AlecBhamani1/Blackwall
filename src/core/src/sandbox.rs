@@ -714,6 +714,18 @@ fn quoted(path: &Path) -> Result<String, ToolError> {
 }
 
 #[cfg(target_os = "macos")]
+fn regex_escaped(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+#[cfg(target_os = "macos")]
 fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
     // Closed by default, including network, Unix sockets, Mach services and process inspection.
     // Fork/exec inherit Seatbelt. No sandbox extension, task port or service-launch privileges.
@@ -723,9 +735,10 @@ fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
 (allow process-exec process-fork)
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
-; Block session/group escape through both direct syscalls and posix_spawn attributes.
+; Block direct session/group escape (setpgid, setsid). posix_spawn stays allowed for Node and
+; Python; cancellation stops its detached children by walking descendants.
 ; Darwin syscall numbers are stable on supported Intel and Apple Silicon macOS.
-(deny syscall-unix (syscall-number 82) (syscall-number 147) (syscall-number 244))
+(deny syscall-unix (syscall-number 82) (syscall-number 147))
 (allow sysctl-read)
 (allow file-read-metadata)
 (allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt/homebrew") (subpath "/Library/Apple") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
@@ -749,6 +762,19 @@ fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
     policy.push_str(r#"(deny file-read* file-write* (regex #"(^|/)(\.git|\.hg|\.svn|\.blackwall|\.ssh|\.aws|\.gnupg|\.config|\.codex|\.claude|\.agents)(/|$)"))
 (deny file-write* (regex #"(^|/)(AGENTS\.md|AGENTS\.override\.md|CLAUDE\.md)(/|$)"))
 "#);
+    // Extra instruction files load from every folder too. Deny creating, removing or renaming
+    // their leading folders, or a folder moved into place could carry a rewritten copy.
+    for name in &workspace.instruction_files {
+        let parts: Vec<String> = name.split('/').map(regex_escaped).collect();
+        for end in 1..=parts.len() {
+            let suffix = if end == parts.len() { "(/|$)" } else { "$" };
+            let pattern = format!("(^|/){}{suffix}", parts[..end].join("/"));
+            policy.push_str(&format!(
+                "(deny file-write* (regex {}))\n",
+                quoted(Path::new(&pattern))?
+            ));
+        }
+    }
     let mut protected = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
@@ -757,6 +783,15 @@ fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
             home.join("Library"),
             home.join(".netrc"),
             home.join(".npmrc"),
+            home.join(".git-credentials"),
+            home.join(".docker"),
+            home.join(".kube"),
+            home.join(".zsh_history"),
+            home.join(".zsh_sessions"),
+            home.join(".bash_history"),
+            home.join(".bash_sessions"),
+            home.join(".python_history"),
+            home.join(".node_repl_history"),
         ]);
     }
     if let Some(data) = &workspace.execution.data_directory {
@@ -783,7 +818,13 @@ fn seatbelt_policy(workspace: &Workspace) -> Result<String, ToolError> {
     }
     policy.push_str(&format!("(deny file-write-unlink (literal {root}))\n"));
     if workspace.execution.network {
-        policy.push_str("(allow network*)\n");
+        // No outbound Unix socket connections (Docker, ssh-agent), except mDNSResponder for DNS.
+        policy.push_str(
+            r#"(allow network*)
+(deny network-outbound (remote unix-socket))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+"#,
+        );
     }
     Ok(policy)
 }
@@ -2817,6 +2858,104 @@ else:
         }
 
         #[tokio::test]
+        async fn native_extra_instruction_files_and_their_folders_are_write_protected() {
+            let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
+            project.workspace.instruction_files = vec![
+                ".github/copilot-instructions.md".into(),
+                "GUIDE (1).md".into(),
+            ];
+            let github = project.workspace.path.join(".github");
+            std::fs::create_dir_all(&github).unwrap();
+            std::fs::write(github.join("copilot-instructions.md"), "owner").unwrap();
+            for command in [
+                "printf blocked > .github/copilot-instructions.md",
+                "printf blocked > .github/COPILOT-instructions.md",
+                "/bin/mkdir nested; /bin/mkdir nested/.github",
+                "printf blocked > 'GUIDE (1).md'",
+                "printf blocked > 'nested/guide (1).md'",
+                "/bin/mv .github moved",
+                "/bin/mkdir staged; /bin/mv staged nested/.github",
+                "/bin/ln -s staged nested/.github",
+            ] {
+                assert!(project.run(command).await.is_err(), "{command}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(github.join("copilot-instructions.md")).unwrap(),
+                "owner"
+            );
+            assert!(!project.workspace.path.join("nested/.github").exists());
+            // Other files in the folder stay writable.
+            project.run("printf ok > .github/ci.yml").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn native_instruction_file_case_variants_cannot_be_created() {
+            // APFS is case-insensitive: agents.md loads as AGENTS.md. None of these exist yet.
+            let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
+            project.workspace.instruction_files =
+                vec![".github/copilot-instructions.md".into(), "GUIDE.md".into()];
+            let path = &project.workspace.path;
+            std::fs::create_dir_all(path.join("sub/.github")).unwrap();
+            for command in [
+                "printf blocked > agents.md",
+                "printf blocked > sub/Claude.md",
+                "printf blocked > guide.md",
+                "printf blocked > sub/Guide.MD",
+                "printf blocked > sub/.GitHub/COPILOT-Instructions.md",
+            ] {
+                assert!(project.run(command).await.is_err(), "{command}");
+            }
+            assert_eq!(
+                std::fs::read_dir(path.join("sub/.github")).unwrap().count(),
+                0
+            );
+            assert!(!path.join("agents.md").exists() && !path.join("guide.md").exists());
+            project.run("printf ok > sub/notes.md").await.unwrap();
+        }
+
+        #[test]
+        fn native_policy_protects_home_credentials_and_histories() {
+            let project = Project::new(ExecutionProfile::ReadOnly);
+            let policy = seatbelt_policy(&project.workspace).unwrap();
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            for name in [
+                ".git-credentials",
+                ".docker",
+                ".kube",
+                ".zsh_history",
+                ".bash_history",
+            ] {
+                let path = home.join(name);
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                let rule = format!(
+                    "(deny file-read* file-write* (subpath {}))",
+                    quoted(&path).unwrap()
+                );
+                assert!(policy.contains(&rule), "{name}");
+            }
+        }
+
+        #[tokio::test]
+        async fn native_network_on_still_blocks_local_unix_sockets() {
+            let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
+            project.workspace.execution.network = true;
+            let socket = project.root.join("s.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let command = format!("/usr/bin/nc -U {} < /dev/null", socket.display());
+            assert!(project.run(&command).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+            // Name lookup goes through mDNSResponder's socket and stays available.
+            project
+                .run("/usr/bin/nc -U /var/run/mDNSResponder < /dev/null")
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
         async fn native_network_and_descendant_network_are_denied_until_owner_enables_them() {
             let mut project = Project::new(ExecutionProfile::WorkspaceWrite);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3140,8 +3279,8 @@ else:
                     .unwrap();
                 assert!(result.ends_with("-1"), "{escape}: {result}");
             }
-            // posix_spawn can change group/session inside the kernel without calling setsid.
-            // Exercise that distinct escape path with a small native fixture.
+            // posix_spawn can still start a child in a new group or session. Cancelling the run
+            // must also stop that child while its spawner is alive.
             let source = project.workspace.path.join("spawn.c");
             std::fs::write(&source, include_str!("../tests/fixtures/sandbox_spawn.c")).unwrap();
             let status = std::process::Command::new("/usr/bin/cc")
@@ -3151,8 +3290,103 @@ else:
                 .status()
                 .unwrap();
             assert!(status.success());
-            project.run("./spawn-probe").await.unwrap();
-            assert!(!project.workspace.path.join("escaped-spawn").exists());
+            let mut run = Box::pin(project.run("./spawn-probe"));
+            let path = |name: &str| project.workspace.path.join(name);
+            tokio::select! {
+                result = &mut run => panic!("command ended before cancellation: {result:?}"),
+                _ = async {
+                    for _ in 0..200 {
+                        if ["spawned", "tried-setsid", "tried-setpgroup"]
+                            .iter()
+                            .all(|name| path(name).exists())
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("detached children never started");
+                } => {}
+            }
+            let pids = std::fs::read_to_string(path("spawned")).unwrap();
+            let pids: Vec<&str> = pids.split(' ').collect();
+            let state = |pid: &str| {
+                let output = std::process::Command::new("/bin/ps")
+                    .args(["-o", "pgid=,stat=", "-p", pid])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            };
+            // Both children lead their own group, apart from the spawner's; the first also leads
+            // a new session.
+            let parent_group = state(pids[0]).split_whitespace().next().unwrap().to_owned();
+            for (pid, session) in [(pids[1], true), (pids[2], false)] {
+                let state = state(pid);
+                let mut fields = state.split_whitespace();
+                assert_eq!(fields.next(), Some(pid), "{state}");
+                assert_ne!(pid, parent_group);
+                assert_eq!(fields.next().unwrap().contains('s'), session, "{state}");
+            }
+            drop(run);
+            for pid in &pids[1..] {
+                let mut seen = state(pid);
+                for _ in 0..100 {
+                    if seen.is_empty() || seen.ends_with('Z') {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    seen = state(pid);
+                }
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", pid])
+                    .status();
+                assert!(
+                    seen.is_empty() || seen.ends_with('Z'),
+                    "{pid} survived: {seen}"
+                );
+            }
+            for mode in ["setsid", "setpgroup"] {
+                assert!(!project.root.join(format!("outside-{mode}")).exists());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_profiles_allow_node_and_python_child_processes() {
+            let project = Project::new(ExecutionProfile::ReadOnly);
+            use std::os::unix::fs::PermissionsExt;
+            // Only locations the profile lets the sandbox read, and only executables there.
+            let readable = ["/opt/homebrew", "/usr"];
+            // `/usr/bin/python3` is Apple's developer-tools shim; its real runtime lives elsewhere.
+            let directories = ["/opt/homebrew/bin", "/usr/local/bin"];
+            for (program, script) in [
+                (
+                    "python3",
+                    "-c 'import subprocess; print(subprocess.run([\"/bin/echo\", \"child-ok\"], capture_output=True, text=True).stdout)'",
+                ),
+                (
+                    "node",
+                    "-e 'console.log(require(\"child_process\").execFileSync(\"/bin/echo\", [\"child-ok\"]).toString())'",
+                ),
+            ] {
+                let found = directories.iter().find_map(|directory| {
+                    let path = Path::new(directory).join(program);
+                    let real = std::fs::canonicalize(&path).ok()?;
+                    let executable = real.metadata().ok()?.permissions().mode() & 0o111 != 0;
+                    (executable && readable.iter().any(|root| real.starts_with(root)))
+                        .then_some(path)
+                });
+                let Some(program) = found else {
+                    eprintln!("skipped {program}: no executable in {directories:?}");
+                    continue;
+                };
+                let output = project
+                    .run(&format!("'{}' {script}", program.display()))
+                    .await;
+                assert!(
+                    output.as_deref().is_ok_and(|text| text.contains("child-ok")),
+                    "{}: {output:?}",
+                    program.display()
+                );
+            }
         }
 
         #[tokio::test]
