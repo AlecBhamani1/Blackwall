@@ -25,6 +25,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loopback-only development relays may still run without one.
 ### Fixed
 
+- An empty model answer no longer makes later chat messages fail with invalid saved history.
+  Conversations affected by the earlier empty-answer bug recover on their next request while
+  retaining their messages and valid checkpoints.
+
 - Web page approval prompts now show the full request URL, including its query string, so data
   placed in a link is visible before you approve the request. URLs too long to show in full
   (over 2,048 characters) are refused instead of being partly hidden.

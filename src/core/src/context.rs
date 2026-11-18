@@ -291,16 +291,43 @@ impl ContextState {
             return Err(ContextError::Limit);
         }
         if let Some(saved) = saved {
-            if saved.covered_messages > source.len()
-                || fingerprint(&source[..saved.covered_messages]) != saved.source_hash
-            {
-                return Err(ContextError::History);
-            }
             saved.validate()?;
             let mut state = saved.clone();
+            if state.covered_messages > source.len()
+                || fingerprint(&source[..state.covered_messages]) != state.source_hash
+            {
+                // Older chat runs committed an empty completion that the UI then marked as
+                // failed and omitted from the next source. Recover only that exact mismatch:
+                // reinserting the trailing placeholder must reproduce the saved source hash.
+                let covered = state
+                    .covered_messages
+                    .checked_sub(1)
+                    .filter(|covered| *covered <= source.len())
+                    .ok_or(ContextError::History)?;
+                let last = state.transcript.last().ok_or(ContextError::History)?;
+                if last["role"] != "assistant"
+                    || !last["content"]
+                        .as_str()
+                        .is_some_and(|s| s.trim().is_empty())
+                    || last.as_object().is_none_or(|m| m.len() != 2)
+                    || state
+                        .checkpoints
+                        .last()
+                        .is_some_and(|c| c.through >= state.transcript.len())
+                {
+                    return Err(ContextError::History);
+                }
+                let mut completed = source[..covered].to_vec();
+                completed.push(last.clone());
+                if fingerprint(&completed) != state.source_hash {
+                    return Err(ContextError::History);
+                }
+                state.transcript.pop();
+                state.covered_messages = covered;
+            }
             state
                 .transcript
-                .extend_from_slice(&source[saved.covered_messages..]);
+                .extend_from_slice(&source[state.covered_messages..]);
             state.covered_messages = source.len();
             state.source_hash = fingerprint(source);
             validate_history(&state.transcript)?;
@@ -781,18 +808,24 @@ async fn chat_traced(
             });
             continue;
         }
-        state
-            .transcript
-            .push(json!({"role":"assistant","content":turn.content}));
-        state.complete_source(&source, &answer);
+        // The UI rejects blank answers and excludes failed messages from future requests.
+        // Keep the prior snapshot in that case, while still reporting usage and reasoning.
+        if !answer.trim().is_empty() {
+            state
+                .transcript
+                .push(json!({"role":"assistant","content":turn.content}));
+            state.complete_source(&source, &answer);
+        }
         emit(AgentEvent::ContextReport {
             request_id: request_id.into(),
             report: budget.report(&messages, &definitions, state.server_usage),
         });
-        emit(AgentEvent::ContextUpdated {
-            request_id: request_id.into(),
-            state,
-        });
+        if !answer.trim().is_empty() {
+            emit(AgentEvent::ContextUpdated {
+                request_id: request_id.into(),
+                state,
+            });
+        }
         let (reasoning_text, reasoning_ms) = reasoning.take();
         emit(AgentEvent::TurnComplete {
             request_id: request_id.into(),
@@ -823,6 +856,7 @@ mod tests {
     use std::sync::Mutex;
     struct Scripted {
         response: String,
+        reasoning: String,
         calls: bool,
         pending: bool,
         pending_after: usize,
@@ -835,6 +869,7 @@ mod tests {
     fn backend(response: String) -> Scripted {
         Scripted {
             response,
+            reasoning: String::new(),
             calls: false,
             pending: false,
             pending_after: usize::MAX,
@@ -863,6 +898,7 @@ mod tests {
                 }
                 Ok(ModelTurn {
                     content: self.response.clone(),
+                    reasoning: self.reasoning.clone(),
                     calls: if self.calls {
                         vec![crate::model::ToolCall::default()]
                     } else {
@@ -1281,6 +1317,114 @@ mod tests {
         let restored = ContextState::restore(&completed, Some(saved)).unwrap();
         assert_eq!(restored.transcript, saved.transcript);
         assert!(events.iter().any(|e| matches!(e, crate::protocol::AgentEvent::ContextReport { report, .. } if report.server_usage.is_some_and(|usage| usage.prompt_tokens == 42))));
+    }
+
+    #[test]
+    fn restore_recovers_only_authenticated_trailing_empty_completions() {
+        for answer in ["", " \n"] {
+            let source = vec![
+                json!({"role":"user","content":"Initial task"}),
+                json!({"role":"assistant","content":"Earlier answer"}),
+                json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}),
+            ];
+            let mut saved = ContextState::restore(&source, None).unwrap();
+            saved.checkpoints.push(Checkpoint {
+                through: 2,
+                source_hash: fingerprint(&source[..2]),
+                summary: serde_json::from_str(&summary()).unwrap(),
+            });
+            saved
+                .transcript
+                .push(json!({"role":"assistant","content":answer}));
+            saved.complete_source(&source, answer);
+            let original = saved.clone();
+            // Also works when the next request is /compact, with no new user message.
+            let restored = ContextState::restore(&source, Some(&saved)).unwrap();
+            assert_eq!(restored.transcript, source);
+            assert_eq!(restored.checkpoints, saved.checkpoints);
+            let mut next = source.clone();
+            next.push(json!({"role":"user","content":"Next request"}));
+            next.push(json!({"role":"user","content":"Why did it break?"}));
+            let restored = ContextState::restore(&next, Some(&saved)).unwrap();
+            assert_eq!(restored.transcript, next);
+            assert_eq!(restored.covered_messages, next.len());
+            assert_eq!(restored.source_hash, fingerprint(&next));
+            assert_eq!(saved, original);
+
+            let mut edited = next.clone();
+            edited[0]["content"] = json!("Different task");
+            assert!(ContextState::restore(&edited, Some(&saved)).is_err());
+            let mut corrupt = saved.clone();
+            corrupt.checkpoints[0].source_hash = "0".repeat(64);
+            assert!(ContextState::restore(&next, Some(&corrupt)).is_err());
+            corrupt = saved.clone();
+            corrupt.source_hash = "0".repeat(64);
+            assert!(ContextState::restore(&next, Some(&corrupt)).is_err());
+            corrupt = saved.clone();
+            corrupt.transcript.last_mut().unwrap()["tool_calls"] = json!([]);
+            assert!(ContextState::restore(&next, Some(&corrupt)).is_err());
+            corrupt = saved.clone();
+            corrupt.checkpoints.push(Checkpoint {
+                through: corrupt.transcript.len(),
+                source_hash: fingerprint(&corrupt.transcript),
+                summary: serde_json::from_str(&summary()).unwrap(),
+            });
+            assert!(ContextState::restore(&next, Some(&corrupt)).is_err());
+            corrupt = saved.clone();
+            corrupt.transcript.last_mut().unwrap()["content"] = json!("Actual answer");
+            corrupt.complete_source(&source, "Actual answer");
+            assert!(ContextState::restore(&next, Some(&corrupt)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_chat_answers_keep_prior_context_and_report_reasoning_and_usage() {
+        use crate::protocol::AgentEvent;
+        for answer in ["", " \n"] {
+            let mut model = backend(answer.into());
+            model.reasoning = "Reasoning without a final answer".into();
+            let source = vec![json!({"role":"user","content":"Task"})];
+            let prior = ContextState::restore(&source, None).unwrap();
+            let events = Mutex::new(vec![]);
+            let result = chat(
+                &model,
+                "blank",
+                ContextRun {
+                    source: source.clone(),
+                    state: prior.clone(),
+                    budget: model.budget,
+                    instructions: vec![],
+                    compact: false,
+                    trace: None,
+                    subagents: Default::default(),
+                    instruction_settings: Default::default(),
+                },
+                &|event| events.lock().unwrap().push(event),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, answer);
+            let events = events.lock().unwrap();
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextUpdated { .. })));
+            assert!(events.iter().any(
+                |e| matches!(e, AgentEvent::TurnComplete { reasoning, usage: Some(_), .. }
+                if reasoning.as_deref() == Some("Reasoning without a final answer"))
+            ));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextReport { report, .. }
+                if report.server_usage.is_some())));
+            let mut next = source;
+            next.push(json!({"role":"user","content":"Continue"}));
+            assert_eq!(
+                ContextState::restore(&next, Some(&prior))
+                    .unwrap()
+                    .transcript,
+                next
+            );
+        }
     }
 
     #[test]

@@ -150,8 +150,6 @@ export async function restoreContext(
   if (
     !Number.isInteger(saved.coveredMessages) ||
     saved.coveredMessages < 0 ||
-    saved.coveredMessages > source.length ||
-    (await fingerprint(source.slice(0, saved.coveredMessages))) !== saved.sourceHash ||
     saved.transcript.length > 20000 ||
     saved.checkpoints.length > 100 ||
     new TextEncoder().encode(JSON.stringify(saved)).length > 48 * 1024 * 1024
@@ -171,9 +169,32 @@ export async function restoreContext(
     validateSummary(c.summary, 32768);
     previous = c.through;
   }
+  const state = structuredClone(saved);
+  if (
+    state.coveredMessages > source.length ||
+    (await fingerprint(source.slice(0, state.coveredMessages))) !== state.sourceHash
+  ) {
+    // Recover only the old empty-completion bug: the omitted trailing placeholder must
+    // reconstruct the original source hash. Unrelated edits/corruption still fail closed.
+    const covered = state.coveredMessages - 1;
+    const last = state.transcript.at(-1);
+    if (
+      covered < 0 ||
+      covered > source.length ||
+      last?.role !== 'assistant' ||
+      typeof last.content !== 'string' ||
+      last.content.trim() ||
+      Object.keys(last).length !== 2 ||
+      (state.checkpoints.at(-1)?.through ?? 0) >= state.transcript.length ||
+      (await fingerprint([...source.slice(0, covered), last])) !== state.sourceHash
+    )
+      throw new Error('The saved context is invalid. Original transcript retained.');
+    state.transcript.pop();
+    state.coveredMessages = covered;
+  }
   return {
-    ...structuredClone(saved),
-    transcript: [...structuredClone(saved.transcript), ...source.slice(saved.coveredMessages)],
+    ...state,
+    transcript: [...state.transcript, ...source.slice(state.coveredMessages)],
     coveredMessages: source.length,
     sourceHash: await fingerprint(source),
   };

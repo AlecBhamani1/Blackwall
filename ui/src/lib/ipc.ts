@@ -429,16 +429,18 @@ async function streamBrowserChat(
     signal,
   );
   if (signal.aborted) throw new DOMException('Response stopped.', 'AbortError');
-  state.transcript.push({ role: 'assistant', content: answer });
-  state.coveredMessages = source.length + 1;
-  state.sourceHash = await fingerprint([...source, { role: 'assistant', content: answer }]);
+  if (answer.trim()) {
+    state.transcript.push({ role: 'assistant', content: answer });
+    state.coveredMessages = source.length + 1;
+    state.sourceHash = await fingerprint([...source, { role: 'assistant', content: answer }]);
+  }
   state.serverUsage = usage;
   emit({
     type: 'context_report',
     requestId: request.requestId,
     report: contextReport(messages, budget, usage),
   });
-  emit({ type: 'context_updated', requestId: request.requestId, state });
+  if (answer.trim()) emit({ type: 'context_updated', requestId: request.requestId, state });
   emit({ type: 'turn_complete', requestId: request.requestId, usage });
   callbacks.onComplete?.();
 }
