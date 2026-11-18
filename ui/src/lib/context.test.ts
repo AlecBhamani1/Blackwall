@@ -102,6 +102,60 @@ describe('browser context budgeting and compaction', () => {
     checkBudget([message], { contextWindow: 32000, outputTokens: 4096, autoCompact: false });
     expect(JSON.stringify(message).length).toBeGreaterThan(500000);
   });
+  it.each(['', ' \n'])('recovers only a verified omitted blank completion (%j)', async (answer) => {
+    const input = [
+      { role: 'user', content: 'Initial task' },
+      { role: 'assistant', content: 'Earlier answer' },
+      {
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
+      },
+    ];
+    const blank = { role: 'assistant', content: answer };
+    const saved = await restoreContext([...input, blank]);
+    saved.checkpoints.push({
+      through: 2,
+      sourceHash: await fingerprint(input.slice(0, 2)),
+      summary,
+    });
+    const original = structuredClone(saved);
+    expect((await restoreContext(input, saved)).transcript).toEqual(input);
+    const next = [
+      ...input,
+      { role: 'user', content: 'Next request' },
+      { role: 'user', content: 'Why did it break?' },
+    ];
+    const restored = await restoreContext(next, saved);
+    expect(restored.transcript).toEqual(next);
+    expect(restored.coveredMessages).toBe(next.length);
+    expect(restored.sourceHash).toBe(await fingerprint(next));
+    expect(restored.checkpoints).toEqual(saved.checkpoints);
+    expect(saved).toEqual(original);
+    await expect(
+      restoreContext([{ role: 'user', content: 'Edited' }, ...next.slice(1)], saved),
+    ).rejects.toThrow('invalid');
+    const corrupt = structuredClone(saved);
+    corrupt.checkpoints[0].sourceHash = 'tampered';
+    await expect(restoreContext(next, corrupt)).rejects.toThrow('checkpoint');
+    await expect(restoreContext(next, { ...saved, sourceHash: '0'.repeat(64) })).rejects.toThrow(
+      'invalid',
+    );
+    const realAnswer = await restoreContext([
+      ...input,
+      { role: 'assistant', content: 'Actual answer' },
+    ]);
+    await expect(restoreContext(next, realAnswer)).rejects.toThrow('invalid');
+    const coveringBlank = structuredClone(saved);
+    coveringBlank.checkpoints.push({
+      through: saved.transcript.length,
+      sourceHash: saved.sourceHash,
+      summary,
+    });
+    await expect(restoreContext(next, coveringBlank)).rejects.toThrow('invalid');
+    const withCall = structuredClone(saved);
+    withCall.transcript.at(-1)!.tool_calls = [];
+    await expect(restoreContext(next, withCall)).rejects.toThrow('tool calls');
+  });
   it('reserves output and safety and separates estimates from endpoint counts', () => {
     expect(() => checkBudget(source(), budget)).toThrow('context budget');
     const usage = { promptTokens: 17, completionTokens: 4, totalTokens: 21 };

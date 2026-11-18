@@ -411,6 +411,64 @@ describe('browser model discovery', () => {
 });
 
 describe('browser model context transport', () => {
+  it.each(['', ' \n'])(
+    'does not commit blank answers and allows the next request (%j)',
+    async (answer) => {
+      const { webcrypto } = await import('node:crypto');
+      const { restoreContext } = await import('./context');
+      vi.stubGlobal('crypto', webcrypto);
+      const source = [{ role: 'user' as const, content: 'Initial task' }];
+      const state = await restoreContext(source);
+      const event = vi.fn();
+      const complete = vi.fn();
+      const sse = (content: string) =>
+        `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: 'stop' }] })}\n\ndata: {"choices":[],"usage":{"prompt_tokens":77,"completion_tokens":12,"total_tokens":89}}\n\ndata: [DONE]\n\n`;
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValueOnce(new Response(sse(answer)))
+          .mockResolvedValueOnce(new Response(sse('Continued'))),
+      );
+      const request = {
+        requestId: 'blank',
+        model: 'fixture',
+        messages: source,
+        contextState: state,
+      };
+      await localModelClient.streamChat(
+        request,
+        { onDelta: vi.fn(), onEvent: event, onComplete: complete },
+        new AbortController().signal,
+      );
+      expect(event.mock.calls.some(([entry]) => entry.type === 'context_updated')).toBe(false);
+      expect(event).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'turn_complete',
+          usage: expect.objectContaining({ completionTokens: 12 }),
+        }),
+      );
+      expect(complete).toHaveBeenCalledOnce();
+      const delta = vi.fn();
+      await localModelClient.streamChat(
+        {
+          ...request,
+          requestId: 'next',
+          messages: [...source, { role: 'user', content: 'Continue' }],
+        },
+        { onDelta: delta, onEvent: event },
+        new AbortController().signal,
+      );
+      expect(delta).toHaveBeenCalledWith('Continued');
+      expect(event).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'context_updated',
+          state: expect.objectContaining({ coveredMessages: 3 }),
+        }),
+      );
+      vi.unstubAllGlobals();
+    },
+  );
   it('caps generated output and retains separately reported server usage', async () => {
     const { webcrypto } = await import('node:crypto');
     vi.stubGlobal('crypto', webcrypto);
